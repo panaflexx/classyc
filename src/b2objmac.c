@@ -33,6 +33,13 @@
 #include "mir-alloc-default.c"
 #include "mir-gen.h" /* mir.h included transitively */
 
+/* ELF GOT-relative relocation type (mir.h only defines PC32 and 64).  We use it
+ * as an internal marker meaning "this reference must go through the GOT"; on
+ * Mach-O it is emitted as X86_64_RELOC_GOT_LOAD. */
+#ifndef R_X86_64_GOTPCREL
+#define R_X86_64_GOTPCREL 9
+#endif
+
 /* ================================================================== */
 /*  Debug tracing                                                      */
 /* ================================================================== */
@@ -291,6 +298,8 @@ typedef struct {
     int         type;       /* original MIR reloc type (R_X86_64_PC32 or R_X86_64_64) */
     int64_t     addend;
     int         in_data;    /* 0 = __text reloc, 1 = __data reloc */
+    int         is_movabs;  /* 1 = reloc sits on a `movabs reg,imm64' immediate */
+    int         is_got;     /* 1 = rewritten into a GOT-relative load (GOT_LOAD) */
 } mach_reloc_t;
 
 /* ================================================================== */
@@ -375,6 +384,7 @@ static int elf_reloc_to_macho (int elf_type) {
   switch (elf_type) {
   case R_X86_64_PC32: return X86_64_RELOC_SIGNED;
   case R_X86_64_64:   return X86_64_RELOC_UNSIGNED;
+  case R_X86_64_GOTPCREL: return X86_64_RELOC_GOT_LOAD; /* GOT-relative load */
   case 4: return 2; /* R_X86_64_PLT32 -> X86_64_RELOC_BRANCH */
   default:
     fprintf (stderr, "warning: unknown ELF reloc type %d, treating as SIGNED\n", elf_type);
@@ -585,6 +595,21 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       mr->type    = cr.type;
       mr->addend  = cr.addend;
       mr->in_data = 0;
+      mr->is_got  = 0;
+      /* An absolute 64-bit reloc that sits on the immediate of a
+       * `movabs reg, imm64' (REX.W + B8+rd) is the code generator taking the
+       * *address* of a symbol.  On macOS the address of an external symbol
+       * cannot be referenced directly from read-only __text; it must be loaded
+       * through the GOT.  Record that this is such a site so Phase 2c can
+       * rewrite it into a `movq sym@GOTPCREL(%rip), reg' (see below). */
+      mr->is_movabs = 0;
+      if (cr.type == R_X86_64_64 && cr.offset >= 2) {
+        const uint8_t *code = (const uint8_t *) funcs[fi].code;
+        uint8_t rex = code[cr.offset - 2];
+        uint8_t op  = code[cr.offset - 1];
+        if ((rex == 0x48 || rex == 0x49) && op >= 0xB8 && op <= 0xBF)
+          mr->is_movabs = 1;
+      }
     }
   }
 
@@ -603,6 +628,8 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     mr->type    = R_X86_64_64; /* absolute 64-bit */
     mr->addend  = datas[i].ref_disp;
     mr->in_data = 1;
+    mr->is_movabs = 0;
+    mr->is_got  = 0;
   }
 
   DBG ("phase 2b done: %zu relocations", n_relocs);
@@ -618,12 +645,35 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   for (size_t i = 0; i < n_datas; i++) if (datas[i].name) name_set_find_or_add (&defined_names, macho_mangle (datas[i].name));
   for (size_t i = 0; i < n_bsses; i++) if (bsses[i].name) name_set_find_or_add (&defined_names, macho_mangle (bsses[i].name));
 
+  /*
+   * Classify every external __text reference (symbol not defined in this
+   * object):
+   *
+   *   - References that load a symbol's *address* into a register are emitted
+   *     by the code generator as `movabs reg, imm64' (is_movabs).  On macOS
+   *     the address of an external symbol (e.g. the FILE* variable __stderrp,
+   *     or any other extern data symbol) must be obtained through the GOT, so
+   *     we rewrite those into `movq sym@GOTPCREL(%rip), reg' below and emit an
+   *     X86_64_RELOC_GOT_LOAD relocation.  This is the fix for fprintf(stderr,
+   *     ...) and all other extern-data references crashing at runtime.
+   *
+   *   - All other external references are call/jump targets reached through the
+   *     constant pool; for those we synthesize a local branch stub (jmp rel32)
+   *     so __text needs no absolute relocations.
+   */
   size_t orig_n_relocs = n_relocs;
   for (size_t i = 0; i < orig_n_relocs; i++) {
     if (relocs[i].in_data) continue; /* data relocations are fine */
     size_t dummy;
     if (!name_set_find (&defined_names, relocs[i].symbol, &dummy)) {
-      /* It's an external symbol referenced from __text. We need a stub. */
+      /* External symbol referenced from __text. */
+      if (relocs[i].is_movabs) {
+        /* Address-of-symbol load: route through the GOT (see rewrite below)
+         * instead of a branch stub. */
+        relocs[i].is_got = 1;
+        continue;
+      }
+      /* Call/jump target: synthesize a branch stub. */
       int found = 0;
       for (size_t j = 0; j < n_stubs; j++) {
         if (strcmp (stubs[j].name, relocs[i].symbol) == 0) { found = 1; break; }
@@ -644,6 +694,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   /* Now update the original relocations to point to the stubs! */
   for (size_t i = 0; i < orig_n_relocs; i++) {
     if (relocs[i].in_data) continue;
+    if (relocs[i].is_got) continue; /* handled via GOT, not a stub */
     size_t dummy;
     if (!name_set_find (&defined_names, relocs[i].symbol, &dummy)) {
       for (size_t j = 0; j < n_stubs; j++) {
@@ -661,12 +712,45 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   for (size_t i = 0; i < n_funcs; i++)
     memcpy (text_buf + funcs[i].text_offset, funcs[i].code, funcs[i].code_len);
 
+  /* Rewrite external address-of loads into GOT-relative loads.
+   *
+   * The code generator emitted, for `&extern_sym':
+   *     48/49 B8+rd <imm64>           movabs reg, imm64      (10 bytes)
+   * which on macOS would need an illegal absolute relocation in __text.  We
+   * turn it into:
+   *     48/4C 8B <modrm> <disp32>     movq sym@GOTPCREL(%rip), reg  (7 bytes)
+   *     90 90 90                      padding nops                 (3 bytes)
+   * and relocate the disp32 with X86_64_RELOC_GOT_LOAD.  The GOT slot holds the
+   * symbol's address, so `reg' ends up with exactly the value the original
+   * movabs would have produced - any following dereference keeps working.
+   * The instruction stays 10 bytes wide, so no other offsets shift. */
+  for (size_t i = 0; i < orig_n_relocs; i++) {
+    if (!relocs[i].is_got) continue;
+    size_t imm = relocs[i].offset;   /* offset of the imm64 within __text */
+    size_t istart = imm - 2;         /* REX prefix of the movabs */
+    uint8_t rex = text_buf[istart];
+    uint8_t op  = text_buf[istart + 1];
+    int reg = (int) (((rex & 1) << 3) | (op - 0xB8)); /* dest register 0..15 */
+    text_buf[istart]     = (uint8_t) (0x48 | ((reg >= 8) ? 0x04 : 0x00)); /* REX.W(+R) */
+    text_buf[istart + 1] = 0x8B;                                         /* mov r64,r/m64 */
+    text_buf[istart + 2] = (uint8_t) (((reg & 7) << 3) | 0x05);          /* mod=00 rm=RIP */
+    memset (text_buf + istart + 3, 0, 4);                                /* disp32 (linker) */
+    text_buf[istart + 7] = 0x90;                                         /* nop padding */
+    text_buf[istart + 8] = 0x90;
+    text_buf[istart + 9] = 0x90;
+    relocs[i].offset = istart + 3;        /* relocation sits on the disp32 */
+    relocs[i].type   = R_X86_64_GOTPCREL; /* -> X86_64_RELOC_GOT_LOAD */
+    relocs[i].addend = 0;
+  }
+
   /* Build __data data buffer */
   uint8_t *data_buf = calloc (1, data_size ? data_size : 1);
   for (size_t i = 0; i < n_datas; i++)
     if (datas[i].size) memcpy (data_buf + datas[i].data_offset, datas[i].bytes, datas[i].size);
 
-  /* Write addends into section data for Mach-O (which uses REL, not RELA) */
+  /* Write addends into section data for Mach-O (which uses REL, not RELA).
+   * GOT-relative relocations keep their disp32 as zero (already written by the
+   * rewrite above) - the linker fills it in. */
   for (size_t i = 0; i < orig_n_relocs; i++) {
     mach_reloc_t *mr = &relocs[i];
     uint8_t *buf = mr->in_data ? data_buf : text_buf;
@@ -695,6 +779,8 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     mr->type    = 4; /* R_X86_64_PLT32 -> X86_64_RELOC_BRANCH */
     mr->addend  = 0; 
     mr->in_data = 0;
+    mr->is_movabs = 0;
+    mr->is_got  = 0;
   }
   /* ----- Phase 3: build symbol table and string table ----- */
   DBG ("phase 3: building symbol table and string table");
@@ -979,7 +1065,9 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     ri.r_extern = 1;
     ri.r_type = mach_type;
     ri.r_length = (mach_type == X86_64_RELOC_UNSIGNED) ? 3 : 2; /* 3=8byte, 2=4byte */
-    ri.r_pcrel = (mach_type == X86_64_RELOC_SIGNED || mach_type == 2) ? 1 : 0;
+    ri.r_pcrel = (mach_type == X86_64_RELOC_SIGNED
+                  || mach_type == X86_64_RELOC_BRANCH
+                  || mach_type == X86_64_RELOC_GOT_LOAD) ? 1 : 0;
 
     if (relocs[i].in_data)
       reloc_data[rd_idx++] = ri;

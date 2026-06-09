@@ -6876,6 +6876,10 @@ struct decl {
   unsigned addr_p : 1, reg_p : 1, asm_p : 1, used_p : 1;
   int bit_offset, width; /* for bitfields, -1 bit_offset for non bitfields. */
   mir_size_t offset;     /* var offset in frame or bss */
+  /* Extra stack bytes for a class/struct local whose trailing flexible array
+     member is brace-initialized with more elements than the (cached) type
+     layout accounts for.  Without it the initializer overruns the frame. */
+  mir_size_t flex_extra_size;
   node_t scope;          /* declaration scope */
   /* The next 2 members are used only for param decls. The 1st member is number of the start MIR
      func arg. The 2nd one is number or MIR func args used to pass param value, it is positive
@@ -9177,6 +9181,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       decl->addr_p = FALSE;
       decl->reg_p = decl->asm_p = decl->used_p = FALSE;
       decl->offset = 0;
+      decl->flex_extra_size = 0;
       decl->bit_offset = -1;
       decl->param_args_start = decl->param_args_num = 0;
       decl->scope = curr_scope;
@@ -9250,11 +9255,49 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                id->u.s.s);
         return;
       }
+      /* classyc extension: a class with a trailing FLEXIBLE array member
+         (e.g. `String arr[];') may be brace-initialized with N elements.
+         check_initializer completes the (shared) member's array type to N
+         elements and writes it back into the member decl - but the containing
+         class' raw_size was cached at class-definition time counting the
+         member as a single element.  Find such a flexible member up front so
+         we can size this declaration's storage and then restore the member to
+         its incomplete form (otherwise a later instance with a different
+         length would wrongly report "excess elements"). */
+      node_t flex_member = NULL;
+      struct type *saved_flex_type = NULL;
+      if (decl->decl_spec.type->mode == TM_CLASS && decl->decl_spec.type->u.tag_type != NULL) {
+        node_t dl = TAG_MEMBER_LIST (decl->decl_spec.type->u.tag_type);
+        node_t last_data = NULL;
+        if (dl != NULL && dl->code != N_IGNORE)
+          for (node_t m = NL_HEAD (dl->u.ops); m != NULL; m = NL_NEXT (m))
+            if (m->code == N_MEMBER && m->attr != NULL) last_data = m;
+        if (last_data != NULL) {
+          struct type *ft = ((decl_t) last_data->attr)->decl_spec.type;
+          if (ft != NULL && ft->mode == TM_ARR && ft->u.arr_type->size->code == N_IGNORE) {
+            flex_member = last_data;
+            saved_flex_type = ft;
+          }
+        }
+      }
       check (c2m_ctx, initializer, decl_node);
       check_initializer (c2m_ctx, NULL, &decl->decl_spec.type, initializer,
                          decl->decl_spec.linkage == N_STATIC || decl->decl_spec.linkage == N_EXTERN
                            || decl->decl_spec.thread_local_p || decl->decl_spec.static_p,
                          TRUE);
+      if (flex_member != NULL) {
+        /* Reserve extra stack bytes for the elements beyond what the cached
+           class layout accounts for, so the initializer does not overrun the
+           frame and clobber callee-saved registers / adjacent variables. */
+        struct type *ft = ((decl_t) flex_member->attr)->decl_spec.type;
+        if (ft != NULL && ft->mode == TM_ARR) {
+          mir_size_t required = ((decl_t) flex_member->attr)->offset + raw_type_size (c2m_ctx, ft);
+          mir_size_t cls_raw = raw_type_size (c2m_ctx, decl->decl_spec.type);
+          if (required > cls_raw) decl->flex_extra_size = required - cls_raw;
+        }
+        /* Restore the shared member to its incomplete (flexible) form. */
+        ((decl_t) flex_member->attr)->decl_spec.type = saved_flex_type;
+      }
     }
 
     static struct type *adjust_type (c2m_ctx_t c2m_ctx, struct type *type) {
@@ -9748,7 +9791,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         }
         ns->offset = round_size (ns->offset, var_align (c2m_ctx, type));
         decl->offset = ns->offset;
-        ns->offset += var_size (c2m_ctx, type);
+        ns->offset += var_size (c2m_ctx, type) + decl->flex_extra_size;
         ns->size = ns->offset - start_offset;
       }
       scope = NULL;
