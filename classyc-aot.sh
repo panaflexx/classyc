@@ -44,6 +44,8 @@ usage () { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; }
 # possible to bootstrap successive generations of the compiler, e.g.
 #     C2M=./classyc-aot ./classyc-aot --with-mir ... -o classyc-gen2.aot
 script_dir=$(cd "$(dirname "$0")" && pwd)
+csrc_dir="./src"
+
 find_tool () {
   local name=$1
   if [ -x "$script_dir/$name" ]; then echo "$script_dir/$name"
@@ -59,8 +61,8 @@ else
     B2OBJ_DEFAULT="b2obj"
 fi
 
-C2M=${C2M:-$(find_tool classyc)}
-B2OBJ=${B2OBJ:-$(find_tool "$B2OBJ_DEFAULT")}
+C2M=${C2M:-$(find_tool "bin/classyc")}
+B2OBJ=${B2OBJ:-$(find_tool "bin/$B2OBJ_DEFAULT")}
 CC=${CC:-gcc}
 
 output="a.out"
@@ -129,10 +131,11 @@ objects=()
 
 # Build the small MIR ahead-of-time runtime (conversion-builtin helpers) and
 # link it in automatically.  Harmless for programs that do not need it.
-if [ -f "$script_dir/mir-aot-runtime.c" ]; then
-  echo Compile runtime support
+if [ -f "$csrc_dir/mir-aot-runtime.c" ]; then
+  echo Compile runtime support $csrc_dir
   rt_obj="$workdir/mir-aot-runtime.o"
-  "$CC" -O2 -c "$script_dir/mir-aot-runtime.c" -o "$rt_obj"
+  echo "$CC" -O2 -I include -c "${csrc_dir}/mir-aot-runtime.c" -o "$rt_obj"
+  "$CC" -O2 -c -I include "$csrc_dir/mir-aot-runtime.c" -o "$rt_obj"
   link_objects+=("$rt_obj")
 fi
 
@@ -204,6 +207,7 @@ link_cmd=("$CC" -o "$output")
 [ ${#link_objects[@]} -gt 0 ] && link_cmd+=("${link_objects[@]}")
 [ ${#ld_flags_v[@]} -gt 0 ] && link_cmd+=("${ld_flags_v[@]}")
 [ ${#default_libs[@]} -gt 0 ] && link_cmd+=("${default_libs[@]}")
+link_cmd+=("-Wl,-no_pie")
 
 # Show the command (safe echo)
 echo "${link_cmd[@]}"
