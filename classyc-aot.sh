@@ -46,6 +46,7 @@ usage () { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; }
 script_dir=$(cd "$(dirname "$0")" && pwd)
 csrc_dir="./src"
 mir_dir="ext/mir"
+mir_lib_dir="./lib"
 
 find_tool () {
   local name=$1
@@ -147,8 +148,8 @@ fi
 # bootstrap compiles from source itself).  Prefer standalone objects next to the
 # script; otherwise extract them from libmir.a so a plain checkout still works.
 if [ "$with_mir" -eq 1 ]; then
-  if [ -f "$mir_dir/libmir.a" ]; then
-    link_objects+=("$mir_dir/libmir.a")
+  if [ -f "${mir_lib_dir}/libmir_static.a" ]; then
+    link_objects+=("${mir_lib_dir}/libmir_static.a")
   else
     echo "$prog: --with-mir: need $script_dir/{mir.o,mir-gen.o} or $script_dir/libmir.a" >&2
     exit 1
@@ -206,7 +207,7 @@ link_cmd=("$CC" -o "$output")
 [ ${#link_objects[@]} -gt 0 ] && link_cmd+=("${link_objects[@]}")
 [ ${#ld_flags_v[@]} -gt 0 ] && link_cmd+=("${ld_flags_v[@]}")
 [ ${#default_libs[@]} -gt 0 ] && link_cmd+=("${default_libs[@]}")
-link_cmd+=("-Wl,-no_pie")
+#link_cmd+=("-Wl,-no_pie")
 
 # Show the command (safe echo)
 echo "${link_cmd[@]}"
