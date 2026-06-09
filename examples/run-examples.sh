@@ -58,6 +58,9 @@ run_example classy-strings.c
 run_example classy-string-copy-test.c
 run_example string_methods_test.c
 run_example test_dict_arena.c
+run_example class-arrays.c
+run_example classy-fstring.c
+run_example classy-auto.c
 
 # ── summary ────────────────────────────────────────────────────────────
 

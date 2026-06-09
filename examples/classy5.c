@@ -20,7 +20,7 @@ void main() {
 	c.set(42);
 	printf("after set: c.find = %d\n", c.find);
 	
-	// C-style designated initializer (requires TM_CLASS fix)
+	// C-style designated initializer
 	setClass s = {
 		.name = "hello",
 		.count = 4,
@@ -28,9 +28,9 @@ void main() {
 	};
 	printf("s.name = %s, s.count = %d\n", s.name, s.count);
 
-	// Positional initializer (also requires TM_CLASS fix)
-	// setClass s2 = {"world", 2};
+	// Positional initializer
+	setClass s2 = {"world", 2};
 
 	// Future: heap allocation with new keyword
-	// setClass *sp = new setClass() { .name = "heap", .count = 1 };
+	//setClass *sp = new setClass() = { .name = "heap", .count = 1 };
 }

@@ -4011,6 +4011,107 @@ static void pre_text_out (c2m_ctx_t c2m_ctx, token_t t) { /* NULL means end of o
   pre_last_token = t;
 }
 
+/* f-string (interpolated string) support.
+ *
+ * A narrow string literal with an `f` prefix, e.g.
+ *
+ *     f"hello {name}, you are {age} years old"
+ *
+ * is lowered, at token-recording time, into an ordinary String concatenation
+ * expression that the existing parser / `+` overload / N_CONCAT codegen already
+ * handle:
+ *
+ *     ( (String)"hello " + (name) + ", you are " + (age) + " years old" )
+ *
+ * The leading `(String)` cast anchors the chain as a genuine `String`, so that
+ * interpolated arithmetic operands (int, bool, char, ...) are auto-cast to text
+ * (see the N_ADD -> N_CONCAT overload in `check`).  `{{` and `}}` denote literal
+ * `{` / `}` characters.  Each `{ ... }` holds an arbitrary C expression.
+ *
+ * Implementation: build the replacement as source text and re-lex it (the same
+ * technique `token_concat` uses for `##`), recording the resulting parser tokens
+ * in place of the single f-string token.  Note: macros are not expanded inside
+ * `{ ... }` (the interpolated text is lexed directly, not run back through the
+ * preprocessor). */
+static void fstring_record_expansion (c2m_ctx_t c2m_ctx, token_t fstr) {
+  MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+  const char *raw = fstr->repr; /* e.g.  f"hello {name}"  */
+  size_t len = strlen (raw);
+  VARR (char) * exp;
+  size_t i, end;
+
+#define FS_PUT_S(s)                                          \
+  do {                                                       \
+    for (const char *fs_p = (s); *fs_p != '\0'; fs_p++)      \
+      VARR_PUSH (char, exp, *fs_p);                          \
+  } while (0)
+#define FS_PUT_C(ch) VARR_PUSH (char, exp, (char) (ch))
+
+  VARR_CREATE (char, exp, alloc, 256);
+  FS_PUT_S ("((String)\"");
+  i = 2;          /* skip the leading  f"  */
+  end = len - 1;  /* index of the closing "  */
+  while (i < end) {
+    char ch = raw[i];
+    if (ch == '{' && i + 1 < end && raw[i + 1] == '{') { FS_PUT_C ('{'); i += 2; continue; }
+    if (ch == '}' && i + 1 < end && raw[i + 1] == '}') { FS_PUT_C ('}'); i += 2; continue; }
+    if (ch == '{') { /* start of an interpolated expression */
+      int depth = 1;
+      FS_PUT_S ("\"+(");   /* close the literal, open the expression */
+      i++;
+      while (i < end && depth > 0) {
+        char ec = raw[i];
+        /* A backslash inside { ... } only escaped the surrounding f-string
+           literal (e.g.  \"  used to embed a quote in  f"{ f(\"x\") }" ).
+           Undo that so the expression is valid C source again. */
+        if (ec == '\\' && i + 1 < end) {
+          char nx = raw[i + 1];
+          if (nx == '"') FS_PUT_C ('"');
+          else if (nx == '\\') FS_PUT_C ('\\');
+          else { FS_PUT_C ('\\'); FS_PUT_C (nx); }
+          i += 2;
+          continue;
+        }
+        if (ec == '{') {
+          depth++;
+        } else if (ec == '}') {
+          if (--depth == 0) { i++; break; }
+        }
+        FS_PUT_C (ec);
+        i++;
+      }
+      FS_PUT_S (")+\"");   /* close the expression, reopen a literal */
+      continue;
+    }
+    if (ch == '\\' && i + 1 < end) { /* keep escape sequences intact */
+      FS_PUT_C ('\\');
+      FS_PUT_C (raw[i + 1]);
+      i += 2;
+      continue;
+    }
+    FS_PUT_C (ch);
+    i++;
+  }
+  FS_PUT_S ("\")");
+  VARR_PUSH (char, exp, '\0');
+
+  /* Re-lex the replacement text.  The string-stream consumer reads characters
+     in reverse (see cs_get), so the buffer must be reversed first -- exactly as
+     token_concat does. */
+  reverse (exp);
+  set_string_stream (c2m_ctx, VARR_ADDR (char, exp), fstr->pos, NULL);
+  for (;;) {
+    token_t pt = get_next_pptoken (c2m_ctx);
+    token_t cv;
+    if (pt->code == T_EOFILE || pt->code == T_EOU) break; /* string stream exhausted */
+    if ((cv = pptoken2token (c2m_ctx, pt, TRUE)) == NULL) continue; /* whitespace */
+    VARR_PUSH (token_t, recorded_tokens, cv);
+  }
+  VARR_DESTROY (char, exp);
+#undef FS_PUT_S
+#undef FS_PUT_C
+}
+
 static void pre_out (c2m_ctx_t c2m_ctx, token_t t) {
   pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
 
@@ -4021,6 +4122,12 @@ static void pre_out (c2m_ctx_t c2m_ctx, token_t t) {
     assert (t->code != T_EOU && t->code != EOF);
     pre_last_token = t;
     if ((t = pptoken2token (c2m_ctx, t, TRUE)) == NULL) return;
+  }
+  if (t->code == T_STR && t->node != NULL && t->node->code == N_STRING
+      && t->repr != NULL && t->repr[0] == 'f' && t->repr[1] == '"') {
+    /* f"..." interpolated string: expand into a String concat expression. */
+    fstring_record_expansion (c2m_ctx, t);
+    return;
   }
   if (t->code == T_STR && VARR_LENGTH (token_t, recorded_tokens) != 0
       && VARR_LAST (token_t, recorded_tokens)->code == T_STR) { /* concat strings */
@@ -8484,6 +8591,14 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       }
     }
 
+    /* Name of a class type (its tag), or NULL for a non-class/anonymous type. */
+    static const char *class_type_name (const struct type *type) {
+      node_t id;
+      if (type == NULL || type->mode != TM_CLASS || type->u.tag_type == NULL) return NULL;
+      id = TAG_ID (type->u.tag_type);
+      return (id != NULL && id->code == N_ID) ? id->u.s.s : NULL;
+    }
+
     static void check_assignment_types (c2m_ctx_t c2m_ctx, struct type *left, struct type *right,
                                         struct expr *expr, node_t assign_node) {
       node_code_t code = assign_node->code;
@@ -8538,11 +8653,39 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       } else if (left->mode == TM_CLASS ) {
         if ((right->mode != TM_CLASS )
             || !compatible_types_p (left, right, TRUE)) {
-          msg = (code == N_CALL ? "incompatible argument type for class type parameter"
-                 : code != N_RETURN
-                   ? "incompatible types in assignment to class"
-                   : "incompatible return-expr type in function returning a class");
-          error (c2m_ctx, POS (assign_node), "%s", msg);
+          const char *cname;
+          /* Very common mistake: assigning a `ClassName *` -- typically the
+             result of `new ClassName(...)`, which heap-allocates and yields a
+             pointer -- to a by-value `ClassName` target.  Detect that exact case
+             and emit an actionable hint instead of a cryptic type error. */
+          if (right->mode == TM_PTR && right->u.ptr_type != NULL
+              && right->u.ptr_type->mode == TM_CLASS
+              && left->u.tag_type == right->u.ptr_type->u.tag_type
+              && (cname = class_type_name (left)) != NULL) {
+            char hint[512];
+            if (code == N_CALL)
+              snprintf (hint, sizeof hint,
+                        "cannot pass a '%s *' (e.g. the result of `new %s(...)`) where a "
+                        "by-value '%s' parameter is expected; make the parameter a pointer '%s *'",
+                        cname, cname, cname, cname);
+            else if (code == N_RETURN)
+              snprintf (hint, sizeof hint,
+                        "cannot return a '%s *' (e.g. the result of `new %s(...)`) from a function "
+                        "returning a by-value '%s'; make the return type a pointer '%s *'",
+                        cname, cname, cname, cname);
+            else
+              snprintf (hint, sizeof hint,
+                        "cannot assign a '%s *' (e.g. the result of `new %s(...)`) to a by-value "
+                        "'%s'; declare the variable as a pointer instead: `%s *p = new %s(...);`",
+                        cname, cname, cname, cname, cname);
+            error (c2m_ctx, POS (assign_node), "%s", hint);
+          } else {
+            msg = (code == N_CALL ? "incompatible argument type for class type parameter"
+                   : code != N_RETURN
+                     ? "incompatible types in assignment to class"
+                     : "incompatible return-expr type in function returning a class");
+            error (c2m_ctx, POS (assign_node), "%s", msg);
+          }
         }
       } else if (left->mode == TM_PTR) {
         if (null_const_p (expr, right)) {
@@ -11622,17 +11765,55 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       }
     }
     /* auto type inference:  `auto x = init;` with no explicit type specifier.
-       The declared type is taken from the initializer (a brace initializer
-       yields a dict). */
+       The declared type is taken from the initializer:
+         - a scalar initializer yields its (decayed) expression type;
+         - a brace initializer is disambiguated syntactically:
+             * keyless list  `auto a = {1, 2, 3};`           -> array (int[3])
+             * keyed   list  `auto d = {"k": v, ...};`        -> dict
+           (the keyed/keyless distinction leaves room for future generic
+            container forms such as  `List<int> x = {1, 2, 3};`.) */
     if (decl_spec.auto_p && !specs_have_type_spec_p (specs)
         && declarator->code != N_IGNORE && initializer != NULL
         && initializer->code != N_IGNORE) {
       if (initializer->code == N_LIST) {
-        struct type *it = create_type (c2m_ctx, NULL);
-        it->mode = TM_DICT;
-        it->pos_node = r;
-        set_type_layout (c2m_ctx, it);
-        decl_spec.type = it;
+        /* Inspect the first element's designator list: a present N_FIELD_ID
+           designator ("key": ...) means this is a dict literal; otherwise it
+           is a positional (keyless) list, deduced as a homogeneous array. */
+        node_t first = NL_HEAD (initializer->u.ops);
+        node_t first_des = NULL, first_val = NULL;
+        if (first != NULL && first->code == N_INIT) {
+          node_t dl = NL_HEAD (first->u.ops);
+          if (dl != NULL && dl->code == N_LIST) first_des = NL_HEAD (dl->u.ops);
+          first_val = NL_NEXT (dl);
+        }
+        if (first != NULL && first_des == NULL && first_val != NULL) {
+          /* keyless braced list -> array; element type from the first element */
+          check (c2m_ctx, first_val, r);
+          struct expr *ve = first_val->attr;
+          if (ve != NULL && ve->type != NULL && ve->type->mode != TM_UNDEF) {
+            struct type *el = create_type (c2m_ctx, ve->type);
+            if (el->mode == TM_ARR) el = adjust_type (c2m_ctx, el); /* decay */
+            struct type *at = create_type (c2m_ctx, NULL);
+            at->mode = TM_ARR;
+            at->pos_node = r;
+            at->u.arr_type = reg_malloc (c2m_ctx, sizeof (struct arr_type));
+            at->u.arr_type->el_type = el;
+            at->u.arr_type->static_p = FALSE;
+            clear_type_qual (&at->u.arr_type->ind_type_qual);
+            /* unspecified size: check_initializer counts the elements and
+               completes the type (exactly like `int a[] = {...};`). */
+            at->u.arr_type->size = new_ignore (c2m_ctx);
+            set_type_layout (c2m_ctx, at);
+            decl_spec.type = at;
+          }
+        } else {
+          /* keyed (or empty) braced list -> dict literal */
+          struct type *it = create_type (c2m_ctx, NULL);
+          it->mode = TM_DICT;
+          it->pos_node = r;
+          set_type_layout (c2m_ctx, it);
+          decl_spec.type = it;
+        }
       } else {
         check (c2m_ctx, initializer, r);
         struct expr *ie = initializer->attr;
