@@ -1,6 +1,6 @@
 # ClassyC — Modern C with Classes, Strings, Dicts & More
 
-**ClassyC** is a C11 compiler with a carefully chosen set of modern language extensions that make systems programming feel dramatically more productive, while staying true to C's spirit.
+**ClassyC** is a C11 compiler with a carefully chosen set of modern language extensions that make systems programming feel dramatically more productive, while staying true to C's spirit.  Classy is a heavily-modified c2m compiler from MIR.
 
 It is built on the battle-tested [MIR](https://github.com/vnmakarov/mir) JIT/AOT infrastructure, giving you:
 - Fast JIT execution (interpreter, lazy codegen, basic-block versioning)
@@ -29,10 +29,43 @@ dict cfg = {
 };
 
 printf("%s\n", cfg.server.host);              // dot access
+printf("%s\n", cfg["timeut"]);                // array access
 cfg.retries = 5;                              // dynamic key creation
 
 for (auto k in cfg) {
     printf("%s = %s\n", k, json(cfg[k]));
+}
+
+class Fruit {
+    /* UNIFIED declarative definition: one dict, one source of truth.
+       Keys are the variant names.
+       Each value is a sub-dict containing the int "value" (for switch/case)
+       and any other metadata you want (desc, color, season, ...).
+    */
+    dict variants = {
+        "Apple": {
+            "value": 0,
+            "desc": "A crisp, classic apple."
+        },
+        "Banana": {
+            "value": 10,
+            "desc": "Curved yellow banana."
+        },
+        "Kiwi": {
+            "value": 1,
+            "desc": "Furry brown kiwi with bright green inside."
+        },
+        "Mango": {
+            "value": 2,
+            "desc": "Sweet tropical mango."
+        }
+    };
+};
+
+printf("\nAll variants (single for-in over the unified dict):\n");
+for (auto name, data in Fruit.variants) {
+    printf("  %s : value=%d  desc=\"%s\"\n",
+           name, (int)data.value, data.desc);
 }
 ```
 
@@ -91,6 +124,8 @@ Works over arrays, dicts, and (via methods) strings.
 
 ```bash
 cd classyc
+git submodule update
+cmake .             # builds in main dir, 
 make                # builds the `classyc` (or `c2m`) compiler
 ```
 
@@ -107,8 +142,8 @@ classyc example.c -eb          # lazy basic-block generation
 
 ### Ahead-of-Time Compilation
 ```bash
-classyc -S example.c           # emit MIR textual
-b2obj example.mir example.o    # produce native ELF .o
+classyc -c example.c -o example.bmir  # emit MIR binary
+b2obj example.bmir example.o          # produce native ELF .o
 ```
 
 You can link the resulting `.o` files with any standard C toolchain.
