@@ -44,6 +44,9 @@ usage () { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; }
 # possible to bootstrap successive generations of the compiler, e.g.
 #     C2M=./classyc-aot ./classyc-aot --with-mir ... -o classyc-gen2.aot
 script_dir=$(cd "$(dirname "$0")" && pwd)
+csrc_dir="./src"
+mir_dir="ext/mir"
+
 find_tool () {
   local name=$1
   if [ -x "$script_dir/$name" ]; then echo "$script_dir/$name"
@@ -59,8 +62,8 @@ else
     B2OBJ_DEFAULT="b2obj"
 fi
 
-C2M=${C2M:-$(find_tool classyc)}
-B2OBJ=${B2OBJ:-$(find_tool "$B2OBJ_DEFAULT")}
+C2M=${C2M:-$(find_tool "bin/classyc")}
+B2OBJ=${B2OBJ:-$(find_tool "bin/$B2OBJ_DEFAULT")}
 CC=${CC:-gcc}
 
 output="a.out"
@@ -87,7 +90,10 @@ while [ $# -gt 0 ]; do
     -h|--help) usage; exit 0 ;;
     -k|--keep) keep=1 ;;
     -v|--verbose) verbose=1 ;;
-    --with-mir) with_mir=1 ;;
+    --with-mir)
+	  c2m_flags+=("-I" "$mir_dir")
+	  c2m_flags+=("-I" "include")
+	  with_mir=1 ;;
     -o) shift; [ $# -gt 0 ] || { echo "$prog: -o needs an argument" >&2; exit 1; }; output=$1 ;;
     -o*) output=${arg#-o} ;;
     # c2m front-end flags that take a separate argument
@@ -129,10 +135,11 @@ objects=()
 
 # Build the small MIR ahead-of-time runtime (conversion-builtin helpers) and
 # link it in automatically.  Harmless for programs that do not need it.
-if [ -f "$script_dir/mir-aot-runtime.c" ]; then
-  echo Compile runtime support
+if [ -f "$csrc_dir/mir-aot-runtime.c" ]; then
+  echo Compile runtime support $csrc_dir
   rt_obj="$workdir/mir-aot-runtime.o"
-  "$CC" -O2 -c "$script_dir/mir-aot-runtime.c" -o "$rt_obj"
+  echo "$CC" -O2 -I include -c "${csrc_dir}/mir-aot-runtime.c" -o "$rt_obj"
+  "$CC" -O2 -c -I include "$csrc_dir/mir-aot-runtime.c" -o "$rt_obj"
   link_objects+=("$rt_obj")
 fi
 
@@ -140,13 +147,8 @@ fi
 # bootstrap compiles from source itself).  Prefer standalone objects next to the
 # script; otherwise extract them from libmir.a so a plain checkout still works.
 if [ "$with_mir" -eq 1 ]; then
-  if [ -f "$script_dir/libmir.a" ]; then
-    ( cd "$workdir" && run ar x "$script_dir/libmir.a" mir.o mir-gen.o )
-    if [ ! -f "$workdir/mir.o" ] || [ ! -f "$workdir/mir-gen.o" ]; then
-      echo "$prog: could not extract mir.o/mir-gen.o from $script_dir/libmir.a" >&2
-      exit 1
-    fi
-    link_objects+=("$workdir/mir.o" "$workdir/mir-gen.o")
+  if [ -f "$mir_dir/libmir.a" ]; then
+    link_objects+=("$mir_dir/libmir.a")
   else
     echo "$prog: --with-mir: need $script_dir/{mir.o,mir-gen.o} or $script_dir/libmir.a" >&2
     exit 1
@@ -204,6 +206,7 @@ link_cmd=("$CC" -o "$output")
 [ ${#link_objects[@]} -gt 0 ] && link_cmd+=("${link_objects[@]}")
 [ ${#ld_flags_v[@]} -gt 0 ] && link_cmd+=("${ld_flags_v[@]}")
 [ ${#default_libs[@]} -gt 0 ] && link_cmd+=("${default_libs[@]}")
+link_cmd+=("-Wl,-no_pie")
 
 # Show the command (safe echo)
 echo "${link_cmd[@]}"

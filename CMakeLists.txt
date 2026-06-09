@@ -13,8 +13,9 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 # ------------------ MIR Subdirectory -----------------------
-# Add MIR as a subdirectory (assumes ext/mir/CMakeLists.txt exists)
-add_subdirectory(ext/mir)
+# Add MIR as a subdirectory (assumes ${MIRDIR}/CMakeLists.txt exists)
+set(MIRDIR ext/mir)
+add_subdirectory(${MIRDIR})
 
 # ------------------ classyc Compiler -----------------------
 add_executable(classyc 
@@ -23,7 +24,7 @@ add_executable(classyc
 )
 
 target_include_directories(classyc PRIVATE 
-    ${CMAKE_SOURCE_DIR}/ext/mir
+    ${CMAKE_SOURCE_DIR}/${MIRDIR}
     ${CMAKE_SOURCE_DIR}/include
 )
 
@@ -68,7 +69,7 @@ if( SNAPPLE ) #APPLE)
     add_executable(b2objmac 
         src/b2objmac.c
     )
-    target_include_directories(b2objmac PRIVATE ${CMAKE_SOURCE_DIR}/ext/mir)
+    target_include_directories(b2objmac PRIVATE ${CMAKE_SOURCE_DIR}/${MIRDIR})
     target_link_libraries(b2objmac PRIVATE mir_static ${CMAKE_DL_LIBS})
     
     # Create symlink or alias for convenience (b2obj -> b2objmac on macOS)
@@ -82,7 +83,7 @@ elseif( UNICS )
     add_executable(b2obj 
         src/b2obj.c
     )
-    target_include_directories(b2obj PRIVATE ${CMAKE_SOURCE_DIR}/ext/mir)
+    target_include_directories(b2obj PRIVATE ${CMAKE_SOURCE_DIR}/${MIRDIR})
     target_link_libraries(b2obj PRIVATE mir_static ${CMAKE_DL_LIBS})
 endif()
 
@@ -92,10 +93,10 @@ endif()
 
 # Install rules (optional)
 install(TARGETS classyc RUNTIME DESTINATION bin)
-if(APPLE)
+if(SNAPPLE)
     install(TARGETS b2objmac RUNTIME DESTINATION bin)
     install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/b2obj DESTINATION bin)
-else()
+elseif(UNICS)
     install(TARGETS b2obj RUNTIME DESTINATION bin)
 endif()
 

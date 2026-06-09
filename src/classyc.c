@@ -10809,7 +10809,9 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
          }
         if (func) {
           assert (func->code == N_FUNC_DEF);
+#ifdef C2MIR_PREPRO_DEBUG
           printf("Found class method call\n");
+#endif
           decl = func->attr;
           // proper: set N_FIELD expr type as pointer-to-function (normal for method)
           struct type *fnt = decl->decl_spec.type;

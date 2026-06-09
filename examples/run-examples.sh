@@ -7,7 +7,7 @@
 # each one so output is easy to scan.  The script exits with the number
 # of examples that failed.
 
-C2M="${1:-./c2m}"
+CLASSYC="${1:-./bin/classyc}"
 DIR="$(dirname "$0")"
 PASS=0
 FAIL=0
@@ -30,7 +30,7 @@ run_example() {
     shift
     extra_flags="$*"
     banner "$name"
-    if $C2M "$DIR/$name" -eg $extra_flags; then
+    if $CLASSYC "$DIR/$name" -eg $extra_flags; then
         PASS=$((PASS + 1))
     else
         printf "\n[FAILED: %s exited non-zero]\n" "$name"

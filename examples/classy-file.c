@@ -20,7 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "inc/file.h"
+#include "include/file.h"
 
 /* ── dict runtime declarations ──────────────────────────────────────── */
 dict  dict_object_get(dict obj, char *key);

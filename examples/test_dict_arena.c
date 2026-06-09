@@ -1,6 +1,6 @@
 /* Quick test for dict.h arena allocator using c2m */
 #include <stdio.h>
-#include "inc/dict.h"
+#include "include/dict.h"
 
 int main() {
     // 4KB stack buffer for the arena

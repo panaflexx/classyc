@@ -13,7 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "inc/file.h"
+#include "include/file.h"
 
 /* no dict helpers needed — bracket writes handle everything */
 
