@@ -1,6 +1,3 @@
 [submodule "ext/mir"]
 	path = ext/mir
 	url = git@github.com:panaflexx/mir.git
-[submodule "ext/mirnew"]
-	path = ext/mirnew
-	url = git@github.com:panaflexx/mirnew.git
