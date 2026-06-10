@@ -641,6 +641,7 @@ typedef enum {
   REP8 (T_EL, SIGNED, SIZEOF, STATIC, STRUCT, CLASS, SWITCH, TYPEDEF, TYPEOF),
   REP8 (T_EL, DICT, STRING, UNION, UNSIGNED, VOID, VOLATILE, WHILE, EOFILE),
   T_IN, /* 'in' keyword for dict key-check and for-in loops */
+  T_FAT_ARROW, /* => fat-arrow token for lambda expressions */
   /* tokens existing in preprocessor only: */
   T_HEADER,         /* include header */
   T_NO_MACRO_IDENT, /* ??? */
@@ -681,6 +682,7 @@ typedef enum {
   N_NEW,    /* new ClassName(args) — heap allocation + constructor call */
   N_DEFER,  /* defer <stmt> — run statement at enclosing scope exit (LIFO) */
   N_DELETE, /* delete <ptr> — run destructor (if any) then free the heap object */
+  N_LAMBDA, /* (params) => body — anonymous function (future: untyped/generic lambdas) */
 } node_code_t;
 
 #undef REP_SEP
@@ -1615,6 +1617,8 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
       curr_c = cs_get (c2m_ctx);
       if (curr_c == '=') {
         return new_token (c2m_ctx, pos, "==", T_EQNE, N_EQ);
+      } else if (curr_c == '>') {
+        return new_token (c2m_ctx, pos, "=>", T_FAT_ARROW, N_IGNORE);
       } else {
         cs_unget (c2m_ctx, curr_c);
         return new_token (c2m_ctx, pos, "=", '=', N_ASSIGN);
@@ -4227,6 +4231,8 @@ struct parse_ctx {
   node_t curr_scope;
   node_t curr_class;
   HTAB (tpname_t) * tpname_tab;
+  VARR (node_t) * pending_lambdas; /* lambda N_FUNC_DEFs waiting for module injection */
+  unsigned lambda_uid;             /* counter for unique lambda names */
 };
 
 #define record_level parse_ctx->record_level
@@ -4235,6 +4241,8 @@ struct parse_ctx {
 #define curr_token parse_ctx->curr_token
 #define curr_scope parse_ctx->curr_scope
 #define tpname_tab parse_ctx->tpname_tab
+#define pending_lambdas parse_ctx->pending_lambdas
+#define lambda_uid parse_ctx->lambda_uid
 
 static struct node err_struct;
 static const node_t err_node = &err_struct;
@@ -4537,12 +4545,91 @@ static node_t try_arg_f (c2m_ctx_t c2m_ctx, nonterm_arg_func_t f, node_t arg) {
 #define TRY_A(f, arg) try_arg_f (c2m_ctx, f, arg)
 
 D (compound_stmt);
+D (lambda_expr);
+D (param_type_list);
 
 /* Expressions: */
 D (type_name);
 D (expr);
 D (assign_expr);
 D (initializer_list);
+
+/* Lambda expression: ( typed-param-list? ) => expr-or-block
+   Always called via TRY(); returns err_node if this is not a lambda.
+   On success, pushes a synthetic N_FUNC_DEF onto pending_lambdas and
+   returns an N_ID referencing the generated lambda name.
+   Typed params only for now; untyped params (generics) are a future TODO. */
+D (lambda_expr) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  node_t plist, r, body;
+  pos_t pos;
+
+  if (!C ('(')) return err_node;
+  pos = curr_token->pos;
+  M ('('); /* consume '(' */
+
+  if (C (')')) {
+    /* Zero-arg lambda: () => body */
+    M (')');
+    plist = new_node (c2m_ctx, N_LIST);
+  } else {
+    /* Try to parse a typed parameter list.  If it fails (untyped or not a
+       param list at all) this is not a lambda — rewind via TRY. */
+    if ((plist = TRY (param_type_list)) == err_node) return err_node;
+    if (!M (')')) return err_node;
+  }
+
+  /* Commit only when we see '=>' immediately after ')' */
+  if (!C (T_FAT_ARROW)) return err_node;
+  M (T_FAT_ARROW); /* consume '=>' — committed from here on */
+
+  /* Parse body: either a block { ... } or a single expression (auto-wrapped in return) */
+  if (C ('{')) {
+    body = compound_stmt (c2m_ctx, FALSE);
+    if (body == err_node) body = new_node (c2m_ctx, N_IGNORE);
+  } else {
+    r = assign_expr (c2m_ctx, FALSE);
+    if (r == err_node) r = new_node (c2m_ctx, N_IGNORE);
+    /* Wrap: { return <expr>; } */
+    node_t ret_stmt = new_pos_node2 (c2m_ctx, N_RETURN, pos,
+                                      new_node (c2m_ctx, N_LIST), r);
+    node_t blist = new_node (c2m_ctx, N_LIST);
+    op_append (c2m_ctx, blist, ret_stmt);
+    body = new_pos_node2 (c2m_ctx, N_BLOCK, pos,
+                           new_node (c2m_ctx, N_LIST), blist);
+    body->attr = NULL; /* scope set during check */
+  }
+
+  /* Generate a unique name for this lambda */
+  char lname[64];
+  snprintf (lname, sizeof (lname), "__lambda_%u", lambda_uid++);
+
+  /* Build specs: [static] [auto]
+     'auto' as function return type → TP_UNDEF → inferred from return stmts */
+  node_t specs = new_node (c2m_ctx, N_LIST);
+  op_append (c2m_ctx, specs, new_pos_node (c2m_ctx, N_STATIC, pos));
+  op_append (c2m_ctx, specs, new_pos_node (c2m_ctx, N_AUTO, pos));
+
+  /* Build declarator: __lambda_N ( param_list ) */
+  node_t lam_id      = build_id (c2m_ctx, lname, pos);
+  node_t func_node   = new_pos_node1 (c2m_ctx, N_FUNC, pos, plist);
+  node_t decl_inner  = new_node1 (c2m_ctx, N_LIST, func_node);
+  node_t declarator  = new_pos_node2 (c2m_ctx, N_DECL, pos, lam_id, decl_inner);
+
+  /* Build N_FUNC_DEF */
+  node_t func_def = new_pos_node4 (c2m_ctx, N_FUNC_DEF, pos,
+                                    specs,
+                                    declarator,
+                                    new_node (c2m_ctx, N_LIST), /* empty K&R decl list */
+                                    body);
+
+  /* Enqueue for module-level injection before the containing top-level item */
+  VARR_PUSH (node_t, pending_lambdas, func_def);
+
+  /* The lambda expression evaluates to a pointer to the generated function */
+  r = build_id (c2m_ctx, lname, pos);
+  return r;
+}
 
 D (par_type_name) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
@@ -4558,6 +4645,13 @@ D (primary_expr) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t r, n, op, gn, list;
   pos_t pos;
+
+  /* Lambda: ( typed-params ) => body  — try before other '(' handling */
+  if (C ('(')) {
+    node_t lr = TRY (lambda_expr);
+    if (lr != err_node) return lr;
+    /* Not a lambda — token stream rewound, fall through to normal handling */
+  }
 
   	if (MN (T_ID, r) || MN (T_NUMBER, r) || MN (T_CH, r) || MN (T_STR, r)) {
   	    return r;
@@ -6383,6 +6477,11 @@ D (transl_unit) {
       r = new_pos_node4 (c2m_ctx, N_FUNC_DEF, POS (d), ds, d, dl, r);
       curr_scope = d->attr;
     }
+    /* Inject any lambdas defined while parsing this top-level item (they must
+       precede the item in the module so their MIR functions are generated first). */
+    for (size_t li = 0; li < VARR_LENGTH (node_t, pending_lambdas); li++)
+      op_append (c2m_ctx, list, VARR_GET (node_t, pending_lambdas, li));
+    VARR_TRUNC (node_t, pending_lambdas, 0);
     op_flat_append (c2m_ctx, list, r);
     continue;
   decl_err:
@@ -6473,6 +6572,8 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   kw_add (c2m_ctx, "__inline", T_INLINE, FLAG_EXT);
   kw_add (c2m_ctx, "__inline__", T_INLINE, FLAG_EXT);
   tpname_init (c2m_ctx);
+  VARR_CREATE (node_t, pending_lambdas, alloc, 8);
+  lambda_uid = 0;
 }
 
 static void add_standard_includes (c2m_ctx_t c2m_ctx) {
@@ -6498,6 +6599,11 @@ static void parse_finish (c2m_ctx_t c2m_ctx) {
   if (buffered_tokens != NULL) VARR_DESTROY (token_t, buffered_tokens);
   pre_finish (c2m_ctx);
   tpname_finish (c2m_ctx);
+  {
+    parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+    if (pending_lambdas != NULL)
+      VARR_DESTROY (node_t, pending_lambdas);
+  }
   finish_streams (c2m_ctx);
   reg_free (c2m_ctx, c2m_ctx->parse_ctx);
 }
@@ -7900,7 +8006,8 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
     case N_TYPEDEF:
     case N_AUTO:
     case N_REGISTER:
-      if (n_sc != 0)
+      /* Allow 'static auto' as a classyc extension for lambda return-type inference */
+      if (n_sc != 0 && !(n->code == N_AUTO && n_sc == 1 && res->static_p))
         error (c2m_ctx, POS (n), "more than one storage specifier");
       else if (n->code == N_TYPEDEF)
         res->typedef_p = TRUE;
@@ -9910,6 +10017,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         REP6 (NODE_CASE, EXPR_SIZEOF, CAST, COMPOUND_LITERAL, CALL, GENERIC, GENERIC_ASSOC)
         NODE_CASE (IN)
         NODE_CASE (NEW)
+        NODE_CASE (LAMBDA)
         *expr_attr_p = TRUE;
         break;
         REP8 (NODE_CASE, IF, SWITCH, WHILE, DO, FOR, GOTO, INDIRECT_GOTO, CONTINUE)
@@ -12102,6 +12210,20 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     VARR_TRUNC(decl_t, func_decls_for_allocation, 0);
     create_decl(c2m_ctx, top_scope, r, decl_spec, NULL, FALSE);
 
+    /* Lambda return-type inference: lambdas are emitted with 'static auto' specs
+       and no explicit type specifier.  After create_decl sets the return type to
+       the default TP_INT, reset it to TP_UNDEF so that N_RETURN can infer the
+       real return type from the first 'return <expr>;' in the body. */
+    if (decl_spec.auto_p && !specs_have_type_spec_p (specs)) {
+      decl_t fdecl = r->attr;
+      if (fdecl != NULL && fdecl->decl_spec.type != NULL
+          && fdecl->decl_spec.type->mode == TM_FUNC) {
+        struct type *rt = fdecl->decl_spec.type->u.func_type->ret_type;
+        if (rt != NULL && rt->mode == TM_BASIC && rt->u.basic_type == TP_INT)
+          rt->u.basic_type = TP_UNDEF;
+      }
+    }
+
     /* Record the enclosing class on the method's function type so gen can mangle
        the method's symbol name (Class_method__<params>).  The method's
        declarator was checked in the function block scope, so check_declarator
@@ -12254,6 +12376,22 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     // Add function definition and check block
     add__func__def(c2m_ctx, block, id->u.s);
     check(c2m_ctx, block, r);
+
+    /* Auto/lambda return type fixup: if the return type is still TP_UNDEF after
+       checking the body (no return-with-value found), default to void. */
+    {
+      decl_t fdecl = r->attr;
+      if (fdecl != NULL && fdecl->decl_spec.auto_p) {
+        struct type *ftype = fdecl->decl_spec.type;
+        if (ftype != NULL && ftype->mode == TM_FUNC
+            && ftype->u.func_type->ret_type != NULL
+            && ftype->u.func_type->ret_type->mode == TM_BASIC
+            && ftype->u.func_type->ret_type->u.basic_type == TP_UNDEF) {
+          ftype->u.func_type->ret_type->u.basic_type = TP_VOID;
+          set_type_layout (c2m_ctx, ftype->u.func_type->ret_type);
+        }
+      }
+    }
 
     // Process label uses
     for (size_t i = 0; i < VARR_LENGTH(node_t, label_uses); i++) {
@@ -12560,6 +12698,25 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     check_labels (c2m_ctx, labels, r);
     check (c2m_ctx, expr, r);
     ret_type = type->u.func_type->ret_type;
+
+    /* Lambda / auto return type inference: TP_UNDEF means "not yet known".
+       On the first return-with-value we lock in the return type; subsequent
+       returns use the normal compatibility check.  'return;' is left alone —
+       TP_UNDEF will be fixed up to void after the body check completes. */
+    if (ret_type != NULL && ret_type->mode == TM_BASIC
+        && ret_type->u.basic_type == TP_UNDEF) {
+      if (expr->code != N_IGNORE) {
+        struct expr *re = (struct expr *) expr->attr;
+        if (re != NULL && re->type != NULL) {
+          struct type *inferred = create_type (c2m_ctx, re->type);
+          type->u.func_type->ret_type = inferred;
+          set_type_layout (c2m_ctx, inferred);
+        }
+      }
+      /* 'return;' with TP_UNDEF: leave for void fixup after body check */
+      break;
+    }
+
     if (expr->code != N_IGNORE && void_type_p (ret_type)) {
       error (c2m_ctx, POS (r), "return with a value in function returning void");
     } else if (expr->code == N_IGNORE
@@ -18431,7 +18588,7 @@ static const char *get_node_name (node_code_t code) {
     REP8 (C, RESTRICT, VOLATILE, ATOMIC, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR);
     REP8 (C, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF);
     REP7 (C, MODULE, ASM, ATTR, CLASS, STRING, CONCAT, DICT);
-    C (IN); C (FORIN); C (NEW); C (DEFER); C (DELETE);
+    C (IN); C (FORIN); C (NEW); C (DEFER); C (DELETE); C (LAMBDA);
   default: abort ();
   }
 #undef C
@@ -18692,6 +18849,7 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_LABEL_ADDR:
   case N_IN:
   case N_NEW:
+  case N_LAMBDA:
     if (attr_p && n->attr != NULL) print_expr (c2m_ctx, f, n->attr);
     fprintf (f, "\n");
     print_ops (c2m_ctx, f, n, indent, attr_p);
