@@ -7714,6 +7714,7 @@ static node_t process_tag (c2m_ctx_t c2m_ctx, node_t r, node_t id, node_t decl_l
 
 static void def_symbol (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, node_t scope,
                         node_t def_node, node_code_t linkage) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
   symbol_t sym;
   struct decl_spec tab_decl_spec, decl_spec;
 
@@ -7727,6 +7728,16 @@ static void def_symbol (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, nod
     error (c2m_ctx, POS (id), "auto %s is declared as thread local", id->u.s.s);
   if (!symbol_find (c2m_ctx, mode, id, scope, &sym)) {
     symbol_insert (c2m_ctx, mode, id, scope, def_node, NULL);
+    return;
+  }
+  /* Class method overloading: several methods of one class may share a name
+     and be distinguished by their parameter types.  Methods are registered by
+     plain name (in the enclosing scope), so `curr_class` is what tells us this
+     is a method definition.  Record the additional overload (resolved at the
+     call site) instead of rejecting it as an incompatible redeclaration. */
+  if (curr_class != NULL && def_node->code == N_FUNC_DEF
+      && sym.def_node->code == N_FUNC_DEF) {
+    VARR_PUSH (node_t, sym.defs, def_node);
     return;
   }
   tab_decl_spec = ((decl_t) sym.def_node->attr)->decl_spec;
@@ -8589,6 +8600,70 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         //printf("UNKNOWN TM TYPE MODE %d\n", type->mode);
         break;  // ???
       }
+    }
+
+    /* Like find_def, but returns the whole symbol (with its `defs` overload set)
+       found by walking up from `scope`. */
+    static int find_overload_sym (c2m_ctx_t c2m_ctx, node_t id, node_t scope, symbol_t *out) {
+      for (;;) {
+        if (symbol_find (c2m_ctx, S_REGULAR, id, scope, out)) return TRUE;
+        if (scope == NULL || scope->attr == NULL) return FALSE;
+        scope = ((struct node_scope *) scope->attr)->scope;
+      }
+    }
+
+    /* Choose the best-matching overload of a class method.  `msym` holds every
+       method def registered under one name (in declaration order); `class_tag`
+       is the receiver's class node, used to ignore unrelated same-named methods
+       of other classes (methods are registered by plain name).  Returns the
+       chosen N_FUNC_DEF, or `msym->def_node` (first declared) as a fallback so
+       the single-method case is unchanged.  Scoring favours exact parameter-type
+       matches over compatible/convertible ones; argument counts must match
+       (unless the candidate is variadic).  `arg_list` holds the already-checked
+       user arguments (no implicit `this`). */
+    static node_t select_method_overload (c2m_ctx_t c2m_ctx, symbol_t *msym, node_t class_tag,
+                                          node_t arg_list) {
+      size_t i, n = VARR_LENGTH (node_t, msym->defs);
+      node_t best = NULL;
+      int best_score = -1;
+
+      if (n <= 1) return msym->def_node;
+      for (i = 0; i < n; i++) {
+        node_t def = VARR_GET (node_t, msym->defs, i);
+        decl_t d;
+        struct func_type *ft;
+        node_t param, a;
+        int score = 0, ok = TRUE;
+        if (def->code != N_FUNC_DEF) continue;
+        d = def->attr;
+        if (d == NULL || d->decl_spec.type == NULL || d->decl_spec.type->mode != TM_FUNC) continue;
+        ft = d->decl_spec.type->u.func_type;
+        /* Only consider overloads belonging to the receiver's class. */
+        if (class_tag != NULL && ft->class_scope != NULL && ft->class_scope != class_tag) continue;
+        param = NL_HEAD (ft->param_list->u.ops);
+        if (!d->decl_spec.static_p && param != NULL) param = NL_NEXT (param); /* skip 'this' */
+        a = NL_HEAD (arg_list->u.ops);
+        for (; param != NULL && a != NULL; param = NL_NEXT (param), a = NL_NEXT (a)) {
+          struct decl_spec *pds = get_param_decl_spec (param);
+          struct expr *ae = a->attr;
+          struct type *pt = pds != NULL ? pds->type : NULL;
+          struct type *at = ae != NULL ? ae->type : NULL;
+          if (pt == NULL || at == NULL) { ok = FALSE; break; }
+          if (type_eq_p (pt, at))
+            score += 3;
+          else if (compatible_types_p (pt, at, TRUE))
+            score += 2;
+          else if (arithmetic_type_p (pt) && arithmetic_type_p (at))
+            score += 1; /* implicit arithmetic conversion */
+          else if (pt->mode == TM_PTR && (at->mode == TM_PTR || at->mode == TM_ARR))
+            score += 1; /* pointer/array compatibility, refined later */
+          else { ok = FALSE; break; }
+        }
+        if (!ok) continue;
+        if ((param != NULL || a != NULL) && !ft->dots_p) continue; /* arg-count mismatch */
+        if (score > best_score) { best_score = score; best = def; }
+      }
+      return best != NULL ? best : msym->def_node;
     }
 
     /* Name of a class type (its tag), or NULL for a non-class/anonymous type. */
@@ -11463,8 +11538,20 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
 	              if (obj_type->mode == TM_CLASS) {
 	                node_t method_id = NL_NEXT(obj);  // Method name (N_ID)
 
-	                // Find method definition in class scope
-	                node_t func_def = find_def(c2m_ctx, S_REGULAR, method_id, obj_type->u.tag_type, NULL);
+	                // Pre-check the user arguments so their types are known for
+	                // overload resolution (this runs before the implicit 'this' is
+	                // prepended below).
+	                for (node_t ua = NL_HEAD(arg_list->u.ops); ua != NULL; ua = NL_NEXT(ua))
+	                  if (!ua->attr) check(c2m_ctx, ua, r);
+
+	                // Find the method in the class scope.  When several overloads
+	                // share the name, pick the best match for the argument types.
+	                symbol_t msym;
+	                node_t func_def = NULL;
+	                if (find_overload_sym(c2m_ctx, method_id, obj_type->u.tag_type, &msym))
+	                  func_def = select_method_overload(c2m_ctx, &msym, obj_type->u.tag_type, arg_list);
+	                if (!func_def)
+	                  func_def = find_def(c2m_ctx, S_REGULAR, method_id, obj_type->u.tag_type, NULL);
 	                if (!func_def) {
 	                  error(c2m_ctx, POS(r), "method '%s' not found in class", method_id->u.s.s);
 	                  break;
@@ -11483,6 +11570,22 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
 	                }
 	                func_type = func_type_type->u.func_type;
 	                ret_type = func_type->ret_type;
+
+	                // Point the method-access node at the *resolved* overload so that
+	                // proto generation (gen_mir_protos) and the call emission both use
+	                // this overload's signature and function item, rather than the
+	                // first-declared method that field resolution initially attached.
+	                {
+	                  struct expr *fe = op1->attr;
+	                  if (fe != NULL) {
+	                    struct type *pf = create_type(c2m_ctx, NULL);
+	                    pf->mode = TM_PTR;
+	                    pf->u.ptr_type = func_type_type;
+	                    set_type_layout(c2m_ctx, pf);
+	                    fe->type = pf;
+	                    fe->def_node = func_def;
+	                  }
+	                }
 
 	                // Determine if this is a static class method (no implicit 'this').
 	                int is_static_meth = decl->decl_spec.static_p;
@@ -11998,6 +12101,30 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     curr_call_arg_area_offset = 0;
     VARR_TRUNC(decl_t, func_decls_for_allocation, 0);
     create_decl(c2m_ctx, top_scope, r, decl_spec, NULL, FALSE);
+
+    /* Record the enclosing class on the method's function type so gen can mangle
+       the method's symbol name (Class_method__<params>).  The method's
+       declarator was checked in the function block scope, so check_declarator
+       could not see N_CLASS; curr_class is the reliable signal here, and it
+       applies to both instance and static methods. */
+    if (curr_class != NULL) {
+      node_t class_node = NULL;
+      if (curr_class->code == N_CLASS) {
+        class_node = curr_class;
+      } else {
+        node_t cid = NL_HEAD (curr_class->u.ops);
+        if (cid != NULL && cid->code == N_ID) {
+          class_node = find_def (c2m_ctx, S_REGULAR, cid, curr_scope, NULL);
+          if (class_node == NULL) class_node = find_def (c2m_ctx, S_TAG, cid, curr_scope, NULL);
+        }
+      }
+      if (class_node != NULL && class_node->code == N_CLASS) {
+        decl_t fdecl = r->attr;
+        if (fdecl != NULL && fdecl->decl_spec.type != NULL
+            && fdecl->decl_spec.type->mode == TM_FUNC)
+          fdecl->decl_spec.type->u.func_type->class_scope = class_node;
+      }
+    }
 
     check(c2m_ctx, declarations, r);
     assert(declarator->code == N_DECL);
@@ -15687,6 +15814,119 @@ static void make_cond_val (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label,
   emit_label_insn_opt (c2m_ctx, end_label);
 }
 
+/* ===== Class-method name mangling =====
+ * Class methods are lowered to free functions whose MIR symbol name encodes the
+ * class, the method name, and the (user) parameter types.  This avoids global
+ * symbol collisions between same-named methods of different classes (visible in
+ * AOT `nm` output) and lets same-named methods of one class coexist as distinct
+ * symbols, which is what enables method overloading.  The scheme is an
+ * Itanium-flavoured shorthand; names stay within [A-Za-z0-9_] so they are safe
+ * for every object format.  e.g.  Point::withX(int) -> `Point_withX__i`. */
+static void append_type_mangle (c2m_ctx_t c2m_ctx, VARR (char) * b, struct type *t) {
+  char numbuf[32];
+  if (t == NULL) { VARR_PUSH (char, b, 'X'); return; }
+  switch (t->mode) {
+  case TM_BASIC: {
+    char c;
+    switch (t->u.basic_type) {
+    case TP_VOID: c = 'v'; break;
+    case TP_BOOL: c = 'b'; break;
+    case TP_CHAR: c = 'c'; break;
+    case TP_SCHAR: c = 'a'; break;
+    case TP_UCHAR: c = 'h'; break;
+    case TP_SHORT: c = 's'; break;
+    case TP_USHORT: c = 't'; break;
+    case TP_INT: c = 'i'; break;
+    case TP_UINT: c = 'j'; break;
+    case TP_LONG: c = 'l'; break;
+    case TP_ULONG: c = 'm'; break;
+    case TP_LLONG: c = 'x'; break;
+    case TP_ULLONG: c = 'y'; break;
+    case TP_FLOAT: c = 'f'; break;
+    case TP_DOUBLE: c = 'd'; break;
+    case TP_LDOUBLE: c = 'e'; break;
+    case TP_STRING: c = 'S'; break;
+    default: c = 'X'; break;
+    }
+    VARR_PUSH (char, b, c);
+    break;
+  }
+  case TM_PTR:
+    VARR_PUSH (char, b, 'P');
+    append_type_mangle (c2m_ctx, b, t->u.ptr_type);
+    break;
+  case TM_ARR:
+    VARR_PUSH (char, b, 'A');
+    append_type_mangle (c2m_ctx, b, t->u.arr_type->el_type);
+    break;
+  case TM_ENUM:
+    VARR_PUSH (char, b, 'i'); /* enum mangles like int */
+    break;
+  case TM_STRUCT:
+  case TM_UNION:
+  case TM_CLASS: {
+    node_t id = (t->u.tag_type != NULL) ? TAG_ID (t->u.tag_type) : NULL;
+    char tag = t->mode == TM_CLASS ? 'C' : t->mode == TM_UNION ? 'U' : 'T';
+    VARR_PUSH (char, b, tag);
+    if (id != NULL && id->code == N_ID) {
+      int n = snprintf (numbuf, sizeof numbuf, "%u", (unsigned) strlen (id->u.s.s));
+      for (int i = 0; i < n; i++) VARR_PUSH (char, b, numbuf[i]);
+      for (const char *p = id->u.s.s; *p != '\0'; p++) VARR_PUSH (char, b, *p);
+    } else {
+      VARR_PUSH (char, b, '0');
+    }
+    break;
+  }
+  case TM_DICT: VARR_PUSH (char, b, 'D'); break;
+  case TM_FUNC: VARR_PUSH (char, b, 'F'); break;
+  default: VARR_PUSH (char, b, 'X'); break;
+  }
+}
+
+/* True if `param` (an N_SPEC_DECL parameter) is the implicit `this` receiver. */
+static int param_is_this_p (node_t param) {
+  node_t decl, id;
+  if (param == NULL || param->code != N_SPEC_DECL) return FALSE;
+  decl = SPEC_DECL_DECL (param);
+  if (decl == NULL || decl->code != N_DECL) return FALSE;
+  id = DECL_ID (decl);
+  return id != NULL && id->code == N_ID && strcmp (id->u.s.s, "this") == 0;
+}
+
+/* Build the mangled MIR symbol name for class method `method` of `class_name`
+   into `out`.  The implicit leading `this` parameter is skipped; `v` denotes an
+   empty (or (void)) user parameter list. */
+static void build_method_mir_name (c2m_ctx_t c2m_ctx, char *out, size_t outsz,
+                                   const char *class_name, const char *method,
+                                   struct func_type *ft) {
+  MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+  VARR (char) * b;
+  node_t param;
+  int any = FALSE;
+
+  VARR_CREATE (char, b, alloc, 64);
+  for (const char *p = class_name; *p != '\0'; p++) VARR_PUSH (char, b, *p);
+  VARR_PUSH (char, b, '_');
+  for (const char *p = method; *p != '\0'; p++) VARR_PUSH (char, b, *p);
+  VARR_PUSH (char, b, '_');
+  VARR_PUSH (char, b, '_');
+  param = (ft != NULL) ? NL_HEAD (ft->param_list->u.ops) : NULL;
+  if (param_is_this_p (param)) param = NL_NEXT (param);
+  for (; param != NULL; param = NL_NEXT (param)) {
+    struct decl_spec *ds;
+    if (param->code != N_SPEC_DECL) continue;
+    if (void_param_p (param)) continue; /* (void) */
+    ds = get_param_decl_spec (param);
+    if (ds == NULL) continue;
+    append_type_mangle (c2m_ctx, b, ds->type);
+    any = TRUE;
+  }
+  if (!any) VARR_PUSH (char, b, 'v');
+  VARR_PUSH (char, b, '\0');
+  snprintf (out, outsz, "%s", VARR_ADDR (char, b));
+  VARR_DESTROY (char, b);
+}
+
 static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_t false_label,
                  int val_p, op_t *desirable_dest, int *expect_res) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
@@ -17243,60 +17483,22 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     target_arg_info_t arg_info;
     char name[256] = {0};
 
-    // NEW: Check if this function is defined inside a class
+    // Detect class methods reliably via the function type's recorded class scope
+    // (set in check_declarator).  Methods are mangled as `Class_method__<params>`
+    // so they do not collide with global functions or with same-named methods of
+    // other classes, and so overloads of one class become distinct symbols.
     int is_method = FALSE;
     const char *class_name = NULL;
-    symbol_t sym;
     node_t id = DECL_ID (declarator);
+    const char *base_name = id->u.s.s;
+    struct func_type *gen_ft = decl_type->u.func_type;
 
-    if (c2m_options->verbose_p) {
-        printf("=== DEBUG: Processing FUNC_DEF ===\n");
-        printf("DEBUG: Function node = %p\n", (void*)r);
-        printf("DEBUG: Function name = %s\n", id->u.s.s);
-        printf("DEBUG: func_decl = %p\n", (void*)func_decl);
-        printf("DEBUG: func_decl->scope = %p\n", (void*)func_decl->scope);
-        if (func_decl->scope) {
-            printf("DEBUG: func_decl->scope->code = %d\n", func_decl->scope->code);
-        }
-
-        // RSD: Find the function symbol to get its definition context
-        printf("DEBUG: Calling symbol_find for function %s\n", id->u.s.s);
-    }
-    if (symbol_find(c2m_ctx, S_REGULAR, id, func_decl->scope, &sym)) {
-        // Check if the function is defined in a class context
-        if (c2m_options->verbose_p) {
-            printf("DEBUG: symbol_find SUCCESS for %s\n", id->u.s.s);
-            printf("DEBUG: sym.def_node = %p\n", (void*)sym.def_node);
-            printf("DEBUG: comparing def_node (%p) with r (%p)\n", (void*)sym.def_node, (void*)r);
-        }
-
-        node_t def_node = sym.def_node;
-        if (def_node && def_node == r) { // This is our function definition
-            // Check if this function's scope has a class parent
-            node_t current_scope = func_decl->scope;
-
-            // Walk up the scope hierarchy to find a class
-            while (current_scope) {
-                // Check if current scope is a class
-                if (current_scope->code == N_CLASS) {
-                    is_method = TRUE;
-                    node_t class_id = NL_HEAD(current_scope->u.ops);
-                    if (class_id && class_id->code == N_ID) {
-                        class_name = class_id->u.s.s;
-                        printf("gen: Found method %s in class %s\n", id->u.s.s, class_name);
-                        break;
-                    }
-                }
-
-                // Move to parent scope
-                struct node_scope *scope_attr = current_scope->attr;
-                if (scope_attr) {
-                    current_scope = scope_attr->scope;
-                } else {
-                    break;
-                }
-            }
-        }
+    if (gen_ft->class_scope != NULL && gen_ft->class_scope->code == N_CLASS) {
+      node_t class_id = TAG_ID (gen_ft->class_scope);
+      if (class_id != NULL && class_id->code == N_ID) {
+        is_method = TRUE;
+        class_name = class_id->u.s.s;
+      }
     }
 
     assert (declarator != NULL && declarator->code == N_DECL
@@ -17307,14 +17509,14 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     curr_call_arg_area_offset = 0;
     collect_args_and_func_types (c2m_ctx, decl_type->u.func_type);
 
-    // NEW: Generate mangled name for class methods
-    if (is_method && class_name != NULL) {
-        const char *base_name = DECL_ID (declarator)->u.s.s;
-        snprintf( name, 255, "%s_%s", class_name, base_name);
-        //name = mangled_name;
+    // Generate the mangled name for class methods.  Constructors/destructors are
+    // already given class-qualified names (`__ctor_<Class>` / `__dtor_<Class>`)
+    // at parse time and are referenced by those names, so they are left as-is.
+    if (is_method && class_name != NULL
+        && strncmp (base_name, "__ctor_", 7) != 0 && strncmp (base_name, "__dtor_", 7) != 0) {
+      build_method_mir_name (c2m_ctx, name, sizeof (name), class_name, base_name, gen_ft);
     } else {
-        snprintf( name, 255, "%s", DECL_ID (declarator)->u.s.s);
-        //name = NL_HEAD(declarator->u.ops)->u.s.s;
+      snprintf (name, sizeof (name), "%s", base_name);
     }
 
     curr_func = ((decl_type->u.func_type->dots_p
