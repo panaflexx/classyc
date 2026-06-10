@@ -39,7 +39,8 @@ static int classify_arg (c2m_ctx_t c2m_ctx, struct type *type, MIR_type_t types[
   size_t size = type_size (c2m_ctx, type), n_qwords = (size + 7) / 8;
   MIR_type_t mir_type;
 
-  if (type->mode == TM_STRUCT || type->mode == TM_UNION || type->mode == TM_ARR) {
+  if (type->mode == TM_STRUCT || type->mode == TM_UNION || type->mode == TM_ARR
+      || type->mode == TM_CLASS) {
     if (n_qwords > MAX_QWORDS) return 0; /* too big aggregate */
 
 #ifndef _WIN32
@@ -56,6 +57,7 @@ static int classify_arg (c2m_ctx_t c2m_ctx, struct type *type, MIR_type_t types[
         types[i] = get_result_type (types[i], subtypes[i % n_el_qwords]);
       break;
     }
+    case TM_CLASS:
     case TM_STRUCT:
     case TM_UNION:
       for (node_t el = NL_HEAD (NL_EL (type->u.tag_type->u.ops, 1)->u.ops); el != NULL;
@@ -67,7 +69,8 @@ static int classify_arg (c2m_ctx_t c2m_ctx, struct type *type, MIR_type_t types[
           if ((container = decl->containing_unnamed_anon_struct_union_member) != NULL) {
             decl_t decl2 = container->attr;
             assert (decl2->decl_spec.type->mode == TM_STRUCT
-                    || decl2->decl_spec.type->mode == TM_UNION);
+                    || decl2->decl_spec.type->mode == TM_UNION
+                    || decl2->decl_spec.type->mode == TM_CLASS);
             offset -= decl2->offset;
           }
           int start_qword = offset / 8;
@@ -145,7 +148,7 @@ static int process_ret_type (c2m_ctx_t c2m_ctx, struct type *ret_type,
   int n, n_iregs, n_fregs, n_stregs, curr;
   int n_qwords = classify_arg (c2m_ctx, ret_type, qword_types, FALSE);
 
-  if (ret_type->mode != TM_STRUCT && ret_type->mode != TM_UNION) return 0;
+  if (ret_type->mode != TM_STRUCT && ret_type->mode != TM_UNION && ret_type->mode != TM_CLASS) return 0;
   if (n_qwords != 0) {
     update_last_qword_type (c2m_ctx, ret_type, qword_types, n_qwords);
     n_iregs = n_fregs = n_stregs = curr = 0;
@@ -178,7 +181,8 @@ static int target_return_by_addr_p (c2m_ctx_t c2m_ctx, struct type *ret_type) {
 
   if (void_type_p (ret_type)) return FALSE;
   n_qwords = process_ret_type (c2m_ctx, ret_type, qword_types);
-  return n_qwords == 0 && (ret_type->mode == TM_STRUCT || ret_type->mode == TM_UNION);
+  return n_qwords == 0 && (ret_type->mode == TM_STRUCT || ret_type->mode == TM_UNION
+                            || ret_type->mode == TM_CLASS);
 }
 
 static void target_add_res_proto (c2m_ctx_t c2m_ctx, struct type *ret_type,
@@ -194,7 +198,8 @@ static void target_add_res_proto (c2m_ctx_t c2m_ctx, struct type *ret_type,
   if (n_qwords != 0) {
     for (n = 0; n < n_qwords; n++)
       VARR_PUSH (MIR_type_t, res_types, promote_mir_int_type (qword_types[n]));
-  } else if (ret_type->mode != TM_STRUCT && ret_type->mode != TM_UNION) {
+  } else if (ret_type->mode != TM_STRUCT && ret_type->mode != TM_UNION
+              && ret_type->mode != TM_CLASS) {
     type = get_mir_type (c2m_ctx, ret_type);
     VARR_PUSH (MIR_type_t, res_types, type);
   } else { /* return by reference */
@@ -223,7 +228,8 @@ static int target_add_call_res_op (c2m_ctx_t c2m_ctx, struct type *ret_type,
       VARR_PUSH (MIR_op_t, call_ops, temp.mir_op);
     }
     return n_qwords;
-  } else if (ret_type->mode == TM_STRUCT || ret_type->mode == TM_UNION) { /* return by reference */
+  } else if (ret_type->mode == TM_STRUCT || ret_type->mode == TM_UNION
+              || ret_type->mode == TM_CLASS) { /* return by reference */
     arg_info->n_iregs++;
     temp = get_new_temp (c2m_ctx, MIR_T_I64);
     emit3 (c2m_ctx, MIR_ADD, temp.mir_op,
@@ -291,7 +297,8 @@ static void target_add_ret_ops (c2m_ctx_t c2m_ctx, struct type *ret_type, op_t r
       MIR_append_insn (ctx, curr_func, insn);
       VARR_PUSH (MIR_op_t, ret_ops, temp.mir_op);
     }
-  } else if (ret_type->mode != TM_STRUCT && ret_type->mode != TM_UNION) {
+  } else if (ret_type->mode != TM_STRUCT && ret_type->mode != TM_UNION
+              && ret_type->mode != TM_CLASS) {
     VARR_PUSH (MIR_op_t, ret_ops, res.mir_op);
   } else {
     ret_addr_reg = MIR_reg (ctx, RET_ADDR_NAME, curr_func->u.func);
@@ -306,7 +313,7 @@ static int process_aggregate_arg (c2m_ctx_t c2m_ctx, struct type *arg_type,
   int n, n_iregs, n_fregs, n_qwords = classify_arg (c2m_ctx, arg_type, qword_types, FALSE);
 
   if (n_qwords == 0) return 0;
-  if (arg_type->mode != TM_STRUCT && arg_type->mode != TM_UNION) return 0;
+  if (arg_type->mode != TM_STRUCT && arg_type->mode != TM_UNION && arg_type->mode != TM_CLASS) return 0;
   update_last_qword_type (c2m_ctx, arg_type, qword_types, n_qwords);
   n_iregs = n_fregs = 0;
   for (n = 0; n < n_qwords; n++) { /* start from the last qword */
@@ -356,7 +363,7 @@ static MIR_type_t get_blk_type (int n_qwords, MIR_type_t *qword_types) {
 static MIR_type_t target_get_blk_type (c2m_ctx_t c2m_ctx, struct type *arg_type) {
   MIR_type_t qword_types[MAX_QWORDS];
   int n_qwords = classify_arg (c2m_ctx, arg_type, qword_types, FALSE);
-  assert (arg_type->mode == TM_STRUCT || arg_type->mode == TM_UNION);
+  assert (arg_type->mode == TM_STRUCT || arg_type->mode == TM_UNION || arg_type->mode == TM_CLASS);
   return get_blk_type (n_qwords, qword_types);
 }
 
@@ -369,7 +376,7 @@ static void target_add_arg_proto (c2m_ctx_t c2m_ctx, const char *name, struct ty
 
   /* pass aggregates on the stack and pass by value for others: */
   var.name = name;
-  if (arg_type->mode != TM_STRUCT && arg_type->mode != TM_UNION) {
+  if (arg_type->mode != TM_STRUCT && arg_type->mode != TM_UNION && arg_type->mode != TM_CLASS) {
     type = get_mir_type (c2m_ctx, arg_type);
     var.type = type;
     if (type == MIR_T_F || type == MIR_T_D)
@@ -392,7 +399,7 @@ static void target_add_call_arg_op (c2m_ctx_t c2m_ctx, struct type *arg_type,
   int n_qwords = process_aggregate_arg (c2m_ctx, arg_type, arg_info, qword_types);
 
   /* pass aggregates on the stack and pass by value for others: */
-  if (arg_type->mode != TM_STRUCT && arg_type->mode != TM_UNION) {
+  if (arg_type->mode != TM_STRUCT && arg_type->mode != TM_UNION && arg_type->mode != TM_CLASS) {
     type = get_mir_type (c2m_ctx, arg_type);
     VARR_PUSH (MIR_op_t, call_ops, arg.mir_op);
     if (type == MIR_T_F || type == MIR_T_D)

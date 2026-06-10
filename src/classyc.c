@@ -13923,6 +13923,7 @@ static const char *get_func_static_var_name (c2m_ctx_t c2m_ctx, const char *suff
 
 static const char *get_param_name (c2m_ctx_t c2m_ctx, struct type *param_type, const char *name) {
   MIR_type_t type = (param_type->mode == TM_STRUCT || param_type->mode == TM_UNION
+                       || param_type->mode == TM_CLASS
                        ? MIR_POINTER_TYPE
                        : get_mir_type (c2m_ctx, param_type));
   return get_reg_var_name (c2m_ctx, promote_mir_int_type (type), name, 0);
@@ -13932,7 +13933,7 @@ static void MIR_UNUSED simple_init_arg_vars (c2m_ctx_t c2m_ctx MIR_UNUSED,
                                              void *arg_info MIR_UNUSED) {}
 
 static int simple_return_by_addr_p (c2m_ctx_t c2m_ctx MIR_UNUSED, struct type *ret_type) {
-  return ret_type->mode == TM_STRUCT || ret_type->mode == TM_UNION;
+  return ret_type->mode == TM_STRUCT || ret_type->mode == TM_UNION || ret_type->mode == TM_CLASS;
 }
 
 static void MIR_UNUSED simple_add_res_proto (c2m_ctx_t c2m_ctx, struct type *ret_type,
@@ -14011,7 +14012,7 @@ static void MIR_UNUSED simple_add_arg_proto (c2m_ctx_t c2m_ctx, const char *name
   MIR_var_t var;
   MIR_type_t type;
 
-  type = (arg_type->mode == TM_STRUCT || arg_type->mode == TM_UNION
+  type = (arg_type->mode == TM_STRUCT || arg_type->mode == TM_UNION || arg_type->mode == TM_CLASS
             ? MIR_T_BLK
             : get_mir_type (c2m_ctx, arg_type));
   var.name = name;
@@ -14025,7 +14026,7 @@ static void MIR_UNUSED simple_add_call_arg_op (c2m_ctx_t c2m_ctx, struct type *a
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_type_t type;
 
-  type = (arg_type->mode == TM_STRUCT || arg_type->mode == TM_UNION
+  type = (arg_type->mode == TM_STRUCT || arg_type->mode == TM_UNION || arg_type->mode == TM_CLASS
             ? MIR_T_BLK
             : get_mir_type (c2m_ctx, arg_type));
   if (type != MIR_T_BLK) {
@@ -16725,19 +16726,32 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       ops_start = VARR_LENGTH (MIR_op_t, call_ops);
       VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, proto));
       VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, cdecl->u.item));
-      VARR_PUSH (MIR_op_t, call_ops, obj.mir_op); /* implicit 'this' */
-      param = NL_HEAD (ft->param_list->u.ops);
-      if (param != NULL) param = NL_NEXT (param); /* skip 'this' */
-      for (node_t a = NL_HEAD (arg_list->u.ops); a != NULL; a = NL_NEXT (a)) {
-        op_t av = val_gen (c2m_ctx, a);
-        if (param != NULL) {
-          struct decl_spec *pds = get_param_decl_spec (param);
-          if (scalar_type_p (pds->type))
-            av = promote (c2m_ctx, av,
-                          promote_mir_int_type (get_mir_type (c2m_ctx, pds->type)), FALSE);
-          param = NL_NEXT (param);
+      {
+        /* Use target_add_call_arg_op for all constructor args so that
+           aggregate (class/struct) args get proper BLK memory operands. */
+        target_arg_info_t new_arg_info;
+        target_init_arg_vars (c2m_ctx, &new_arg_info);
+        /* 'this' pointer — push directly and record register usage. */
+        target_add_call_arg_op (c2m_ctx, ne->type, &new_arg_info, obj);
+        param = NL_HEAD (ft->param_list->u.ops);
+        if (param != NULL) param = NL_NEXT (param); /* skip 'this' */
+        for (node_t a = NL_HEAD (arg_list->u.ops); a != NULL; a = NL_NEXT (a)) {
+          struct type *a_type = ((struct expr *) a->attr)->type;
+          int is_agg = (a_type->mode == TM_STRUCT || a_type->mode == TM_UNION
+                        || a_type->mode == TM_CLASS);
+          op_t av = gen (c2m_ctx, a, NULL, NULL, !is_agg, NULL, NULL);
+          if (param != NULL) {
+            struct decl_spec *pds = get_param_decl_spec (param);
+            a_type = pds->type;
+            is_agg = (a_type->mode == TM_STRUCT || a_type->mode == TM_UNION
+                      || a_type->mode == TM_CLASS);
+            if (!is_agg && scalar_type_p (a_type))
+              av = promote (c2m_ctx, av,
+                            promote_mir_int_type (get_mir_type (c2m_ctx, a_type)), FALSE);
+            param = NL_NEXT (param);
+          }
+          target_add_call_arg_op (c2m_ctx, a_type, &new_arg_info, av);
         }
-        VARR_PUSH (MIR_op_t, call_ops, av.mir_op);
       }
       emit_insn (c2m_ctx,
                  MIR_new_insn_arr (ctx, MIR_CALL,
@@ -17099,10 +17113,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         struct type *arg_type;
         arg_num++;
         e = arg->attr;
-        struct_p = e->type->mode == TM_STRUCT || e->type->mode == TM_UNION;
-        if (e->type->mode == TM_CLASS) {
-          fprintf(stderr, "Detected TM_CLASS in argument %d\n", arg_num);
-        }
+        struct_p = e->type->mode == TM_STRUCT || e->type->mode == TM_UNION || e->type->mode == TM_CLASS;
         op2 = gen (c2m_ctx, arg, NULL, NULL, !struct_p, NULL, NULL);
         assert (param != NULL || NL_HEAD (param_list->u.ops) == NULL
                 || func_type->u.func_type->dots_p);
@@ -17114,12 +17125,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           arg_type = decl_spec->type;
           t = get_mir_type (c2m_ctx, arg_type);
           t = promote_mir_int_type (t);
-          if (param != NULL && arg_type->mode == TM_PTR &&
-              (e->type->mode == TM_CLASS) && op2.mir_op.mode == MIR_OP_MEM)
-          {
-            fprintf(stderr, "Converting mem to address for TM_CLASS param %d (likely 'this' if first)\n", arg_num);
+          if (param != NULL && arg_type->mode == TM_PTR
+              && e->type->mode == TM_CLASS && op2.mir_op.mode == MIR_OP_MEM)
             op2 = mem_to_address (c2m_ctx, op2, FALSE);
-          }
           op2 = promote (c2m_ctx, op2, t, FALSE);
         } else {
           t = get_mir_type (c2m_ctx, e->type);
@@ -17547,12 +17555,14 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         param_id = NL_HEAD (param_declarator->u.ops);
         param_type = param_decl->decl_spec.type;
         assert (!param_decl->reg_p
-                || (param_type->mode != TM_STRUCT && param_type->mode != TM_UNION));
+                || (param_type->mode != TM_STRUCT && param_type->mode != TM_UNION
+                    && param_type->mode != TM_CLASS));
         const char *param_name = get_param_name (c2m_ctx, param_type, param_id->u.s.s);
         if (target_gen_gather_arg (c2m_ctx, param_name, param_type, param_decl, &arg_info)) continue;
         if (param_decl->reg_p) continue;
         if (param_type->mode == TM_STRUCT
-            || param_type->mode == TM_UNION) { /* ??? only block pass */
+            || param_type->mode == TM_UNION
+            || param_type->mode == TM_CLASS) { /* block pass for aggregates */
           param_reg = get_reg_var (c2m_ctx, MIR_POINTER_TYPE, param_name, NULL).reg;
           val = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, param_reg, 0, 1));
           var
@@ -18112,7 +18122,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     decl_t func_decl = curr_func_def->attr;
     struct type *func_type = func_decl->decl_spec.type;
     struct type *ret_type = func_type->u.func_type->ret_type;
-    int scalar_p = ret_type->mode != TM_STRUCT && ret_type->mode != TM_UNION;
+    int scalar_p = ret_type->mode != TM_STRUCT && ret_type->mode != TM_UNION && ret_type->mode != TM_CLASS;
     int ret_by_addr_p = target_return_by_addr_p (c2m_ctx, ret_type);
 
     assert (false_label == NULL && true_label == NULL);
