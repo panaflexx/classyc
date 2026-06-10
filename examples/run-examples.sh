@@ -61,6 +61,8 @@ run_example test_dict_arena.c
 run_example class-arrays.c
 run_example classy-fstring.c
 run_example classy-auto.c
+run_example classy-brace-forin.c
+run_example classy-seq-lambdas.c
 
 # ── summary ────────────────────────────────────────────────────────────
 

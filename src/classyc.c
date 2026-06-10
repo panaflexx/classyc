@@ -353,6 +353,8 @@ enum type_mode {
   TM_ARR,
   TM_FUNC,
   TM_DICT,
+  TM_SLICE, /* filter/map result: pointer to {i64 len; i64 pad; el[0] data} on the stack.
+               Scalar (one pointer) at MIR level; u.ptr_type holds the element type. */
 };
 
 struct type {
@@ -4800,36 +4802,34 @@ D (expr);
 D (assign_expr);
 D (initializer_list);
 
-/* Lambda expression: ( typed-param-list? ) => expr-or-block
-   Always called via TRY(); returns err_node if this is not a lambda.
-   On success, pushes a synthetic N_FUNC_DEF onto pending_lambdas and
-   returns an N_ID referencing the generated lambda name.
-   Typed params only for now; untyped params (generics) are a future TODO. */
-D (lambda_expr) {
+/* Assemble a lambda N_FUNC_DEF:  static auto LNAME (PLIST) BODY.
+   The 'auto' return type becomes TP_UNDEF during check and is inferred from
+   the body's return statements.  Shared by parse-time typed lambdas and
+   check-time instantiation of untyped lambdas (N_LAMBDA). */
+static node_t build_lambda_func_def (c2m_ctx_t c2m_ctx, const char *lname, node_t plist,
+                                     node_t body, pos_t pos) {
+  node_t specs = new_node (c2m_ctx, N_LIST);
+  op_append (c2m_ctx, specs, new_pos_node (c2m_ctx, N_STATIC, pos));
+  op_append (c2m_ctx, specs, new_pos_node (c2m_ctx, N_AUTO, pos));
+
+  /* Declarator: LNAME ( param_list ) */
+  node_t lam_id = build_id (c2m_ctx, lname, pos);
+  node_t func_node = new_pos_node1 (c2m_ctx, N_FUNC, pos, plist);
+  node_t decl_inner = new_node1 (c2m_ctx, N_LIST, func_node);
+  node_t declarator = new_pos_node2 (c2m_ctx, N_DECL, pos, lam_id, decl_inner);
+
+  return new_pos_node4 (c2m_ctx, N_FUNC_DEF, pos, specs, declarator,
+                        new_node (c2m_ctx, N_LIST), /* empty K&R decl list */
+                        body);
+}
+
+/* Parse a lambda body after '=>': either a block { ... } or a single
+   expression auto-wrapped in { return <expr>; }.  Shared by typed lambdas
+   (lambda_expr) and untyped/shorthand lambdas (N_LAMBDA nodes). */
+static node_t parse_lambda_body (c2m_ctx_t c2m_ctx, pos_t pos) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
-  node_t plist, r, body;
-  pos_t pos;
+  node_t body, r;
 
-  if (!C ('(')) return err_node;
-  pos = curr_token->pos;
-  M ('('); /* consume '(' */
-
-  if (C (')')) {
-    /* Zero-arg lambda: () => body */
-    M (')');
-    plist = new_node (c2m_ctx, N_LIST);
-  } else {
-    /* Try to parse a typed parameter list.  If it fails (untyped or not a
-       param list at all) this is not a lambda — rewind via TRY. */
-    if ((plist = TRY (param_type_list)) == err_node) return err_node;
-    if (!M (')')) return err_node;
-  }
-
-  /* Commit only when we see '=>' immediately after ')' */
-  if (!C (T_FAT_ARROW)) return err_node;
-  M (T_FAT_ARROW); /* consume '=>' — committed from here on */
-
-  /* Parse body: either a block { ... } or a single expression (auto-wrapped in return) */
   if (C ('{')) {
     body = compound_stmt (c2m_ctx, FALSE);
     if (body == err_node) body = new_node (c2m_ctx, N_IGNORE);
@@ -4845,29 +4845,65 @@ D (lambda_expr) {
                            new_node (c2m_ctx, N_LIST), blist);
     body->attr = NULL; /* scope set during check */
   }
+  return body;
+}
+
+/* Lambda expression: ( typed-param-list? ) => expr-or-block
+   Always called via TRY(); returns err_node if this is not a lambda.
+   On success, pushes a synthetic N_FUNC_DEF onto pending_lambdas and
+   returns an N_ID referencing the generated lambda name.
+
+   Untyped parameter lists —  (a, b) => body  — are also accepted here; they
+   produce an N_LAMBDA(param_ids, body) node whose parameter types are
+   inferred later at the call site (filter/map/reduce receiver element type).
+   The single-identifier shorthand  x => body  is handled in primary_expr. */
+D (lambda_expr) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  node_t plist, r, body;
+  pos_t pos;
+  int untyped_p = FALSE;
+
+  if (!C ('(')) return err_node;
+  pos = curr_token->pos;
+  M ('('); /* consume '(' */
+
+  if (C (')')) {
+    /* Zero-arg lambda: () => body */
+    M (')');
+    plist = new_node (c2m_ctx, N_LIST);
+  } else {
+    /* Try a typed parameter list first; on failure fall back to an untyped
+       identifier list  (a, b, ...).  Either way ')' '=>' must follow. */
+    size_t mark = record_start (c2m_ctx);
+    if ((plist = TRY (param_type_list)) != err_node && M (')') && C (T_FAT_ARROW)) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit typed list */
+    } else {
+      record_stop (c2m_ctx, mark, TRUE); /* rewind to after '(' */
+      plist = new_node (c2m_ctx, N_LIST);
+      for (;;) {
+        if (!MN (T_ID, r)) return err_node;
+        op_append (c2m_ctx, plist, r);
+        if (!M (',')) break;
+      }
+      if (!M (')')) return err_node;
+      untyped_p = TRUE;
+    }
+  }
+
+  /* Commit only when we see '=>' immediately after ')' */
+  if (!C (T_FAT_ARROW)) return err_node;
+  M (T_FAT_ARROW); /* consume '=>' — committed from here on */
+
+  body = parse_lambda_body (c2m_ctx, pos);
+
+  if (untyped_p) /* parameter types unknown: defer everything to check */
+    return new_pos_node2 (c2m_ctx, N_LAMBDA, pos, plist, body);
 
   /* Generate a unique name for this lambda */
   char lname[64];
   snprintf (lname, sizeof (lname), "__lambda_%u", lambda_uid++);
 
-  /* Build specs: [static] [auto]
-     'auto' as function return type → TP_UNDEF → inferred from return stmts */
-  node_t specs = new_node (c2m_ctx, N_LIST);
-  op_append (c2m_ctx, specs, new_pos_node (c2m_ctx, N_STATIC, pos));
-  op_append (c2m_ctx, specs, new_pos_node (c2m_ctx, N_AUTO, pos));
-
-  /* Build declarator: __lambda_N ( param_list ) */
-  node_t lam_id      = build_id (c2m_ctx, lname, pos);
-  node_t func_node   = new_pos_node1 (c2m_ctx, N_FUNC, pos, plist);
-  node_t decl_inner  = new_node1 (c2m_ctx, N_LIST, func_node);
-  node_t declarator  = new_pos_node2 (c2m_ctx, N_DECL, pos, lam_id, decl_inner);
-
-  /* Build N_FUNC_DEF */
-  node_t func_def = new_pos_node4 (c2m_ctx, N_FUNC_DEF, pos,
-                                    specs,
-                                    declarator,
-                                    new_node (c2m_ctx, N_LIST), /* empty K&R decl list */
-                                    body);
+  node_t func_def = build_lambda_func_def (c2m_ctx, lname, plist, body, pos);
 
   /* Enqueue for module-level injection before the containing top-level item */
   VARR_PUSH (node_t, pending_lambdas, func_def);
@@ -4897,6 +4933,23 @@ D (primary_expr) {
     node_t lr = TRY (lambda_expr);
     if (lr != err_node) return lr;
     /* Not a lambda — token stream rewound, fall through to normal handling */
+  }
+
+  /* Shorthand untyped lambda:  x => body  (single parameter, no parens).
+     The parameter type is inferred at the call site during check. */
+  if (C (T_ID)) {
+    size_t mark = record_start (c2m_ctx);
+    node_t pid;
+    pos = curr_token->pos;
+    MN (T_ID, pid);
+    if (C (T_FAT_ARROW)) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit */
+      M (T_FAT_ARROW);
+      node_t plist = new_node1 (c2m_ctx, N_LIST, pid);
+      node_t body = parse_lambda_body (c2m_ctx, pos);
+      return new_pos_node2 (c2m_ctx, N_LAMBDA, pos, plist, body);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not a lambda: rewind */
   }
 
   	if (MN (T_ID, r) || MN (T_NUMBER, r) || MN (T_CH, r) || MN (T_STR, r)) {
@@ -7051,6 +7104,11 @@ struct check_ctx {
   node_t curr_func_def, curr_loop, curr_loop_switch;
   mir_size_t curr_call_arg_area_offset;
   VARR (node_t) * context_stack;
+  /* Sequence lambda methods (filter/map/reduce): module-level injection points
+     for lambda FUNC_DEFs synthesized while checking a call site. */
+  node_t module_item_list; /* the module's top-level N_LIST */
+  node_t curr_module_item; /* module item currently being checked */
+  node_t curr_lambda_def;  /* innermost synthetic lambda FUNC_DEF being checked */
 };
 
 #define curr_scope check_ctx->curr_scope
@@ -7071,6 +7129,9 @@ struct check_ctx {
 #define curr_loop_switch check_ctx->curr_loop_switch
 #define curr_call_arg_area_offset check_ctx->curr_call_arg_area_offset
 #define context_stack check_ctx->context_stack
+#define module_item_list check_ctx->module_item_list
+#define curr_module_item check_ctx->curr_module_item
+#define curr_lambda_def check_ctx->curr_lambda_def
 
 
 static int supported_alignment_p (mir_llong align MIR_UNUSED) { return TRUE; }  // ???
@@ -7336,7 +7397,8 @@ static enum str_method get_string_method (const char *name, int *nargs,
 
 static int scalar_type_p (const struct type *type) {
   // RSD: Added string_type_p
-  return arithmetic_type_p (type) || string_type_p (type) || type->mode == TM_PTR || type->mode == TM_DICT;
+  return arithmetic_type_p (type) || string_type_p (type) || type->mode == TM_PTR
+         || type->mode == TM_DICT || type->mode == TM_SLICE;
 }
 
 static struct type get_ptr_int_type (int signed_p) {
@@ -7517,6 +7579,7 @@ static int type_eq_p (struct type *type1, struct type *type2) {
   case TM_STRUCT:
   case TM_UNION: return type1->u.tag_type == type2->u.tag_type;
   case TM_PTR: return type_eq_p (type1->u.ptr_type, type2->u.ptr_type);
+  case TM_SLICE: return type_eq_p (type1->u.ptr_type, type2->u.ptr_type);
   case TM_ARR: {
     struct expr *cexpr1, *cexpr2;
     struct arr_type *at1 = type1->u.arr_type, *at2 = type2->u.arr_type;
@@ -7686,7 +7749,7 @@ static void aux_set_type_align (c2m_ctx_t c2m_ctx, struct type *type) {
     align = type_align (type->u.arr_type->el_type);
   } else if (type->mode == TM_UNDEF) {
     align = 0; /* error type */
-  } else if (type->mode == TM_DICT) {
+  } else if (type->mode == TM_DICT || type->mode == TM_SLICE) {
     align = sizeof(void*);
   } else {
     assert (type->mode == TM_STRUCT || type->mode == TM_UNION || type->mode == TM_CLASS || type->mode == TM_DICT);
@@ -7825,8 +7888,8 @@ static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
     overall_size = type_size (c2m_ctx, arr_type->el_type) * nel;
   } else if (type->mode == TM_UNDEF) {
     overall_size = sizeof (int); /* error type */
-  } else if (type->mode == TM_DICT) {
-    overall_size = sizeof (void*); /* DictValue* */
+  } else if (type->mode == TM_DICT || type->mode == TM_SLICE) {
+    overall_size = sizeof (void*); /* DictValue* / slice header pointer */
   } else {
     int bf_p = FALSE, bits = -1, bound_bit = 0;
     mir_size_t offset = 0, prev_size = 0;
@@ -9351,6 +9414,9 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         }
       } else if (left->mode == TM_DICT) {
         /* allow assignment to dict field; runtime will handle coercion */
+      } else if (left->mode == TM_SLICE && right != NULL && right->mode == TM_SLICE
+                 && type_eq_p (left->u.ptr_type, right->u.ptr_type)) {
+        /* slice-to-slice of the same element type: copies the header pointer */
       } else {
         msg = (code == N_CALL     ? "passing assign incompatible value"
                : code == N_RETURN ? "returning assign incompatible value"
@@ -9726,6 +9792,438 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                 ? sexpr->c.i_val
                 : -1);
     }
+
+/* ==========================================================================
+   Sequence lambda methods:
+     seq.filter(pred)        -> slice of seq's element type
+     seq.map(fn)             -> slice of fn's return type
+     seq.reduce(init, fn)    -> type of init
+     seq.count()             -> size_t
+   where seq is a C array, a slice (the result of a previous filter/map), or
+   a class instance implementing the same Count()/Get(int) iteration protocol
+   that for-in uses (so List<T> works out of the box).
+
+   A slice is a pointer to a stack (alloca) block: a 16-byte header holding
+   the i64 element count, followed by the packed elements.  Slices are scalar
+   values at MIR level, bound with `auto`, indexable, for-in iterable, and
+   chainable.  They live until the enclosing function returns and therefore
+   cannot be returned from a function.
+   ========================================================================== */
+
+#define SLICE_HDR_SIZE 16
+
+static struct type *adjust_type (c2m_ctx_t c2m_ctx, struct type *type);
+static struct expr *create_expr (c2m_ctx_t c2m_ctx, node_t r);
+
+enum seq_method { SEQM_NONE = 0, SEQM_FILTER, SEQM_MAP, SEQM_REDUCE, SEQM_COUNT };
+
+static enum seq_method get_seq_method (const char *name, int *nargs) {
+  static const struct {
+    const char *name;
+    enum seq_method sm;
+    int nargs;
+  } tab[] = {
+    {"filter", SEQM_FILTER, 1},
+    {"map", SEQM_MAP, 1},
+    {"reduce", SEQM_REDUCE, 2},
+    {"count", SEQM_COUNT, 0},
+  };
+  for (size_t i = 0; i < sizeof (tab) / sizeof (tab[0]); i++)
+    if (strcmp (name, tab[i].name) == 0) {
+      if (nargs != NULL) *nargs = tab[i].nargs;
+      return tab[i].sm;
+    }
+  return SEQM_NONE;
+}
+
+enum seq_recv_kind { SEQ_RECV_NONE = 0, SEQ_RECV_ARR, SEQ_RECV_SLICE, SEQ_RECV_CLASS };
+
+struct seq_recv {
+  enum seq_recv_kind kind;
+  struct type *el_type;      /* element type of the sequence */
+  mir_llong static_len;      /* SEQ_RECV_ARR: element count (-1 if not constant) */
+  struct type *cls_type;     /* SEQ_RECV_CLASS: the class type */
+  node_t count_def, get_def; /* SEQ_RECV_CLASS: Count()/Get(int) FUNC_DEFs */
+};
+
+/* Classify a checked receiver type T as a lambda-method sequence; fill *SR.
+   Returns SEQ_RECV_NONE if T is not a sequence (no errors are reported). */
+static enum seq_recv_kind classify_seq_receiver (c2m_ctx_t c2m_ctx, struct type *t, pos_t pos,
+                                                 struct seq_recv *sr) {
+  memset (sr, 0, sizeof (*sr));
+  sr->static_len = -1;
+  if (t == NULL) return SEQ_RECV_NONE;
+  if (t->mode == TM_ARR || (t->mode == TM_PTR && t->arr_type != NULL)) {
+    struct type *arr = t->mode == TM_ARR ? t : t->arr_type;
+    sr->kind = SEQ_RECV_ARR;
+    sr->el_type = arr->u.arr_type->el_type;
+    sr->static_len = get_arr_type_size (arr);
+    return sr->kind;
+  }
+  if (t->mode == TM_SLICE) {
+    sr->kind = SEQ_RECV_SLICE;
+    sr->el_type = t->u.ptr_type;
+    return sr->kind;
+  }
+  if (t->mode == TM_CLASS
+      || (t->mode == TM_PTR && t->u.ptr_type != NULL && t->u.ptr_type->mode == TM_CLASS)) {
+    struct type *cls = t->mode == TM_PTR ? t->u.ptr_type : t;
+    node_t tag = cls->u.tag_type;
+    node_t count_def = find_class_protocol_method (c2m_ctx, tag, "Count", 0, pos);
+    node_t get_def = find_class_protocol_method (c2m_ctx, tag, "Get", 1, pos);
+    decl_t gd;
+
+    if (count_def == NULL || get_def == NULL) return SEQ_RECV_NONE;
+    gd = get_def->attr;
+    if (gd == NULL || gd->decl_spec.type == NULL || gd->decl_spec.type->mode != TM_FUNC)
+      return SEQ_RECV_NONE;
+    sr->kind = SEQ_RECV_CLASS;
+    sr->cls_type = cls;
+    sr->count_def = count_def;
+    sr->get_def = get_def;
+    sr->el_type = gd->decl_spec.type->u.func_type->ret_type;
+    return sr->kind;
+  }
+  return SEQ_RECV_NONE;
+}
+
+static void add_type_spec (c2m_ctx_t c2m_ctx, node_t specs, node_code_t code, pos_t pos) {
+  op_append (c2m_ctx, specs, new_pos_node (c2m_ctx, code, pos));
+}
+
+/* Synthesize declaration-specifier AST nodes (appended to SPECS) and pointer
+   declarator nodes (appended to DECL_OPS) expressing the semantic type T, so
+   an inferred lambda parameter can flow through the normal AST type checks.
+   Returns FALSE for types that cannot be expressed (slices, functions, ...). */
+static int build_type_spec_nodes (c2m_ctx_t c2m_ctx, struct type *t, pos_t pos, node_t specs,
+                                  node_t decl_ops) {
+  switch (t->mode) {
+  case TM_PTR:
+    if (!build_type_spec_nodes (c2m_ctx, t->u.ptr_type, pos, specs, decl_ops)) return FALSE;
+    op_append (c2m_ctx, decl_ops,
+               new_pos_node1 (c2m_ctx, N_POINTER, pos, new_node (c2m_ctx, N_LIST)));
+    return TRUE;
+  case TM_BASIC:
+    switch (t->u.basic_type) {
+    case TP_VOID: add_type_spec (c2m_ctx, specs, N_VOID, pos); return TRUE;
+    case TP_BOOL: add_type_spec (c2m_ctx, specs, N_BOOL, pos); return TRUE;
+    case TP_CHAR: add_type_spec (c2m_ctx, specs, N_CHAR, pos); return TRUE;
+    case TP_SCHAR:
+      add_type_spec (c2m_ctx, specs, N_SIGNED, pos);
+      add_type_spec (c2m_ctx, specs, N_CHAR, pos);
+      return TRUE;
+    case TP_UCHAR:
+      add_type_spec (c2m_ctx, specs, N_UNSIGNED, pos);
+      add_type_spec (c2m_ctx, specs, N_CHAR, pos);
+      return TRUE;
+    case TP_SHORT: add_type_spec (c2m_ctx, specs, N_SHORT, pos); return TRUE;
+    case TP_USHORT:
+      add_type_spec (c2m_ctx, specs, N_UNSIGNED, pos);
+      add_type_spec (c2m_ctx, specs, N_SHORT, pos);
+      return TRUE;
+    case TP_INT: add_type_spec (c2m_ctx, specs, N_INT, pos); return TRUE;
+    case TP_UINT:
+      add_type_spec (c2m_ctx, specs, N_UNSIGNED, pos);
+      add_type_spec (c2m_ctx, specs, N_INT, pos);
+      return TRUE;
+    case TP_LONG: add_type_spec (c2m_ctx, specs, N_LONG, pos); return TRUE;
+    case TP_ULONG:
+      add_type_spec (c2m_ctx, specs, N_UNSIGNED, pos);
+      add_type_spec (c2m_ctx, specs, N_LONG, pos);
+      return TRUE;
+    case TP_LLONG:
+      add_type_spec (c2m_ctx, specs, N_LONG, pos);
+      add_type_spec (c2m_ctx, specs, N_LONG, pos);
+      return TRUE;
+    case TP_ULLONG:
+      add_type_spec (c2m_ctx, specs, N_UNSIGNED, pos);
+      add_type_spec (c2m_ctx, specs, N_LONG, pos);
+      add_type_spec (c2m_ctx, specs, N_LONG, pos);
+      return TRUE;
+    case TP_FLOAT: add_type_spec (c2m_ctx, specs, N_FLOAT, pos); return TRUE;
+    case TP_DOUBLE: add_type_spec (c2m_ctx, specs, N_DOUBLE, pos); return TRUE;
+    case TP_LDOUBLE:
+      add_type_spec (c2m_ctx, specs, N_LONG, pos);
+      add_type_spec (c2m_ctx, specs, N_DOUBLE, pos);
+      return TRUE;
+    case TP_STRING: add_type_spec (c2m_ctx, specs, N_STRING, pos); return TRUE;
+    default: return FALSE;
+    }
+  case TM_ENUM:
+  case TM_STRUCT:
+  case TM_UNION:
+  case TM_CLASS: {
+    node_t tag_id = NL_HEAD (t->u.tag_type->u.ops);
+    node_code_t code = t->mode == TM_ENUM     ? N_ENUM
+                       : t->mode == TM_STRUCT ? N_STRUCT
+                       : t->mode == TM_UNION  ? N_UNION
+                                              : N_CLASS;
+    if (tag_id == NULL || tag_id->code != N_ID) return FALSE; /* unnamed tag */
+    op_append (c2m_ctx, specs,
+               new_pos_node2 (c2m_ctx, code, pos, copy_node (c2m_ctx, tag_id),
+                              new_node (c2m_ctx, N_IGNORE)));
+    return TRUE;
+  }
+  case TM_DICT: add_type_spec (c2m_ctx, specs, N_DICT, pos); return TRUE;
+  default: return FALSE;
+  }
+}
+
+/* Check a synthetic lambda FUNC_DEF in the middle of checking another
+   function.  All per-function check state is saved and restored so the
+   enclosing function's check continues undisturbed.  The lambda is checked
+   at top scope: there are no closures, so enclosing locals are not visible. */
+static void check_lambda_func_def (c2m_ctx_t c2m_ctx, node_t func_def) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
+  node_t saved_scope = curr_scope, saved_func_block_scope = func_block_scope;
+  node_t saved_func_def = curr_func_def, saved_class = curr_class;
+  node_t saved_switch = curr_switch, saved_loop = curr_loop;
+  node_t saved_loop_switch = curr_loop_switch;
+  node_t saved_unnamed = curr_unnamed_anon_struct_union_member;
+  node_t saved_lambda_def = curr_lambda_def;
+  unsigned saved_scope_num = curr_func_scope_num;
+  unsigned char saved_in_params_p = in_params_p, saved_jump_ret_p = jump_ret_p;
+  mir_size_t saved_arg_area = curr_call_arg_area_offset;
+  size_t i, fda_len = VARR_LENGTH (decl_t, func_decls_for_allocation);
+  size_t lu_len = VARR_LENGTH (node_t, label_uses);
+  decl_t *fda_save = NULL;
+  node_t *lu_save = NULL;
+
+  /* The FUNC_DEF check truncates and consumes these per-function VARRs;
+     preserve the enclosing function's entries. */
+  if (fda_len != 0) {
+    fda_save = reg_malloc (c2m_ctx, fda_len * sizeof (decl_t));
+    memcpy (fda_save, VARR_ADDR (decl_t, func_decls_for_allocation), fda_len * sizeof (decl_t));
+  }
+  if (lu_len != 0) {
+    lu_save = reg_malloc (c2m_ctx, lu_len * sizeof (node_t));
+    memcpy (lu_save, VARR_ADDR (node_t, label_uses), lu_len * sizeof (node_t));
+  }
+  VARR_TRUNC (node_t, label_uses, 0);
+  curr_scope = top_scope;
+  curr_class = NULL;
+  curr_lambda_def = func_def;
+  check (c2m_ctx, func_def, NULL);
+  curr_lambda_def = saved_lambda_def;
+  VARR_TRUNC (decl_t, func_decls_for_allocation, 0);
+  for (i = 0; i < fda_len; i++) VARR_PUSH (decl_t, func_decls_for_allocation, fda_save[i]);
+  VARR_TRUNC (node_t, label_uses, 0);
+  for (i = 0; i < lu_len; i++) VARR_PUSH (node_t, label_uses, lu_save[i]);
+  /* fda_save/lu_save are arena (reg_malloc) memory: reclaimed at compile end */
+  curr_scope = saved_scope;
+  func_block_scope = saved_func_block_scope;
+  curr_func_def = saved_func_def;
+  curr_class = saved_class;
+  curr_switch = saved_switch;
+  curr_loop = saved_loop;
+  curr_loop_switch = saved_loop_switch;
+  curr_unnamed_anon_struct_union_member = saved_unnamed;
+  curr_func_scope_num = saved_scope_num;
+  in_params_p = saved_in_params_p;
+  jump_ret_p = saved_jump_ret_p;
+  curr_call_arg_area_offset = saved_arg_area;
+}
+
+/* Instantiate an untyped lambda  (params) => body  with concrete parameter
+   types inferred at the call site.  Builds a synthetic static FUNC_DEF,
+   inserts it into the module item list before the item being checked (so its
+   MIR function is generated before its caller needs the func item ref), and
+   checks it at top scope.  Returns the FUNC_DEF node or NULL on error. */
+static node_t instantiate_lambda (c2m_ctx_t c2m_ctx, node_t lam, struct type **ptypes,
+                                  int n_ptypes) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  node_t params = NL_HEAD (lam->u.ops), body = NL_NEXT (params);
+  pos_t pos = POS (lam);
+  node_t plist, func_def, insert_before;
+  char lname[64];
+  int i;
+
+  if ((insert_before = curr_lambda_def != NULL ? curr_lambda_def : curr_module_item) == NULL
+      || module_item_list == NULL) {
+    error (c2m_ctx, pos, "lambda methods are only supported inside a function body");
+    return NULL;
+  }
+  if ((int) NL_LENGTH (params->u.ops) != n_ptypes) {
+    error (c2m_ctx, pos, "lambda takes %u parameter%s but %d %s expected here",
+           (unsigned) NL_LENGTH (params->u.ops), NL_LENGTH (params->u.ops) == 1 ? "" : "s",
+           n_ptypes, n_ptypes == 1 ? "is" : "are");
+    return NULL;
+  }
+  plist = new_node (c2m_ctx, N_LIST);
+  i = 0;
+  for (node_t pid = NL_HEAD (params->u.ops); pid != NULL; pid = NL_NEXT (pid), i++) {
+    node_t pspecs = new_node (c2m_ctx, N_LIST);
+    node_t pdecl_ops = new_node (c2m_ctx, N_LIST);
+
+    if (!build_type_spec_nodes (c2m_ctx, ptypes[i], pos, pspecs, pdecl_ops)) {
+      error (c2m_ctx, pos, "cannot express the inferred type of lambda parameter '%s'",
+             pid->u.s.s);
+      return NULL;
+    }
+    op_append (c2m_ctx, plist,
+               build_spec_decl (c2m_ctx, pos, pspecs,
+                                new_pos_node2 (c2m_ctx, N_DECL, pos, copy_node (c2m_ctx, pid),
+                                               pdecl_ops),
+                                NULL, NULL, NULL));
+  }
+  snprintf (lname, sizeof (lname), "__lambda_%u", lambda_uid++);
+  func_def = build_lambda_func_def (c2m_ctx, lname, plist, body, pos);
+  /* Generation order: the lambda must precede its caller in the module list.
+     For a lambda inside another lambda's body, insert before the enclosing
+     lambda's FUNC_DEF (which is already in the list before the caller). */
+  DLIST_INSERT_BEFORE (node_t, module_item_list->u.ops, insert_before, func_def);
+  check_lambda_func_def (c2m_ctx, func_def);
+  if (func_def->attr == NULL || ((decl_t) func_def->attr)->decl_spec.type == NULL
+      || ((decl_t) func_def->attr)->decl_spec.type->mode != TM_FUNC)
+    return NULL; /* body check failed; errors already reported */
+  return func_def;
+}
+
+/* Check a sequence lambda-method call  recv.filter/map/reduce/count(...).
+   R is the N_CALL node, SR the (already classified) receiver, ARG_LIST the
+   call arguments.  Returns the call's result type, or NULL after reporting
+   an error. */
+static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm,
+                                           struct seq_recv *sr, node_t arg_list) {
+  static const char *const seq_names[] = {"?", "filter", "map", "reduce", "count"};
+  int nargs;
+  node_t arg, cb_node, init_node;
+  struct type *res, *acc_type = NULL, *el_type = sr->el_type, *cb_ret;
+  struct func_type *cb_ft = NULL;
+
+  get_seq_method (seq_names[sm], &nargs);
+  if ((int) NL_LENGTH (arg_list->u.ops) != nargs) {
+    error (c2m_ctx, POS (r), "'%s' expects %d argument%s", seq_names[sm], nargs,
+           nargs == 1 ? "" : "s");
+    return NULL;
+  }
+  set_type_layout (c2m_ctx, el_type);
+  if (sm != SEQM_COUNT && (!scalar_type_p (el_type) || el_type->mode == TM_SLICE)) {
+    error (c2m_ctx, POS (r),
+           "'%s' requires a scalar element type (integer, floating, pointer, String)",
+           seq_names[sm]);
+    return NULL;
+  }
+  if (sr->kind == SEQ_RECV_ARR && sr->static_len < 0) {
+    error (c2m_ctx, POS (r), "'%s' requires an array with a known constant length",
+           seq_names[sm]);
+    return NULL;
+  }
+  /* Check the non-lambda arguments (untyped lambdas are typed below). */
+  for (arg = NL_HEAD (arg_list->u.ops); arg != NULL; arg = NL_NEXT (arg))
+    if (arg->code != N_LAMBDA && arg->attr == NULL) check (c2m_ctx, arg, r);
+
+  if (sm == SEQM_COUNT) {
+    res = create_basic_type (c2m_ctx, get_uint_basic_type (sizeof (mir_size_t)));
+    res->pos_node = r;
+    return res;
+  }
+  if (sm == SEQM_REDUCE) {
+    struct expr *ie;
+
+    init_node = NL_HEAD (arg_list->u.ops);
+    ie = init_node->attr;
+    acc_type = create_type (c2m_ctx, ie->type);
+    if (acc_type->mode == TM_ARR) acc_type = adjust_type (c2m_ctx, acc_type);
+    if (!scalar_type_p (acc_type) || acc_type->mode == TM_SLICE) {
+      error (c2m_ctx, POS (init_node), "'reduce' initial value must have a scalar type");
+      return NULL;
+    }
+    set_type_layout (c2m_ctx, acc_type);
+    cb_node = NL_EL (arg_list->u.ops, 1);
+  } else {
+    cb_node = NL_HEAD (arg_list->u.ops);
+  }
+
+  if (cb_node->code == N_LAMBDA) {
+    struct type *ptypes[2];
+    int np = sm == SEQM_REDUCE ? 2 : 1;
+    node_t func_def;
+    decl_t ld;
+    struct expr *le;
+
+    /* Initializer expressions may be checked twice (auto deduction + decl
+       creation): reuse the FUNC_DEF instantiated on the first pass. */
+    if (cb_node->attr != NULL && (le = cb_node->attr)->def_node != NULL
+        && le->def_node->code == N_FUNC_DEF) {
+      func_def = le->def_node;
+    } else {
+      if (sm == SEQM_REDUCE) {
+        ptypes[0] = acc_type;
+        ptypes[1] = el_type;
+      } else {
+        ptypes[0] = el_type;
+      }
+      if ((func_def = instantiate_lambda (c2m_ctx, cb_node, ptypes, np)) == NULL) return NULL;
+      ld = func_def->attr;
+      le = create_expr (c2m_ctx, cb_node);
+      le->type->mode = TM_PTR;
+      le->type->u.ptr_type = ld->decl_spec.type;
+      set_type_layout (c2m_ctx, le->type);
+      le->def_node = func_def;
+      le->u.lvalue_node = NULL;
+    }
+    ld = func_def->attr;
+    cb_ft = ld->decl_spec.type->u.func_type;
+  } else {
+    struct expr *ce = cb_node->attr;
+    struct type *ct = ce != NULL ? ce->type : NULL;
+    int want = sm == SEQM_REDUCE ? 2 : 1, have = 0;
+
+    if (ct != NULL && ct->mode == TM_PTR && ct->u.ptr_type->mode == TM_FUNC)
+      cb_ft = ct->u.ptr_type->u.func_type;
+    else if (ct != NULL && ct->mode == TM_FUNC)
+      cb_ft = ct->u.func_type;
+    if (cb_ft == NULL) {
+      error (c2m_ctx, POS (cb_node), "'%s' argument must be a lambda or a function",
+             seq_names[sm]);
+      return NULL;
+    }
+    for (node_t p = NL_HEAD (cb_ft->param_list->u.ops); p != NULL; p = NL_NEXT (p))
+      if (p->code == N_SPEC_DECL || p->code == N_TYPE) have++;
+    if (have != want) {
+      error (c2m_ctx, POS (cb_node), "'%s' callback must take %d typed parameter%s, not %d",
+             seq_names[sm], want, want == 1 ? "" : "s", have);
+      return NULL;
+    }
+  }
+
+  cb_ret = cb_ft->ret_type;
+  switch (sm) {
+  case SEQM_FILTER:
+    if (!integer_type_p (cb_ret)) {
+      error (c2m_ctx, POS (cb_node), "'filter' predicate must return an integer (0/1)");
+      return NULL;
+    }
+    res = create_type (c2m_ctx, NULL);
+    init_type (res);
+    res->mode = TM_SLICE;
+    res->pos_node = r;
+    res->u.ptr_type = create_type (c2m_ctx, el_type);
+    set_type_layout (c2m_ctx, res);
+    return res;
+  case SEQM_MAP:
+    if (!scalar_type_p (cb_ret) || cb_ret->mode == TM_SLICE || void_type_p (cb_ret)) {
+      error (c2m_ctx, POS (cb_node), "'map' transform must return a scalar value");
+      return NULL;
+    }
+    res = create_type (c2m_ctx, NULL);
+    init_type (res);
+    res->mode = TM_SLICE;
+    res->pos_node = r;
+    res->u.ptr_type = create_type (c2m_ctx, cb_ret);
+    set_type_layout (c2m_ctx, res);
+    return res;
+  case SEQM_REDUCE:
+    if (void_type_p (cb_ret)) {
+      error (c2m_ctx, POS (cb_node), "'reduce' accumulator function must return a value");
+      return NULL;
+    }
+    return acc_type;
+  default: return NULL;
+  }
+}
 
     static void check_initializer (c2m_ctx_t c2m_ctx, decl_t member_decl MIR_UNUSED,
                                    struct type **type_ptr, node_t initializer, int const_only_p,
@@ -10667,9 +11165,30 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       case N_STAR:
       case N_FIELD_ID: break; /* do nothing */
       case N_LIST: {
-        for (node_t n = NL_HEAD (r->u.ops); n != NULL; n = NL_NEXT (n)) check (c2m_ctx, n, r);
+        /* The module's top-level list: track the item being checked so that
+           lambda instantiation (filter/map/reduce) can inject synthesized
+           FUNC_DEFs into the module before the current item. */
+        int top_list_p = context != NULL && context->code == N_MODULE;
+        node_t saved_module_item = curr_module_item, saved_item_list = module_item_list;
+
+        if (top_list_p) module_item_list = r;
+        for (node_t n = NL_HEAD (r->u.ops); n != NULL; n = NL_NEXT (n)) {
+          if (top_list_p) curr_module_item = n;
+          check (c2m_ctx, n, r);
+        }
+        if (top_list_p) {
+          curr_module_item = saved_module_item;
+          module_item_list = saved_item_list;
+        }
         break;
       }
+      case N_LAMBDA:
+        /* An untyped lambda outside a filter/map/reduce argument: there is no
+           context to infer the parameter types from. */
+        error (c2m_ctx, POS (r),
+               "untyped lambda is only supported as a filter/map/reduce argument"
+               " (add parameter types:  (int x) => ...)");
+        break;
       case N_I:
       case N_L:
         e = create_basic_type_expr (c2m_ctx, r, r->code == N_I ? TP_INT : TP_LONG);
@@ -11108,6 +11627,9 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           if (!t2 || (t2->mode != TM_PTR && t2->mode != TM_ARR && !integer_type_p(t2))) {
             error (c2m_ctx, POS (r), "dict subscript must be a string or integer");
           }
+        } else if (t1->mode == TM_SLICE) {
+          /* slice[i] — filter/map result element access (read/write lvalue) */
+          *e->type = *t1->u.ptr_type;
         } else if (t1->mode != TM_PTR && t1->mode != TM_ARR) {
           error (c2m_ctx, POS (r), "subscripted value is neither array nor pointer");
         } else if (t1->mode == TM_PTR) {
@@ -11122,7 +11644,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
             error (c2m_ctx, POS (r), "array type has incomplete element type");
           }
         }
-        if (t1->mode != TM_DICT && !integer_type_p (t2)) {
+        if (t1->mode != TM_DICT && t2 != NULL && !integer_type_p (t2)) {
           error (c2m_ctx, POS (r), "array subscript is not an integer");
         }
         break;
@@ -11341,19 +11863,22 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         e1 = collection->attr;
         int forin_arr_p = (e1 && (e1->type->mode == TM_ARR
                                  || (e1->type->mode == TM_PTR && e1->type->arr_type != NULL)));
+        int forin_slice_p = (e1 && e1->type->mode == TM_SLICE);
         int forin_class_p
           = (e1 && !forin_arr_p
              && ((e1->type->mode == TM_PTR && e1->type->u.ptr_type->mode == TM_CLASS)
                  || e1->type->mode == TM_CLASS));
-        if (e1 && e1->type->mode != TM_DICT && !forin_arr_p && !forin_class_p)
+        if (e1 && e1->type->mode != TM_DICT && !forin_arr_p && !forin_slice_p && !forin_class_p)
           error (c2m_ctx, POS (r),
-                 "for-in collection must be a dict, array, or class with Count()/Get(int)");
+                 "for-in collection must be a dict, array, slice, or class with Count()/Get(int)");
 
-        /* Determine element type for arrays (needed for loop var type) */
+        /* Determine element type for arrays/slices (needed for loop var type) */
         struct type *forin_el_type = NULL;
         if (forin_arr_p) {
           struct type *orig = (e1->type->mode == TM_ARR ? e1->type : e1->type->arr_type);
           forin_el_type = orig->u.arr_type->el_type;
+        } else if (forin_slice_p) {
+          forin_el_type = e1->type->u.ptr_type;
         }
 
         /* ----- declare auto loop variable(s) in the symbol table ----- */
@@ -11376,7 +11901,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           symbol_insert(c2m_ctx, S_REGULAR, _copy, curr_scope, _sd, NULL); \
         } while(0)
 
-        if (forin_arr_p) {
+        if (forin_arr_p || forin_slice_p) {
           /* for (auto x in array) — single var gets element type.
              for (auto i, x in array) — i=index(int), x=element. */
           if (val_id->code == N_ID) {
@@ -11599,6 +12124,22 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
 	          e->u.lvalue_node = NULL;
 	          break;
 	        }
+        /* Sequence lambda-method access (arr.filter, slice.map, lst.reduce,
+           s.count): same placeholder treatment; N_CALL does the real work.
+           A user-defined class method with the same name takes precedence. */
+        if (get_seq_method (op2->u.s.s, NULL) != SEQM_NONE && !builtin_string_type_p (t1)) {
+          struct seq_recv seq_sr;
+          if (classify_seq_receiver (c2m_ctx, t1, POS (r), &seq_sr) != SEQ_RECV_NONE
+              && (seq_sr.kind != SEQ_RECV_CLASS
+                  || (!symbol_find (c2m_ctx, S_REGULAR, op2, seq_sr.cls_type->u.tag_type, &sym)
+                      && find_def (c2m_ctx, S_REGULAR, op2, seq_sr.cls_type->u.tag_type, NULL)
+                           == NULL))) {
+            e->type->mode = TM_BASIC;
+            e->type->u.basic_type = TP_VOID;
+            e->u.lvalue_node = NULL;
+            break;
+          }
+        }
         if (t1->mode != TM_STRUCT && t1->mode != TM_UNION && t1->mode != TM_CLASS && t1->mode != TM_DICT) {
           error (c2m_ctx, POS (r), "request for member %s in something not a structure, union, class or dict",
                  op2->u.s.s);
@@ -11984,6 +12525,9 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           va_arg_p = str_eq_p(op1->u.s.s, BUILTIN_VA_ARG);
           va_start_p = str_eq_p(op1->u.s.s, BUILTIN_VA_START);
           if (!va_arg_p && !va_start_p && !alloca_p && !json_p) {
+            error (c2m_ctx, POS (op1),
+                   "implicit declaration of function '%s' — did you forget an #include?",
+                   op1->u.s.s);
             spec_list = new_node1 (c2m_ctx, N_LIST, new_node (c2m_ctx, N_INT));
             list = new_node1 (c2m_ctx, N_LIST,
                               new_node1 (c2m_ctx, N_FUNC, new_node (c2m_ctx, N_LIST)));
@@ -12173,6 +12717,34 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
 	                }
 	                obj_type = obj_type->u.ptr_type;  // Get the pointed-to type
 	              }
+
+              /* Sequence lambda-method call: receiver is an array, a slice, or
+                 a class with the Count()/Get(int) protocol — and, for classes,
+                 no user method shadows the builtin name. */
+              {
+                node_t seq_mid = NL_NEXT (obj);
+                enum seq_method seqm = seq_mid != NULL && seq_mid->code == N_ID
+                                         ? get_seq_method (seq_mid->u.s.s, NULL)
+                                         : SEQM_NONE;
+                struct seq_recv seq_sr;
+                int seq_call_p = FALSE;
+
+                if (seqm != SEQM_NONE && !builtin_string_type_p (obj_type)
+                    && classify_seq_receiver (c2m_ctx, obj_type, POS (r), &seq_sr)
+                         != SEQ_RECV_NONE)
+                  seq_call_p
+                    = (seq_sr.kind != SEQ_RECV_CLASS
+                       || find_def (c2m_ctx, S_REGULAR, seq_mid, seq_sr.cls_type->u.tag_type,
+                                    NULL)
+                            == NULL);
+                if (seq_call_p) {
+                  if ((ret_type = check_seq_method_call (c2m_ctx, r, seqm, &seq_sr, arg_list))
+                      == NULL)
+                    break;
+                  method_call_p = TRUE;
+                  goto seq_method_done;
+                }
+              }
 
 	              // Only proceed with method call logic if the object is a class (TM_CLASS)
 	              if (obj_type->mode == TM_CLASS) {
@@ -12382,6 +12954,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
 	          }
         }
 
+      seq_method_done:
         e = create_expr(c2m_ctx, r);
         *e->type = *ret_type;
         e->builtin_call_p = builtin_call_p;
@@ -13231,6 +13804,15 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     check (c2m_ctx, expr, r);
     ret_type = type->u.func_type->ret_type;
 
+    /* A slice points into the function's own stack frame (alloca); returning
+       one would dangle.  Materialize it into a heap/static container instead. */
+    if (expr->code != N_IGNORE && expr->attr != NULL
+        && ((struct expr *) expr->attr)->type->mode == TM_SLICE) {
+      error (c2m_ctx, POS (r),
+             "cannot return a filter/map slice: it lives on this function's stack");
+      break;
+    }
+
     /* Lambda / auto return type inference: TP_UNDEF means "not yet known".
        On the first return-with-value we lock in the return type; subsequent
        returns use the normal compatibility check.  'return;' is left alone —
@@ -13792,7 +14374,8 @@ static int MIR_UNUSED get_int_mir_type_size (MIR_type_t t) {
 
 static MIR_type_t get_mir_type (c2m_ctx_t c2m_ctx, struct type *type) {
   size_t size = raw_type_size (c2m_ctx, type);
-  if (type->mode == TM_DICT) return MIR_T_I64; /* dict is a DictValue* pointer */
+  if (type->mode == TM_DICT) return MIR_T_I64;  /* dict is a DictValue* pointer */
+  if (type->mode == TM_SLICE) return MIR_T_I64; /* slice is a header pointer */
   int int_p = !floating_type_p (type), signed_p = signed_integer_type_p (type);
 
   //RSD: New
@@ -13920,7 +14503,8 @@ static void get_type_alias_name (c2m_ctx_t c2m_ctx, struct type *type, VARR (cha
     VARR_PUSH (char, name, type->u.func_type->dots_p ? 'E' : 'e');
     break;
   case TM_DICT:
-    VARR_PUSH (char, name, 'p'); /* dict is a pointer alias */
+  case TM_SLICE:
+    VARR_PUSH (char, name, 'p'); /* dict/slice is a pointer alias */
     VARR_PUSH (char, name, 'v'); /* to void (opaque) */
     break;
   default: assert (FALSE);
@@ -16578,6 +17162,10 @@ static void append_type_mangle (c2m_ctx_t c2m_ctx, VARR (char) * b, struct type 
     break;
   }
   case TM_DICT: VARR_PUSH (char, b, 'D'); break;
+  case TM_SLICE:
+    VARR_PUSH (char, b, 'Q');
+    append_type_mangle (c2m_ctx, b, t->u.ptr_type);
+    break;
   case TM_FUNC: VARR_PUSH (char, b, 'F'); break;
   default: VARR_PUSH (char, b, 'X'); break;
   }
@@ -16627,27 +17215,14 @@ static void build_method_mir_name (c2m_ctx_t c2m_ctx, char *out, size_t outsz,
   VARR_DESTROY (char, b);
 }
 
-/* Emit a direct call THIS_OP->method(args...) for a check-resolved class
-   method FUNC_DEF.  Used by the brace-init protocol (new T{...} → Add calls)
-   and the for-in Count/Get iteration protocol, where no N_CALL node exists in
-   the AST.  THIS_TYPE is the receiver pointer type, ARGS holds N_ARGS
-   already-evaluated user argument values (scalars are promoted to the
-   parameter types here; aggregate args must already be memory ops).  Returns
-   the call result (a meaningless op for void methods).  Aggregate return
-   types are rejected during check. */
-static op_t gen_class_method_call (c2m_ctx_t c2m_ctx, node_t func_def, struct type *this_type,
-                                   op_t this_op, op_t *args, int n_args) {
+/* Build a MIR proto item for direct/indirect calls to a function of type FT
+   and move it to the module start.  Shared by check-resolved class-method
+   calls and the filter/map/reduce callback calls. */
+static MIR_item_t gen_func_proto_item (c2m_ctx_t c2m_ctx, struct func_type *ft) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
-  decl_t mdecl = func_def->attr;
-  struct func_type *ft = mdecl->decl_spec.type->u.func_type;
   MIR_item_t proto;
   char pname[64];
-  size_t ops_start;
-  target_arg_info_t arg_info;
-  node_t param;
-  op_t res = zero_op;
-  int i, n;
 
   collect_args_and_func_types (c2m_ctx, ft);
   sprintf (pname, "__methproto%d", new_proto_count++);
@@ -16656,28 +17231,47 @@ static op_t gen_class_method_call (c2m_ctx_t c2m_ctx, node_t func_def, struct ty
                              VARR_LENGTH (MIR_var_t, proto_info.arg_vars),
                              VARR_ADDR (MIR_var_t, proto_info.arg_vars));
   move_item_to_module_start (curr_func->module, proto);
-  ops_start = VARR_LENGTH (MIR_op_t, call_ops);
+  return proto;
+}
+
+/* Emit a call FUNC_OP(args...) through PROTO for a function of type FT, where
+   FUNC_OP is a func-item ref or a function address value and ARGS holds the
+   already-evaluated argument values for every parameter (including 'this' for
+   methods).  Scalar args are promoted/cast to the parameter types; aggregate
+   args must already be memory ops.  Returns the call result (a meaningless op
+   for void functions). */
+static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_type *ft,
+                              MIR_op_t func_op, op_t *args, int n_args) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  size_t ops_start = VARR_LENGTH (MIR_op_t, call_ops);
+  target_arg_info_t arg_info;
+  node_t param;
+  op_t res = zero_op;
+  int i, n;
+
   VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, proto));
-  VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, mdecl->u.item));
+  VARR_PUSH (MIR_op_t, call_ops, func_op);
   target_init_arg_vars (c2m_ctx, &arg_info);
   n = target_add_call_res_op (c2m_ctx, ft->ret_type, &arg_info, 0);
   if (n > 0) {
     assert (n == 1);
     res = new_op (NULL, VARR_LAST (MIR_op_t, call_ops));
   }
-  /* 'this' receiver pointer */
-  target_add_call_arg_op (c2m_ctx, this_type, &arg_info, this_op);
   param = NL_HEAD (ft->param_list->u.ops);
-  if (param != NULL) param = NL_NEXT (param); /* skip implicit 'this' */
   for (i = 0; i < n_args; i++) {
     op_t av = args[i];
-    struct decl_spec *pds;
+    struct decl_spec *pds = param != NULL ? get_param_decl_spec (param) : NULL;
+    struct type *pt = pds != NULL ? pds->type : NULL;
 
-    assert (param != NULL); /* arity was validated during check */
-    pds = get_param_decl_spec (param);
-    if (scalar_type_p (pds->type))
-      av = promote (c2m_ctx, av, promote_mir_int_type (get_mir_type (c2m_ctx, pds->type)), FALSE);
-    target_add_call_arg_op (c2m_ctx, pds->type, &arg_info, av);
+    if (pt == NULL) { /* unprototyped callback: pass promoted scalar as-is */
+      av = promote (c2m_ctx, av, MIR_T_I64, FALSE);
+      VARR_PUSH (MIR_op_t, call_ops, av.mir_op);
+      continue;
+    }
+    if (scalar_type_p (pt))
+      av = promote (c2m_ctx, av, promote_mir_int_type (get_mir_type (c2m_ctx, pt)), FALSE);
+    target_add_call_arg_op (c2m_ctx, pt, &arg_info, av);
     param = NL_NEXT (param);
   }
   emit_insn (c2m_ctx,
@@ -16685,6 +17279,211 @@ static op_t gen_class_method_call (c2m_ctx_t c2m_ctx, node_t func_def, struct ty
                                VARR_ADDR (MIR_op_t, call_ops) + ops_start));
   VARR_TRUNC (MIR_op_t, call_ops, ops_start);
   return res;
+}
+
+/* Emit a direct call THIS_OP->method(args...) for a check-resolved class
+   method FUNC_DEF.  Used by the brace-init protocol (new T{...} → Add calls),
+   the for-in Count/Get iteration protocol, and filter/map/reduce over class
+   receivers, where no N_CALL node exists in the AST.  THIS_TYPE is the
+   receiver pointer type, ARGS holds N_ARGS already-evaluated user argument
+   values.  Aggregate return types are rejected during check. */
+#define GEN_METHOD_MAX_ARGS 8
+static op_t gen_class_method_call (c2m_ctx_t c2m_ctx, node_t func_def, struct type *this_type MIR_UNUSED,
+                                   op_t this_op, op_t *args, int n_args) {
+  MIR_context_t ctx = c2m_ctx->ctx;
+  decl_t mdecl = func_def->attr;
+  struct func_type *ft = mdecl->decl_spec.type->u.func_type;
+  MIR_item_t proto = gen_func_proto_item (c2m_ctx, ft);
+  op_t all_args[GEN_METHOD_MAX_ARGS + 1];
+
+  assert (n_args <= GEN_METHOD_MAX_ARGS);
+  all_args[0] = this_op; /* 'this' is the first parameter of the method */
+  for (int i = 0; i < n_args; i++) all_args[i + 1] = args[i];
+  return gen_funcptr_call (c2m_ctx, proto, ft, MIR_new_ref_op (ctx, mdecl->u.item), all_args,
+                           n_args + 1);
+}
+
+/* ---- Sequence lambda methods: MIR lowering ----
+
+   filter:  cap = len(recv); out = alloca(HDR + cap*elsz); k = 0;
+            for i in [0,len): el = recv[i]; if (cb(el)) out[k++] = el;
+            out.len = k
+   map:     out = alloca(HDR + len*outsz); out.len = len;
+            for i in [0,len): out[i] = cb(recv[i])
+   reduce:  acc = init; for i in [0,len): acc = cb(acc, recv[i])
+   count:   len(recv)
+
+   recv is a C array (compile-time length), a slice (len in its header), or a
+   class instance (len = Count(), element = Get(i)).  The alloca happens once,
+   before the loop, in the enclosing function's frame. */
+static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  node_t field = NL_HEAD (r->u.ops);
+  node_t arg_list = NL_NEXT (field);
+  node_t obj = NL_HEAD (field->u.ops);
+  struct expr *obj_e = obj->attr;
+  struct type *obj_type = obj_e->type;
+  struct seq_recv sr;
+  struct type *this_type = NULL;
+  op_t base = zero_op, this_reg = zero_op;
+  op_t n_save = get_new_temp (c2m_ctx, MIR_T_I64);
+
+  classify_seq_receiver (c2m_ctx, obj_type, POS (r), &sr);
+  assert (sr.kind != SEQ_RECV_NONE);
+
+  /* --- receiver: element base address (arrays/slices) or 'this' + length --- */
+  if (sr.kind == SEQ_RECV_ARR) {
+    op_t arr_op = gen (c2m_ctx, obj, NULL, NULL, FALSE, NULL, NULL);
+    if (arr_op.mir_op.mode == MIR_OP_MEM) {
+      base = mem_to_address (c2m_ctx, arr_op, TRUE);
+    } else {
+      base = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, base.mir_op, arr_op.mir_op);
+    }
+    emit2 (c2m_ctx, MIR_MOV, n_save.mir_op,
+           MIR_new_int_op (ctx, sr.static_len < 0 ? 0 : (long) sr.static_len));
+  } else if (sr.kind == SEQ_RECV_SLICE) {
+    op_t ptr = force_reg (c2m_ctx, val_gen (c2m_ctx, obj), MIR_T_I64);
+    emit2 (c2m_ctx, MIR_MOV, n_save.mir_op,
+           MIR_new_mem_op (ctx, MIR_T_I64, 0, ptr.mir_op.u.reg, 0, 1));
+    base = get_new_temp (c2m_ctx, MIR_T_I64);
+    emit3 (c2m_ctx, MIR_ADD, base.mir_op, ptr.mir_op, MIR_new_int_op (ctx, SLICE_HDR_SIZE));
+  } else { /* SEQ_RECV_CLASS: evaluate the receiver pointer once */
+    op_t cnt;
+    this_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+    if (obj_type->mode == TM_PTR) {
+      op_t cv = val_gen (c2m_ctx, obj);
+      emit2 (c2m_ctx, MIR_MOV, this_reg.mir_op, cv.mir_op);
+      this_type = obj_type;
+    } else { /* class lvalue: use its address */
+      op_t cv = gen (c2m_ctx, obj, NULL, NULL, FALSE, NULL, NULL);
+      if (cv.mir_op.mode == MIR_OP_MEM) cv = mem_to_address (c2m_ctx, cv, TRUE);
+      emit2 (c2m_ctx, MIR_MOV, this_reg.mir_op, cv.mir_op);
+      this_type = create_ptr_type (c2m_ctx, sr.cls_type);
+    }
+    cnt = gen_class_method_call (c2m_ctx, sr.count_def, this_type, this_reg, NULL, 0);
+    emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, cnt.mir_op);
+  }
+
+  if (sm == SEQM_COUNT) return n_save;
+
+  struct type *el_type = sr.el_type;
+  MIR_type_t el_mir_t = get_mir_type (c2m_ctx, el_type);
+  MIR_type_t el_reg_t = promote_mir_int_type (el_mir_t);
+  mir_size_t el_size = type_size (c2m_ctx, el_type);
+
+  /* --- callback: resolve its type, build its proto, evaluate it once --- */
+  node_t cb_node = sm == SEQM_REDUCE ? NL_EL (arg_list->u.ops, 1) : NL_HEAD (arg_list->u.ops);
+  struct expr *cb_e = cb_node->attr;
+  struct func_type *cb_ft = cb_e->type->mode == TM_PTR && cb_e->type->u.ptr_type->mode == TM_FUNC
+                              ? cb_e->type->u.ptr_type->u.func_type
+                              : cb_e->type->u.func_type;
+  MIR_item_t cb_proto = gen_func_proto_item (c2m_ctx, cb_ft);
+  op_t cb_addr = val_gen (c2m_ctx, cb_node);
+
+  /* --- output slice (filter/map) / accumulator (reduce) --- */
+  op_t res_ptr = zero_op, k_reg = zero_op, acc = zero_op;
+  struct type *out_type = el_type;
+  MIR_type_t out_mir_t = el_mir_t, out_reg_t = el_reg_t;
+  mir_size_t out_size = el_size;
+  MIR_type_t acc_mir_t = MIR_T_I64;
+
+  if (sm == SEQM_MAP) {
+    out_type = cb_ft->ret_type;
+    out_mir_t = get_mir_type (c2m_ctx, out_type);
+    out_reg_t = promote_mir_int_type (out_mir_t);
+    out_size = type_size (c2m_ctx, out_type);
+  }
+  if (sm == SEQM_FILTER || sm == SEQM_MAP) {
+    op_t bytes = get_new_temp (c2m_ctx, MIR_T_I64);
+    emit3 (c2m_ctx, MIR_MUL, bytes.mir_op, n_save.mir_op, MIR_new_int_op (ctx, (long) out_size));
+    emit3 (c2m_ctx, MIR_ADD, bytes.mir_op, bytes.mir_op, MIR_new_int_op (ctx, SLICE_HDR_SIZE));
+    res_ptr = get_new_temp (c2m_ctx, MIR_T_I64);
+    emit2 (c2m_ctx, MIR_ALLOCA, res_ptr.mir_op, bytes.mir_op);
+    k_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+    emit2 (c2m_ctx, MIR_MOV, k_reg.mir_op, MIR_new_int_op (ctx, 0));
+  } else { /* SEQM_REDUCE: acc = init */
+    node_t init_node = NL_HEAD (arg_list->u.ops);
+    struct expr *ie = init_node->attr;
+    op_t iv;
+
+    acc_mir_t = promote_mir_int_type (get_mir_type (c2m_ctx, ie->type));
+    iv = promote (c2m_ctx, val_gen (c2m_ctx, init_node), acc_mir_t, FALSE);
+    acc = get_new_temp (c2m_ctx, acc_mir_t);
+    emit2 (c2m_ctx, tp_mov (acc_mir_t), acc.mir_op, iv.mir_op);
+  }
+
+  /* --- loop --- */
+  MIR_label_t loop_label = MIR_new_label (ctx), end_label = MIR_new_label (ctx);
+  op_t i_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+
+  emit2 (c2m_ctx, MIR_MOV, i_reg.mir_op, MIR_new_int_op (ctx, 0));
+  emit_label_insn_opt (c2m_ctx, loop_label);
+  emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (ctx, end_label), i_reg.mir_op, n_save.mir_op);
+
+  /* el = recv[i] */
+  op_t el_op;
+  if (sr.kind == SEQ_RECV_CLASS) {
+    el_op = gen_class_method_call (c2m_ctx, sr.get_def, this_type, this_reg, &i_reg, 1);
+  } else {
+    op_t addr = get_new_temp (c2m_ctx, MIR_T_I64);
+    emit3 (c2m_ctx, MIR_MUL, addr.mir_op, i_reg.mir_op, MIR_new_int_op (ctx, (long) el_size));
+    emit3 (c2m_ctx, MIR_ADD, addr.mir_op, addr.mir_op, base.mir_op);
+    el_op = get_new_temp (c2m_ctx, el_reg_t);
+    emit2 (c2m_ctx, tp_mov (el_reg_t), el_op.mir_op,
+           MIR_new_mem_op (ctx, el_mir_t, 0, addr.mir_op.u.reg, 0, 1));
+  }
+
+  switch (sm) {
+  case SEQM_FILTER: {
+    op_t keep = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, &el_op, 1);
+    MIR_label_t skip_label = MIR_new_label (ctx);
+    op_t daddr = get_new_temp (c2m_ctx, MIR_T_I64);
+
+    emit3 (c2m_ctx, MIR_BEQ, MIR_new_label_op (ctx, skip_label), keep.mir_op,
+           MIR_new_int_op (ctx, 0));
+    emit3 (c2m_ctx, MIR_MUL, daddr.mir_op, k_reg.mir_op, MIR_new_int_op (ctx, (long) el_size));
+    emit3 (c2m_ctx, MIR_ADD, daddr.mir_op, daddr.mir_op, res_ptr.mir_op);
+    emit2 (c2m_ctx, tp_mov (el_reg_t),
+           MIR_new_mem_op (ctx, el_mir_t, SLICE_HDR_SIZE, daddr.mir_op.u.reg, 0, 1),
+           el_op.mir_op);
+    emit3 (c2m_ctx, MIR_ADD, k_reg.mir_op, k_reg.mir_op, MIR_new_int_op (ctx, 1));
+    emit_label_insn_opt (c2m_ctx, skip_label);
+    break;
+  }
+  case SEQM_MAP: {
+    op_t v = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, &el_op, 1);
+    op_t daddr = get_new_temp (c2m_ctx, MIR_T_I64);
+
+    emit3 (c2m_ctx, MIR_MUL, daddr.mir_op, i_reg.mir_op, MIR_new_int_op (ctx, (long) out_size));
+    emit3 (c2m_ctx, MIR_ADD, daddr.mir_op, daddr.mir_op, res_ptr.mir_op);
+    emit2 (c2m_ctx, tp_mov (out_reg_t),
+           MIR_new_mem_op (ctx, out_mir_t, SLICE_HDR_SIZE, daddr.mir_op.u.reg, 0, 1), v.mir_op);
+    break;
+  }
+  case SEQM_REDUCE: {
+    op_t cb_args[2], v;
+
+    cb_args[0] = acc;
+    cb_args[1] = el_op;
+    v = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, cb_args, 2);
+    emit2 (c2m_ctx, tp_mov (acc_mir_t), acc.mir_op,
+           promote (c2m_ctx, v, acc_mir_t, FALSE).mir_op);
+    break;
+  }
+  default: break;
+  }
+
+  emit3 (c2m_ctx, MIR_ADD, i_reg.mir_op, i_reg.mir_op, MIR_new_int_op (ctx, 1));
+  emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, loop_label));
+  emit_label_insn_opt (c2m_ctx, end_label);
+
+  if (sm == SEQM_REDUCE) return acc;
+  /* store the final element count into the slice header */
+  emit2 (c2m_ctx, MIR_MOV, MIR_new_mem_op (ctx, MIR_T_I64, 0, res_ptr.mir_op.u.reg, 0, 1),
+         sm == SEQM_FILTER ? k_reg.mir_op : n_save.mir_op);
+  return res_ptr;
 }
 
 static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_t false_label,
@@ -17121,6 +17920,31 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       res = gen_dict_object_get (c2m_ctx, op1.mir_op, op2.mir_op);
       break;
     }
+    if (arr_type->mode == TM_SLICE) {
+      /* slice[i]: element memory at slice_ptr + SLICE_HDR_SIZE + i*el_size */
+      op_t sbase = get_new_temp (c2m_ctx, MIR_T_I64);
+
+      t = get_mir_type (c2m_ctx, el_type);
+      op1 = force_reg (c2m_ctx, val_gen (c2m_ctx, arr), MIR_T_I64);
+      op2 = val_gen (c2m_ctx, NL_EL (r->u.ops, 1));
+      ind_t = get_mir_type (c2m_ctx, ((struct expr *) NL_EL (r->u.ops, 1)->attr)->type);
+      op2 = force_reg (c2m_ctx, cast (c2m_ctx, op2,
+                                      ind_t == MIR_T_U32 || ind_t == MIR_T_U64 ? MIR_T_U64
+                                                                               : MIR_T_I64,
+                                      FALSE),
+                       MIR_T_I64);
+      emit3 (c2m_ctx, MIR_ADD, sbase.mir_op, op1.mir_op, MIR_new_int_op (ctx, SLICE_HDR_SIZE));
+      if (size <= MIR_MAX_SCALE) {
+        res = new_op (NULL, MIR_new_mem_op (ctx, t, 0, sbase.mir_op.u.reg, op2.mir_op.u.reg,
+                                            (MIR_scale_t) size));
+      } else {
+        op_t off = get_new_temp (c2m_ctx, MIR_T_I64);
+        emit3 (c2m_ctx, MIR_MUL, off.mir_op, op2.mir_op, MIR_new_int_op (ctx, (long) size));
+        emit3 (c2m_ctx, MIR_ADD, sbase.mir_op, sbase.mir_op, off.mir_op);
+        res = new_op (NULL, MIR_new_mem_op (ctx, t, 0, sbase.mir_op.u.reg, 0, 1));
+      }
+      break;
+    }
     t = get_mir_type (c2m_ctx, el_type);
     op1 = val_gen (c2m_ctx, arr);
     op2 = val_gen (c2m_ctx, NL_EL (r->u.ops, 1));
@@ -17176,6 +18000,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     t = get_mir_type (c2m_ctx, type);
     res = get_new_temp (c2m_ctx, t);
     emit2 (c2m_ctx, MIR_LADDR, res.mir_op, MIR_new_label_op (ctx, get_label (c2m_ctx, target)));
+    break;
+  }
+  case N_LAMBDA: {
+    /* An untyped lambda instantiated at its filter/map/reduce call site:
+       evaluates to the generated static function (a func-item ref). */
+    decl_t lam_decl;
+
+    e = r->attr;
+    assert (e != NULL && e->def_node != NULL && e->def_node->attr != NULL);
+    lam_decl = e->def_node->attr;
+    assert (lam_decl->u.item != NULL);
+    res = new_op (NULL, MIR_new_ref_op (ctx, lam_decl->u.item));
     break;
   }
   case N_ADDR: {
@@ -17684,6 +18520,26 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, call_args));
       }
       break;
+    }
+    /* Sequence lambda-method call (arr/slice/List .filter/.map/.reduce/.count):
+       lowered to an inline MIR loop.  Identified by the check-phase placeholder
+       (void-typed field expr) so user class methods with these names are not
+       intercepted. */
+    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
+      node_t mobj = NL_HEAD (func->u.ops);
+      node_t mid = NL_NEXT (mobj);
+      struct expr *fe = func->attr;
+      enum seq_method seqm = mid != NULL && mid->code == N_ID
+                               ? get_seq_method (mid->u.s.s, NULL)
+                               : SEQM_NONE;
+
+      if (seqm != SEQM_NONE && mobj->code != N_STRING && fe != NULL && fe->type != NULL
+          && fe->type->mode == TM_BASIC && fe->type->u.basic_type == TP_VOID
+          && (mobj->attr == NULL
+              || !builtin_string_type_p (((struct expr *) mobj->attr)->type))) {
+        res = gen_seq_method_call (c2m_ctx, r, seqm);
+        goto finish;
+      }
     }
     /* Built-in String method call: lower s.method(...) to a UTF-8 runtime call. */
 	    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
@@ -18749,31 +19605,41 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     struct type *coll_type = coll_e ? coll_e->type : NULL;
     int arr_forin = (coll_type && (coll_type->mode == TM_ARR
                      || (coll_type->mode == TM_PTR && coll_type->arr_type != NULL)));
+    int slice_forin = (coll_type && coll_type->mode == TM_SLICE);
     int class_forin
-      = (coll_type && !arr_forin
+      = (coll_type && !arr_forin && !slice_forin
          && ((coll_type->mode == TM_PTR && coll_type->u.ptr_type->mode == TM_CLASS)
              || coll_type->mode == TM_CLASS));
     op_t i_reg = {0}; /* loop counter — shared by all branches */
 
-    if (arr_forin) {
-      /* ---- Array for-in ---- */
-      struct type *orig_arr = (coll_type->mode == TM_ARR ? coll_type : coll_type->arr_type);
-      struct type *el_type = orig_arr->u.arr_type->el_type;
-      mir_llong arr_len = get_arr_type_size (orig_arr);
+    if (arr_forin || slice_forin) {
+      /* ---- Array / slice for-in ---- */
+      struct type *el_type;
+      op_t base_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+      op_t n_save = get_new_temp (c2m_ctx, MIR_T_I64);
+
+      if (arr_forin) {
+        struct type *orig_arr = (coll_type->mode == TM_ARR ? coll_type : coll_type->arr_type);
+        el_type = orig_arr->u.arr_type->el_type;
+        /* base = address of array, n = compile-time array length */
+        op_t arr_op = gen (c2m_ctx, coll, NULL, NULL, FALSE, NULL, NULL);
+        if (arr_op.mir_op.mode == MIR_OP_MEM)
+          base_reg = mem_to_address (c2m_ctx, arr_op, TRUE);
+        else
+          emit2 (c2m_ctx, MIR_MOV, base_reg.mir_op, arr_op.mir_op);
+        emit2 (c2m_ctx, MIR_MOV, n_save.mir_op,
+               MIR_new_int_op (ctx, get_arr_type_size (orig_arr)));
+      } else {
+        /* slice: n is in the header, elements start after it */
+        el_type = coll_type->u.ptr_type;
+        op_t ptr = force_reg (c2m_ctx, val_gen (c2m_ctx, coll), MIR_T_I64);
+        emit2 (c2m_ctx, MIR_MOV, n_save.mir_op,
+               MIR_new_mem_op (ctx, MIR_T_I64, 0, ptr.mir_op.u.reg, 0, 1));
+        emit3 (c2m_ctx, MIR_ADD, base_reg.mir_op, ptr.mir_op,
+               MIR_new_int_op (ctx, SLICE_HDR_SIZE));
+      }
       MIR_type_t el_mir_t = get_mir_type (c2m_ctx, el_type);
       mir_size_t el_size = type_size (c2m_ctx, el_type);
-
-      /* base = address of array */
-      op_t arr_op = gen (c2m_ctx, coll, NULL, NULL, FALSE, NULL, NULL);
-      op_t base_reg = get_new_temp (c2m_ctx, MIR_T_I64);
-      if (arr_op.mir_op.mode == MIR_OP_MEM)
-        base_reg = mem_to_address (c2m_ctx, arr_op, TRUE);
-      else
-        emit2 (c2m_ctx, MIR_MOV, base_reg.mir_op, arr_op.mir_op);
-
-      /* n = array length */
-      op_t n_save = get_new_temp (c2m_ctx, MIR_T_I64);
-      emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, MIR_new_int_op (ctx, arr_len));
 
       /* i = 0 */
       i_reg = get_new_temp (c2m_ctx, MIR_T_I64);
@@ -19191,6 +20057,16 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
           && (sobj->code == N_STRING
               || (sobj_e != NULL && builtin_string_type_p (sobj_e->type))))
         continue;
+      /* Sequence lambda methods (arr.filter/map/reduce/count) are lowered to an
+         inline MIR loop in gen; the check phase marks them with a void-typed
+         field placeholder.  They have no user-level C prototype either. */
+      if (smethod != NULL && smethod->code == N_ID
+          && get_seq_method (smethod->u.s.s, NULL) != SEQM_NONE) {
+        struct expr *sfe = func->attr;
+        if (sfe != NULL && sfe->type != NULL && sfe->type->mode == TM_BASIC
+            && sfe->type->u.basic_type == TP_VOID)
+          continue;
+      }
     }
     type = ((struct expr *) func->attr)->type;
     assert (type->mode == TM_PTR && type->u.ptr_type->mode == TM_FUNC);
@@ -19379,6 +20255,10 @@ static void print_type (c2m_ctx_t c2m_ctx, FILE *f, struct type *type) {
     fprintf (f, type->u.func_type->dots_p ? ", ...)" : ")");
     break;
   case TM_DICT: fprintf (f, "dict"); break;
+  case TM_SLICE:
+    fprintf (f, "slice of ");
+    print_type (c2m_ctx, f, type->u.ptr_type);
+    break;
   default: assert (FALSE);
   }
   print_qual (f, type->type_qual);
