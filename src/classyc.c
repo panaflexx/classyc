@@ -4224,6 +4224,24 @@ typedef struct {
 
 DEF_HTAB (tpname_t);
 
+/* Generic class template registry */
+typedef struct {
+  const char *name;           /* original class name, e.g. "List" */
+  node_t class_node;          /* N_CLASS template (unchecked, with T placeholders) */
+  int n_type_params;          /* number of type parameters */
+  const char *type_params[4]; /* parameter names: ["T", ...] */
+} generic_tmpl_t;
+
+DEF_VARR (generic_tmpl_t);
+
+/* Specialization cache: tracks which List<String>, List<int>, etc. have been created */
+typedef struct {
+  const char *orig_name;  /* "List" */
+  const char *spec_name;  /* "__generic_List_String" */
+} generic_spec_t;
+
+DEF_VARR (generic_spec_t);
+
 struct parse_ctx {
   int record_level;
   size_t next_token_index;
@@ -4233,6 +4251,8 @@ struct parse_ctx {
   HTAB (tpname_t) * tpname_tab;
   VARR (node_t) * pending_lambdas; /* lambda N_FUNC_DEFs waiting for module injection */
   unsigned lambda_uid;             /* counter for unique lambda names */
+  VARR (generic_tmpl_t) * generic_templates; /* registered generic class templates */
+  VARR (generic_spec_t) * generic_specs;     /* created specializations (dedup cache) */
 };
 
 #define record_level parse_ctx->record_level
@@ -4243,6 +4263,8 @@ struct parse_ctx {
 #define tpname_tab parse_ctx->tpname_tab
 #define pending_lambdas parse_ctx->pending_lambdas
 #define lambda_uid parse_ctx->lambda_uid
+#define generic_templates parse_ctx->generic_templates
+#define generic_specs parse_ctx->generic_specs
 
 static struct node err_struct;
 static const node_t err_node = &err_struct;
@@ -4544,6 +4566,230 @@ static node_t try_arg_f (c2m_ctx_t c2m_ctx, nonterm_arg_func_t f, node_t arg) {
 #define TRY(f) try_f (c2m_ctx, f)
 #define TRY_A(f, arg) try_arg_f (c2m_ctx, f, arg)
 
+/* ─────────────────────────── Generics helpers ─────────────────────────── */
+
+/* Returns 1 if `name` is a registered generic class template. */
+static int is_generic_class_p (c2m_ctx_t c2m_ctx, const char *name) {
+  if (c2m_ctx->parse_ctx == NULL) return 0;
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  VARR (generic_tmpl_t) *gt = generic_templates; /* macro: parse_ctx->generic_templates */
+  if (gt == NULL) return 0;
+  for (size_t i = 0; i < VARR_LENGTH (generic_tmpl_t, gt); i++)
+    if (strcmp (VARR_GET (generic_tmpl_t, gt, i).name, name) == 0) return 1;
+  return 0;
+}
+
+/* Returns a pointer to the template for `name`, or NULL if not found. */
+static generic_tmpl_t *get_generic_template (c2m_ctx_t c2m_ctx, const char *name) {
+  if (c2m_ctx->parse_ctx == NULL) return NULL;
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  VARR (generic_tmpl_t) *gt = generic_templates; /* macro: parse_ctx->generic_templates */
+  if (gt == NULL) return NULL;
+  for (size_t i = 0; i < VARR_LENGTH (generic_tmpl_t, gt); i++) {
+    generic_tmpl_t *t = &VARR_ADDR (generic_tmpl_t, gt)[i];
+    if (strcmp (t->name, name) == 0) return t;
+  }
+  return NULL;
+}
+
+/* Build a mangled specialization name, e.g. List + String -> __generic_List_String */
+static const char *mangle_generic_name (c2m_ctx_t c2m_ctx,
+                                         const char *base_name,
+                                         int n_args, node_t *args) {
+  VARR_TRUNC (char, temp_string, 0);
+  add_to_temp_string (c2m_ctx, "__generic_");
+  add_to_temp_string (c2m_ctx, base_name);
+  for (int i = 0; i < n_args; i++) {
+    add_to_temp_string (c2m_ctx, "_");
+    node_t a = args[i];
+    const char *arg_name;
+    switch (a->code) {
+    case N_STRING:   arg_name = "String"; break;
+    case N_INT:      arg_name = "int"; break;
+    case N_DOUBLE:   arg_name = "double"; break;
+    case N_FLOAT:    arg_name = "float"; break;
+    case N_CHAR:     arg_name = "char"; break;
+    case N_LONG:     arg_name = "long"; break;
+    case N_SHORT:    arg_name = "short"; break;
+    case N_UNSIGNED: arg_name = "unsigned"; break;
+    case N_VOID:     arg_name = "void"; break;
+    case N_DICT:     arg_name = "dict"; break;
+    case N_BOOL:     arg_name = "bool"; break;
+    case N_ID:       arg_name = a->u.s.s; break;
+    default:         arg_name = "T"; break;
+    }
+    add_to_temp_string (c2m_ctx, arg_name);
+  }
+  return uniq_cstr (c2m_ctx, VARR_ADDR (char, temp_string)).s;
+}
+
+/* Returns 1 for nodes that carry scalar data in u rather than children in u.ops. */
+static int generic_node_has_scalar_data (node_code_t code) {
+  switch (code) {
+  case N_I: case N_L: case N_LL: case N_U: case N_UL: case N_ULL:
+  case N_F: case N_D: case N_LD: case N_CH: case N_CH16: case N_CH32:
+  case N_STR: case N_STR16: case N_STR32:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* Deep-copy `n`, substituting type-parameter N_IDs with concrete type-arg nodes.
+   Also renames `orig_name` -> `spec_name` and __ctor_/dtor_ accordingly. */
+static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
+                                const char *orig_name, const char *spec_name,
+                                int n_params, const char **params, node_t *args) {
+  if (n == NULL) return NULL;
+
+  if (n->code == N_ID) {
+    const char *s = n->u.s.s;
+    /* Substitute type parameter */
+    for (int i = 0; i < n_params; i++) {
+      if (strcmp (s, params[i]) == 0) {
+        node_t a = args[i];
+        /* For simple keyword-type args (N_INT, N_STRING, ...) create a fresh node */
+        node_t fresh = new_node (c2m_ctx, a->code);
+        set_node_pos (c2m_ctx, fresh, POS (n));
+        if (a->code == N_ID) fresh->u.s = a->u.s; /* copy the identifier string */
+        return fresh;
+      }
+    }
+    /* Rename __ctor_Orig -> __ctor_Spec */
+    char buf[512], nbuf[512];
+    snprintf (buf, sizeof (buf), "__ctor_%s", orig_name);
+    if (strcmp (s, buf) == 0) {
+      snprintf (nbuf, sizeof (nbuf), "__ctor_%s", spec_name);
+      return build_id (c2m_ctx, nbuf, POS (n));
+    }
+    snprintf (buf, sizeof (buf), "__dtor_%s", orig_name);
+    if (strcmp (s, buf) == 0) {
+      snprintf (nbuf, sizeof (nbuf), "__dtor_%s", spec_name);
+      return build_id (c2m_ctx, nbuf, POS (n));
+    }
+    /* Rename the class name itself */
+    if (strcmp (s, orig_name) == 0)
+      return build_id (c2m_ctx, spec_name, POS (n));
+    /* Any other identifier: copy as-is */
+    return build_id (c2m_ctx, s, POS (n));
+  }
+
+  /* Allocate a new node of the same kind */
+  node_t cp = new_node (c2m_ctx, n->code);
+  set_node_pos (c2m_ctx, cp, POS (n));
+
+  if (generic_node_has_scalar_data (n->code)) {
+    /* Literal value node: copy the scalar union member */
+    cp->u = n->u;
+  } else {
+    /* Structural node: recursively specialize children */
+    for (node_t child = NL_HEAD (n->u.ops); child != NULL; child = NL_NEXT (child)) {
+      node_t child_cp = specialize_node (c2m_ctx, child, orig_name, spec_name,
+                                          n_params, params, args);
+      if (child_cp != NULL) op_append (c2m_ctx, cp, child_cp);
+    }
+  }
+  return cp;
+}
+
+/* Parse one generic type argument after '<': a primitive keyword or an N_ID class name. */
+static node_t parse_generic_type_arg (c2m_ctx_t c2m_ctx) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  node_t r;
+  pos_t pos = curr_token->pos;
+
+  if (MP (T_STRING,   pos)) return new_pos_node (c2m_ctx, N_STRING, pos);
+  if (MP (T_INT,      pos)) return new_pos_node (c2m_ctx, N_INT,    pos);
+  if (MP (T_DOUBLE,   pos)) return new_pos_node (c2m_ctx, N_DOUBLE, pos);
+  if (MP (T_FLOAT,    pos)) return new_pos_node (c2m_ctx, N_FLOAT,  pos);
+  if (MP (T_CHAR,     pos)) return new_pos_node (c2m_ctx, N_CHAR,   pos);
+  if (MP (T_LONG,     pos)) return new_pos_node (c2m_ctx, N_LONG,   pos);
+  if (MP (T_SHORT,    pos)) return new_pos_node (c2m_ctx, N_SHORT,  pos);
+  if (MP (T_UNSIGNED, pos)) return new_pos_node (c2m_ctx, N_UNSIGNED, pos);
+  if (MP (T_VOID,     pos)) return new_pos_node (c2m_ctx, N_VOID,   pos);
+  if (MP (T_DICT,     pos)) return new_pos_node (c2m_ctx, N_DICT,   pos);
+  if (MP (T_BOOL,     pos)) return new_pos_node (c2m_ctx, N_BOOL,   pos);
+  if (MN (T_ID, r)) return r;   /* user class name */
+  return NULL;
+}
+
+/* Get or create the specialization of `base_name` with the given type args.
+   Pushes the specialized N_CLASS onto pending_lambdas if it's new.
+   Returns an N_ID for the mangled class name. */
+static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
+                                             const char *base_name,
+                                             int n_args, node_t *args,
+                                             pos_t pos) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+
+  generic_tmpl_t *tmpl = get_generic_template (c2m_ctx, base_name);
+  if (tmpl == NULL) {
+    error (c2m_ctx, pos, "'%s' is not a generic class", base_name);
+    return build_id (c2m_ctx, base_name, pos);
+  }
+  if (n_args != tmpl->n_type_params) {
+    error (c2m_ctx, pos,
+           "generic class '%s' expects %d type argument(s), got %d",
+           base_name, tmpl->n_type_params, n_args);
+    return build_id (c2m_ctx, base_name, pos);
+  }
+
+  const char *spec_name = mangle_generic_name (c2m_ctx, base_name, n_args, args);
+
+  /* Check cache: already created? */
+  for (size_t i = 0; i < VARR_LENGTH (generic_spec_t, generic_specs); i++) {
+    if (strcmp (VARR_GET (generic_spec_t, generic_specs, i).spec_name, spec_name) == 0)
+      return build_id (c2m_ctx, spec_name, pos);
+  }
+
+  /* Deep-copy the template with type substitution */
+  node_t spec_class = specialize_node (c2m_ctx, tmpl->class_node,
+                                        base_name, spec_name,
+                                        tmpl->n_type_params, tmpl->type_params, args);
+
+  /* Register spec_name as a tpname so declarations like `List<String> x` work */
+  node_t spec_id_node = build_id (c2m_ctx, spec_name, pos);
+  tpname_add (c2m_ctx, spec_id_node, curr_scope, TRUE);
+
+  /* Record in specialization cache */
+  generic_spec_t gs;
+  gs.orig_name = base_name;
+  gs.spec_name = spec_name;
+  VARR_PUSH (generic_spec_t, generic_specs, gs);
+
+  /* Inject before the containing top-level item */
+  VARR_PUSH (node_t, pending_lambdas, spec_class);
+
+  return build_id (c2m_ctx, spec_name, pos);
+}
+
+/* Parse `< TypeArg1, TypeArg2 >` for a generic class instantiation.
+   Returns N_ID for the mangled specialization name, or NULL on error. */
+static node_t parse_generic_instantiation (c2m_ctx_t c2m_ctx,
+                                            const char *base_name, pos_t pos) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  /* Caller already checked: curr_token is T_CMP/N_LT */
+  M (T_CMP); /* consume '<' */
+
+  node_t type_args[4];
+  int n_args = 0;
+  do {
+    node_t arg = parse_generic_type_arg (c2m_ctx);
+    if (arg == NULL) break;
+    if (n_args < 4) type_args[n_args++] = arg;
+  } while (M (','));
+
+  if (C (T_CMP) && curr_token->node_code == N_GT) {
+    M (T_CMP); /* consume '>' */
+  } else {
+    error (c2m_ctx, pos, "expected '>' to close generic type argument list");
+  }
+
+  return get_or_create_specialization (c2m_ctx, base_name, n_args, type_args, pos);
+}
+
+/* ─────────────────────────── Generics helpers end ─────────────────────── */
+
 D (compound_stmt);
 D (lambda_expr);
 D (param_type_list);
@@ -4791,7 +5037,13 @@ D (unary_expr) {
       }
       record_stop (c2m_ctx, dmark, TRUE); /* not new dict(): rewind */
     }
-    if (MN (T_ID, tid) && C ('(')) {
+    if (MN (T_ID, tid)) {
+      /* Generic new: new List<String>(...) - specialize before checking '(' */
+      if (is_generic_class_p (c2m_ctx, tid->u.s.s)
+          && C (T_CMP) && curr_token->node_code == N_LT) {
+        tid = parse_generic_instantiation (c2m_ctx, tid->u.s.s, POS (tid));
+      }
+      if (C ('(')) {
       node_t args;
       record_stop (c2m_ctx, mark, FALSE); /* commit: this is a new-expression */
       M ('(');
@@ -4825,7 +5077,31 @@ D (unary_expr) {
       r = new_pos_node2 (c2m_ctx, N_NEW, npos, tid, args);
       PA (post_expr_part, r); /* allow chaining: new Foo(..).method(..) */
       return r;
-    }
+      } /* end if C('(') */
+      else if (C ('{')) {
+        /* Brace-init:  new T{e1, e2, ...}  — sugar for the zero-arg constructor
+           followed by one obj->Add(e) call per element (duck-typed protocol:
+           any class with an Add method taking one argument supports it).
+           children: type_id(0), ctor arg_list(1, empty), init_list(2). */
+        node_t args, inits;
+        record_stop (c2m_ctx, mark, FALSE); /* commit: this is a new-expression */
+        M ('{');
+        args = new_node (c2m_ctx, N_LIST); /* empty ctor argument list */
+        inits = new_node (c2m_ctx, N_LIST);
+        if (!C ('}')) {
+          for (;;) {
+            P (assign_expr);
+            op_append (c2m_ctx, inits, r);
+            if (!M (',')) break;
+            if (C ('}')) break; /* allow trailing comma */
+          }
+        }
+        PT ('}');
+        r = new_pos_node3 (c2m_ctx, N_NEW, npos, tid, args, inits);
+        PA (post_expr_part, r); /* allow chaining: new Foo{..}->method(..) */
+        return r;
+      } /* end if C('{') */
+    } /* end if MN(T_ID, tid) */
     record_stop (c2m_ctx, mark, TRUE); /* not a new-expression: rewind */
   }
 
@@ -5075,6 +5351,55 @@ D (declaration) {
       }
     }
 
+    /* ── Missing-semicolon detection after class definitions ─────────────────
+       A class body must be followed by ';' or a declarator.  If the next token
+       is instead the unambiguous start of a new declaration (a type keyword,
+       storage specifier, or EOF), the author almost certainly forgot the ';'.
+       We emit a clear, targeted diagnostic and recover by treating the class as
+       if ';' were present, so subsequent declarations continue to parse cleanly
+       rather than producing a cascade of confusing secondary errors.
+
+       Example fix:  class Foo { ... }   →   class Foo { ... };          ── */
+    if (is_class_typedef && !C (';')) {
+      int next_is_new_decl
+        = (curr_token->code == T_INT    || curr_token->code == T_CHAR
+           || curr_token->code == T_DOUBLE  || curr_token->code == T_FLOAT
+           || curr_token->code == T_VOID    || curr_token->code == T_STRING
+           || curr_token->code == T_LONG    || curr_token->code == T_SHORT
+           || curr_token->code == T_UNSIGNED || curr_token->code == T_SIGNED
+           || curr_token->code == T_STRUCT  || curr_token->code == T_CLASS
+           || curr_token->code == T_UNION   || curr_token->code == T_ENUM
+           || curr_token->code == T_STATIC  || curr_token->code == T_EXTERN
+           || curr_token->code == T_INLINE  || curr_token->code == T_TYPEDEF
+           || curr_token->code == T_CONST   || curr_token->code == T_VOLATILE
+           || curr_token->code == T_DICT    || curr_token->code == T_EOFILE);
+      if (next_is_new_decl) {
+        /* Extract the class name for a helpful message */
+        const char *cname = NULL;
+        for (node_t sn = NL_HEAD (spec->u.ops); sn != NULL; sn = NL_NEXT (sn)) {
+          if (sn->code == N_CLASS) {
+            node_t cid = NL_HEAD (sn->u.ops);
+            if (cid && cid->code == N_ID) cname = cid->u.s.s;
+            break;
+          }
+        }
+        error (c2m_ctx, POS (spec),
+               "missing ';' after definition of class '%s' "
+               "-- classyc requires ';' after every class body "
+               "(e.g. \"class %s { ... };\")",
+               cname ? cname : "<anonymous>",
+               cname ? cname : "Name");
+        /* Synthesise the missing ';': build an anonymous class declaration
+           and return immediately.  We do NOT consume a token because the
+           current token is the start of the next real declaration. */
+        list = new_node (c2m_ctx, N_LIST);
+        op_append (c2m_ctx, list,
+                   build_shared_spec_decl (c2m_ctx, last_pos, spec,
+                                           new_ignore (c2m_ctx), NULL, NULL, NULL));
+        return list;
+      }
+    }
+
     list = new_node (c2m_ctx, N_LIST);
     if (C (';')) {
       // For class declarations without declarators, create proper type definition
@@ -5190,6 +5515,18 @@ DA (declaration_specs) {
       prev_type_spec = r;
     } else if ((r = TRY_A (type_spec, prev_type_spec)) != err_node) {
       prev_type_spec = r;
+      /* A named class definition with a body is a complete standalone type.
+         Stop the type-spec loop here — continuing would greedily consume the
+         type keyword from the *next* declaration when a ';' is missing after
+         the class body, e.g. "class Foo { } int y;" would eat the `int`. */
+      if (r->code == N_CLASS) {
+        node_t _cid   = NL_HEAD (r->u.ops);
+        node_t _cbody = _cid ? NL_NEXT (_cid) : NULL;
+        if (_cid && _cid->code == N_ID && _cbody && _cbody->code != N_IGNORE) {
+          op_append (c2m_ctx, list, r);
+          break; /* named class with body: stop type-spec accumulation */
+        }
+      }
     } else if ((r = try_attr_spec (c2m_ctx, spec_pos, FALSE)) != err_node && r != NULL) {
       continue; /* ignore attrs for declaration specs (type attrs) */
     } else
@@ -5462,6 +5799,24 @@ DA (type_spec) {
       id_p = TRUE;
     }
 
+    /* Generic class definition: class List<T> { ... }
+       Detect <T,...> after the class name and register type params as temp typedefs. */
+    int n_type_params = 0;
+    const char *type_params[4] = {NULL, NULL, NULL, NULL};
+    if (id_p && struct_p == 3 && C (T_CMP) && curr_token->node_code == N_LT) {
+      M (T_CMP); /* consume '<' */
+      do {
+        if (!C (T_ID)) break;
+        node_t tp_id; MN (T_ID, tp_id);
+        if (n_type_params < 4) {
+          type_params[n_type_params++] = tp_id->u.s.s;
+          /* Register as a temporary typedef so the class body can reference it */
+          tpname_add (c2m_ctx, tp_id, curr_scope, TRUE);
+        }
+      } while (M (',') && n_type_params < 4);
+      if (C (T_CMP) && curr_token->node_code == N_GT) M (T_CMP); /* consume '>' */
+    }
+
     if (M ('{')) {
       if (!C ('}') && !M (';')) {
         if (struct_p == 3) { // T_CLASS == 3
@@ -5493,10 +5848,24 @@ DA (type_spec) {
       r = new_pos_node2 (c2m_ctx, N_UNION, pos, op1, r);
     } else if (struct_p == 3) {
       r = new_pos_node2 (c2m_ctx, N_CLASS, pos, op1, r);
-      // For classes, register as typedef immediately if it has a name
-      if (id_p) {
-        tpname_add (c2m_ctx, op1, curr_scope, TRUE);
-        symbol_insert(c2m_ctx, S_TAG, op1, curr_scope, r, new_node(c2m_ctx, N_IGNORE));
+      if (n_type_params > 0) {
+        /* Generic class template: store in registry, mark with sentinel attr.
+           The base name is registered as a tpname so List<X> can be parsed later. */
+        if (id_p) tpname_add (c2m_ctx, op1, curr_scope, TRUE);
+        generic_tmpl_t tmpl;
+        tmpl.name = op1->u.s.s;
+        tmpl.class_node = r;
+        tmpl.n_type_params = n_type_params;
+        for (int _i = 0; _i < 4; _i++) tmpl.type_params[_i] = type_params[_i];
+        VARR_PUSH (generic_tmpl_t, generic_templates, tmpl);
+        /* Mark the N_CLASS as a template so check/gen can skip it */
+        r->attr = (void *)((intptr_t)-1); /* sentinel: template, not a real class */
+      } else {
+        /* Normal (non-generic) class */
+        if (id_p) {
+          tpname_add (c2m_ctx, op1, curr_scope, TRUE);
+          symbol_insert(c2m_ctx, S_TAG, op1, curr_scope, r, new_node(c2m_ctx, N_IGNORE));
+        }
       }
     }
   } else if (MP (T_ENUM, pos)) { /* enum-specifier */
@@ -5529,6 +5898,14 @@ DA (type_spec) {
     r = new_pos_node2 (c2m_ctx, N_ENUM, pos, op1, op2);
   } else if (arg == NULL) {
     P (typedef_name);
+    /* Generic type instantiation: TypeName<TypeArg>
+       If the matched type name is a registered generic class and '<' follows,
+       monomorphize and return the specialized class name. */
+    if (r != err_node && r->code == N_ID
+        && is_generic_class_p (c2m_ctx, r->u.s.s)
+        && C (T_CMP) && curr_token->node_code == N_LT) {
+      r = parse_generic_instantiation (c2m_ctx, r->u.s.s, POS (r));
+    }
   } else {
     r = err_node;
   }
@@ -6574,6 +6951,8 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   tpname_init (c2m_ctx);
   VARR_CREATE (node_t, pending_lambdas, alloc, 8);
   lambda_uid = 0;
+  VARR_CREATE (generic_tmpl_t, generic_templates, alloc, 4);
+  VARR_CREATE (generic_spec_t, generic_specs, alloc, 8);
 }
 
 static void add_standard_includes (c2m_ctx_t c2m_ctx) {
@@ -6603,6 +6982,10 @@ static void parse_finish (c2m_ctx_t c2m_ctx) {
     parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
     if (pending_lambdas != NULL)
       VARR_DESTROY (node_t, pending_lambdas);
+    if (generic_templates != NULL)
+      VARR_DESTROY (generic_tmpl_t, generic_templates);
+    if (generic_specs != NULL)
+      VARR_DESTROY (generic_spec_t, generic_specs);
   }
   finish_streams (c2m_ctx);
   reg_free (c2m_ctx, c2m_ctx->parse_ctx);
@@ -8154,6 +8537,13 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
       break;
     }
     case N_CLASS: {
+                /* Skip generic class templates: mark with sentinel attr; only
+                   their monomorphized specializations are checked/generated. */
+                if (n->attr == (void *)((intptr_t)-1)) {
+                  type->mode = TM_CLASS;
+                  type->u.tag_type = n;
+                  break;
+                }
                 int new_scope_p;
                 node_t res_tag_type, id = NL_HEAD(n->u.ops);
                 node_t decl_list = NL_NEXT(id);
@@ -8779,6 +9169,47 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       if (type == NULL || type->mode != TM_CLASS || type->u.tag_type == NULL) return NULL;
       id = TAG_ID (type->u.tag_type);
       return (id != NULL && id->code == N_ID) ? id->u.s.s : NULL;
+    }
+
+    /* Duck-typed protocol lookup: find an instance method NAME belonging to
+       class CLASS_TAG (methods are registered by plain name in an enclosing
+       scope, so candidates are filtered by their func_type->class_scope; a
+       global function of the same name is never picked up) taking exactly
+       N_USER_PARAMS arguments (not counting the implicit 'this').  Used by
+       the brace-init protocol (new T{...} needs Add(item)) and the for-in
+       iteration protocol (Count() / Get(int)).  Returns the N_FUNC_DEF node
+       or NULL.  Both check and gen resolve through this helper so they always
+       agree on the chosen overload. */
+    static node_t find_class_protocol_method (c2m_ctx_t c2m_ctx, node_t class_tag,
+                                              const char *name, int n_user_params, pos_t pos) {
+      symbol_t sym;
+      node_t id;
+
+      if (class_tag == NULL) return NULL;
+      id = build_id (c2m_ctx, name, pos);
+      if (!find_overload_sym (c2m_ctx, id, class_tag, &sym)) return NULL;
+      for (size_t i = 0; i < VARR_LENGTH (node_t, sym.defs); i++) {
+        node_t def = VARR_GET (node_t, sym.defs, i);
+        decl_t d;
+        struct func_type *ft;
+        node_t param;
+        int n = 0;
+
+        if (def == NULL || def->code != N_FUNC_DEF) continue;
+        d = def->attr;
+        if (d == NULL || d->decl_spec.type == NULL || d->decl_spec.type->mode != TM_FUNC) continue;
+        if (d->decl_spec.static_p) continue; /* protocol methods are instance methods */
+        ft = d->decl_spec.type->u.func_type;
+        if (ft->class_scope != class_tag) continue; /* method of another class / global func */
+        param = NL_HEAD (ft->param_list->u.ops);
+        if (param != NULL) param = NL_NEXT (param); /* skip implicit 'this' */
+        for (; param != NULL; param = NL_NEXT (param)) {
+          if (param->code != N_SPEC_DECL && param->code != N_TYPE) { n = -1; break; } /* dots */
+          n++;
+        }
+        if (n == n_user_params) return def;
+      }
+      return NULL;
     }
 
     static void check_assignment_types (c2m_ctx_t c2m_ctx, struct type *left, struct type *right,
@@ -10018,6 +10449,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         NODE_CASE (IN)
         NODE_CASE (NEW)
         NODE_CASE (LAMBDA)
+        NODE_CASE (CONCAT)
         *expr_attr_p = TRUE;
         break;
         REP8 (NODE_CASE, IF, SWITCH, WHILE, DO, FOR, GOTO, INDIRECT_GOTO, CONTINUE)
@@ -10033,6 +10465,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         REP8 (NODE_CASE, UNION, ENUM, ENUM_CONST, MEMBER, CONST, RESTRICT, VOLATILE, ATOMIC)
         REP8 (NODE_CASE, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR, POINTER, DOTS, ARR)
         REP7 (NODE_CASE, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF, MODULE, DICT)
+        REP4 (NODE_CASE, CLASS, STRING, ASM, ATTR)
         break;
       default: assert (FALSE);
       }
@@ -10850,6 +11283,45 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                    "class '%s' has no constructor but arguments were given",
                    type_id->u.s.s);
         }
+
+        /* Brace-init:  new T{e1, e2, ...}  (init_list is the optional third
+           child).  Protocol: the class must have an instance method 'Add'
+           taking exactly one argument; each element is type-checked against
+           that parameter.  Gen re-resolves Add via the same helper. */
+        {
+          node_t init_list = NL_NEXT (arg_list);
+
+          if (init_list != NULL) {
+            node_t el, add_def;
+
+            for (el = NL_HEAD (init_list->u.ops); el != NULL; el = NL_NEXT (el))
+              check (c2m_ctx, el, r);
+            add_def = find_class_protocol_method (c2m_ctx, class_def, "Add", 1, POS (r));
+            if (add_def == NULL) {
+              error (c2m_ctx, POS (r),
+                     "class '%s' does not support brace initialization "
+                     "(needs an 'Add' method taking one argument)",
+                     type_id->u.s.s);
+            } else {
+              decl_t adecl = add_def->attr;
+              struct func_type *aft = adecl->decl_spec.type->u.func_type;
+              node_t aparam = NL_HEAD (aft->param_list->u.ops);
+              struct decl_spec *apds;
+
+              if (aparam != NULL) aparam = NL_NEXT (aparam); /* skip 'this' */
+              apds = get_param_decl_spec (aparam);
+              if (!void_type_p (aft->ret_type) && !scalar_type_p (aft->ret_type)) {
+                error (c2m_ctx, POS (r),
+                       "brace initialization requires 'Add' of class '%s' to return "
+                       "void or a scalar type",
+                       type_id->u.s.s);
+              } else {
+                for (el = NL_HEAD (init_list->u.ops); el != NULL; el = NL_NEXT (el))
+                  check_assignment_types (c2m_ctx, apds->type, NULL, el->attr, el);
+              }
+            }
+          }
+        }
         break;
       }
       case N_FORIN: {
@@ -10869,8 +11341,13 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         e1 = collection->attr;
         int forin_arr_p = (e1 && (e1->type->mode == TM_ARR
                                  || (e1->type->mode == TM_PTR && e1->type->arr_type != NULL)));
-        if (e1 && e1->type->mode != TM_DICT && !forin_arr_p)
-          error (c2m_ctx, POS (r), "for-in collection must be a dict or array");
+        int forin_class_p
+          = (e1 && !forin_arr_p
+             && ((e1->type->mode == TM_PTR && e1->type->u.ptr_type->mode == TM_CLASS)
+                 || e1->type->mode == TM_CLASS));
+        if (e1 && e1->type->mode != TM_DICT && !forin_arr_p && !forin_class_p)
+          error (c2m_ctx, POS (r),
+                 "for-in collection must be a dict, array, or class with Count()/Get(int)");
 
         /* Determine element type for arrays (needed for loop var type) */
         struct type *forin_el_type = NULL;
@@ -10916,6 +11393,61 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
             struct type *el_copy = create_type(c2m_ctx, NULL);
             *el_copy = *forin_el_type; el_copy->pos_node = key_id;
             FORIN_DECL_VAR(key_id, el_copy);
+          }
+        } else if (forin_class_p) {
+          /* Class with the Count/Get iteration protocol (duck-typed):
+               for (auto x in coll)    — x = coll->Get(i) for i in [0, coll->Count())
+               for (auto i, x in coll) — i = index (int), x = element
+             The element type is Get's return type. */
+          struct type *cls_type = e1->type->mode == TM_PTR ? e1->type->u.ptr_type : e1->type;
+          const char *cls_name = class_type_name (cls_type);
+          node_t class_tag = cls_type->u.tag_type;
+          node_t count_def = find_class_protocol_method (c2m_ctx, class_tag, "Count", 0, POS (r));
+          node_t get_def = find_class_protocol_method (c2m_ctx, class_tag, "Get", 1, POS (r));
+          struct type *el_type = NULL;
+
+          if (cls_name == NULL) cls_name = "?";
+          if (count_def == NULL || get_def == NULL) {
+            error (c2m_ctx, POS (r),
+                   "class '%s' is not iterable (needs 'Count()' and 'Get(int)' methods)",
+                   cls_name);
+          } else {
+            decl_t cd = count_def->attr, gd = get_def->attr;
+            struct func_type *gft = gd->decl_spec.type->u.func_type;
+            node_t gparam = NL_HEAD (gft->param_list->u.ops);
+            struct decl_spec *gpds;
+
+            if (!integer_type_p (cd->decl_spec.type->u.func_type->ret_type))
+              error (c2m_ctx, POS (r),
+                     "for-in: 'Count()' of class '%s' must return an integer type", cls_name);
+            if (gparam != NULL) gparam = NL_NEXT (gparam); /* skip 'this' */
+            gpds = get_param_decl_spec (gparam);
+            if (gpds == NULL || !integer_type_p (gpds->type)) {
+              error (c2m_ctx, POS (r),
+                     "for-in: 'Get' of class '%s' must take a single integer index", cls_name);
+            } else if (!scalar_type_p (gft->ret_type)) {
+              error (c2m_ctx, POS (r),
+                     "for-in: 'Get' of class '%s' must return a scalar or pointer type",
+                     cls_name);
+            } else {
+              el_type = gft->ret_type;
+            }
+          }
+          /* On protocol errors fall back to int so the body check can proceed. */
+          if (el_type == NULL) el_type = create_basic_type (c2m_ctx, TP_INT);
+          if (val_id->code == N_ID) {
+            /* Two-variable form: key_id = index, val_id = element */
+            struct type *idx_type = create_basic_type (c2m_ctx, TP_INT);
+            idx_type->pos_node = key_id;
+            FORIN_DECL_VAR (key_id, idx_type);
+            struct type *el_copy = create_type (c2m_ctx, NULL);
+            *el_copy = *el_type; el_copy->pos_node = val_id;
+            FORIN_DECL_VAR (val_id, el_copy);
+          } else {
+            /* Single-variable form: key_id = element */
+            struct type *el_copy = create_type (c2m_ctx, NULL);
+            *el_copy = *el_type; el_copy->pos_node = key_id;
+            FORIN_DECL_VAR (key_id, el_copy);
           }
         } else {
           /* Dict: key_id = char* , value_id = TM_DICT */
@@ -12780,12 +13312,22 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     break;
   }
   case N_CLASS: {
+    /* Skip generic class templates — they have a sentinel attr and are only
+       instantiated as specialized concrete classes via get_or_create_specialization. */
+    if (r->attr == (void *)((intptr_t)-1)) break;
+
     node_t id = NL_HEAD (r->u.ops);
     node_t decl_list = NL_NEXT (id);
     struct type *class_type = create_type (c2m_ctx, NULL);
     class_type->mode = TM_CLASS;
     class_type->u.tag_type = process_tag (c2m_ctx, r, id, decl_list);
     class_type->pos_node = r;
+
+    /* Register the class name in S_REGULAR so check_decl_spec N_ID can find it
+       (needed for specialized classes injected directly into the module list). */
+    if (id->code == N_ID) {
+      symbol_insert (c2m_ctx, S_REGULAR, id, curr_scope, r, NULL);
+    }
 
     // Always attach as decl_t (consistent with check_decl_spec N_CLASS path) so that
     // later when curr_class = this node, N_FUNC_DEF can do decl = curr_class->attr; class_type = decl->decl_spec.type
@@ -16085,6 +16627,66 @@ static void build_method_mir_name (c2m_ctx_t c2m_ctx, char *out, size_t outsz,
   VARR_DESTROY (char, b);
 }
 
+/* Emit a direct call THIS_OP->method(args...) for a check-resolved class
+   method FUNC_DEF.  Used by the brace-init protocol (new T{...} → Add calls)
+   and the for-in Count/Get iteration protocol, where no N_CALL node exists in
+   the AST.  THIS_TYPE is the receiver pointer type, ARGS holds N_ARGS
+   already-evaluated user argument values (scalars are promoted to the
+   parameter types here; aggregate args must already be memory ops).  Returns
+   the call result (a meaningless op for void methods).  Aggregate return
+   types are rejected during check. */
+static op_t gen_class_method_call (c2m_ctx_t c2m_ctx, node_t func_def, struct type *this_type,
+                                   op_t this_op, op_t *args, int n_args) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  decl_t mdecl = func_def->attr;
+  struct func_type *ft = mdecl->decl_spec.type->u.func_type;
+  MIR_item_t proto;
+  char pname[64];
+  size_t ops_start;
+  target_arg_info_t arg_info;
+  node_t param;
+  op_t res = zero_op;
+  int i, n;
+
+  collect_args_and_func_types (c2m_ctx, ft);
+  sprintf (pname, "__methproto%d", new_proto_count++);
+  proto = MIR_new_proto_arr (ctx, pname, VARR_LENGTH (MIR_type_t, proto_info.ret_types),
+                             VARR_ADDR (MIR_type_t, proto_info.ret_types),
+                             VARR_LENGTH (MIR_var_t, proto_info.arg_vars),
+                             VARR_ADDR (MIR_var_t, proto_info.arg_vars));
+  move_item_to_module_start (curr_func->module, proto);
+  ops_start = VARR_LENGTH (MIR_op_t, call_ops);
+  VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, proto));
+  VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, mdecl->u.item));
+  target_init_arg_vars (c2m_ctx, &arg_info);
+  n = target_add_call_res_op (c2m_ctx, ft->ret_type, &arg_info, 0);
+  if (n > 0) {
+    assert (n == 1);
+    res = new_op (NULL, VARR_LAST (MIR_op_t, call_ops));
+  }
+  /* 'this' receiver pointer */
+  target_add_call_arg_op (c2m_ctx, this_type, &arg_info, this_op);
+  param = NL_HEAD (ft->param_list->u.ops);
+  if (param != NULL) param = NL_NEXT (param); /* skip implicit 'this' */
+  for (i = 0; i < n_args; i++) {
+    op_t av = args[i];
+    struct decl_spec *pds;
+
+    assert (param != NULL); /* arity was validated during check */
+    pds = get_param_decl_spec (param);
+    if (scalar_type_p (pds->type))
+      av = promote (c2m_ctx, av, promote_mir_int_type (get_mir_type (c2m_ctx, pds->type)), FALSE);
+    target_add_call_arg_op (c2m_ctx, pds->type, &arg_info, av);
+    param = NL_NEXT (param);
+  }
+  emit_insn (c2m_ctx,
+             MIR_new_insn_arr (ctx, MIR_CALL, VARR_LENGTH (MIR_op_t, call_ops) - ops_start,
+                               VARR_ADDR (MIR_op_t, call_ops) + ops_start));
+  VARR_TRUNC (MIR_op_t, call_ops, ops_start);
+  return res;
+}
+
 static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_t false_label,
                  int val_p, op_t *desirable_dest, int *expect_res) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
@@ -16916,6 +17518,26 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                                    VARR_ADDR (MIR_op_t, call_ops) + ops_start));
       VARR_TRUNC (MIR_op_t, call_ops, ops_start);
     }
+    /* Brace-init:  new T{e1, e2, ...} — emit one obj->Add(e) call per element
+       (resolved through the same protocol helper as check). */
+    {
+      node_t init_list = NL_NEXT (arg_list);
+
+      if (init_list != NULL && NL_HEAD (init_list->u.ops) != NULL) {
+        node_t add_def
+          = find_class_protocol_method (c2m_ctx, class_type->u.tag_type, "Add", 1, POS (r));
+
+        assert (add_def != NULL); /* validated during check */
+        for (node_t el = NL_HEAD (init_list->u.ops); el != NULL; el = NL_NEXT (el)) {
+          struct expr *ee = el->attr;
+          int el_agg_p = (ee->type->mode == TM_STRUCT || ee->type->mode == TM_UNION
+                          || ee->type->mode == TM_CLASS);
+          op_t av = gen (c2m_ctx, el, NULL, NULL, !el_agg_p, NULL, NULL);
+
+          gen_class_method_call (c2m_ctx, add_def, ne->type, obj, &av, 1);
+        }
+      }
+    }
     res = obj;
     break;
   }
@@ -17595,6 +18217,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_ST_ASSERT: /* do nothing */ break;
   case N_INIT: break;  // ???
   case N_CLASS: {
+    /* Skip generic templates — only their monomorphized specializations are generated */
+    if (r->attr == (void *)((intptr_t)-1)) break;
 #ifdef C2MIR_PREPRO_DEBUG
     printf("gen processing N_CLASS\n");
 #endif
@@ -18125,7 +18749,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     struct type *coll_type = coll_e ? coll_e->type : NULL;
     int arr_forin = (coll_type && (coll_type->mode == TM_ARR
                      || (coll_type->mode == TM_PTR && coll_type->arr_type != NULL)));
-    op_t i_reg = {0}; /* loop counter — shared by both branches */
+    int class_forin
+      = (coll_type && !arr_forin
+         && ((coll_type->mode == TM_PTR && coll_type->u.ptr_type->mode == TM_CLASS)
+             || coll_type->mode == TM_CLASS));
+    op_t i_reg = {0}; /* loop counter — shared by all branches */
 
     if (arr_forin) {
       /* ---- Array for-in ---- */
@@ -18185,6 +18813,66 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         emit2 (c2m_ctx, tp_mov (var_t),
                MIR_new_reg_op (ctx, kvar.reg),
                MIR_new_mem_op (ctx, el_mir_t, 0, addr_reg.mir_op.u.reg, 0, 1));
+      }
+    } else if (class_forin) {
+      /* ---- Class Count/Get protocol for-in ----
+         n = coll->Count(); for (i = 0; i < n; i++) { x = coll->Get(i); body } */
+      struct type *cls_type = coll_type->mode == TM_PTR ? coll_type->u.ptr_type : coll_type;
+      struct type *this_type
+        = coll_type->mode == TM_PTR ? coll_type : create_ptr_type (c2m_ctx, cls_type);
+      node_t count_def
+        = find_class_protocol_method (c2m_ctx, cls_type->u.tag_type, "Count", 0, POS (r));
+      node_t get_def
+        = find_class_protocol_method (c2m_ctx, cls_type->u.tag_type, "Get", 1, POS (r));
+
+      assert (count_def != NULL && get_def != NULL); /* validated during check */
+      /* Evaluate the receiver pointer once, before the loop. */
+      op_t this_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+      if (coll_type->mode == TM_PTR) {
+        op_t cv = val_gen (c2m_ctx, coll);
+        emit2 (c2m_ctx, MIR_MOV, this_reg.mir_op, cv.mir_op);
+      } else { /* class lvalue: iterate over its address */
+        op_t cv = gen (c2m_ctx, coll, NULL, NULL, FALSE, NULL, NULL);
+        if (cv.mir_op.mode == MIR_OP_MEM) cv = mem_to_address (c2m_ctx, cv, TRUE);
+        emit2 (c2m_ctx, MIR_MOV, this_reg.mir_op, cv.mir_op);
+      }
+      /* n = coll->Count() */
+      op_t n_res = gen_class_method_call (c2m_ctx, count_def, this_type, this_reg, NULL, 0);
+      op_t n_save = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, n_res.mir_op);
+
+      /* i = 0 */
+      i_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, i_reg.mir_op, MIR_new_int_op (ctx, 0));
+
+      /* loop_label: if i >= n goto break */
+      emit_label_insn_opt (c2m_ctx, loop_label);
+      emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (ctx, break_label), i_reg.mir_op, n_save.mir_op);
+      emit_label_insn_opt (c2m_ctx, body_label);
+
+      /* elem = coll->Get(i) */
+      op_t el_res = gen_class_method_call (c2m_ctx, get_def, this_type, this_reg, &i_reg, 1);
+      node_t el_var = val_id->code == N_ID ? val_id : key_id;
+      if (val_id->code == N_ID) {
+        /* Two-var form: key_id = i (index) */
+        MIR_type_t idx_t = promote_mir_int_type (MIR_T_I32);
+        const char *iname = get_reg_var_name (c2m_ctx, idx_t, key_id->u.s.s, fsn);
+        reg_var_t ivar = get_reg_var (c2m_ctx, idx_t, iname, NULL);
+        emit2 (c2m_ctx, tp_mov (idx_t), MIR_new_reg_op (ctx, ivar.reg), i_reg.mir_op);
+      }
+      {
+        /* Store the element using the loop variable's *declared* MIR type so
+           the register name matches what N_ID reads in the body (same approach
+           as the dict branch below). */
+        symbol_t vsym;
+        MIR_type_t vt = MIR_T_I64;
+        if (symbol_find (c2m_ctx, S_REGULAR, el_var, r, &vsym) && vsym.def_node != NULL
+            && vsym.def_node->attr != NULL)
+          vt = promote_mir_int_type (
+                 get_mir_type (c2m_ctx, ((decl_t) vsym.def_node->attr)->decl_spec.type));
+        const char *vname = get_reg_var_name (c2m_ctx, vt, el_var->u.s.s, fsn);
+        reg_var_t vvar = get_reg_var (c2m_ctx, vt, vname, NULL);
+        emit2 (c2m_ctx, tp_mov (vt), MIR_new_reg_op (ctx, vvar.reg), el_res.mir_op);
       }
     } else {
       /* ---- Dict for-in ---- */
@@ -18940,13 +19628,19 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_MODULE:
   case N_BLOCK:
   case N_FOR:
+    if (n->code == N_CLASS && n->attr == (void *) ((intptr_t) -1)) {
+      /* Generic class template: sentinel attr, never checked/generated. */
+      fprintf (f, ": generic template\n");
+      print_ops (c2m_ctx, f, n, indent, attr_p);
+      break;
+    }
     if (!attr_p
         || ((n->code == N_STRUCT || n->code == N_UNION || n->code == N_CLASS)
             && (NL_EL (n->u.ops, 1) == NULL || NL_EL (n->u.ops, 1)->code == N_IGNORE)))
       fprintf (f, "\n");
     else if (n->code == N_MODULE)
       fprintf (f, ": the top scope");
-    else if (n->attr != NULL)
+    else if (n->attr != NULL && ((struct node_scope *) n->attr)->scope != NULL)
       fprintf (f, ": higher scope node %u", ((struct node_scope *) n->attr)->scope->uid);
     if (n->code == N_STRUCT || n->code == N_UNION || n->code == N_CLASS)
       fprintf (f, "\n");
