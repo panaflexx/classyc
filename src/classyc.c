@@ -10,10 +10,10 @@
    o generation pass producing MIR
 
    The compiler implements C11 standard w/o C11  features:
-   atomic, complex, variable size arrays. 
+   atomic, complex, variable size arrays.
 
    o class, String, dict extensions make it Classy
-   o 	
+   o
    */
 
 
@@ -4657,6 +4657,26 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
         return fresh;
       }
     }
+    /* Self-referential generic placeholder: __generic_<orig>_<TypeParam>  e.g.
+       __generic_List_T  inside List<T>'s body gets stored as-is in the template
+       AST.  When the template is specialised (T -> String), substitute the type
+       param part with the concrete mangled name so it becomes __generic_List_String.
+       Only the single-type-param case (n_params == 1) is handled here; multi-param
+       classes can extend this pattern. */
+    {
+      char _pfx[512];
+      snprintf (_pfx, sizeof (_pfx), "__generic_%s_", orig_name);
+      size_t _plen = strlen (_pfx);
+      if (strncmp (s, _pfx, _plen) == 0) {
+        const char *_rest = s + _plen;
+        for (int _i = 0; _i < n_params; _i++) {
+          if (params[_i] && strcmp (_rest, params[_i]) == 0) {
+            const char *_new = mangle_generic_name (c2m_ctx, orig_name, 1, &args[_i]);
+            return build_id (c2m_ctx, _new, POS (n));
+          }
+        }
+      }
+    }
     /* Rename __ctor_Orig -> __ctor_Spec */
     char buf[512], nbuf[512];
     snprintf (buf, sizeof (buf), "__ctor_%s", orig_name);
@@ -4723,6 +4743,37 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
                                              int n_args, node_t *args,
                                              pos_t pos) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+
+  /* Self-reference inside a generic class body: if the class being specialised
+     is the class currently being parsed (class_node == NULL in the pre-registered
+     entry) AND every type arg is one of its own type parameters, return the
+     mangled placeholder name without creating a real specialisation.  The
+     placeholder looks like "__generic_List_T" and is resolved to the concrete
+     name ("__generic_List_String") by specialize_node when the template is later
+     instantiated with a real type argument. */
+  if (parse_ctx != NULL && parse_ctx->curr_class != NULL) {
+    VARR (generic_tmpl_t) *gt = generic_templates;
+    for (size_t _si = 0; gt != NULL && _si < VARR_LENGTH (generic_tmpl_t, gt); _si++) {
+      generic_tmpl_t *_t = VARR_ADDR (generic_tmpl_t, gt) + _si;
+      if (_t->class_node != NULL || strcmp (_t->name, base_name) != 0) continue;
+      /* This is the pre-registered (partially-parsed) template — check that every
+         supplied type arg is one of its own type parameters. */
+      int _all_params = (n_args > 0);
+      for (int _j = 0; _j < n_args && _all_params; _j++) {
+        if (args[_j]->code != N_ID) { _all_params = 0; break; }
+        int _found = 0;
+        for (int _k = 0; _k < _t->n_type_params; _k++)
+          if (_t->type_params[_k] && strcmp (args[_j]->u.s.s, _t->type_params[_k]) == 0)
+            { _found = 1; break; }
+        if (!_found) _all_params = 0;
+      }
+      if (_all_params) {
+        /* Return a placeholder N_ID; specialize_node will substitute it. */
+        const char *mangled = mangle_generic_name (c2m_ctx, base_name, n_args, args);
+        return build_id (c2m_ctx, mangled, pos);
+      }
+    }
+  }
 
   generic_tmpl_t *tmpl = get_generic_template (c2m_ctx, base_name);
   if (tmpl == NULL) {
@@ -5856,6 +5907,9 @@ DA (type_spec) {
        Detect <T,...> after the class name and register type params as temp typedefs. */
     int n_type_params = 0;
     const char *type_params[4] = {NULL, NULL, NULL, NULL};
+    /* Index into generic_templates for the pre-registration done before body parsing.
+       (size_t)-1 means no pre-registration was done. */
+    size_t generic_tmpl_preidx = (size_t)-1;
     if (id_p && struct_p == 3 && C (T_CMP) && curr_token->node_code == N_LT) {
       M (T_CMP); /* consume '<' */
       do {
@@ -5879,6 +5933,22 @@ DA (type_spec) {
              method/member can refer to the class's own type (e.g. a method that
              returns `ClassName *` for Go-style chaining, or a self-pointer). */
           if (id_p) tpname_add (c2m_ctx, op1, curr_scope, TRUE);
+          /* Pre-register the generic template (class_node = NULL placeholder) so
+             that self-referential generic types like `List<T>*` used as parameter
+             or return types inside the class body are recognised by
+             is_generic_class_p() / parse_generic_instantiation() during parsing.
+             get_or_create_specialization() detects the NULL class_node and returns
+             a mangled placeholder name instead of materialising a real class;
+             specialize_node() later resolves the placeholder to the concrete name. */
+          if (n_type_params > 0 && id_p) {
+            generic_tmpl_t pre;
+            pre.name        = op1->u.s.s;
+            pre.class_node  = NULL; /* back-filled after body is parsed */
+            pre.n_type_params = n_type_params;
+            for (int _i = 0; _i < 4; _i++) pre.type_params[_i] = type_params[_i];
+            VARR_PUSH (generic_tmpl_t, generic_templates, pre);
+            generic_tmpl_preidx = VARR_LENGTH (generic_tmpl_t, generic_templates) - 1;
+          }
           P (class_member_list);
           parse_ctx->curr_class = last_class;
         } else {
@@ -5905,12 +5975,18 @@ DA (type_spec) {
         /* Generic class template: store in registry, mark with sentinel attr.
            The base name is registered as a tpname so List<X> can be parsed later. */
         if (id_p) tpname_add (c2m_ctx, op1, curr_scope, TRUE);
-        generic_tmpl_t tmpl;
-        tmpl.name = op1->u.s.s;
-        tmpl.class_node = r;
-        tmpl.n_type_params = n_type_params;
-        for (int _i = 0; _i < 4; _i++) tmpl.type_params[_i] = type_params[_i];
-        VARR_PUSH (generic_tmpl_t, generic_templates, tmpl);
+        if (generic_tmpl_preidx != (size_t)-1) {
+          /* Back-fill the class_node into the pre-registered entry. */
+          (VARR_ADDR (generic_tmpl_t, generic_templates) + generic_tmpl_preidx)->class_node = r;
+        } else {
+          /* No pre-registration (forward declaration only, no body): push fresh. */
+          generic_tmpl_t tmpl;
+          tmpl.name = op1->u.s.s;
+          tmpl.class_node = r;
+          tmpl.n_type_params = n_type_params;
+          for (int _i = 0; _i < 4; _i++) tmpl.type_params[_i] = type_params[_i];
+          VARR_PUSH (generic_tmpl_t, generic_templates, tmpl);
+        }
         /* Mark the N_CLASS as a template so check/gen can skip it */
         r->attr = (void *)((intptr_t)-1); /* sentinel: template, not a real class */
       } else {
@@ -9213,6 +9289,10 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
             score += 3;
           else if (compatible_types_p (pt, at, TRUE))
             score += 2;
+          /* String parameter accepts string literals (TM_ARR of char) and other
+             String values; use the same leniency as check_assignment_types. */
+          else if (builtin_string_type_p (pt) && str_concat_string_operand_p (at, a))
+            score += 2;
           else if (arithmetic_type_p (pt) && arithmetic_type_p (at))
             score += 1; /* implicit arithmetic conversion */
           else if (pt->mode == TM_PTR && (at->mode == TM_PTR || at->mode == TM_ARR))
@@ -11411,6 +11491,12 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
         } else if ((t1->mode == TM_DICT && (integer_type_p (t2) || t2->mode == TM_DICT))
                    || (t2->mode == TM_DICT && integer_type_p (t1))) {
           /* dict is a pointer — allow comparison with integers and other dicts */
+        } else if (builtin_string_type_p (t1) && builtin_string_type_p (t2)) {
+          /* String == String: pointer-equality comparison is valid. */
+        } else if (builtin_string_type_p (t1) && t2->mode == TM_PTR) {
+          /* String == char* (e.g. comparing with a literal that decayed to ptr). */
+        } else if (t1->mode == TM_PTR && builtin_string_type_p (t2)) {
+          /* char* == String */
         } else {
           error (c2m_ctx, POS (r), "invalid types of comparison operands");
         }
@@ -11709,76 +11795,130 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
 
         snprintf (ctor_name, sizeof (ctor_name), "__ctor_%s", type_id->u.s.s);
         ctor_id = build_id (c2m_ctx, ctor_name, POS (r));
-        ctor_def = find_def (c2m_ctx, S_REGULAR, ctor_id, curr_scope, NULL);
 
         for (arg = NL_HEAD (arg_list->u.ops); arg != NULL; arg = NL_NEXT (arg))
           if (arg->code == N_FIELD_ID) has_named = TRUE;
 
-        /* Named arguments (new Foo(b=2, a=1)): reorder them into positional
-           order using the constructor's parameter names. */
+        /* Look up all constructor overloads registered under __ctor_<ClassName>.
+           Multiple constructors with different signatures are stored as overloads
+           in the same symbol (exactly like regular method overloads). */
+        symbol_t ctor_sym;
+        int has_ctor_sym = find_overload_sym (c2m_ctx, ctor_id, curr_scope, &ctor_sym);
+        ctor_def = has_ctor_sym ? ctor_sym.def_node : NULL;
+
+        /* Named arguments (new Foo(b=2, a=1)): find the constructor whose
+           parameter names match the supplied names (scanning all overloads when
+           there are several), then reorder into positional order. */
         if (has_named) {
-          if (ctor_def == NULL || ctor_def->code != N_FUNC_DEF) {
+          if (!has_ctor_sym) {
             error (c2m_ctx, POS (r),
                    "named arguments require a constructor for class '%s'", type_id->u.s.s);
           } else {
-            decl_t cdecl = ctor_def->attr;
-            struct func_type *ft = cdecl->decl_spec.type->u.func_type;
-            node_t reordered = new_node (c2m_ctx, N_LIST);
-            node_t a2;
-            param = NL_HEAD (ft->param_list->u.ops);
-            if (param != NULL) param = NL_NEXT (param); /* skip 'this' */
-            for (; param != NULL; param = NL_NEXT (param)) {
-              node_t pdeclr = NL_EL (param->u.ops, 1);
-              node_t pid = (pdeclr != NULL && pdeclr->code == N_DECL)
-                             ? NL_HEAD (pdeclr->u.ops) : NULL;
-              const char *pname = (pid != NULL && pid->code == N_ID) ? pid->u.s.s : NULL;
-              node_t found_val = NULL, name_node = NULL;
+            /* With multiple overloads, pick the one that owns all named params. */
+            if (VARR_LENGTH (node_t, ctor_sym.defs) > 1) {
+              ctor_def = NULL;
+              for (size_t ci = 0; ci < VARR_LENGTH (node_t, ctor_sym.defs); ci++) {
+                node_t cand = VARR_GET (node_t, ctor_sym.defs, ci);
+                if (cand == NULL || cand->code != N_FUNC_DEF) continue;
+                decl_t cd = cand->attr;
+                if (cd == NULL || cd->decl_spec.type == NULL
+                    || cd->decl_spec.type->mode != TM_FUNC) continue;
+                struct func_type *cft = cd->decl_spec.type->u.func_type;
+                int all_found = TRUE;
+                for (node_t a2n = NL_HEAD (arg_list->u.ops); a2n != NULL; a2n = NL_NEXT (a2n)) {
+                  if (a2n->code != N_FIELD_ID) continue;
+                  node_t an = NL_HEAD (a2n->u.ops);
+                  const char *aname = (an && an->code == N_ID) ? an->u.s.s : NULL;
+                  if (!aname) { all_found = FALSE; break; }
+                  int found_p = FALSE;
+                  node_t cp = NL_HEAD (cft->param_list->u.ops);
+                  if (cp != NULL) cp = NL_NEXT (cp); /* skip 'this' */
+                  for (; cp != NULL; cp = NL_NEXT (cp)) {
+                    node_t pdeclr = NL_EL (cp->u.ops, 1);
+                    node_t pid = (pdeclr && pdeclr->code == N_DECL)
+                                   ? NL_HEAD (pdeclr->u.ops) : NULL;
+                    if (pid && pid->code == N_ID && strcmp (pid->u.s.s, aname) == 0)
+                      { found_p = TRUE; break; }
+                  }
+                  if (!found_p) { all_found = FALSE; break; }
+                }
+                if (all_found) { ctor_def = cand; break; }
+              }
+              if (ctor_def == NULL) ctor_def = ctor_sym.def_node; /* fallback to first */
+            }
+
+            if (ctor_def == NULL || ctor_def->code != N_FUNC_DEF) {
+              error (c2m_ctx, POS (r),
+                     "named arguments require a constructor for class '%s'", type_id->u.s.s);
+            } else {
+              decl_t cdecl = ctor_def->attr;
+              struct func_type *ft = cdecl->decl_spec.type->u.func_type;
+              node_t reordered = new_node (c2m_ctx, N_LIST);
+              node_t a2;
+              param = NL_HEAD (ft->param_list->u.ops);
+              if (param != NULL) param = NL_NEXT (param); /* skip 'this' */
+              for (; param != NULL; param = NL_NEXT (param)) {
+                node_t pdeclr = NL_EL (param->u.ops, 1);
+                node_t pid = (pdeclr != NULL && pdeclr->code == N_DECL)
+                               ? NL_HEAD (pdeclr->u.ops) : NULL;
+                const char *pname = (pid != NULL && pid->code == N_ID) ? pid->u.s.s : NULL;
+                node_t found_val = NULL, name_node = NULL;
+                for (a2 = NL_HEAD (arg_list->u.ops); a2 != NULL; a2 = NL_NEXT (a2)) {
+                  node_t an;
+                  if (a2->code != N_FIELD_ID) continue;
+                  an = NL_HEAD (a2->u.ops);
+                  if (pname != NULL && an->code == N_ID && NL_NEXT (an) != NULL
+                      && strcmp (an->u.s.s, pname) == 0) {
+                    name_node = an;
+                    found_val = NL_NEXT (an);
+                    break;
+                  }
+                }
+                if (found_val == NULL) {
+                  error (c2m_ctx, POS (r),
+                         "no argument provided for constructor parameter '%s'",
+                         pname != NULL ? pname : "?");
+                } else {
+                  NL_REMOVE (a2->u.ops, found_val); /* detach value from its marker */
+                  op_append (c2m_ctx, reordered, found_val);
+                  (void) name_node;
+                }
+              }
+              /* Any named marker that still owns its value names an unknown param. */
               for (a2 = NL_HEAD (arg_list->u.ops); a2 != NULL; a2 = NL_NEXT (a2)) {
                 node_t an;
                 if (a2->code != N_FIELD_ID) continue;
                 an = NL_HEAD (a2->u.ops);
-                if (pname != NULL && an->code == N_ID && NL_NEXT (an) != NULL
-                    && strcmp (an->u.s.s, pname) == 0) {
-                  name_node = an;
-                  found_val = NL_NEXT (an);
-                  break;
-                }
+                if (NL_NEXT (an) != NULL)
+                  error (c2m_ctx, POS (r), "unknown constructor parameter '%s'", an->u.s.s);
               }
-              if (found_val == NULL) {
-                error (c2m_ctx, POS (r),
-                       "no argument provided for constructor parameter '%s'",
-                       pname != NULL ? pname : "?");
-              } else {
-                NL_REMOVE (a2->u.ops, found_val); /* detach value from its marker */
-                op_append (c2m_ctx, reordered, found_val);
-                (void) name_node;
+              /* Replace arg_list contents with the positional value list. */
+              for (a2 = NL_HEAD (arg_list->u.ops); a2 != NULL;) {
+                node_t nx = NL_NEXT (a2);
+                NL_REMOVE (arg_list->u.ops, a2);
+                a2 = nx;
               }
-            }
-            /* Any named marker that still owns its value names an unknown param. */
-            for (a2 = NL_HEAD (arg_list->u.ops); a2 != NULL; a2 = NL_NEXT (a2)) {
-              node_t an;
-              if (a2->code != N_FIELD_ID) continue;
-              an = NL_HEAD (a2->u.ops);
-              if (NL_NEXT (an) != NULL)
-                error (c2m_ctx, POS (r), "unknown constructor parameter '%s'", an->u.s.s);
-            }
-            /* Replace arg_list contents with the positional value list. */
-            for (a2 = NL_HEAD (arg_list->u.ops); a2 != NULL;) {
-              node_t nx = NL_NEXT (a2);
-              NL_REMOVE (arg_list->u.ops, a2);
-              a2 = nx;
-            }
-            for (a2 = NL_HEAD (reordered->u.ops); a2 != NULL;) {
-              node_t nx = NL_NEXT (a2);
-              NL_REMOVE (reordered->u.ops, a2);
-              op_append (c2m_ctx, arg_list, a2);
-              a2 = nx;
+              for (a2 = NL_HEAD (reordered->u.ops); a2 != NULL;) {
+                node_t nx = NL_NEXT (a2);
+                NL_REMOVE (reordered->u.ops, a2);
+                op_append (c2m_ctx, arg_list, a2);
+                a2 = nx;
+              }
             }
           }
         }
 
+        /* Type-check all arguments.  For positional calls this must happen
+           before overload selection so each argument's type is known for
+           scoring.  Named-arg calls have already been reordered above. */
         for (arg = NL_HEAD (arg_list->u.ops); arg != NULL; arg = NL_NEXT (arg))
           check (c2m_ctx, arg, r);
+
+        /* For positional calls: pick the best-matching constructor overload now
+           that all argument types are known.  Named-arg calls already set
+           ctor_def during the reordering step above. */
+        if (!has_named && has_ctor_sym)
+          ctor_def = select_method_overload (c2m_ctx, &ctor_sym, class_def, arg_list);
 
         if (ctor_def != NULL && ctor_def->code == N_FUNC_DEF) {
           decl_t cdecl = ctor_def->attr;
@@ -12224,14 +12364,13 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
          if (t1->mode == TM_DICT) {
            e = create_expr(c2m_ctx, r);
            if (strcmp(op2->u.s.s, "json") == 0) {
-             /* d.json — serialize dict to JSON string (char*) */
-             e->type->mode = TM_PTR;
-             e->type->u.ptr_type = create_type(c2m_ctx, NULL);
-             init_type(e->type->u.ptr_type);
-             e->type->u.ptr_type->mode = TM_BASIC;
-             e->type->u.ptr_type->u.basic_type = TP_CHAR;
-             set_type_layout(c2m_ctx, e->type->u.ptr_type);
-             set_type_layout(c2m_ctx, e->type);
+             /* d.json — serialize dict to JSON String (works in f-strings and +).
+                TP_STRING is pointer-sized; set raw_size/align manually because
+                basic_type_size() does not handle TP_STRING. */
+             e->type->mode = TM_BASIC;
+             e->type->u.basic_type = TP_STRING;
+             e->type->raw_size = 8;
+             e->type->align    = 8;
            } else if (strcmp(op2->u.s.s, "value") == 0) {
              /* special for variant sub-dict .value to get the int */
              e->type->mode = TM_BASIC;
@@ -12525,7 +12664,7 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
           va_arg_p = str_eq_p(op1->u.s.s, BUILTIN_VA_ARG);
           va_start_p = str_eq_p(op1->u.s.s, BUILTIN_VA_START);
           if (!va_arg_p && !va_start_p && !alloca_p && !json_p) {
-            error (c2m_ctx, POS (op1),
+            warning (c2m_ctx, POS (op1),
                    "implicit declaration of function '%s' — did you forget an #include?",
                    op1->u.s.s);
             spec_list = new_node1 (c2m_ctx, N_LIST, new_node (c2m_ctx, N_INT));
@@ -12650,14 +12789,12 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
               e2 = arg->attr;
               t2 = e2->type;
               if (t2->mode == TM_DICT) {
-                /* json(dict) → char* (serialized JSON string) */
-                res_type.mode = TM_PTR;
-                res_type.u.ptr_type = create_type(c2m_ctx, NULL);
-                init_type(res_type.u.ptr_type);
-                res_type.u.ptr_type->mode = TM_BASIC;
-                res_type.u.ptr_type->u.basic_type = TP_CHAR;
-                set_type_layout(c2m_ctx, res_type.u.ptr_type);
-                set_type_layout(c2m_ctx, &res_type);
+                /* json(dict) → String (serialized JSON, works in f-strings and +).
+                   TP_STRING is pointer-sized; set raw_size/align manually. */
+                res_type.mode = TM_BASIC;
+                res_type.u.basic_type = TP_STRING;
+                res_type.raw_size = 8;
+                res_type.align    = 8;
               } else if (t2->mode == TM_PTR || t2->mode == TM_ARR
                          || string_type_p(t2)) {
                 /* json(string) → dict (parsed JSON) */
@@ -17741,10 +17878,22 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       /* When the lhs is itself a dict element (d.key / d["key"]) the new object
          must be inserted into the parent dict; otherwise it is stored into the
          lhs (dict) variable. */
-      int lhs_is_dict_elem
-        = (lhs->code == N_FIELD || lhs->code == N_DEREF_FIELD
-           || (lhs->code == N_IND
-               && ((struct expr *) NL_HEAD (lhs->u.ops)->attr)->type->mode == TM_DICT));
+      /* Only treat as dict-element store when the *parent* of the
+         field access is itself a dict object — not when a class/struct
+         member merely has type TM_DICT. */
+      int lhs_is_dict_elem = FALSE;
+      if (lhs->code == N_IND
+          && ((struct expr *) NL_HEAD (lhs->u.ops)->attr)->type->mode == TM_DICT) {
+        lhs_is_dict_elem = TRUE;
+      } else if (lhs->code == N_FIELD || lhs->code == N_DEREF_FIELD) {
+        node_t _par = NL_HEAD (lhs->u.ops);
+        struct expr *_pe = _par ? (struct expr *) _par->attr : NULL;
+        struct type *_pt = (_pe && _pe->type) ? _pe->type : NULL;
+        if (_pt && lhs->code == N_DEREF_FIELD && _pt->mode == TM_PTR)
+          _pt = _pt->u.ptr_type;
+        if (_pt && _pt->mode == TM_DICT)
+          lhs_is_dict_elem = TRUE;
+      }
       if (lhs_is_dict_elem) {
         MIR_op_t key_op;
         if (lhs->code == N_IND) {
@@ -17767,11 +17916,26 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       res = obj;
       break;
     }
-    /* Dict assignment: d.key = val  OR  d["key"] = val */
-    if (((struct expr *) r->attr)->type->mode == TM_DICT
-        && (lhs->code == N_FIELD || lhs->code == N_DEREF_FIELD
-            || (lhs->code == N_IND
-                && ((struct expr *) NL_HEAD(lhs->u.ops)->attr)->type->mode == TM_DICT))) {
+    /* Dict assignment: d.key = val  OR  d["key"] = val
+       Only intercept when the *parent* of the field access is itself a dict
+       object — not when a class/struct member merely has type TM_DICT. */
+    {
+      int dict_field_assign = FALSE;
+      if (((struct expr *) r->attr)->type->mode == TM_DICT) {
+        if (lhs->code == N_IND
+            && ((struct expr *) NL_HEAD(lhs->u.ops)->attr)->type->mode == TM_DICT) {
+          dict_field_assign = TRUE;
+        } else if (lhs->code == N_FIELD || lhs->code == N_DEREF_FIELD) {
+          node_t _par = NL_HEAD (lhs->u.ops);
+          struct expr *_pe = _par ? (struct expr *) _par->attr : NULL;
+          struct type *_pt = (_pe && _pe->type) ? _pe->type : NULL;
+          if (_pt && lhs->code == N_DEREF_FIELD && _pt->mode == TM_PTR)
+            _pt = _pt->u.ptr_type;
+          if (_pt && _pt->mode == TM_DICT)
+            dict_field_assign = TRUE;
+        }
+      }
+    if (dict_field_assign) {
       MIR_op_t key_op;
       if (lhs->code == N_IND) {
         /* d["key"] = val  or  d[var] = val */
@@ -17793,24 +17957,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       struct expr *rhs_expr = rhs_node->attr;
       op_t wrapped;
       if (rhs_expr != NULL && rhs_expr->type->mode == TM_DICT) {
-        /* RHS is a borrowed DictValue* (d.k, d["k"], or another dict var).
-           Store an independent deep copy so the destination dict owns its
-           value; otherwise it would alias the source, causing a
-           use-after-free on self-assignment (d["k"] = d["k"]) and a
-           double-free when both dicts are destroyed. */
         wrapped = gen_dict_value_copy (c2m_ctx, op2.mir_op);
       } else if (rhs_node->code == N_STR || (rhs_expr != NULL && rhs_expr->type->mode == TM_PTR)) {
-        /* String literal or char* — wrap as dict string */
         wrapped = gen_dict_create_string (c2m_ctx, op2.mir_op);
       } else if (rhs_expr != NULL && rhs_expr->const_p && floating_type_p (rhs_expr->type)) {
         wrapped = gen_dict_create_number (c2m_ctx, op2.mir_op);
       } else {
-        /* Integer or fallback — wrap as int64 */
         wrapped = gen_dict_create_int64 (c2m_ctx, op2.mir_op);
       }
       gen_dict_object_set (c2m_ctx, op1.mir_op, key_op, wrapped.mir_op);
-      res = wrapped; /* result of assignment expression */
+      res = wrapped;
       break;
+    }
     }
     var = gen (c2m_ctx, lhs, NULL, NULL, FALSE, NULL, NULL);
     t = get_op_type (c2m_ctx, var);
@@ -18238,6 +18396,17 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       res.decl = NULL;
       res.mir_op.mode = MIR_OP_UNDEF;
     } else {
+      /* If source is a DictValue* (TM_DICT), unwrap the union payload first.
+         This extracts int64_value for integer targets, string_value for pointer
+         targets.  Offset 8 in DictValue is the start of the value union. */
+      {
+        node_t src_node = NL_EL (r->u.ops, 1);
+        struct expr *src_e = src_node ? (struct expr *) src_node->attr : NULL;
+        if (src_e && src_e->type && src_e->type->mode == TM_DICT
+            && type->mode != TM_DICT) {
+          op1 = gen_dict_unwrap (c2m_ctx, op1);
+        }
+      }
       t = get_mir_type (c2m_ctx, type);
       res = cast (c2m_ctx, op1, t, TRUE);
     }
@@ -19154,12 +19323,47 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     curr_call_arg_area_offset = 0;
     collect_args_and_func_types (c2m_ctx, decl_type->u.func_type);
 
-    // Generate the mangled name for class methods.  Constructors/destructors are
-    // already given class-qualified names (`__ctor_<Class>` / `__dtor_<Class>`)
-    // at parse time and are referenced by those names, so they are left as-is.
+    // Generate the mangled name for class methods.
+    // Regular methods:  ClassName_method__<param-types>  (via build_method_mir_name)
+    // Ctors/dtors:      __ctor_ClassName__<param-types>  (suffix appended in-place)
+    //   This ensures overloaded constructors get distinct MIR function names while
+    //   keeping the well-known __ctor_/__dtor_ prefix intact.
     if (is_method && class_name != NULL
         && strncmp (base_name, "__ctor_", 7) != 0 && strncmp (base_name, "__dtor_", 7) != 0) {
       build_method_mir_name (c2m_ctx, name, sizeof (name), class_name, base_name, gen_ft);
+    } else if (is_method && class_name != NULL) {
+      /* Ctor/dtor: base name + "__" + param-type-suffix (same encoding as regular methods). */
+      MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+      VARR (char) * b;
+      node_t param;
+      int any = FALSE;
+      VARR_CREATE (char, b, alloc, 128);
+      for (const char *p = base_name; *p != '\0'; p++) VARR_PUSH (char, b, *p);
+      VARR_PUSH (char, b, '_'); VARR_PUSH (char, b, '_');
+      param = (gen_ft != NULL) ? NL_HEAD (gen_ft->param_list->u.ops) : NULL;
+      if (param_is_this_p (param)) param = NL_NEXT (param);
+      for (; param != NULL; param = NL_NEXT (param)) {
+        struct decl_spec *ds;
+        if (param->code != N_SPEC_DECL) continue;
+        if (void_param_p (param)) continue;
+        ds = get_param_decl_spec (param);
+        if (ds == NULL) continue;
+        append_type_mangle (c2m_ctx, b, ds->type);
+        any = TRUE;
+      }
+      if (!any) VARR_PUSH (char, b, 'v');
+      /* Append the node UID to guarantee uniqueness even when two ctor
+         overloads have identical parameter type signatures (e.g. List(int)
+         and List(T=int) for List<int>).  Callers use cdecl->u.item (the
+         pointer) so the suffix is invisible outside name-deduplication. */
+      {
+        char uid_buf[24];
+        snprintf (uid_buf, sizeof uid_buf, "_%u", r->uid);
+        for (const char *p = uid_buf; *p != '\0'; p++) VARR_PUSH (char, b, *p);
+      }
+      VARR_PUSH (char, b, '\0');
+      snprintf (name, sizeof (name), "%s", VARR_ADDR (char, b));
+      VARR_DESTROY (char, b);
     } else {
       snprintf (name, sizeof (name), "%s", base_name);
     }
