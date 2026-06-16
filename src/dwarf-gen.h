@@ -94,6 +94,8 @@ static void dwbuf_patch_u32(dwbuf_t *b, size_t off, uint32_t v) {
 #define DW_TAG_union_type       0x17
 #define DW_TAG_subroutine_type  0x15
 #define DW_TAG_unspecified_parameters 0x18
+#define DW_TAG_restrict_type    0x37
+#define DW_TAG_unspecified_type 0x3b
 
 /* Attributes */
 #define DW_AT_name              0x03
@@ -143,6 +145,11 @@ static void dwbuf_patch_u32(dwbuf_t *b, size_t off, uint32_t v) {
 #define DW_OP_fbreg  0x91
 #define DW_OP_addr   0x03
 #define DW_OP_reg0   0x50  /* DW_OP_reg0..reg31 */
+#define DW_OP_breg0  0x70  /* DW_OP_breg0..breg31: base reg + SLEB offset */
+#define DW_OP_regx   0x90  /* ULEB reg number */
+#define DW_OP_bregx  0x92  /* ULEB reg number + SLEB offset */
+#define DW_OP_deref  0x06
+#define DW_OP_plus_uconst 0x23  /* ULEB constant added to top of stack */
 #define DW_OP_call_frame_cfa 0x9c
 
 /* Line number standard opcodes */

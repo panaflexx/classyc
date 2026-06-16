@@ -1099,6 +1099,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
         dwbuf_uleb(&dw_abbrev, DW_AT_name);      dwbuf_uleb(&dw_abbrev, DW_FORM_string);
         dwbuf_uleb(&dw_abbrev, DW_AT_decl_line); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, DW_AT_type);      dwbuf_uleb(&dw_abbrev, DW_FORM_ref4);
         dwbuf_uleb(&dw_abbrev, DW_AT_location);  dwbuf_uleb(&dw_abbrev, DW_FORM_exprloc);
         dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
 
@@ -1108,6 +1109,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
         dwbuf_uleb(&dw_abbrev, DW_AT_name);      dwbuf_uleb(&dw_abbrev, DW_FORM_string);
         dwbuf_uleb(&dw_abbrev, DW_AT_decl_line); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, DW_AT_type);      dwbuf_uleb(&dw_abbrev, DW_FORM_ref4);
         dwbuf_uleb(&dw_abbrev, DW_AT_location);  dwbuf_uleb(&dw_abbrev, DW_FORM_exprloc);
         dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
 
@@ -1118,6 +1120,113 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         dwbuf_uleb(&dw_abbrev, DW_AT_name);      dwbuf_uleb(&dw_abbrev, DW_FORM_string);
         dwbuf_uleb(&dw_abbrev, DW_AT_byte_size); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
         dwbuf_uleb(&dw_abbrev, DW_AT_encoding);  dwbuf_uleb(&dw_abbrev, DW_FORM_data1);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* ---- Type-DIE abbreviations (consumed by emit_type_die below) ---- */
+        /* 6: pointer_type with pointee type */
+        dwbuf_uleb(&dw_abbrev, 6);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_pointer_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_byte_size); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, DW_AT_type);      dwbuf_uleb(&dw_abbrev, DW_FORM_ref4);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* 7: pointer_type to void (no DW_AT_type) */
+        dwbuf_uleb(&dw_abbrev, 7);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_pointer_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_byte_size); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* 8: typedef */
+        dwbuf_uleb(&dw_abbrev, 8);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_typedef);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_name); dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_type); dwbuf_uleb(&dw_abbrev, DW_FORM_ref4);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* 9/10/11: const / volatile / restrict qualified types */
+        dwbuf_uleb(&dw_abbrev, 9);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_const_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_type); dwbuf_uleb(&dw_abbrev, DW_FORM_ref4);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+        dwbuf_uleb(&dw_abbrev, 10);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_volatile_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_type); dwbuf_uleb(&dw_abbrev, DW_FORM_ref4);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+        dwbuf_uleb(&dw_abbrev, 11);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_restrict_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_type); dwbuf_uleb(&dw_abbrev, DW_FORM_ref4);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* 12/13: structure / union type (have children: members) */
+        dwbuf_uleb(&dw_abbrev, 12);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_structure_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_yes);
+        dwbuf_uleb(&dw_abbrev, DW_AT_name);      dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_byte_size); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+        dwbuf_uleb(&dw_abbrev, 13);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_union_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_yes);
+        dwbuf_uleb(&dw_abbrev, DW_AT_name);      dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_byte_size); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* 14: member */
+        dwbuf_uleb(&dw_abbrev, 14);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_member);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_name);                 dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_type);                 dwbuf_uleb(&dw_abbrev, DW_FORM_ref4);
+        dwbuf_uleb(&dw_abbrev, DW_AT_data_member_location); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* 15: enumeration_type (children: enumerators) */
+        dwbuf_uleb(&dw_abbrev, 15);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_enumeration_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_yes);
+        dwbuf_uleb(&dw_abbrev, DW_AT_name);      dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_byte_size); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, DW_AT_type);      dwbuf_uleb(&dw_abbrev, DW_FORM_ref4);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* 16: enumerator */
+        dwbuf_uleb(&dw_abbrev, 16);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_enumerator);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_name);        dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_const_value); dwbuf_uleb(&dw_abbrev, DW_FORM_sdata);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* 17: array_type (children: subrange) */
+        dwbuf_uleb(&dw_abbrev, 17);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_array_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_yes);
+        dwbuf_uleb(&dw_abbrev, DW_AT_type); dwbuf_uleb(&dw_abbrev, DW_FORM_ref4);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* 18: subrange_type with known upper bound */
+        dwbuf_uleb(&dw_abbrev, 18);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_subrange_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_upper_bound); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* 19: subrange_type with unknown bound (no attrs) */
+        dwbuf_uleb(&dw_abbrev, 19);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_subrange_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* 20: unspecified_type (used for void references) */
+        dwbuf_uleb(&dw_abbrev, 20);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_unspecified_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
         dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
 
         /* Null terminator for abbreviation table */
@@ -1157,6 +1266,113 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         /* DW_AT_stmt_list = 0 (offset into .debug_line) */
         dwbuf_u32(&dw_info, 0);
 
+        /* ---- Type DIEs ----
+           Every module debug-type id gets a DIE here (as a child of the
+           compile unit).  Variables, parameters and struct members reference
+           them through DW_AT_type (DW_FORM_ref4, a CU-relative offset).  Those
+           offsets are recorded as fixups and patched once every type DIE has
+           been placed (forward references are therefore fine). */
+        MIR_dbtype_table_t *dbtypes = mod->dbtypes;
+        uint32_t num_types = dbtypes != NULL ? dbtypes->num_types : 0;
+        size_t *type_off = NULL; /* CU-relative offset of each type's DIE */
+        struct dwtype_fixup { size_t pos; uint32_t id; } *tfix = NULL;
+        size_t n_tfix = 0, cap_tfix = 0;
+#define TYPE_REF(TID)                                                              \
+        do {                                                                       \
+            if (n_tfix == cap_tfix) {                                              \
+                cap_tfix = cap_tfix ? cap_tfix * 2 : 64;                           \
+                tfix = realloc(tfix, cap_tfix * sizeof(*tfix));                    \
+            }                                                                      \
+            tfix[n_tfix].pos = dw_info.len; tfix[n_tfix].id = (uint32_t)(TID);     \
+            n_tfix++;                                                              \
+            dwbuf_u32(&dw_info, 0);                                                \
+        } while (0)
+
+        /* unspecified_type DIE: target for void and any unresolved reference */
+        size_t void_off = dw_info.len - cu_start;
+        dwbuf_uleb(&dw_info, 20);
+        if (num_types > 0) {
+            type_off = malloc(num_types * sizeof(size_t));
+            for (uint32_t i = 0; i < num_types; i++) type_off[i] = void_off;
+            for (uint32_t id = 1; id < num_types; id++) {
+                MIR_dbtype_t *t = &dbtypes->types[id];
+                type_off[id] = dw_info.len - cu_start;
+                switch (t->kind) {
+                case MIR_DBT_BASE:
+                    dwbuf_uleb(&dw_info, 5);
+                    dwbuf_str(&dw_info, t->name ? t->name : "");
+                    dwbuf_uleb(&dw_info, t->byte_size);
+                    dwbuf_u8(&dw_info, (uint8_t)(t->u.base.encoding ? t->u.base.encoding
+                                                                    : DW_ATE_signed));
+                    break;
+                case MIR_DBT_PTR:
+                    if (t->u.ref.target_id == 0) {
+                        dwbuf_uleb(&dw_info, 7); /* pointer to void */
+                        dwbuf_uleb(&dw_info, t->byte_size ? t->byte_size : 8);
+                    } else {
+                        dwbuf_uleb(&dw_info, 6);
+                        dwbuf_uleb(&dw_info, t->byte_size ? t->byte_size : 8);
+                        TYPE_REF(t->u.ref.target_id);
+                    }
+                    break;
+                case MIR_DBT_TYPEDEF:
+                    dwbuf_uleb(&dw_info, 8);
+                    dwbuf_str(&dw_info, t->name ? t->name : "");
+                    TYPE_REF(t->u.ref.target_id);
+                    break;
+                case MIR_DBT_CONST:
+                    dwbuf_uleb(&dw_info, 9); TYPE_REF(t->u.ref.target_id); break;
+                case MIR_DBT_VOLATILE:
+                    dwbuf_uleb(&dw_info, 10); TYPE_REF(t->u.ref.target_id); break;
+                case MIR_DBT_RESTRICT:
+                    dwbuf_uleb(&dw_info, 11); TYPE_REF(t->u.ref.target_id); break;
+                case MIR_DBT_STRUCT:
+                case MIR_DBT_UNION:
+                    dwbuf_uleb(&dw_info, t->kind == MIR_DBT_STRUCT ? 12 : 13);
+                    dwbuf_str(&dw_info, t->name ? t->name : "");
+                    dwbuf_uleb(&dw_info, t->byte_size);
+                    for (uint32_t mi = 0; mi < t->u.aggregate.num_members; mi++) {
+                        MIR_dbmember_t *mb = &t->u.aggregate.members[mi];
+                        dwbuf_uleb(&dw_info, 14);
+                        dwbuf_str(&dw_info, mb->name ? mb->name : "");
+                        TYPE_REF(mb->type_id);
+                        dwbuf_uleb(&dw_info, mb->byte_offset);
+                    }
+                    dwbuf_u8(&dw_info, 0); /* end of members */
+                    break;
+                case MIR_DBT_ENUM:
+                    dwbuf_uleb(&dw_info, 15);
+                    dwbuf_str(&dw_info, t->name ? t->name : "");
+                    dwbuf_uleb(&dw_info, t->byte_size ? t->byte_size : 4);
+                    TYPE_REF(t->u.enumeration.underlying_id);
+                    for (uint32_t ei = 0; ei < t->u.enumeration.num_enumerators; ei++) {
+                        MIR_dbenumerator_t *en = &t->u.enumeration.enumerators[ei];
+                        dwbuf_uleb(&dw_info, 16);
+                        dwbuf_str(&dw_info, en->name ? en->name : "");
+                        dwbuf_sleb(&dw_info, en->value);
+                    }
+                    dwbuf_u8(&dw_info, 0); /* end of enumerators */
+                    break;
+                case MIR_DBT_ARRAY:
+                    dwbuf_uleb(&dw_info, 17);
+                    TYPE_REF(t->u.array.element_id);
+                    if (t->u.array.count >= 0) { /* upper_bound = count - 1 */
+                        dwbuf_uleb(&dw_info, 18);
+                        dwbuf_uleb(&dw_info,
+                                   (uint64_t)(t->u.array.count > 0 ? t->u.array.count - 1 : 0));
+                    } else {
+                        dwbuf_uleb(&dw_info, 19); /* unknown bound */
+                    }
+                    dwbuf_u8(&dw_info, 0); /* end of subranges */
+                    break;
+                default:
+                    /* MIR_DBT_FUNC / unknown: fall back to void (unspecified). */
+                    type_off[id] = void_off;
+                    break;
+                }
+            }
+        }
+
         /* Emit a DW_TAG_subprogram for each function */
         for (size_t fi = 0; fi < n_funcs; fi++) {
             func_entry_t *fe = &funcs[fi];
@@ -1192,19 +1408,46 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
                     dwbuf_uleb(&dw_info, v->is_param ? 3 : 4);
                     dwbuf_str(&dw_info, v->source_name); /* DW_AT_name */
                     dwbuf_uleb(&dw_info, v->decl_line); /* DW_AT_decl_line */
-                    /* DW_AT_location */
-                    if (v->loc_kind == MIR_DBLOC_FRAME) {
+                    TYPE_REF(v->type_id); /* DW_AT_type (patched below) */
+                    /* DW_AT_location.
+                       Prefer the machine location resolved by the code
+                       generator (mir-gen, after register allocation); fall
+                       back to the front-end's MIR-level intent. */
+                    dwbuf_t loc; dwbuf_init(&loc);
+                    if (v->mach_kind == MIR_DBMACH_MEM) {
+                        /* [base reg + offset]: DW_OP_bregN <sleb offset> */
+                        if (v->mach_reg < 32) {
+                            dwbuf_u8(&loc, (uint8_t)(DW_OP_breg0 + v->mach_reg));
+                        } else {
+                            dwbuf_u8(&loc, DW_OP_bregx);
+                            dwbuf_uleb(&loc, v->mach_reg);
+                        }
+                        dwbuf_sleb(&loc, v->mach_offset);
+                        if (v->mach_deref) {
+                            /* Aggregate reached through a spilled frame pointer:
+                               [[base+offset]] + offset2. */
+                            dwbuf_u8(&loc, DW_OP_deref);
+                            if (v->mach_offset2 != 0) {
+                                dwbuf_u8(&loc, DW_OP_plus_uconst);
+                                dwbuf_uleb(&loc, (uint64_t)(uint32_t) v->mach_offset2);
+                            }
+                        }
+                    } else if (v->mach_kind == MIR_DBMACH_REG) {
+                        /* Whole value in a register: DW_OP_regN */
+                        if (v->mach_reg < 32) {
+                            dwbuf_u8(&loc, (uint8_t)(DW_OP_reg0 + v->mach_reg));
+                        } else {
+                            dwbuf_u8(&loc, DW_OP_regx);
+                            dwbuf_uleb(&loc, v->mach_reg);
+                        }
+                    } else if (v->loc_kind == MIR_DBLOC_FRAME) {
                         /* DW_OP_fbreg <offset> */
-                        dwbuf_t loc; dwbuf_init(&loc);
                         dwbuf_u8(&loc, DW_OP_fbreg);
                         dwbuf_sleb(&loc, v->loc.frame_offset);
-                        dwbuf_uleb(&dw_info, loc.len);
-                        dwbuf_bytes(&dw_info, loc.data, loc.len);
-                        dwbuf_free(&loc);
-                    } else {
-                        /* For register vars, emit a 0-length location (optimized out) */
-                        dwbuf_uleb(&dw_info, 0);
                     }
+                    dwbuf_uleb(&dw_info, loc.len); /* exprloc length (0 = unavailable) */
+                    if (loc.len > 0) dwbuf_bytes(&dw_info, loc.data, loc.len);
+                    dwbuf_free(&loc);
                 }
             }
 
@@ -1212,6 +1455,18 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         }
 
         dwbuf_u8(&dw_info, 0); /* end of compile_unit children */
+
+        /* Resolve every DW_AT_type reference now that all type DIE offsets are
+           known.  Out-of-range ids degrade to the void/unspecified DIE. */
+        for (size_t i = 0; i < n_tfix; i++) {
+            uint32_t off = (type_off != NULL && tfix[i].id < num_types)
+                             ? (uint32_t) type_off[tfix[i].id]
+                             : (uint32_t) void_off;
+            dwbuf_patch_u32(&dw_info, tfix[i].pos, off);
+        }
+        free(tfix);
+        free(type_off);
+#undef TYPE_REF
 
         /* Patch CU length (excludes the 4-byte length field itself) */
         uint32_t cu_len = (uint32_t)(dw_info.len - cu_start - 4);

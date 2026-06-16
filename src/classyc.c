@@ -20895,6 +20895,106 @@ static MIR_dbtype_id_t dbinfo_lower_type_impl (c2m_ctx_t c2m_ctx, MIR_module_t m
 }
 
 /* Emit MIR_dbvar_t records for all parameters and locals of the current function. */
+/* Emit one source-level variable (parameter or local) into the function's
+   debug info.  The MIR register name is reconstructed with the *same* rules
+   used during code generation (see the N_ID case in gen() and get_param_name),
+   so the code generator can later resolve it to a concrete machine location. */
+static void dbinfo_emit_var (c2m_ctx_t c2m_ctx, MIR_module_t mod, MIR_func_t func, node_t id,
+                             decl_t d, int is_param) {
+  MIR_context_t ctx = c2m_ctx->ctx;
+  struct type *type = d->decl_spec.type;
+  pos_t pos = POS (id);
+  struct node_scope *ns = d->scope ? d->scope->attr : NULL;
+  unsigned scope_num = ns ? ns->func_scope_num : 0;
+  MIR_dbvar_t dv;
+
+  memset (&dv, 0, sizeof (dv));
+  dv.source_name = id->u.s.s;
+  dv.type_id = dbinfo_lower_type (c2m_ctx, mod, type);
+  dv.scope_num = scope_num;
+  dv.decl_line = pos.lno > 0 ? (uint32_t) pos.lno : 0;
+  dv.decl_col = pos.ln_pos > 0 ? (uint16_t) pos.ln_pos : 0;
+  dv.decl_file_id = (pos.fname != NULL) ? MIR_module_add_source_file (ctx, mod, pos.fname) : 0;
+  dv.is_param = is_param ? 1 : 0;
+  if (d->reg_p) {
+    /* Scalar kept in a MIR register.  Reconstruct the register name exactly as
+       gen()/get_param_name() does so mir-gen can match and resolve it. */
+    const char *mir_name;
+    if (is_param) {
+      mir_name = get_param_name (c2m_ctx, type, id->u.s.s);
+    } else {
+      MIR_type_t t = promote_mir_int_type (get_mir_type (c2m_ctx, type));
+      mir_name = get_reg_var_name (c2m_ctx, t, id->u.s.s, scope_num);
+    }
+    dv.loc_kind = MIR_DBLOC_REG;
+    dv.loc.reg_name = mir_name;
+  } else {
+    /* Aggregate / address-taken variable living in the frame at [fp + offset]. */
+    dv.loc_kind = MIR_DBLOC_FRAME;
+    dv.loc.frame_offset = (int64_t) d->offset;
+  }
+  MIR_dbinfo_add_var (ctx, func, &dv);
+}
+
+/* True for a declaration that has its own storage outside the function frame
+   (globals, static and extern locals): those are not described here. */
+static int dbinfo_local_skip_p (c2m_ctx_t c2m_ctx, decl_t d) {
+  if (d == NULL || d->decl_spec.typedef_p) return 1;
+  if (d->decl_spec.type == NULL || d->decl_spec.type->mode == TM_FUNC) return 1;
+  if (d->scope == top_scope || d->decl_spec.static_p
+      || d->decl_spec.linkage != N_IGNORE)
+    return 1;
+  return 0;
+}
+
+/* Recursively collect local variable declarations from the statement subtree
+   rooted at N.  Only the statement node types that can introduce declarations
+   are traversed; nested function/lambda bodies are intentionally not entered. */
+static void dbinfo_walk_stmt (c2m_ctx_t c2m_ctx, MIR_module_t mod, MIR_func_t func, node_t n) {
+  if (n == NULL || n->code == N_IGNORE) return;
+  switch (n->code) {
+  case N_SPEC_DECL: {
+    decl_t d = n->attr;
+    node_t declr = NL_EL (n->u.ops, 1);
+    node_t id = (declr != NULL && declr->code == N_DECL) ? NL_HEAD (declr->u.ops) : NULL;
+    if (id != NULL && id->code == N_ID && !dbinfo_local_skip_p (c2m_ctx, d))
+      dbinfo_emit_var (c2m_ctx, mod, func, id, d, 0);
+    break;
+  }
+  case N_LIST:
+    for (node_t e = NL_HEAD (n->u.ops); e != NULL; e = NL_NEXT (e))
+      dbinfo_walk_stmt (c2m_ctx, mod, func, e);
+    break;
+  case N_BLOCK:
+    dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 1)); /* declaration|stmt list */
+    break;
+  case N_IF: { /* labels, expr, then, else? */
+    node_t then_s = NL_EL (n->u.ops, 2);
+    dbinfo_walk_stmt (c2m_ctx, mod, func, then_s);
+    dbinfo_walk_stmt (c2m_ctx, mod, func, NL_NEXT (then_s));
+    break;
+  }
+  case N_SWITCH:
+  case N_WHILE:
+  case N_DO: /* labels, expr, stmt (DO: labels, stmt, expr) */
+    dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 2));
+    dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 1));
+    break;
+  case N_FOR: /* labels, init, cond, iter, stmt */
+    dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 1)); /* init declarations */
+    dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 4)); /* body */
+    break;
+  case N_FORIN: /* labels, var_id, val_id, collection, body */
+    dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 4));
+    break;
+  case N_DEFER: /* labels, stmt */
+    dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 1));
+    break;
+  default:
+    break;
+  }
+}
+
 void dbinfo_emit_func_vars (c2m_ctx_t c2m_ctx, node_t func_def_node) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
@@ -20903,7 +21003,6 @@ void dbinfo_emit_func_vars (c2m_ctx_t c2m_ctx, node_t func_def_node) {
   decl_t func_decl = func_def_node->attr;
   struct type *decl_type = func_decl->decl_spec.type;
   struct func_type *ft = decl_type->u.func_type;
-  (void) ft; /* used below */
 
   if (mod == NULL || func == NULL) return;
 
@@ -20916,86 +21015,13 @@ void dbinfo_emit_func_vars (c2m_ctx_t c2m_ctx, node_t func_def_node) {
       node_t p_decl = NL_EL (p->u.ops, 1);
       node_t p_id = (p_decl != NULL && p_decl->code == N_DECL) ? NL_HEAD (p_decl->u.ops) : NULL;
       if (p_id == NULL || p_id->code != N_ID) continue;
-      pos_t pos = POS (p_id);
-      struct node_scope *pns = pd->scope ? pd->scope->attr : NULL;
-      unsigned scope_num = pns ? pns->func_scope_num : 0;
-      MIR_type_t promoted = get_mir_type (c2m_ctx, pd->decl_spec.type);
-      const char *mir_name = get_reg_var_name (c2m_ctx, promoted, p_id->u.s.s, scope_num);
-
-      MIR_dbvar_t dv;
-      memset (&dv, 0, sizeof (dv));
-      dv.source_name = p_id->u.s.s;
-      dv.type_id = dbinfo_lower_type (c2m_ctx, mod, pd->decl_spec.type);
-      dv.loc_kind = MIR_DBLOC_REG;
-      dv.loc.reg_name = mir_name;
-      dv.scope_num = scope_num;
-      dv.decl_line = pos.lno > 0 ? (uint32_t) pos.lno : 0;
-      dv.decl_col = pos.ln_pos > 0 ? (uint16_t) pos.ln_pos : 0;
-      dv.decl_file_id = (pos.fname != NULL && mod != NULL)
-                           ? MIR_module_add_source_file (ctx, mod, pos.fname) : 0;
-      dv.is_param = 1;
-      MIR_dbinfo_add_var (ctx, func, &dv);
+      dbinfo_emit_var (c2m_ctx, mod, func, p_id, pd, 1);
     }
   }
 
-  /* Locals: walk func_decls_for_allocation (populated during check) */
-  check_ctx_t check_ctx = c2m_ctx->check_ctx;
-  for (size_t i = 0; i < VARR_LENGTH (decl_t, func_decls_for_allocation); i++) {
-    decl_t d = VARR_GET (decl_t, func_decls_for_allocation, i);
-    if (d == NULL || d->decl_spec.typedef_p) continue;
-    /* Find the id node from the decl's scope — look through spec_decl nodes */
-    node_t scope = d->scope;
-    struct node_scope *ns = scope ? scope->attr : NULL;
-    unsigned scope_num = ns ? ns->func_scope_num : 0;
-
-    /* We need the source name. The decl was created from a N_SPEC_DECL whose
-       child[1] is N_DECL whose child[0] is N_ID.  We can find it by searching
-       for the name in the decl's MIR reg name. */
-    const char *source_name = NULL;
-    /* Try to extract from func_decls_for_allocation entries — these all have ids */
-    /* The decl was pushed during create_decl which set decl_node->attr = decl.
-       We don't have a back-pointer to the node, so derive the name from the MIR reg name. */
-    if (d->reg_p) {
-      /* Register var: name is encoded as {type_prefix}{scope_num}_{name} */
-      MIR_type_t promoted = get_mir_type (c2m_ctx, d->decl_spec.type);
-      /* We need the original name. For locals created via VARR_PUSH to
-         func_decls_for_allocation, the name comes from their ID node.
-         The simplest approach: iterate func->vars to find a matching reg. */
-      for (size_t vi = func->nargs; vi < VARR_LENGTH (MIR_var_t, func->vars); vi++) {
-        MIR_var_t mv = VARR_GET (MIR_var_t, func->vars, vi);
-        /* MIR local names look like "I0_x", "U0_y", etc. Extract after underscore. */
-        const char *underscore = strchr (mv.name, '_');
-        if (underscore != NULL) {
-          const char *candidate = underscore + 1;
-          /* Match if it could be this decl's scope */
-          MIR_dbvar_t dv;
-          memset (&dv, 0, sizeof (dv));
-          dv.source_name = candidate;
-          dv.type_id = dbinfo_lower_type (c2m_ctx, mod, d->decl_spec.type);
-          dv.loc_kind = MIR_DBLOC_REG;
-          dv.loc.reg_name = mv.name;
-          dv.scope_num = scope_num;
-          dv.decl_file_id = 0;
-          dv.is_param = 0;
-          MIR_dbinfo_add_var (ctx, func, &dv);
-          source_name = candidate; /* mark as found */
-          break;
-        }
-      }
-    } else {
-      /* Frame variable at FP + offset */
-      /* Same issue: need source name. Derive from the first matching VARR entry or skip. */
-      MIR_dbvar_t dv;
-      memset (&dv, 0, sizeof (dv));
-      dv.source_name = NULL; /* unknown — we'll improve this later */
-      dv.type_id = dbinfo_lower_type (c2m_ctx, mod, d->decl_spec.type);
-      dv.loc_kind = MIR_DBLOC_FRAME;
-      dv.loc.frame_offset = (int64_t) d->offset;
-      dv.scope_num = scope_num;
-      dv.is_param = 0;
-      MIR_dbinfo_add_var (ctx, func, &dv);
-    }
-  }
+  /* Locals: walk the function body AST so every declaration is described with
+     its real source name, type and declaration position. */
+  dbinfo_walk_stmt (c2m_ctx, mod, func, FUNC_DEF_BLOCK (func_def_node));
 }
 
 #endif /* !MIR_NO_DBINFO */
