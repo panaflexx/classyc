@@ -40,11 +40,11 @@ echo "=== Building classyc jitrunner ==="
 
 # 1. Compile mir-bridge.c with gcc (needs real MIR headers + macros)
 echo "[1/4] Compiling mir-bridge.c (gcc)..."
-"$CC" -O2 -I "$MIR_DIR" -I "$INC_DIR" -c "$SRC/mir-bridge.c" -o "$WORK_DIR/mir-bridge.o"
+"$CC" -g -O2 -I "$MIR_DIR" -I "$INC_DIR" -c "$SRC/mir-bridge.c" -o "$WORK_DIR/mir-bridge.o"
 
 # 2. Compile jitrunner.c with classyc → .bmir
 echo "[2/4] Compiling jitrunner.c (classyc → bmir)..."
-"$CLASSYC" -c -o "$WORK_DIR/jitrunner.bmir" "$SRC/jitrunner.c"
+"$CLASSYC" -g -c -o "$WORK_DIR/jitrunner.bmir" "$SRC/jitrunner.c"
 
 # 3. Convert .bmir → .o
 echo "[3/4] Converting jitrunner.bmir → .o (b2obj)..."
@@ -54,14 +54,14 @@ echo "[3/4] Converting jitrunner.bmir → .o (b2obj)..."
 RT_OBJ=""
 if [ -f "src/mir-aot-runtime.c" ]; then
     echo "[3.5/4] Compiling AOT runtime..."
-    "$CC" -O2 -I "$INC_DIR" -c src/mir-aot-runtime.c -o "$WORK_DIR/mir-aot-runtime.o"
+    "$CC" -O2 -I "$INC_DIR" -g -c src/mir-aot-runtime.c -o "$WORK_DIR/mir-aot-runtime.o"
     RT_OBJ="$WORK_DIR/mir-aot-runtime.o"
 fi
 
 # 5. Link everything
 echo "[4/4] Linking jitrunner..."
 LINK_CMD=(
-    "$CC" -no-pie -o "$OUT_DIR/jitrunner"
+    "$CC" -no-pie -g -o "$OUT_DIR/jitrunner"
     "$WORK_DIR/jitrunner.o"
     "$WORK_DIR/mir-bridge.o"
 )

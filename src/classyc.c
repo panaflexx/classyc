@@ -10627,8 +10627,31 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
       }
       if (declarator->code == N_DECL) {
         def_symbol (c2m_ctx, S_REGULAR, id, scope, decl_node, decl->decl_spec.linkage);
-        if (scope != top_scope && decl->decl_spec.linkage == N_EXTERN)
-          def_symbol (c2m_ctx, S_REGULAR, id, top_scope, decl_node, N_EXTERN);
+        /* A block-scope `extern` declaration also refers to the file-scope
+           identifier, so it is mirrored into top_scope.
+
+           This must NOT apply to ordinary class/struct/union member methods: a
+           class method has external linkage but is intentionally scoped to its
+           class (decl_scope == class node) so that a bare identifier never
+           resolves to it.  Mirroring it to top_scope would let a plain call like
+           `close(fd)` (meant for POSIX close) resolve to the method `File::close`
+           and crash.  Instance/static methods are reached only via `obj.method`,
+           `Class.method`, or the duck-typed protocol lookup, all of which search
+           the class scope directly.
+
+           Constructors and destructors are the exception: `new T(...)` and
+           `delete obj` resolve `__ctor_T` / `__dtor_T` through the lexical scope
+           chain (curr_scope -> ... -> top_scope), so those synthesized,
+           prefix-namespaced symbols must still be mirrored to top_scope. */
+        if (scope != top_scope && decl->decl_spec.linkage == N_EXTERN) {
+          int member_scope_p = (scope->code == N_CLASS || scope->code == N_STRUCT
+                                || scope->code == N_UNION);
+          int ctor_dtor_p = (id->code == N_ID && id->u.s.s != NULL
+                             && (strncmp (id->u.s.s, "__ctor_", 7) == 0
+                                 || strncmp (id->u.s.s, "__dtor_", 7) == 0));
+          if (!member_scope_p || ctor_dtor_p)
+            def_symbol (c2m_ctx, S_REGULAR, id, top_scope, decl_node, N_EXTERN);
+        }
         if (func_p && decl->decl_spec.thread_local_p) {
           error (c2m_ctx, POS (id), "thread local function declaration");
           if (c2m_options->message_file != NULL) {
@@ -12374,80 +12397,94 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
           break;
         } else if (t1->mode != TM_DICT && !symbol_find (c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &sym) &&
             !(func = find_def(c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &func_op)) )  {
-            // FIXME: Needs to be able to find clsss cuntions
-             if (t1->mode != TM_DICT) {
-               if (t1->mode == TM_CLASS) {
-                 /* TM_CLASS namespace static: variants dict member or bare variant as const */
-                 node_t class_node = t1->u.tag_type;
-                 symbol_t vsym;
-                 if (symbol_find(c2m_ctx, S_REGULAR, op2, class_node, &vsym)) {
-                   decl = vsym.def_node->attr;
-                   if (decl) {
-                     *e->type = *decl->decl_spec.type;
-                     e->u.lvalue_node = vsym.def_node;
-                     r->attr = e;
-                     break;
-                   }
-                 }
-                 /* Declarative-dict variant sugar:  ClassName.Variant resolves
-                    to the integer  variants["Variant"]["value"]  at compile
-                    time, for use in constant contexts (case labels, etc.). */
-                 node_t v_id = build_id(c2m_ctx, "variants", POS(op2));
-                 symbol_t vsym2;
-                 node_t valnode = NULL;
-                 if (symbol_find(c2m_ctx, S_REGULAR, v_id, class_node, &vsym2)) {
-                   node_t vd = vsym2.def_node;
-                   node_t vi = vd ? MEMBER_INIT(vd) : NULL;
-                   node_t found_sub = NULL;
-                   if (vi && vi->code == N_LIST) {
-                     for (node_t ii = NL_HEAD(vi->u.ops); ii != NULL; ii = NL_NEXT(ii)) {
-                       if (ii->code != N_INIT) continue;
-                       node_t dlist = NL_HEAD(ii->u.ops);
-                       node_t fid = dlist ? NL_HEAD(dlist->u.ops) : NULL;
-                       node_t kn = (fid && fid->code == N_FIELD_ID) ? NL_HEAD(fid->u.ops) : NULL;
-                       if (kn && (kn->code == N_STR || kn->code == N_ID)
-                           && strcmp(kn->u.s.s, op2->u.s.s) == 0) {
-                         found_sub = NL_NEXT(dlist);
-                         break;
-                       }
-                     }
-                   }
-                   if (found_sub && found_sub->code == N_LIST) {
-                     for (node_t si = NL_HEAD(found_sub->u.ops); si != NULL; si = NL_NEXT(si)) {
-                       if (si->code != N_INIT) continue;
-                       node_t sdlist = NL_HEAD(si->u.ops);
-                       node_t sfid = sdlist ? NL_HEAD(sdlist->u.ops) : NULL;
-                       node_t sk = (sfid && sfid->code == N_FIELD_ID) ? NL_HEAD(sfid->u.ops) : NULL;
-                       if (sk && (sk->code == N_STR || sk->code == N_ID)
-                           && strcmp(sk->u.s.s, "value") == 0) {
-                         valnode = NL_NEXT(sdlist);
-                         break;
-                       }
-                     }
-                   }
-                 }
-                 if (valnode != NULL && valnode->code != N_LIST) {
-                   check(c2m_ctx, valnode, r); /* ensure const expr attr is set */
-                   struct expr *vve = valnode->attr;
-                   if (vve != NULL && vve->const_p && integer_type_p(vve->type)) {
-                     e->const_p = TRUE;
-                     e->c.i_val = vve->c.i_val;
-                     e->type->mode = TM_BASIC;
-                     e->type->u.basic_type = TP_INT;
-                     e->u.lvalue_node = NULL;
-                     r->attr = e;
-                     break;
-                   }
-                 }
-                 error (c2m_ctx, POS (r), "%s has no member %s", "class", op2->u.s.s);
-                 break;
-               } else {
-                 error (c2m_ctx, POS (r), "%s has no member %s", t1->mode == TM_STRUCT ? "struct" : t1->mode == TM_UNION ?"union" : "class",
-                    op2->u.s.s);
-                 break;
-               }
-             }
-             break;
+            /* TM_CLASS namespace: first look for a static or instance method
+               (ClassName.method or obj.method).  Only fall back to variant
+               sugar / error if nothing is found. */
+            if (t1->mode == TM_CLASS) {
+              node_t class_node = t1->u.tag_type;
+              symbol_t msym;
+              node_t mfunc = NULL, mfunc_op = NULL;
+              if (symbol_find(c2m_ctx, S_REGULAR, op2, class_node, &msym)) {
+                if (msym.def_node && msym.def_node->code == N_FUNC_DEF) {
+                  mfunc = msym.def_node;
+                } else if (msym.def_node && msym.def_node->code == N_MEMBER) {
+                  decl = msym.def_node->attr;
+                  if (decl) {
+                    *e->type = *decl->decl_spec.type;
+                    e->u.lvalue_node = msym.def_node;
+                    r->attr = e;
+                    break;
+                  }
+                }
+              }
+              if (!mfunc) {
+                mfunc = find_def(c2m_ctx, S_REGULAR, op2, class_node, &mfunc_op);
+              }
+              if (mfunc && mfunc->code == N_FUNC_DEF) {
+                func = mfunc;
+                func_op = mfunc_op;
+                /* fall through to the func handling below */
+              } else {
+                /* Declarative-dict variant sugar:  ClassName.Variant resolves
+                   to the integer  variants["Variant"]["value"]  at compile
+                   time, for use in constant contexts (case labels, etc.). */
+                node_t v_id = build_id(c2m_ctx, "variants", POS(op2));
+                symbol_t vsym2;
+                node_t valnode = NULL;
+                if (symbol_find(c2m_ctx, S_REGULAR, v_id, class_node, &vsym2)) {
+                  node_t vd = vsym2.def_node;
+                  node_t vi = vd ? MEMBER_INIT(vd) : NULL;
+                  node_t found_sub = NULL;
+                  if (vi && vi->code == N_LIST) {
+                    for (node_t ii = NL_HEAD(vi->u.ops); ii != NULL; ii = NL_NEXT(ii)) {
+                      if (ii->code != N_INIT) continue;
+                      node_t dlist = NL_HEAD(ii->u.ops);
+                      node_t fid = dlist ? NL_HEAD(dlist->u.ops) : NULL;
+                      node_t kn = (fid && fid->code == N_FIELD_ID) ? NL_HEAD(fid->u.ops) : NULL;
+                      if (kn && (kn->code == N_STR || kn->code == N_ID)
+                          && strcmp(kn->u.s.s, op2->u.s.s) == 0) {
+                        found_sub = NL_NEXT(dlist);
+                        break;
+                      }
+                    }
+                  }
+                  if (found_sub && found_sub->code == N_LIST) {
+                    for (node_t si = NL_HEAD(found_sub->u.ops); si != NULL; si = NL_NEXT(si)) {
+                      if (si->code != N_INIT) continue;
+                      node_t sdlist = NL_HEAD(si->u.ops);
+                      node_t sfid = sdlist ? NL_HEAD(sdlist->u.ops) : NULL;
+                      node_t sk = (sfid && sfid->code == N_FIELD_ID) ? NL_HEAD(sfid->u.ops) : NULL;
+                      if (sk && (sk->code == N_STR || sk->code == N_ID)
+                          && strcmp(sk->u.s.s, "value") == 0) {
+                        valnode = NL_NEXT(sdlist);
+                        break;
+                      }
+                    }
+                  }
+                }
+                if (valnode != NULL && valnode->code != N_LIST) {
+                  check(c2m_ctx, valnode, r); /* ensure const expr attr is set */
+                  struct expr *vve = valnode->attr;
+                  if (vve != NULL && vve->const_p && integer_type_p(vve->type)) {
+                    e->const_p = TRUE;
+                    e->c.i_val = vve->c.i_val;
+                    e->type->mode = TM_BASIC;
+                    e->type->u.basic_type = TP_INT;
+                    e->u.lvalue_node = NULL;
+                    r->attr = e;
+                    break;
+                  }
+                }
+                error (c2m_ctx, POS (r), "class has no member %s", op2->u.s.s);
+                break;
+              }
+            } else {
+              error (c2m_ctx, POS (r), "%s has no member %s",
+                     t1->mode == TM_STRUCT ? "struct" : t1->mode == TM_UNION ? "union" : "class",
+                     op2->u.s.s);
+              break;
+            }
+            break;
           }
          if (t1->mode == TM_DICT) {
            e = create_expr(c2m_ctx, r);
@@ -13539,7 +13576,25 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
     curr_switch = curr_loop = curr_loop_switch = NULL;
     curr_call_arg_area_offset = 0;
     VARR_TRUNC(decl_t, func_decls_for_allocation, 0);
-    create_decl(c2m_ctx, top_scope, r, decl_spec, NULL, FALSE);
+
+    /* Determine insertion scope: use the class node itself as the scope key
+       for any method (static or instance) so bare identifiers never resolve
+       to them.  Lookups in N_FIELD already use t1->u.tag_type directly. */
+    node_t decl_scope = top_scope;
+    if (curr_class != NULL) {
+      node_t class_tag = (curr_class->code == N_CLASS) ? curr_class : NULL;
+      if (!class_tag) {
+        node_t cid = NL_HEAD(curr_class->u.ops);
+        if (cid && cid->code == N_ID) {
+          class_tag = find_def(c2m_ctx, S_REGULAR, cid, curr_scope, NULL);
+          if (!class_tag) class_tag = find_def(c2m_ctx, S_TAG, cid, curr_scope, NULL);
+        }
+      }
+      if (class_tag && class_tag->code == N_CLASS) {
+        decl_scope = class_tag;
+      }
+    }
+    create_decl(c2m_ctx, decl_scope, r, decl_spec, NULL, FALSE);
 
     /* Lambda return-type inference: lambdas are emitted with 'static auto' specs
        and no explicit type specifier.  After create_decl sets the return type to

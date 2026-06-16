@@ -858,6 +858,10 @@ C2M_DICT_API DictValue *dict_parse_value(DictJsonParser *p) {
     } else if ((c == '-') || (c >= '0' && c <= '9')) {
         double num;
         if (!dict_parse_number(p, &num)) return NULL;
+        /* Use DICT_INT64 when the value is an exact integer (no fractional part)
+           so that ClassyC dict field reads work correctly via the i64 union slot. */
+        if (num >= (double)INT64_MIN && num <= (double)INT64_MAX && num == (double)(int64_t)num)
+            return dict_create_int64((int64_t)num);
         return dict_create_number(num);
     } else if (dict_parse_literal(p, "true")) {
         return dict_create_bool(1);

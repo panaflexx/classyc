@@ -20,6 +20,8 @@
 #include <string.h>
 #include "include/file.h"
 #include "include/term.h"
+#include <stdlib.h>
+#include <fcntl.h>  /* for F_GETFL, F_SETFL, O_NONBLOCK */
 
 /* Declare POSIX functions we need without pulling in <unistd.h>
    (which conflicts with File::write). */
@@ -32,12 +34,32 @@ extern int    waitpid(int pid, int *status, int options);
 extern int    dup(int fd);
 extern int    dup2(int oldfd, int newfd);
 
+/* For output capture in run_bmir (DAP mode) */
+extern int    pipe(int pipefd[2]);
+extern int    fcntl(int fd, int cmd, ...);
+
+/* For DAP debug logging to dapdebug.log */
+/*
+#define O_WRONLY   1
+#define O_CREAT    64
+#define O_APPEND   1024
+extern int open(const char *pathname, int flags, unsigned mode);
+*/
+
+/* waitpid option (WNOHANG not pulled in without sys/wait.h) */
+#ifndef WNOHANG
+#define WNOHANG   1
+#endif
+
 /* inotify */
 extern int    inotify_init(void);
 extern int    inotify_add_watch(int fd, char *path, unsigned mask);
 
 /* time — struct timespec is already visible from libc headers */
 extern int    clock_gettime(int clk_id, void *tp);
+
+/* Output callback for capturing program stdout/stderr (used in DAP mode) */
+typedef void (*OutputCB)(void *user, char *category, char *text);
 
 /* errno */
 extern int   *__errno_location(void);
@@ -81,7 +103,7 @@ class RunConfig {
     int    jit_mode;        /* 0=lazy  1=gen  2=interp                */
     int    verbose;         /* 1 = extra diagnostic output            */
     int    dap_port;        /* >0 = run as DAP server on this port    */
-    int    dap_stdio;       /* 1 = DAP over stdin/stdout (for Zed)    */
+    int dap_stdio;       /* 1 = DAP over stdin/stdout (for Zed)    */
 
     RunConfig() {
         this.bmir_path     = "";
@@ -96,6 +118,9 @@ class RunConfig {
 
     ~RunConfig() {}
 };
+
+/* Global DAP debug log fd, shared with dap.h (declared extern earlier) */
+int dap_logger_fd = -1;
 
 /* ═══════════════════════════════════════════════════════════════════════
    RunResult — outcome of a single JIT execution
@@ -145,24 +170,49 @@ long time_ms(void) {
    JIT execution — fork + JIT in child
    ═══════════════════════════════════════════════════════════════════════ */
 
-RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose) {
+RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb, void *cb_user) {
     RunResult *result = new RunResult();
     long start = time_ms();
 
     if (verbose)
         printf("[jitrunner] loading %s (mode=%d)\n", bmir_path, jit_mode);
 
+    int out_pipe[2] = {-1, -1};
+    int err_pipe[2] = {-1, -1};
+
+    if (out_cb) {
+        if (pipe(out_pipe) < 0 || pipe(err_pipe) < 0) {
+            printf("[jitrunner] error: pipe() failed\n");
+            result->exit_code = 127;
+            result->elapsed_ms = time_ms() - start;
+            return result;
+        }
+    }
+
     int pid = fork();
 
     if (pid < 0) {
         printf("[jitrunner] error: fork() failed\n");
+        if (out_cb) { close(out_pipe[0]); close(out_pipe[1]); close(err_pipe[0]); close(err_pipe[1]); }
         result->exit_code = 127;
         result->elapsed_ms = time_ms() - start;
         return result;
     }
 
     if (pid == 0) {
-        /* ── child process ─────────────────────────────────────────── */
+        /* ── child process ──────────────── */
+        if (out_cb) {
+            /* Redirect stdout(1)/stderr(2) to the pipe write ends so the parent
+               captures the JIT'd program's output, then close all the pipe fds
+               we no longer need in the child. */
+            close(out_pipe[0]);
+            close(err_pipe[0]);
+            dup2(out_pipe[1], 1);
+            dup2(err_pipe[1], 2);
+            close(out_pipe[1]);
+            close(err_pipe[1]);
+        }
+
         JIT_context ctx = jit_init();
         if (!ctx) {
             fprintf(stderr, "[jitrunner] error: jit_init() failed\n");
@@ -212,23 +262,117 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose) {
         int (*entry)(int, char**, char**) = addr;
         int code = entry(0, (char **)0, (char **)0);
 
+        fflush(stdout);
+        fflush(stderr);
+
         jit_gen_finish(ctx);
         jit_finish(ctx);
         _exit(code);
     }
 
-    /* ── parent process ──────────────────────────────────────────── */
-    int status = 0;
-    waitpid(pid, &status, 0);
-    result->elapsed_ms = time_ms() - start;
+    /* ── parent process ───────────────────────── */
+    int out_r = out_pipe[0];
+    int err_r = err_pipe[0];
 
-    if ((status & 0x7f) == 0) {
-        result->exit_code = (status >> 8) & 0xff;
-    } else {
-        result->signal_num = status & 0x7f;
-        result->exit_code  = 128 + result->signal_num;
+    if (out_cb) {
+        /* Close the write ends in the parent so the read ends see EOF once the
+           child exits (and closes its copies). */
+        close(out_pipe[1]);
+        close(err_pipe[1]);
+        /* make read ends non-blocking */
+        int fl = fcntl(out_r, F_GETFL, 0);
+        fcntl(out_r, F_SETFL, fl | O_NONBLOCK);
+        fl = fcntl(err_r, F_GETFL, 0);
+        fcntl(err_r, F_SETFL, fl | O_NONBLOCK);
     }
 
+    if (out_cb) {
+        char buf[4096];
+        int out_open = 1, err_open = 1;
+
+        while (1) {
+            if (out_open) {
+                long n = read(out_r, buf, sizeof(buf) - 1);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    out_cb(cb_user, "stdout", buf);
+                } else if (n == 0) {
+                    out_open = 0;
+                    close(out_r);
+                } else {
+                    if (*__errno_location() != 11 /* EAGAIN */) {
+                        out_open = 0;
+                        close(out_r);
+                    }
+                }
+            }
+            if (err_open) {
+                long n = read(err_r, buf, sizeof(buf) - 1);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    out_cb(cb_user, "stderr", buf);
+                } else if (n == 0) {
+                    err_open = 0;
+                    close(err_r);
+                } else {
+                    if (*__errno_location() != 11 /* EAGAIN */) {
+                        err_open = 0;
+                        close(err_r);
+                    }
+                }
+            }
+
+            int wstatus = 0;
+            int wr = waitpid(pid, &wstatus, WNOHANG);
+            if (wr == pid) {
+                if ((wstatus & 0x7f) == 0) {
+                    result->exit_code = (wstatus >> 8) & 0xff;
+                } else {
+                    result->signal_num = wstatus & 0x7f;
+                    result->exit_code = 128 + result->signal_num;
+                }
+                result->elapsed_ms = time_ms() - start;
+
+                /* drain any remaining output (blocking) */
+                fcntl(out_r, F_SETFL, 0);
+                fcntl(err_r, F_SETFL, 0);
+                if (out_open) {
+                    long n;
+                    while ((n = read(out_r, buf, sizeof(buf)-1)) > 0) {
+                        buf[n] = '\0';
+                        out_cb(cb_user, "stdout", buf);
+                    }
+                    close(out_r);
+                }
+                if (err_open) {
+                    long n;
+                    while ((n = read(err_r, buf, sizeof(buf)-1)) > 0) {
+                        buf[n] = '\0';
+                        out_cb(cb_user, "stderr", buf);
+                    }
+                    close(err_r);
+                }
+                return result;
+            }
+
+            usleep(2000); /* 2ms */
+        }
+    } else {
+        /* original no-capture path */
+        int status = 0;
+        waitpid(pid, &status, 0);
+        result->elapsed_ms = time_ms() - start;
+
+        if ((status & 0x7f) == 0) {
+            result->exit_code = (status >> 8) & 0xff;
+        } else {
+            result->signal_num = status & 0x7f;
+            result->exit_code  = 128 + result->signal_num;
+        }
+        return result;
+    }
+
+    /* unreachable */
     return result;
 }
 
@@ -381,8 +525,8 @@ int dap_main(RunConfig *cfg) {
         if (!bmir_path || strlen(bmir_path) == 0) {
             dap->send_output("stderr",
                 "[jitrunner] error: no program specified in launch request\n");
-            dict exit_body = dict_create_object();
-            dict_object_set(exit_body, "exitCode", dict_create_int64(1));
+            dict exit_body = {"exitCode": 1};
+
             dap->send_event("exited", exit_body);
             dap->send_event_simple("terminated");
         } else {
@@ -390,15 +534,17 @@ int dap_main(RunConfig *cfg) {
             if (!File.exists(bmir_path)) {
                 String errmsg = f"[jitrunner] error: {bmir_path} not found\n";
                 dap->send_output("stderr", (char *)errmsg);
-                dict exit_body2 = dict_create_object();
-                dict_object_set(exit_body2, "exitCode", dict_create_int64(1));
+                dict exit_body2 = {"exitCode": 1};
+
                 dap->send_event("exited", exit_body2);
                 dap->send_event_simple("terminated");
             } else {
                 dap->on_pre_run(bmir_path);
 
                 /* Fork + JIT + run */
-                RunResult *result = run_bmir(bmir_path, cfg->jit_mode, cfg->verbose);
+                RunResult *result = run_bmir(bmir_path, cfg->jit_mode, cfg->verbose,
+                    (void *u, char *cat, char *txt) => { ((DapServer*)u)->send_output(cat, txt); },
+                    (void *)dap);
 
                 /* Print locally too */
                 print_run_result(result);
@@ -631,22 +777,24 @@ int dap_stdio_main(RunConfig *cfg) {
         if (!bmir_path || strlen(bmir_path) == 0) {
             dap->send_output("stderr",
                 "[jitrunner] error: no program specified in launch request\n");
-            dict exit_body = dict_create_object();
-            dict_object_set(exit_body, "exitCode", dict_create_int64(1));
+            dict exit_body = {"exitCode": 1};
+
             dap->send_event("exited", exit_body);
             dap->send_event_simple("terminated");
             exit_code = 1;
         } else if (!File.exists(bmir_path)) {
             String errmsg = f"[jitrunner] error: {bmir_path} not found\n";
             dap->send_output("stderr", (char *)errmsg);
-            dict exit_body2 = dict_create_object();
-            dict_object_set(exit_body2, "exitCode", dict_create_int64(1));
+            dict exit_body2 = {"exitCode": 1};
+
             dap->send_event("exited", exit_body2);
             dap->send_event_simple("terminated");
             exit_code = 1;
         } else {
             dap->on_pre_run(bmir_path);
-            RunResult *result = run_bmir(bmir_path, cfg->jit_mode, cfg->verbose);
+            RunResult *result = run_bmir(bmir_path, cfg->jit_mode, cfg->verbose,
+                (void *u, char *cat, char *txt) => { ((DapServer*)u)->send_output(cat, txt); },
+                (void *)dap);
             dap->on_post_run(result->exit_code, result->signal_num);
             exit_code = result->exit_code;
             delete result;
@@ -710,7 +858,15 @@ int main(int argc, char **argv) {
 
     /* ── DAP stdio mode (for Zed / editor integration) ─────────── */
     /* Skip the banner — stdout is the DAP channel, not a terminal. */
+
     if (cfg->dap_stdio) {
+        /* Open a debug log for all DAP wire traffic (both directions) */
+        dap_logger_fd = open("dapdebug.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (dap_logger_fd < 0) {
+            /* non-fatal: continue without logging */
+            dap_logger_fd = -1;
+        } else {
+        }
         return dap_stdio_main(cfg);
     }
 
@@ -794,7 +950,8 @@ int main(int argc, char **argv) {
         RunResult *result = run_bmir(
             (char *)cfg->bmir_path,
             cfg->jit_mode,
-            cfg->verbose
+            cfg->verbose,
+            NULL, NULL
         );
 
         print_run_result(result);
