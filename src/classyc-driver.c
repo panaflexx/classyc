@@ -61,6 +61,7 @@ typedef pthread_attr_t mir_thread_attr_t;
 #include "real-time.h"
 
 #include "mir-alloc-default.c"
+#include "classyc-stacktrace.h"
 
 struct lib {
   char *name;
@@ -286,6 +287,7 @@ static void init_options (int argc, char *argv[]) {
   options.debug_p = options.verbose_p = options.ignore_warnings_p = FALSE;
   options.asm_p = options.object_p = options.no_prepro_p = options.prepro_only_p = FALSE;
   options.syntax_only_p = options.pedantic_p = FALSE;
+  options.debug_info_p = FALSE;
   gen_debug_level = -1;
   VARR_CREATE (char, temp_string, &default_alloc, 0);
   VARR_CREATE (char_ptr_t, headers, &default_alloc, 0);
@@ -314,6 +316,8 @@ static void init_options (int argc, char *argv[]) {
       options.no_prepro_p = TRUE;
     } else if (strcmp (argv[i], "-pedantic") == 0) {
       options.pedantic_p = TRUE;
+    } else if (strcmp (argv[i], "-g") == 0) {
+      options.debug_info_p = TRUE;
     } else if (strncmp (argv[i], "-O", 2) == 0) {
       optimize_level = argv[i][2] != '\0' ? atoi (&argv[i][2]) : 2;
     } else if (strcmp (argv[i], "-o") == 0) {
@@ -389,6 +393,7 @@ static void init_options (int argc, char *argv[]) {
       fprintf (stderr, "  -fsyntax-only -- check C code correctness only\n");
       fprintf (stderr, "  -fpedantic -- assume strict standard input C code\n");
       fprintf (stderr, "  -w -- do not print any warnings\n");
+      fprintf (stderr, "  -g -- emit source-level debug info (source locations, types, variables)\n");
       fprintf (stderr, "  -S, -c -- generate corresponding textual or binary MIR files\n");
       fprintf (stderr, "  -o file -- put output code into given file\n");
       fprintf (stderr, "  -On -- use given optimization level in MIR-generator\n");
@@ -977,6 +982,14 @@ int main (int argc, char *argv[], char *env[]) {
                   import_resolver);
         if (options.verbose_p)
           fprintf (stderr, "MIR link finish        -- %.0f usec\n", real_usec_time () - start_time);
+        if (options.debug_info_p) {
+          classyc_register_jit_funcs (main_ctx);
+          cstktr_mir_ctx = main_ctx; /* enable lazy lookup for -el/-eb */
+          classyc_install_crash_handlers ();
+          if (options.verbose_p)
+            fprintf (stderr, "stack-trace handlers installed (%zu funcs registered)\n",
+                     cstktr_count);
+        }
         fun_addr = main_func->addr;
         start_time = real_usec_time ();
         result_code = (int) fun_addr (fun_argc, fun_argv, env);

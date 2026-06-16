@@ -12,6 +12,7 @@
 #include <time.h>
 #include "mir-alloc-default.c"
 #include "mir-gen.h"  // mir.h gets included as well
+#include "dwarf-gen.h"
 
 /* Debug tracing: enabled when B2OBJ_DEBUG is set in the environment. */
 static int b2obj_debug = -1;
@@ -480,6 +481,49 @@ static const char *map_symbol(const char *name) {
 }
 
 /* ================================================================== */
+/* ================================================================== */
+/*  DWARF helper: produce a GDB-friendly display name from mangled MIR name. */
+/*  Class methods:  "ClassName_method__params" -> "ClassName::method"         */
+/*  Constructors:   "__ctor_ClassName__params" -> "ClassName::ClassName"      */
+/*  Destructors:    "__dtor_ClassName__params" -> "ClassName::~ClassName"     */
+/*  Plain functions: returned as-is.                                         */
+/* ================================================================== */
+static char dwarf_name_buf[512];
+static const char *dwarf_display_name(const char *mir_name) {
+    if (strncmp(mir_name, "__ctor_", 7) == 0) {
+        const char *cls = mir_name + 7;
+        const char *sep = strstr(cls, "__");
+        size_t clen = sep ? (size_t)(sep - cls) : strlen(cls);
+        snprintf(dwarf_name_buf, sizeof(dwarf_name_buf), "%.*s::%.*s",
+                 (int)clen, cls, (int)clen, cls);
+        return dwarf_name_buf;
+    }
+    if (strncmp(mir_name, "__dtor_", 7) == 0) {
+        const char *cls = mir_name + 7;
+        const char *sep = strstr(cls, "__");
+        size_t clen = sep ? (size_t)(sep - cls) : strlen(cls);
+        snprintf(dwarf_name_buf, sizeof(dwarf_name_buf), "%.*s::~%.*s",
+                 (int)clen, cls, (int)clen, cls);
+        return dwarf_name_buf;
+    }
+    /* ClassName_method__params: find __ suffix, then last _ before it */
+    const char *dbl = strstr(mir_name, "__");
+    if (dbl != NULL && dbl != mir_name) {
+        const char *under = NULL;
+        for (const char *p = mir_name; p < dbl; p++)
+            if (*p == '_') under = p;
+        if (under != NULL && under > mir_name && under < dbl - 1) {
+            size_t clen = (size_t)(under - mir_name);
+            size_t mlen = (size_t)(dbl - under - 1);
+            snprintf(dwarf_name_buf, sizeof(dwarf_name_buf), "%.*s::%.*s",
+                     (int)clen, mir_name, (int)mlen, under + 1);
+            return dwarf_name_buf;
+        }
+    }
+    return mir_name;
+}
+
+/* ================================================================== */
 /*  create_object_file_from_module                                     */
 /*  Walks all items in all modules, generates code, collects data/bss, */
 /*  builds ELF sections, and writes a valid ELF64 relocatable object.  */
@@ -738,7 +782,13 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         SEC_STRTAB,      /* 7 */
         SEC_SHSTRTAB,    /* 8 */
         SEC_NOTE_STACK,  /* 9 */
-        NUM_SECTIONS     /* 10 */
+        SEC_DEBUG_INFO,  /* 10 — .debug_info */
+        SEC_DEBUG_ABBREV,/* 11 — .debug_abbrev */
+        SEC_DEBUG_LINE,  /* 12 — .debug_line */
+        SEC_DEBUG_STR,   /* 13 — .debug_str */
+        SEC_RELA_DEBUG_INFO, /* 14 — .rela.debug_info */
+        SEC_RELA_DEBUG_LINE, /* 15 — .rela.debug_line */
+        NUM_SECTIONS     /* 16 */
     };
 
     /* Build .shstrtab */
@@ -754,6 +804,12 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t nm_strtab     = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".strtab");
     size_t nm_shstrtab   = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".shstrtab");
     size_t nm_note_stack = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".note.GNU-stack");
+    size_t nm_debug_info   = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".debug_info");
+    size_t nm_debug_abbrev = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".debug_abbrev");
+    size_t nm_debug_line   = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".debug_line");
+    size_t nm_debug_str    = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".debug_str");
+    size_t nm_rela_debug_info = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.debug_info");
+    size_t nm_rela_debug_line = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.debug_line");
 
     /* Build .strtab + symtab entries */
     char  *strtab = NULL;
@@ -967,6 +1023,388 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     }
 
     DBG("phase 3 done: %zu symbols", n_syms);
+
+    /* ----- Phase 3b: Build DWARF debug sections (if debug info present) ----- */
+    dwbuf_t dw_abbrev, dw_info, dw_line, dw_str;
+    dwbuf_init(&dw_abbrev);
+    dwbuf_init(&dw_info);
+    dwbuf_init(&dw_line);
+    dwbuf_init(&dw_str);
+    int has_dwarf = 0;
+
+    /* DWARF relocation tracking: records (offset_in_dwarf_section, addend_in_text, is_line) */
+    typedef struct { size_t offset; int64_t addend; int in_line; /* 0=.debug_info, 1=.debug_line */ } dwarf_reloc_t;
+    dwarf_reloc_t *dw_relocs = NULL;
+    size_t n_dw_relocs = 0, cap_dw_relocs = 0;
+    #define DW_RELOC_PUSH(off, add, sect) do { \
+        if (n_dw_relocs >= cap_dw_relocs) { \
+            cap_dw_relocs = cap_dw_relocs ? cap_dw_relocs * 2 : 32; \
+            dw_relocs = realloc(dw_relocs, cap_dw_relocs * sizeof(dwarf_reloc_t)); \
+        } \
+        dw_relocs[n_dw_relocs++] = (dwarf_reloc_t){(off), (add), (sect)}; \
+    } while(0)
+
+#if !MIR_NO_DBINFO
+    {
+    /* Check if any module has debug info */
+    MIR_module_t mod = DLIST_HEAD(MIR_module_t, *MIR_get_module_list(ctx));
+    if (mod != NULL && mod->num_source_files > 0) {
+        has_dwarf = 1;
+        DBG("phase 3b: generating DWARF debug sections");
+
+        /* --- .debug_str: collect all strings --- */
+        /* offset 0 = empty string */
+        dwbuf_u8(&dw_str, 0);
+        /* We'll use inline strings (DW_FORM_string) for simplicity,
+           but populate .debug_str for the producer and comp_dir. */
+        size_t str_producer_off = dw_str.len;
+        dwbuf_str(&dw_str, "classyc (MIR)");
+        size_t str_compdir_off = dw_str.len;
+        {
+            char cwd[1024];
+            if (getcwd(cwd, sizeof(cwd)) == NULL) strcpy(cwd, ".");
+            dwbuf_str(&dw_str, cwd);
+        }
+
+        /* --- .debug_abbrev --- */
+        /* Abbreviation 1: DW_TAG_compile_unit (has children) */
+        dwbuf_uleb(&dw_abbrev, 1); /* abbrev code */
+        dwbuf_uleb(&dw_abbrev, DW_TAG_compile_unit);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_yes);
+        dwbuf_uleb(&dw_abbrev, DW_AT_producer);  dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_language);   dwbuf_uleb(&dw_abbrev, DW_FORM_data2);
+        dwbuf_uleb(&dw_abbrev, DW_AT_name);       dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_comp_dir);   dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_low_pc);     dwbuf_uleb(&dw_abbrev, DW_FORM_addr);
+        dwbuf_uleb(&dw_abbrev, DW_AT_high_pc);    dwbuf_uleb(&dw_abbrev, DW_FORM_data8);
+        dwbuf_uleb(&dw_abbrev, DW_AT_stmt_list);  dwbuf_uleb(&dw_abbrev, DW_FORM_sec_offset);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0); /* end attrs */
+
+        /* Abbreviation 2: DW_TAG_subprogram (has children — for params/vars) */
+        dwbuf_uleb(&dw_abbrev, 2);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_subprogram);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_yes);
+        dwbuf_uleb(&dw_abbrev, DW_AT_name);        dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_low_pc);      dwbuf_uleb(&dw_abbrev, DW_FORM_addr);
+        dwbuf_uleb(&dw_abbrev, DW_AT_high_pc);     dwbuf_uleb(&dw_abbrev, DW_FORM_data8);
+        dwbuf_uleb(&dw_abbrev, DW_AT_frame_base);  dwbuf_uleb(&dw_abbrev, DW_FORM_exprloc);
+        dwbuf_uleb(&dw_abbrev, DW_AT_decl_file);   dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, DW_AT_decl_line);   dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, DW_AT_external);    dwbuf_uleb(&dw_abbrev, DW_FORM_flag_present);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* Abbreviation 3: DW_TAG_formal_parameter (no children) */
+        dwbuf_uleb(&dw_abbrev, 3);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_formal_parameter);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_name);      dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_decl_line); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, DW_AT_location);  dwbuf_uleb(&dw_abbrev, DW_FORM_exprloc);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* Abbreviation 4: DW_TAG_variable (no children) */
+        dwbuf_uleb(&dw_abbrev, 4);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_variable);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_name);      dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_decl_line); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, DW_AT_location);  dwbuf_uleb(&dw_abbrev, DW_FORM_exprloc);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* Abbreviation 5: DW_TAG_base_type (no children) */
+        dwbuf_uleb(&dw_abbrev, 5);
+        dwbuf_uleb(&dw_abbrev, DW_TAG_base_type);
+        dwbuf_u8(&dw_abbrev, DW_CHILDREN_no);
+        dwbuf_uleb(&dw_abbrev, DW_AT_name);      dwbuf_uleb(&dw_abbrev, DW_FORM_string);
+        dwbuf_uleb(&dw_abbrev, DW_AT_byte_size); dwbuf_uleb(&dw_abbrev, DW_FORM_udata);
+        dwbuf_uleb(&dw_abbrev, DW_AT_encoding);  dwbuf_uleb(&dw_abbrev, DW_FORM_data1);
+        dwbuf_uleb(&dw_abbrev, 0); dwbuf_uleb(&dw_abbrev, 0);
+
+        /* Null terminator for abbreviation table */
+        dwbuf_uleb(&dw_abbrev, 0);
+
+        /* --- .debug_info: compilation unit header + DIEs --- */
+        size_t cu_start = dw_info.len;
+        dwbuf_u32(&dw_info, 0); /* unit_length placeholder */
+        dwbuf_u16(&dw_info, 4); /* DWARF version 4 */
+        dwbuf_u32(&dw_info, 0); /* debug_abbrev_offset */
+        dwbuf_u8(&dw_info, 8);  /* address_size = 8 (x86_64) */
+
+        /* DIE: compile_unit (abbrev 1) */
+        dwbuf_uleb(&dw_info, 1); /* abbrev code 1 */
+        dwbuf_str(&dw_info, "classyc (MIR)"); /* DW_AT_producer */
+        dwbuf_u16(&dw_info, DW_LANG_C11); /* DW_AT_language */
+        /* DW_AT_name: use first real source file */
+        const char *cu_name = mod->num_source_files >= 1 ? mod->source_files[1] : "<unknown>";
+        /* Skip "<environment>" if there are more files */
+        for (uint32_t fi = 1; fi <= mod->num_source_files; fi++) {
+            if (mod->source_files[fi] != NULL && mod->source_files[fi][0] != '<') {
+                cu_name = mod->source_files[fi];
+                break;
+            }
+        }
+        dwbuf_str(&dw_info, cu_name);
+        { /* DW_AT_comp_dir */
+            char cwd[1024];
+            if (getcwd(cwd, sizeof(cwd)) == NULL) strcpy(cwd, ".");
+            dwbuf_str(&dw_info, cwd);
+        }
+        /* DW_AT_low_pc = 0 (relocatable — needs R_X86_64_64 reloc to .text) */
+        DW_RELOC_PUSH(dw_info.len, 0, 0); /* reloc at current offset, addend=0, in .debug_info */
+        dwbuf_u64(&dw_info, 0);
+        /* DW_AT_high_pc = text_size (length form — not an address, no reloc needed) */
+        dwbuf_u64(&dw_info, text_size);
+        /* DW_AT_stmt_list = 0 (offset into .debug_line) */
+        dwbuf_u32(&dw_info, 0);
+
+        /* Emit a DW_TAG_subprogram for each function */
+        for (size_t fi = 0; fi < n_funcs; fi++) {
+            func_entry_t *fe = &funcs[fi];
+            MIR_func_t func = fe->item->u.func;
+
+            dwbuf_uleb(&dw_info, 2); /* abbrev 2: subprogram */
+            dwbuf_str(&dw_info, dwarf_display_name(fe->name)); /* DW_AT_name */
+            DW_RELOC_PUSH(dw_info.len, (int64_t)fe->text_offset, 0); /* reloc to .text + offset */
+            dwbuf_u64(&dw_info, 0); /* DW_AT_low_pc (relocated) */
+            dwbuf_u64(&dw_info, fe->code_len); /* DW_AT_high_pc (length, not relocated) */
+            /* DW_AT_frame_base: DW_OP_call_frame_cfa (1 byte expr) */
+            dwbuf_uleb(&dw_info, 1); /* exprloc length */
+            dwbuf_u8(&dw_info, DW_OP_call_frame_cfa);
+            /* DW_AT_decl_file */
+            dwbuf_uleb(&dw_info, 1); /* file index 1 */
+            /* DW_AT_decl_line — find first source line from insns */
+            {
+                uint32_t first_line = 0;
+                for (MIR_insn_t insn = DLIST_HEAD(MIR_insn_t, func->insns);
+                     insn != NULL; insn = DLIST_NEXT(MIR_insn_t, insn)) {
+                    if (insn->source_line != 0) { first_line = insn->source_line; break; }
+                }
+                dwbuf_uleb(&dw_info, first_line);
+            }
+            /* DW_AT_external = flag_present (implicit true) */
+
+            /* Emit params and vars from dbinfo */
+            if (func->dbinfo != NULL) {
+                for (uint32_t vi = 0; vi < func->dbinfo->num_vars; vi++) {
+                    MIR_dbvar_t *v = &func->dbinfo->vars[vi];
+                    if (v->source_name == NULL) continue;
+                    /* Use abbrev 3 for params, abbrev 4 for vars */
+                    dwbuf_uleb(&dw_info, v->is_param ? 3 : 4);
+                    dwbuf_str(&dw_info, v->source_name); /* DW_AT_name */
+                    dwbuf_uleb(&dw_info, v->decl_line); /* DW_AT_decl_line */
+                    /* DW_AT_location */
+                    if (v->loc_kind == MIR_DBLOC_FRAME) {
+                        /* DW_OP_fbreg <offset> */
+                        dwbuf_t loc; dwbuf_init(&loc);
+                        dwbuf_u8(&loc, DW_OP_fbreg);
+                        dwbuf_sleb(&loc, v->loc.frame_offset);
+                        dwbuf_uleb(&dw_info, loc.len);
+                        dwbuf_bytes(&dw_info, loc.data, loc.len);
+                        dwbuf_free(&loc);
+                    } else {
+                        /* For register vars, emit a 0-length location (optimized out) */
+                        dwbuf_uleb(&dw_info, 0);
+                    }
+                }
+            }
+
+            dwbuf_u8(&dw_info, 0); /* end of subprogram children */
+        }
+
+        dwbuf_u8(&dw_info, 0); /* end of compile_unit children */
+
+        /* Patch CU length (excludes the 4-byte length field itself) */
+        uint32_t cu_len = (uint32_t)(dw_info.len - cu_start - 4);
+        dwbuf_patch_u32(&dw_info, cu_start, cu_len);
+
+        /* --- .debug_line: DWARF4 line number program --- */
+        /* Build a minimal line table from instruction source locations.
+           For each function, walk insns and emit set_address + advance_line + copy. */
+        size_t line_start = dw_line.len;
+        dwbuf_u32(&dw_line, 0); /* total_length placeholder */
+        dwbuf_u16(&dw_line, 4); /* DWARF version 4 */
+        size_t header_length_off = dw_line.len;
+        dwbuf_u32(&dw_line, 0); /* header_length placeholder */
+        size_t after_header_len = dw_line.len;
+        dwbuf_u8(&dw_line, 1);  /* minimum_instruction_length */
+        dwbuf_u8(&dw_line, 1);  /* maximum_operations_per_instruction */
+        dwbuf_u8(&dw_line, 1);  /* default_is_stmt */
+        dwbuf_u8(&dw_line, (uint8_t)(int8_t)-5); /* line_base */
+        dwbuf_u8(&dw_line, 14); /* line_range */
+        dwbuf_u8(&dw_line, 13); /* opcode_base */
+        /* standard_opcode_lengths: opcodes 1..12 */
+        dwbuf_u8(&dw_line, 0); /* copy */
+        dwbuf_u8(&dw_line, 1); /* advance_pc */
+        dwbuf_u8(&dw_line, 1); /* advance_line */
+        dwbuf_u8(&dw_line, 1); /* set_file */
+        dwbuf_u8(&dw_line, 1); /* set_column */
+        dwbuf_u8(&dw_line, 0); /* negate_stmt */
+        dwbuf_u8(&dw_line, 0); /* set_basic_block */
+        dwbuf_u8(&dw_line, 0); /* const_add_pc */
+        dwbuf_u8(&dw_line, 1); /* fixed_advance_pc */
+        dwbuf_u8(&dw_line, 0); /* set_prologue_end */
+        dwbuf_u8(&dw_line, 0); /* set_epilogue_begin */
+        dwbuf_u8(&dw_line, 1); /* set_isa */
+
+        /* include_directories: just null terminator (no include dirs) */
+        dwbuf_u8(&dw_line, 0);
+
+        /* file_names table */
+        for (uint32_t fi = 1; fi <= mod->num_source_files; fi++) {
+            const char *fn = mod->source_files[fi];
+            if (fn == NULL) fn = "?";
+            dwbuf_str(&dw_line, fn);  /* file name */
+            dwbuf_uleb(&dw_line, 0); /* directory index 0 */
+            dwbuf_uleb(&dw_line, 0); /* last modification time */
+            dwbuf_uleb(&dw_line, 0); /* file size */
+        }
+        dwbuf_u8(&dw_line, 0); /* end of file_names */
+
+        /* Patch header_length */
+        uint32_t hdr_len = (uint32_t)(dw_line.len - after_header_len);
+        dwbuf_patch_u32(&dw_line, header_length_off, hdr_len);
+
+        /* Line number program: for each function, use exact PC offsets from the
+           line map (captured during target_translate) when available. */
+        for (size_t fi = 0; fi < n_funcs; fi++) {
+            func_entry_t *fe = &funcs[fi];
+            MIR_func_t func = fe->item->u.func;
+            MIR_line_map_t *lm = (func->dbinfo != NULL) ? func->dbinfo->line_map : NULL;
+
+            /* Need at least some source info to emit a line sequence */
+            uint32_t first_line = 0, first_file = 0;
+            if (lm != NULL && lm->num_entries > 0) {
+                first_line = lm->entries[0].source_line;
+                first_file = lm->entries[0].source_file_id;
+            } else {
+                for (MIR_insn_t insn = DLIST_HEAD(MIR_insn_t, func->insns);
+                     insn != NULL; insn = DLIST_NEXT(MIR_insn_t, insn)) {
+                    if (insn->source_line != 0) {
+                        first_line = insn->source_line;
+                        first_file = insn->source_file_id;
+                        break;
+                    }
+                }
+            }
+            if (first_line == 0) continue;
+
+            /* DW_LNE_set_address to function start (needs relocation) */
+            dwbuf_u8(&dw_line, 0); /* extended opcode escape */
+            dwbuf_uleb(&dw_line, 9); /* 1 + 8 bytes */
+            dwbuf_u8(&dw_line, DW_LNE_set_address);
+            DW_RELOC_PUSH(dw_line.len, (int64_t)fe->text_offset, 1);
+            dwbuf_u64(&dw_line, 0); /* address placeholder (relocated) */
+
+            /* Set initial file */
+            if (first_file != 0) {
+                dwbuf_u8(&dw_line, DW_LNS_set_file);
+                dwbuf_uleb(&dw_line, first_file);
+            }
+
+            if (lm != NULL && lm->num_entries > 0) {
+                /* ---- Exact PC offsets from line map ---- */
+                uint32_t prev_pc = 0;
+                uint32_t cur_line = 1; /* DWARF line state machine starts at line 1 */
+                uint16_t cur_file = first_file;
+
+                for (uint32_t li = 0; li < lm->num_entries; li++) {
+                    MIR_line_map_entry_t *e = &lm->entries[li];
+                    /* Skip duplicate line entries at same PC */
+                    if (li > 0 && e->source_line == lm->entries[li-1].source_line
+                               && e->pc_offset == lm->entries[li-1].pc_offset)
+                        continue;
+                    /* Skip entries with same line as current (unless different file) */
+                    if (e->source_line == cur_line && e->source_file_id == cur_file && li > 0)
+                        continue;
+
+                    /* Advance PC */
+                    if (e->pc_offset > prev_pc) {
+                        dwbuf_u8(&dw_line, DW_LNS_advance_pc);
+                        dwbuf_uleb(&dw_line, e->pc_offset - prev_pc);
+                        prev_pc = e->pc_offset;
+                    }
+
+                    /* Set file if changed */
+                    if (e->source_file_id != cur_file) {
+                        dwbuf_u8(&dw_line, DW_LNS_set_file);
+                        dwbuf_uleb(&dw_line, e->source_file_id);
+                        cur_file = e->source_file_id;
+                    }
+
+                    /* Set column if non-zero */
+                    if (e->source_col != 0) {
+                        dwbuf_u8(&dw_line, DW_LNS_set_column);
+                        dwbuf_uleb(&dw_line, e->source_col);
+                    }
+
+                    /* Advance line */
+                    int32_t line_delta = (int32_t)e->source_line - (int32_t)cur_line;
+                    if (line_delta != 0) {
+                        dwbuf_u8(&dw_line, DW_LNS_advance_line);
+                        dwbuf_sleb(&dw_line, line_delta);
+                    }
+                    cur_line = e->source_line;
+
+                    /* Emit row */
+                    dwbuf_u8(&dw_line, DW_LNS_copy);
+                }
+
+                /* Advance to end of function */
+                if (fe->code_len > prev_pc) {
+                    dwbuf_u8(&dw_line, DW_LNS_advance_pc);
+                    dwbuf_uleb(&dw_line, fe->code_len - prev_pc);
+                }
+            } else {
+                /* ---- Fallback: single line entry at function start ---- */
+                dwbuf_u8(&dw_line, DW_LNS_advance_line);
+                dwbuf_sleb(&dw_line, (int64_t)first_line - 1);
+                dwbuf_u8(&dw_line, DW_LNS_copy);
+
+                dwbuf_u8(&dw_line, DW_LNS_advance_pc);
+                dwbuf_uleb(&dw_line, fe->code_len);
+            }
+
+            /* End sequence */
+            dwbuf_u8(&dw_line, 0); /* extended escape */
+            dwbuf_uleb(&dw_line, 1);
+            dwbuf_u8(&dw_line, DW_LNE_end_sequence);
+        }
+
+        /* Patch total_length */
+        uint32_t line_total = (uint32_t)(dw_line.len - line_start - 4);
+        dwbuf_patch_u32(&dw_line, line_start, line_total);
+
+        DBG("phase 3b done: .debug_info=%zu .debug_abbrev=%zu .debug_line=%zu .debug_str=%zu relocs=%zu",
+            dw_info.len, dw_abbrev.len, dw_line.len, dw_str.len, n_dw_relocs);
+    }
+    }
+#endif /* !MIR_NO_DBINFO */
+
+    /* Build .rela.debug_info and .rela.debug_line from collected DWARF relocs.
+       All relocations point at the .text section symbol (index 1 in symtab)
+       with R_X86_64_64 type and the function's text_offset as addend. */
+    size_t n_rela_dbinfo = 0, n_rela_dbline = 0;
+    for (size_t i = 0; i < n_dw_relocs; i++) {
+        if (dw_relocs[i].in_line) n_rela_dbline++; else n_rela_dbinfo++;
+    }
+    Elf64_Rela *rela_dbinfo = calloc(n_rela_dbinfo ? n_rela_dbinfo : 1, sizeof(Elf64_Rela));
+    Elf64_Rela *rela_dbline = calloc(n_rela_dbline ? n_rela_dbline : 1, sizeof(Elf64_Rela));
+    {
+        size_t di_idx = 0, dl_idx = 0;
+        /* .text section symbol is at index 1 in symtab (SEC_TEXT section sym) */
+        size_t text_sym_idx = 1;
+        for (size_t i = 0; i < n_dw_relocs; i++) {
+            Elf64_Rela r = {0};
+            r.r_offset = dw_relocs[i].offset;
+            r.r_info = ELF64_R_INFO(text_sym_idx, R_X86_64_64);
+            r.r_addend = dw_relocs[i].addend;
+            if (dw_relocs[i].in_line)
+                rela_dbline[dl_idx++] = r;
+            else
+                rela_dbinfo[di_idx++] = r;
+        }
+    }
+
     /* ----- Phase 4: compute file layout and write ELF ----- */
 
     /* File layout:
@@ -1017,6 +1455,39 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     /* .shstrtab */
     size_t shstrtab_off = off;
     off += shstrtab_size;
+
+    /* DWARF debug sections (only if present) */
+    off = align8(off);
+    size_t debug_info_off = off;
+    size_t debug_info_size = dw_info.len;
+    off += debug_info_size;
+
+    off = align8(off);
+    size_t debug_abbrev_off = off;
+    size_t debug_abbrev_size = dw_abbrev.len;
+    off += debug_abbrev_size;
+
+    off = align8(off);
+    size_t debug_line_off = off;
+    size_t debug_line_size = dw_line.len;
+    off += debug_line_size;
+
+    off = align8(off);
+    size_t debug_str_off = off;
+    size_t debug_str_size = dw_str.len;
+    off += debug_str_size;
+
+    /* .rela.debug_info */
+    off = align8(off);
+    size_t rela_dbinfo_off = off;
+    size_t rela_dbinfo_size = n_rela_dbinfo * sizeof(Elf64_Rela);
+    off += rela_dbinfo_size;
+
+    /* .rela.debug_line */
+    off = align8(off);
+    size_t rela_dbline_off = off;
+    size_t rela_dbline_size = n_rela_dbline * sizeof(Elf64_Rela);
+    off += rela_dbline_size;
 
     /* section headers */
     off = align8(off);
@@ -1105,6 +1576,59 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     shdrs[SEC_NOTE_STACK].sh_size      = 0;
     shdrs[SEC_NOTE_STACK].sh_addralign = 1;
 
+    /* 10: .debug_info */
+    shdrs[SEC_DEBUG_INFO].sh_name      = nm_debug_info;
+    shdrs[SEC_DEBUG_INFO].sh_type      = SHT_PROGBITS;
+    shdrs[SEC_DEBUG_INFO].sh_flags     = 0;
+    shdrs[SEC_DEBUG_INFO].sh_offset    = debug_info_off;
+    shdrs[SEC_DEBUG_INFO].sh_size      = debug_info_size;
+    shdrs[SEC_DEBUG_INFO].sh_addralign = 1;
+
+    /* 11: .debug_abbrev */
+    shdrs[SEC_DEBUG_ABBREV].sh_name      = nm_debug_abbrev;
+    shdrs[SEC_DEBUG_ABBREV].sh_type      = SHT_PROGBITS;
+    shdrs[SEC_DEBUG_ABBREV].sh_flags     = 0;
+    shdrs[SEC_DEBUG_ABBREV].sh_offset    = debug_abbrev_off;
+    shdrs[SEC_DEBUG_ABBREV].sh_size      = debug_abbrev_size;
+    shdrs[SEC_DEBUG_ABBREV].sh_addralign = 1;
+
+    /* 12: .debug_line */
+    shdrs[SEC_DEBUG_LINE].sh_name      = nm_debug_line;
+    shdrs[SEC_DEBUG_LINE].sh_type      = SHT_PROGBITS;
+    shdrs[SEC_DEBUG_LINE].sh_flags     = 0;
+    shdrs[SEC_DEBUG_LINE].sh_offset    = debug_line_off;
+    shdrs[SEC_DEBUG_LINE].sh_size      = debug_line_size;
+    shdrs[SEC_DEBUG_LINE].sh_addralign = 1;
+
+    /* 13: .debug_str */
+    shdrs[SEC_DEBUG_STR].sh_name      = nm_debug_str;
+    shdrs[SEC_DEBUG_STR].sh_type      = SHT_PROGBITS;
+    shdrs[SEC_DEBUG_STR].sh_flags     = SHF_MERGE | SHF_STRINGS;
+    shdrs[SEC_DEBUG_STR].sh_offset    = debug_str_off;
+    shdrs[SEC_DEBUG_STR].sh_size      = debug_str_size;
+    shdrs[SEC_DEBUG_STR].sh_addralign = 1;
+    shdrs[SEC_DEBUG_STR].sh_entsize   = 1;
+
+    /* 14: .rela.debug_info */
+    shdrs[SEC_RELA_DEBUG_INFO].sh_name      = nm_rela_debug_info;
+    shdrs[SEC_RELA_DEBUG_INFO].sh_type      = SHT_RELA;
+    shdrs[SEC_RELA_DEBUG_INFO].sh_offset    = rela_dbinfo_off;
+    shdrs[SEC_RELA_DEBUG_INFO].sh_size      = rela_dbinfo_size;
+    shdrs[SEC_RELA_DEBUG_INFO].sh_link      = SEC_SYMTAB;
+    shdrs[SEC_RELA_DEBUG_INFO].sh_info      = SEC_DEBUG_INFO;
+    shdrs[SEC_RELA_DEBUG_INFO].sh_addralign = 8;
+    shdrs[SEC_RELA_DEBUG_INFO].sh_entsize   = sizeof(Elf64_Rela);
+
+    /* 15: .rela.debug_line */
+    shdrs[SEC_RELA_DEBUG_LINE].sh_name      = nm_rela_debug_line;
+    shdrs[SEC_RELA_DEBUG_LINE].sh_type      = SHT_RELA;
+    shdrs[SEC_RELA_DEBUG_LINE].sh_offset    = rela_dbline_off;
+    shdrs[SEC_RELA_DEBUG_LINE].sh_size      = rela_dbline_size;
+    shdrs[SEC_RELA_DEBUG_LINE].sh_link      = SEC_SYMTAB;
+    shdrs[SEC_RELA_DEBUG_LINE].sh_info      = SEC_DEBUG_LINE;
+    shdrs[SEC_RELA_DEBUG_LINE].sh_addralign = 8;
+    shdrs[SEC_RELA_DEBUG_LINE].sh_entsize   = sizeof(Elf64_Rela);
+
     /* ----- ELF header ----- */
     Elf64_Ehdr ehdr;
     memset(&ehdr, 0, sizeof(ehdr));
@@ -1172,8 +1696,45 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     /* .shstrtab */
     write(fd, shstrtab, shstrtab_size);
 
+    /* DWARF debug sections */
+    if (debug_info_size > 0) {
+        { size_t cur = shstrtab_off + shstrtab_size;
+          if (debug_info_off > cur) write_padding(fd, debug_info_off - cur); }
+        write(fd, dw_info.data, debug_info_size);
+
+        { size_t cur = debug_info_off + debug_info_size;
+          if (debug_abbrev_off > cur) write_padding(fd, debug_abbrev_off - cur); }
+        write(fd, dw_abbrev.data, debug_abbrev_size);
+
+        { size_t cur = debug_abbrev_off + debug_abbrev_size;
+          if (debug_line_off > cur) write_padding(fd, debug_line_off - cur); }
+        write(fd, dw_line.data, debug_line_size);
+
+        { size_t cur = debug_line_off + debug_line_size;
+          if (debug_str_off > cur) write_padding(fd, debug_str_off - cur); }
+        write(fd, dw_str.data, debug_str_size);
+    }
+
+    /* .rela.debug_info */
+    if (rela_dbinfo_size > 0) {
+        { size_t cur = (debug_str_size > 0 ? debug_str_off + debug_str_size
+                                           : shstrtab_off + shstrtab_size);
+          if (rela_dbinfo_off > cur) write_padding(fd, rela_dbinfo_off - cur); }
+        write(fd, rela_dbinfo, rela_dbinfo_size);
+    }
+
+    /* .rela.debug_line */
+    if (rela_dbline_size > 0) {
+        { size_t cur = rela_dbinfo_off + rela_dbinfo_size;
+          if (rela_dbline_off > cur) write_padding(fd, rela_dbline_off - cur); }
+        write(fd, rela_dbline, rela_dbline_size);
+    }
+
     /* padding to sh_off */
-    { size_t cur = shstrtab_off + shstrtab_size;
+    { size_t cur = (rela_dbline_size > 0 ? rela_dbline_off + rela_dbline_size
+                  : rela_dbinfo_size > 0 ? rela_dbinfo_off + rela_dbinfo_size
+                  : debug_str_size > 0   ? debug_str_off + debug_str_size
+                  : shstrtab_off + shstrtab_size);
       if (sh_off > cur) write_padding(fd, sh_off - cur); }
 
     /* section headers */
@@ -1208,9 +1769,17 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     free(exports.names);
     for (size_t i = 0; i < imports.n; i++) free(imports.names[i]);
     free(imports.names);
+    dwbuf_free(&dw_abbrev);
+    dwbuf_free(&dw_info);
+    dwbuf_free(&dw_line);
+    dwbuf_free(&dw_str);
+    free(dw_relocs);
+    free(rela_dbinfo);
+    free(rela_dbline);
 
     #undef SYMTAB_PUSH
     #undef SYM_MAP_ADD
+    #undef DW_RELOC_PUSH
 }
 
 int main(int argc, char **argv) {

@@ -4604,6 +4604,12 @@ static const char *mangle_generic_name (c2m_ctx_t c2m_ctx,
   for (int i = 0; i < n_args; i++) {
     add_to_temp_string (c2m_ctx, "_");
     node_t a = args[i];
+    /* Count and strip pointer wrappers: int* -> "intP", int** -> "intPP" */
+    int ptr_depth = 0;
+    while (a->code == N_POINTER) {
+      ptr_depth++;
+      a = NL_HEAD (a->u.ops); /* unwrap to the base type */
+    }
     const char *arg_name;
     switch (a->code) {
     case N_STRING:   arg_name = "String"; break;
@@ -4621,6 +4627,8 @@ static const char *mangle_generic_name (c2m_ctx_t c2m_ctx,
     default:         arg_name = "T"; break;
     }
     add_to_temp_string (c2m_ctx, arg_name);
+    for (int p = 0; p < ptr_depth; p++)
+      add_to_temp_string (c2m_ctx, "P");
   }
   return uniq_cstr (c2m_ctx, VARR_ADDR (char, temp_string)).s;
 }
@@ -4650,7 +4658,10 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
     for (int i = 0; i < n_params; i++) {
       if (strcmp (s, params[i]) == 0) {
         node_t a = args[i];
-        /* For simple keyword-type args (N_INT, N_STRING, ...) create a fresh node */
+        /* For pointer type args (N_POINTER wrapping a base type), unwrap to
+           the base type for the specifier substitution.  The pointer level(s)
+           are accounted for by _spec_add_ptr_to_decl below. */
+        while (a->code == N_POINTER) a = NL_HEAD (a->u.ops);
         node_t fresh = new_node (c2m_ctx, a->code);
         set_node_pos (c2m_ctx, fresh, POS (n));
         if (a->code == N_ID) fresh->u.s = a->u.s; /* copy the identifier string */
@@ -4711,6 +4722,53 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
       if (child_cp != NULL) op_append (c2m_ctx, cp, child_cp);
     }
   }
+  /* ── Pointer type argument fixup ────────────────────────────────────────
+     When a type parameter T has a pointer type argument (e.g. T=char*), the
+     substitution above placed just the base type (char) into the type
+     specifier list.  We now need to inject N_POINTER nodes into the
+     declarator's decoration list so that `T data` becomes `char *data` and
+     `T* data` becomes `char **data`.  This applies to N_MEMBER (class
+     fields), N_SPEC_DECL (parameters, locals), and N_FUNC_DEF (return
+     types).  We scan the type-specifier list to see which type param was
+     used (matched by node code against the base-type arg) and check the
+     original arg for pointer depth. */
+  if ((cp->code == N_MEMBER || cp->code == N_SPEC_DECL || cp->code == N_FUNC_DEF)
+      && n_params > 0) {
+    /* Determine the spec list and the declarator in both original and copy. */
+    node_t orig_specs = NL_HEAD (n->u.ops);      /* original spec list */
+    node_t cp_decl = NL_NEXT (NL_HEAD (cp->u.ops)); /* copied declarator */
+    /* Unwrap N_SHARE to find the real spec list (e.g. `T* data;` shares
+       specifiers across multiple members via SHARE nodes). */
+    if (orig_specs != NULL && orig_specs->code == N_SHARE)
+      orig_specs = NL_HEAD (orig_specs->u.ops);
+    if (orig_specs != NULL && orig_specs->code == N_LIST
+        && cp_decl != NULL && cp_decl->code == N_DECL) {
+      /* Check if any child of the original spec list was a type-param N_ID. */
+      for (node_t os = NL_HEAD (orig_specs->u.ops); os != NULL; os = NL_NEXT (os)) {
+        if (os->code != N_ID) continue;
+        for (int pi = 0; pi < n_params; pi++) {
+          if (params[pi] == NULL || strcmp (os->u.s.s, params[pi]) != 0) continue;
+          /* Count pointer depth in the original arg. */
+          node_t aa = args[pi];
+          int pd = 0;
+          while (aa->code == N_POINTER) { pd++; aa = NL_HEAD (aa->u.ops); }
+          if (pd == 0) break; /* not a pointer type arg — nothing to fix up */
+          /* Inject pd pointer levels into the declarator's decoration list.
+             Skip FUNC_DEF nodes whose specs are just the return type — the
+             pointer must go AFTER any existing N_FUNC in the list (matching
+             how the parser places pointer return types). */
+          node_t decl_list = DECL_LIST (cp_decl);
+          if (decl_list != NULL && decl_list->code == N_LIST) {
+            for (int pp = 0; pp < pd; pp++)
+              op_append (c2m_ctx, decl_list,
+                         new_pos_node1 (c2m_ctx, N_POINTER, POS (n),
+                                        new_node (c2m_ctx, N_LIST)));
+          }
+          break;
+        }
+      }
+    }
+  }
   return cp;
 }
 
@@ -4719,20 +4777,26 @@ static node_t parse_generic_type_arg (c2m_ctx_t c2m_ctx) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t r;
   pos_t pos = curr_token->pos;
+  node_t base = NULL;
 
-  if (MP (T_STRING,   pos)) return new_pos_node (c2m_ctx, N_STRING, pos);
-  if (MP (T_INT,      pos)) return new_pos_node (c2m_ctx, N_INT,    pos);
-  if (MP (T_DOUBLE,   pos)) return new_pos_node (c2m_ctx, N_DOUBLE, pos);
-  if (MP (T_FLOAT,    pos)) return new_pos_node (c2m_ctx, N_FLOAT,  pos);
-  if (MP (T_CHAR,     pos)) return new_pos_node (c2m_ctx, N_CHAR,   pos);
-  if (MP (T_LONG,     pos)) return new_pos_node (c2m_ctx, N_LONG,   pos);
-  if (MP (T_SHORT,    pos)) return new_pos_node (c2m_ctx, N_SHORT,  pos);
-  if (MP (T_UNSIGNED, pos)) return new_pos_node (c2m_ctx, N_UNSIGNED, pos);
-  if (MP (T_VOID,     pos)) return new_pos_node (c2m_ctx, N_VOID,   pos);
-  if (MP (T_DICT,     pos)) return new_pos_node (c2m_ctx, N_DICT,   pos);
-  if (MP (T_BOOL,     pos)) return new_pos_node (c2m_ctx, N_BOOL,   pos);
-  if (MN (T_ID, r)) return r;   /* user class name */
-  return NULL;
+  if (MP (T_STRING,   pos)) base = new_pos_node (c2m_ctx, N_STRING, pos);
+  else if (MP (T_INT,      pos)) base = new_pos_node (c2m_ctx, N_INT,    pos);
+  else if (MP (T_DOUBLE,   pos)) base = new_pos_node (c2m_ctx, N_DOUBLE, pos);
+  else if (MP (T_FLOAT,    pos)) base = new_pos_node (c2m_ctx, N_FLOAT,  pos);
+  else if (MP (T_CHAR,     pos)) base = new_pos_node (c2m_ctx, N_CHAR,   pos);
+  else if (MP (T_LONG,     pos)) base = new_pos_node (c2m_ctx, N_LONG,   pos);
+  else if (MP (T_SHORT,    pos)) base = new_pos_node (c2m_ctx, N_SHORT,  pos);
+  else if (MP (T_UNSIGNED, pos)) base = new_pos_node (c2m_ctx, N_UNSIGNED, pos);
+  else if (MP (T_VOID,     pos)) base = new_pos_node (c2m_ctx, N_VOID,   pos);
+  else if (MP (T_DICT,     pos)) base = new_pos_node (c2m_ctx, N_DICT,   pos);
+  else if (MP (T_BOOL,     pos)) base = new_pos_node (c2m_ctx, N_BOOL,   pos);
+  else if (MN (T_ID, r)) base = r;   /* user class name */
+  if (base == NULL) return NULL;
+  /* Check for trailing '*' — pointer type argument (e.g. int*, Point*) */
+  while (MP ('*', pos)) {
+    base = new_pos_node1 (c2m_ctx, N_POINTER, pos, base);
+  }
+  return base;
 }
 
 /* Get or create the specialization of `base_name` with the given type args.
@@ -11716,6 +11780,27 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
         } else if (t1->mode == TM_SLICE) {
           /* slice[i] — filter/map result element access (read/write lvalue) */
           *e->type = *t1->u.ptr_type;
+        } else if (t1->mode == TM_CLASS
+                   || (t1->mode == TM_PTR && t1->u.ptr_type != NULL
+                       && t1->u.ptr_type->mode == TM_CLASS)) {
+          /* class[i] — bracket subscript via Get(int)/Set(int,T) protocol.
+             Resolve the Get(int) method to determine the element type.
+             Assignment (class[i] = val) is handled in the gen N_ASSIGN path. */
+          struct type *cls = t1->mode == TM_PTR ? t1->u.ptr_type : t1;
+          node_t get_def = find_class_protocol_method (c2m_ctx, cls->u.tag_type, "Get", 1, POS (r));
+          if (get_def == NULL) {
+            error (c2m_ctx, POS (r), "class type has no Get(int) method for [] subscript");
+          } else {
+            decl_t gd = get_def->attr;
+            if (gd != NULL && gd->decl_spec.type != NULL && gd->decl_spec.type->mode == TM_FUNC) {
+              struct type *ret = gd->decl_spec.type->u.func_type->ret_type;
+              if (ret != NULL) *e->type = *ret;
+            }
+          }
+          if (t2 != NULL && !integer_type_p (t2)) {
+            error (c2m_ctx, POS (r), "class subscript index must be an integer");
+          }
+          e->def_node = get_def; /* stash for gen to find the method */
         } else if (t1->mode != TM_PTR && t1->mode != TM_ARR) {
           error (c2m_ctx, POS (r), "subscripted value is neither array nor pointer");
         } else if (t1->mode == TM_PTR) {
@@ -11730,7 +11815,10 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
             error (c2m_ctx, POS (r), "array type has incomplete element type");
           }
         }
-        if (t1->mode != TM_DICT && t2 != NULL && !integer_type_p (t2)) {
+        if (t1->mode != TM_DICT && t1->mode != TM_CLASS
+            && !(t1->mode == TM_PTR && t1->u.ptr_type != NULL
+                 && t1->u.ptr_type->mode == TM_CLASS)
+            && t2 != NULL && !integer_type_p (t2)) {
           error (c2m_ctx, POS (r), "array subscript is not an integer");
         }
         break;
@@ -13442,6 +13530,7 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
     }
 
     // Initialize function scope and state
+    node_t saved_scope_before_func = curr_scope; /* save for assertion below */
     curr_func_scope_num = 0;
     create_node_scope(c2m_ctx, block);
     func_block_scope = curr_scope;
@@ -13649,8 +13738,11 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
     }
     VARR_TRUNC(node_t, label_uses, 0);
 
-    assert(curr_scope == top_scope); // curr_scope is #define as check_ctx->curr_scope above, don't use check_ctx->curr_scope
-    func_block_scope = top_scope;
+    /* After checking the function body, curr_scope must be back to what
+       it was before we created the function block scope.  For top-level
+       functions that's top_scope; for class methods it's the class scope. */
+    assert(curr_scope == saved_scope_before_func);
+    func_block_scope = saved_scope_before_func;
     process_func_decls_for_allocation(c2m_ctx);
     ns = block->attr;
     ns->size = round_size(ns->size, MAX_ALIGNMENT);
@@ -14236,6 +14328,7 @@ struct gen_ctx {
   MIR_item_t dict_init_funcs[64]; /* generated __dict_init_* funcs */
   int dict_init_func_count;
   MIR_item_t dict_create_object_proto, dict_create_object_item;
+  MIR_item_t dict_create_bool_proto, dict_create_bool_item;
   MIR_item_t dict_create_int64_proto, dict_create_int64_item;
   MIR_item_t dict_create_number_proto, dict_create_number_item;
   MIR_item_t dict_create_string_proto, dict_create_string_item;
@@ -14281,6 +14374,10 @@ struct gen_ctx {
   int curr_mir_proto_num;
   HTAB (MIR_item_t) * proto_tab;
   VARR (node_t) * node_stack;
+  /* Debug source location tracking for MIR instructions */
+  uint16_t curr_src_file_id;
+  uint32_t curr_src_line;
+  uint16_t curr_src_col;
 };
 
 #define zero_op gen_ctx->zero_op
@@ -14311,6 +14408,8 @@ struct gen_ctx {
 #define dict_init_func_count gen_ctx->dict_init_func_count
 #define dict_create_object_proto gen_ctx->dict_create_object_proto
 #define dict_create_object_item gen_ctx->dict_create_object_item
+#define dict_create_bool_proto gen_ctx->dict_create_bool_proto
+#define dict_create_bool_item gen_ctx->dict_create_bool_item
 #define dict_create_int64_proto gen_ctx->dict_create_int64_proto
 #define dict_create_int64_item gen_ctx->dict_create_int64_item
 #define dict_create_number_proto gen_ctx->dict_create_number_proto
@@ -14389,6 +14488,9 @@ struct gen_ctx {
 #define curr_mir_proto_num gen_ctx->curr_mir_proto_num
 #define proto_tab gen_ctx->proto_tab
 #define node_stack gen_ctx->node_stack
+#define curr_src_file_id gen_ctx->curr_src_file_id
+#define curr_src_line gen_ctx->curr_src_line
+#define curr_src_col gen_ctx->curr_src_col
 
 static op_t new_op (decl_t decl, MIR_op_t mir_op) {
   op_t res;
@@ -14706,6 +14808,9 @@ static MIR_insn_code_t tp_mov (MIR_type_t t) {
 static void emit_insn (c2m_ctx_t c2m_ctx, MIR_insn_t insn) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
 
+  /* Stamp source location on every emitted instruction (only with -g) */
+  if (c2m_options->debug_info_p && curr_src_line != 0 && curr_src_file_id != 0)
+    MIR_insn_set_source_loc (insn, curr_src_file_id, curr_src_line, curr_src_col);
   MIR_append_insn (c2m_ctx->ctx, curr_func, insn);
 }
 
@@ -16035,6 +16140,13 @@ static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, dict_create_object_proto);
   move_item_to_module_start (module, dict_create_object_item);
 
+  /* dict_create_bool(int b) -> DictValue* */
+  vars[0].name = "b"; vars[0].type = MIR_T_I64;
+  dict_create_bool_proto = MIR_new_proto_arr (ctx, "__dict_create_bool_p", 1, &ptr_t, 1, vars);
+  dict_create_bool_item = MIR_new_import (ctx, "dict_create_bool");
+  move_item_to_module_start (module, dict_create_bool_proto);
+  move_item_to_module_start (module, dict_create_bool_item);
+
   /* dict_create_int64(int64_t n) -> DictValue* */
   vars[0].name = "n"; vars[0].type = MIR_T_I64;
   dict_create_int64_proto = MIR_new_proto_arr (ctx, "__dict_create_int64_p", 1, &ptr_t, 1, vars);
@@ -16183,6 +16295,22 @@ static op_t gen_dict_create_heap_arena_call (c2m_ctx_t c2m_ctx, MIR_op_t size_op
 }
 
 /* Emit: res = dict_create_int64(val) */
+/* Emit: res = dict_create_bool(val) — produces JSON true/false */
+static op_t gen_dict_create_bool (c2m_ctx_t c2m_ctx, MIR_op_t val_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[4];
+
+  dict_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, dict_create_bool_proto);
+  args[1] = MIR_new_ref_op (ctx, dict_create_bool_item);
+  args[2] = res.mir_op;
+  args[3] = val_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+  return res;
+}
+
 static op_t gen_dict_create_int64 (c2m_ctx_t c2m_ctx, MIR_op_t val_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
@@ -16371,7 +16499,10 @@ static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initi
       /* scalar value */
       struct expr *ve = value->attr;
       op_t wrapped;
-      if (ve != NULL && ve->const_p && integer_type_p (ve->type)) {
+      if (ve != NULL && ve->const_p && ve->type->mode == TM_BASIC
+          && ve->type->u.basic_type == TP_BOOL) {
+        wrapped = gen_dict_create_bool (c2m_ctx, MIR_new_int_op (ctx, ve->c.i_val));
+      } else if (ve != NULL && ve->const_p && integer_type_p (ve->type)) {
         wrapped = gen_dict_create_int64 (c2m_ctx, MIR_new_int_op (ctx, ve->c.i_val));
       } else if (ve != NULL && ve->const_p && floating_type_p (ve->type)) {
         wrapped = gen_dict_create_number (c2m_ctx, MIR_new_double_op (ctx, ve->c.d_val));
@@ -16383,6 +16514,11 @@ static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initi
            pointer (avoids aliasing / double-free with the source dict). */
         op_t v = val_gen (c2m_ctx, value);
         wrapped = gen_dict_value_copy (c2m_ctx, v.mir_op);
+      } else if (ve != NULL && ve->type->mode == TM_BASIC
+                 && ve->type->u.basic_type == TP_BOOL) {
+        /* runtime _Bool expression: wrap as JSON boolean */
+        op_t v = val_gen (c2m_ctx, value);
+        wrapped = gen_dict_create_bool (c2m_ctx, v.mir_op);
       } else {
         /* runtime expression: evaluate then wrap as int64 */
         op_t v = val_gen (c2m_ctx, value);
@@ -17640,6 +17776,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   unsigned long long ull;
   int expr_attr_p, stmt_p;
 
+  /* Update source location from the AST node for debug info (only with -g) */
+  if (c2m_options->debug_info_p) {
+    pos_t p = POS (r);
+    if (p.lno > 0 && p.fname != NULL) {
+      MIR_module_t mod = DLIST_TAIL (MIR_module_t, *MIR_get_module_list (ctx));
+      if (mod != NULL) {
+        curr_src_file_id = MIR_module_add_source_file (ctx, mod, p.fname);
+        curr_src_line = (uint32_t) p.lno;
+        curr_src_col = (uint16_t) (p.ln_pos > 0 ? p.ln_pos : 0);
+      }
+    }
+  }
   classify_node (r, &expr_attr_p, &stmt_p);
   assert ((true_label == NULL && false_label == NULL && expect_res == NULL)
           || (true_label != NULL && false_label != NULL));
@@ -17868,6 +18016,44 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_ASSIGN: {
     node_t lhs = NL_HEAD (r->u.ops);
     node_t rhs_node = NL_EL (r->u.ops, 1);
+    /* class[i] = val — bracket subscript write via Set(int,T) protocol.
+       Intercept N_ASSIGN when the LHS is N_IND on a class-typed receiver. */
+    if (lhs->code == N_IND) {
+      node_t ind_arr = NL_HEAD (lhs->u.ops);
+      struct type *ind_arr_t = ((struct expr *) ind_arr->attr)->type;
+      int class_ind_p = (ind_arr_t->mode == TM_CLASS
+                         || (ind_arr_t->mode == TM_PTR && ind_arr_t->u.ptr_type != NULL
+                             && ind_arr_t->u.ptr_type->mode == TM_CLASS));
+      if (class_ind_p) {
+        struct type *cls_type = ind_arr_t->mode == TM_PTR ? ind_arr_t->u.ptr_type : ind_arr_t;
+        struct type *this_type
+          = ind_arr_t->mode == TM_PTR ? ind_arr_t : create_ptr_type (c2m_ctx, cls_type);
+        node_t set_def = find_class_protocol_method (c2m_ctx, cls_type->u.tag_type, "Set", 2, POS (r));
+        if (set_def != NULL) {
+          /* Evaluate the receiver */
+          op_t this_op;
+          if (ind_arr_t->mode == TM_PTR) {
+            this_op = val_gen (c2m_ctx, ind_arr);
+          } else {
+            this_op = gen (c2m_ctx, ind_arr, NULL, NULL, FALSE, NULL, NULL);
+            if (this_op.mir_op.mode == MIR_OP_MEM)
+              this_op = mem_to_address (c2m_ctx, this_op, TRUE);
+          }
+          /* Evaluate the index */
+          op_t idx_op = val_gen (c2m_ctx, NL_EL (lhs->u.ops, 1));
+          idx_op = cast (c2m_ctx, idx_op, MIR_T_I64, FALSE);
+          /* Evaluate the rhs value */
+          op_t val_op = val_gen (c2m_ctx, rhs_node);
+          /* Call: this->Set(index, value) */
+          op_t set_args[2] = { idx_op, val_op };
+          gen_class_method_call (c2m_ctx, set_def, this_type, this_op, set_args, 2);
+          res = val_op;
+          break;
+        }
+        /* If no Set method exists, fall through to the normal assign path
+           (will likely produce a sensible error at runtime or already errored in check). */
+      }
+    }
     /* Dict-literal assignment: d = { "k": v, ... }.  Build a fresh dict object,
        populate it from the initializer list, then store the pointer into the
        lhs lvalue. */
@@ -17962,6 +18148,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         wrapped = gen_dict_create_string (c2m_ctx, op2.mir_op);
       } else if (rhs_expr != NULL && rhs_expr->const_p && floating_type_p (rhs_expr->type)) {
         wrapped = gen_dict_create_number (c2m_ctx, op2.mir_op);
+      } else if (rhs_expr != NULL && rhs_expr->type->mode == TM_BASIC
+                 && rhs_expr->type->u.basic_type == TP_BOOL) {
+        wrapped = gen_dict_create_bool (c2m_ctx, op2.mir_op);
       } else {
         wrapped = gen_dict_create_int64 (c2m_ctx, op2.mir_op);
       }
@@ -18076,6 +18265,34 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       op1 = val_gen (c2m_ctx, arr);
       op2 = val_gen (c2m_ctx, NL_EL (r->u.ops, 1));
       res = gen_dict_object_get (c2m_ctx, op1.mir_op, op2.mir_op);
+      break;
+    }
+    if (arr_type->mode == TM_CLASS
+        || (arr_type->mode == TM_PTR && arr_type->u.ptr_type != NULL
+            && arr_type->u.ptr_type->mode == TM_CLASS)) {
+      /* class[i] — bracket subscript read via Get(int) protocol.
+         The checker already validated the Get method and stashed it in e->def_node. */
+      struct type *cls_type = arr_type->mode == TM_PTR ? arr_type->u.ptr_type : arr_type;
+      struct type *this_type
+        = arr_type->mode == TM_PTR ? arr_type : create_ptr_type (c2m_ctx, cls_type);
+      node_t get_def = ((struct expr *) r->attr)->def_node;
+      if (get_def == NULL)
+        get_def = find_class_protocol_method (c2m_ctx, cls_type->u.tag_type, "Get", 1, POS (r));
+      assert (get_def != NULL);
+      /* Evaluate the receiver (this pointer) */
+      op_t this_op;
+      if (arr_type->mode == TM_PTR) {
+        this_op = val_gen (c2m_ctx, arr);
+      } else { /* class lvalue: pass its address */
+        this_op = gen (c2m_ctx, arr, NULL, NULL, FALSE, NULL, NULL);
+        if (this_op.mir_op.mode == MIR_OP_MEM)
+          this_op = mem_to_address (c2m_ctx, this_op, TRUE);
+      }
+      /* Evaluate the index and promote to I64 */
+      op_t idx_op = val_gen (c2m_ctx, NL_EL (r->u.ops, 1));
+      idx_op = cast (c2m_ctx, idx_op, MIR_T_I64, FALSE);
+      /* Call: result = this->Get(index) */
+      res = gen_class_method_call (c2m_ctx, get_def, this_type, this_op, &idx_op, 1);
       break;
     }
     if (arr_type->mode == TM_SLICE) {
@@ -19492,6 +19709,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         }
       }
     }
+#if !MIR_NO_DBINFO
+    if (c2m_options->debug_info_p) dbinfo_emit_func_vars (c2m_ctx, r);
+#endif
     MIR_finish_func (ctx);
 
     // NEW: Export with the appropriate name
@@ -20303,6 +20523,427 @@ static void gen_finish (c2m_ctx_t c2m_ctx) {
       reg_free (c2m_ctx, c2m_ctx->gen_ctx);
   }
 }
+
+/* ---- Debug info emission (-g): type + variable tables ---- */
+#if !MIR_NO_DBINFO
+
+static MIR_dbtype_id_t dbinfo_lower_type (c2m_ctx_t c2m_ctx, MIR_module_t mod, struct type *type);
+static MIR_dbencoding_t basic_type_encoding (enum basic_type bt) {
+  switch (bt) {
+  case TP_BOOL: return MIR_DBENC_BOOLEAN;
+  case TP_CHAR: return char_is_signed_p () ? MIR_DBENC_SIGNED_CHAR : MIR_DBENC_UNSIGNED_CHAR;
+  case TP_SCHAR: return MIR_DBENC_SIGNED_CHAR;
+  case TP_UCHAR: return MIR_DBENC_UNSIGNED_CHAR;
+  case TP_SHORT: case TP_INT: case TP_LONG: case TP_LLONG: return MIR_DBENC_SIGNED;
+  case TP_USHORT: case TP_UINT: case TP_ULONG: case TP_ULLONG: return MIR_DBENC_UNSIGNED;
+  case TP_FLOAT: case TP_DOUBLE: case TP_LDOUBLE: return MIR_DBENC_FLOAT;
+  case TP_STRING: return MIR_DBENC_UTF;
+  default: return MIR_DBENC_NONE;
+  }
+}
+
+static const char *basic_type_dbname (enum basic_type bt) {
+  switch (bt) {
+  case TP_VOID: return "void";
+  case TP_BOOL: return "_Bool";
+  case TP_CHAR: return "char";
+  case TP_SCHAR: return "signed char";
+  case TP_UCHAR: return "unsigned char";
+  case TP_SHORT: return "short";
+  case TP_USHORT: return "unsigned short";
+  case TP_INT: return "int";
+  case TP_UINT: return "unsigned int";
+  case TP_LONG: return "long";
+  case TP_ULONG: return "unsigned long";
+  case TP_LLONG: return "long long";
+  case TP_ULLONG: return "unsigned long long";
+  case TP_FLOAT: return "float";
+  case TP_DOUBLE: return "double";
+  case TP_LDOUBLE: return "long double";
+  case TP_STRING: return "String";
+  default: return "?";
+  }
+}
+
+/* Simple recursion depth guard to break cycles (self-referential structs). */
+static int dbinfo_depth = 0;
+#define DBINFO_MAX_DEPTH 32
+
+/* ---- Debug-type cache (deduplication) ----
+   Without caching, every variable declaration re-emits the full type tree,
+   leading to millions of duplicate entries for common types like char/int.
+   Cache key = (struct type *, qualifier bits).
+   16K slots (256 KB BSS) handles even very large single-file compilers
+   like classyc.c (~700 struct references × qualifier/pointer variants). */
+#define DBTYPE_CACHE_BITS 14
+#define DBTYPE_CACHE_SIZE (1 << DBTYPE_CACHE_BITS)
+#define DBTYPE_CACHE_MASK (DBTYPE_CACHE_SIZE - 1)
+
+typedef struct {
+  struct type *type;      /* NULL = empty slot */
+  uint8_t quals;
+  MIR_dbtype_id_t id;
+} dbtype_cache_entry_t;
+
+static dbtype_cache_entry_t dbtype_cache[DBTYPE_CACHE_SIZE];
+static MIR_module_t dbtype_cache_module = NULL;
+
+static void dbtype_cache_reset (MIR_module_t mod) {
+  if (dbtype_cache_module != mod) {
+    memset (dbtype_cache, 0, sizeof (dbtype_cache));
+    dbtype_cache_module = mod;
+  }
+}
+
+static inline uint8_t dbtype_qual_bits (struct type *t) {
+  return (uint8_t) ((t->type_qual.const_p ? 1 : 0) | (t->type_qual.volatile_p ? 2 : 0)
+                    | (t->type_qual.restrict_p ? 4 : 0) | (t->type_qual.atomic_p ? 8 : 0));
+}
+
+static inline uint32_t dbtype_cache_hash (struct type *t, uint8_t quals) {
+  uintptr_t p = (uintptr_t) t;
+  return (uint32_t) ((p >> 3) ^ (p >> 17) ^ quals) & DBTYPE_CACHE_MASK;
+}
+
+static MIR_dbtype_id_t dbtype_cache_lookup (struct type *t, uint8_t quals, int *found) {
+  uint32_t h = dbtype_cache_hash (t, quals);
+  for (int i = 0; i < 32; i++) {
+    uint32_t idx = (h + i) & DBTYPE_CACHE_MASK;
+    if (dbtype_cache[idx].type == NULL) { *found = 0; return 0; }
+    if (dbtype_cache[idx].type == t && dbtype_cache[idx].quals == quals) {
+      *found = 1;
+      return dbtype_cache[idx].id;
+    }
+  }
+  *found = 0;
+  return 0;
+}
+
+static void dbtype_cache_insert (struct type *t, uint8_t quals, MIR_dbtype_id_t id) {
+  uint32_t h = dbtype_cache_hash (t, quals);
+  for (int i = 0; i < 32; i++) {
+    uint32_t idx = (h + i) & DBTYPE_CACHE_MASK;
+    if (dbtype_cache[idx].type == NULL
+        || (dbtype_cache[idx].type == t && dbtype_cache[idx].quals == quals)) {
+      dbtype_cache[idx].type = t;
+      dbtype_cache[idx].quals = quals;
+      dbtype_cache[idx].id = id;
+      return;
+    }
+  }
+  /* Too many collisions — skip caching this entry */
+}
+
+static MIR_dbtype_id_t dbinfo_lower_type_impl (c2m_ctx_t c2m_ctx, MIR_module_t mod, struct type *type);
+
+static MIR_dbtype_id_t dbinfo_lower_type (c2m_ctx_t c2m_ctx, MIR_module_t mod, struct type *type) {
+  if (type == NULL || dbinfo_depth >= DBINFO_MAX_DEPTH) return 0;
+
+  dbtype_cache_reset (mod);
+  uint8_t quals = dbtype_qual_bits (type);
+  int found;
+  MIR_dbtype_id_t cached = dbtype_cache_lookup (type, quals, &found);
+  if (found) return cached;
+
+  dbinfo_depth++;
+  MIR_dbtype_id_t result = dbinfo_lower_type_impl (c2m_ctx, mod, type);
+  dbinfo_depth--;
+
+  dbtype_cache_insert (type, quals, result);
+  return result;
+}
+
+static MIR_dbtype_id_t dbinfo_lower_type_impl (c2m_ctx_t c2m_ctx, MIR_module_t mod, struct type *type) {
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_dbtype_t dt;
+  memset (&dt, 0, sizeof (dt));
+
+  /* Apply qualifiers as wrappers */
+  if (type->type_qual.const_p) {
+    struct type_qual saved = type->type_qual;
+    type->type_qual.const_p = 0;
+    MIR_dbtype_id_t inner = dbinfo_lower_type (c2m_ctx, mod, type);
+    type->type_qual = saved;
+    dt.kind = MIR_DBT_CONST;
+    dt.name = NULL;
+    dt.byte_size = type->raw_size != MIR_SIZE_MAX ? (uint32_t) type->raw_size : 0;
+    dt.u.ref.target_id = inner;
+    return MIR_dbinfo_add_type (ctx, mod, &dt);
+  }
+  if (type->type_qual.volatile_p) {
+    struct type_qual saved = type->type_qual;
+    type->type_qual.volatile_p = 0;
+    MIR_dbtype_id_t inner = dbinfo_lower_type (c2m_ctx, mod, type);
+    type->type_qual = saved;
+    dt.kind = MIR_DBT_VOLATILE;
+    dt.name = NULL;
+    dt.byte_size = type->raw_size != MIR_SIZE_MAX ? (uint32_t) type->raw_size : 0;
+    dt.u.ref.target_id = inner;
+    return MIR_dbinfo_add_type (ctx, mod, &dt);
+  }
+
+  switch (type->mode) {
+  case TM_BASIC: {
+    enum basic_type bt = type->u.basic_type;
+    if (bt == TP_VOID) return 0;
+    dt.kind = MIR_DBT_BASE;
+    dt.name = basic_type_dbname (bt);
+    dt.byte_size = (bt == TP_STRING) ? (uint32_t) sizeof (void *) : (uint32_t) basic_type_size (bt);
+    dt.align = (bt == TP_STRING) ? (uint32_t) sizeof (void *) : (uint32_t) basic_type_align (bt);
+    dt.u.base.encoding = basic_type_encoding (bt);
+    return MIR_dbinfo_add_type (ctx, mod, &dt);
+  }
+  case TM_PTR: {
+    MIR_dbtype_id_t target = dbinfo_lower_type (c2m_ctx, mod, type->u.ptr_type);
+    dt.kind = MIR_DBT_PTR;
+    dt.name = NULL;
+    dt.byte_size = sizeof (void *);
+    dt.align = sizeof (void *);
+    dt.u.ref.target_id = target;
+    return MIR_dbinfo_add_type (ctx, mod, &dt);
+  }
+  case TM_ARR: {
+    struct arr_type *at = type->u.arr_type;
+    MIR_dbtype_id_t el = dbinfo_lower_type (c2m_ctx, mod, at->el_type);
+    dt.kind = MIR_DBT_ARRAY;
+    dt.name = NULL;
+    dt.byte_size = type->raw_size != MIR_SIZE_MAX ? (uint32_t) type->raw_size : 0;
+    dt.align = type->align >= 0 ? (uint32_t) type->align : 0;
+    dt.u.array.element_id = el;
+    /* Compute element count from sizes */
+    if (at->el_type->raw_size != MIR_SIZE_MAX && at->el_type->raw_size > 0
+        && type->raw_size != MIR_SIZE_MAX)
+      dt.u.array.count = (int64_t) (type->raw_size / at->el_type->raw_size);
+    else
+      dt.u.array.count = -1;
+    return MIR_dbinfo_add_type (ctx, mod, &dt);
+  }
+  case TM_STRUCT:
+  case TM_UNION:
+  case TM_CLASS: {
+    node_t tag = type->u.tag_type;
+    node_t tag_id = TAG_ID (tag);
+    const char *tname = (tag_id != NULL && tag_id->code == N_ID) ? tag_id->u.s.s : NULL;
+    node_t member_list = TAG_MEMBER_LIST (tag);
+    dt.kind = (type->mode == TM_UNION) ? MIR_DBT_UNION : MIR_DBT_STRUCT;
+    dt.name = tname;
+    dt.byte_size = type->raw_size != MIR_SIZE_MAX ? (uint32_t) type->raw_size : 0;
+    dt.align = type->align >= 0 ? (uint32_t) type->align : 0;
+    dt.u.aggregate.num_members = 0;
+    dt.u.aggregate.members = NULL;
+    /* Count members */
+    uint32_t n = 0;
+    if (member_list != NULL && member_list->code != N_IGNORE)
+      for (node_t m = NL_HEAD (member_list->u.ops); m != NULL; m = NL_NEXT (m))
+        if (m->code == N_MEMBER && m->attr != NULL) n++;
+    if (n > 0) {
+      MIR_dbmember_t *mbrs = reg_malloc (c2m_ctx, sizeof (MIR_dbmember_t) * n);
+      uint32_t idx = 0;
+      for (node_t m = NL_HEAD (member_list->u.ops); m != NULL; m = NL_NEXT (m)) {
+        if (m->code != N_MEMBER || m->attr == NULL) continue;
+        decl_t md = m->attr;
+        node_t m_decl = MEMBER_DECL (m);
+        node_t m_id = (m_decl != NULL && m_decl->code == N_DECL) ? NL_HEAD (m_decl->u.ops) : NULL;
+        mbrs[idx].name = (m_id != NULL && m_id->code == N_ID) ? m_id->u.s.s : NULL;
+        mbrs[idx].type_id = dbinfo_lower_type (c2m_ctx, mod, md->decl_spec.type);
+        mbrs[idx].byte_offset = (uint32_t) md->offset;
+        mbrs[idx].byte_size = (md->decl_spec.type->raw_size != MIR_SIZE_MAX)
+                                ? (uint32_t) md->decl_spec.type->raw_size : 0;
+        mbrs[idx].bit_offset = (int16_t) md->bit_offset;
+        mbrs[idx].bit_size = (md->width >= 0) ? (int16_t) md->width : 0;
+        idx++;
+      }
+      dt.u.aggregate.num_members = idx;
+      dt.u.aggregate.members = mbrs;
+    }
+    return MIR_dbinfo_add_type (ctx, mod, &dt);
+  }
+  case TM_ENUM: {
+    node_t tag = type->u.tag_type;
+    node_t tag_id = TAG_ID (tag);
+    dt.kind = MIR_DBT_ENUM;
+    dt.name = (tag_id != NULL && tag_id->code == N_ID) ? tag_id->u.s.s : NULL;
+    dt.byte_size = type->raw_size != MIR_SIZE_MAX ? (uint32_t) type->raw_size : 0;
+    dt.align = type->align >= 0 ? (uint32_t) type->align : 0;
+    /* Underlying integer type */
+    enum basic_type ebt = get_enum_basic_type (type);
+    MIR_dbtype_t base_dt;
+    memset (&base_dt, 0, sizeof (base_dt));
+    base_dt.kind = MIR_DBT_BASE;
+    base_dt.name = basic_type_dbname (ebt);
+    base_dt.byte_size = (uint32_t) basic_type_size (ebt);
+    base_dt.align = (uint32_t) basic_type_align (ebt);
+    base_dt.u.base.encoding = basic_type_encoding (ebt);
+    dt.u.enumeration.underlying_id = MIR_dbinfo_add_type (ctx, mod, &base_dt);
+    /* Count enumerators */
+    node_t enum_list = TAG_MEMBER_LIST (tag);
+    uint32_t ne = 0;
+    if (enum_list != NULL && enum_list->code != N_IGNORE)
+      for (node_t e = NL_HEAD (enum_list->u.ops); e != NULL; e = NL_NEXT (e))
+        if (e->code == N_ENUM_CONST) ne++;
+    dt.u.enumeration.num_enumerators = ne;
+    dt.u.enumeration.enumerators = NULL;
+    if (ne > 0) {
+      MIR_dbenumerator_t *ens = reg_malloc (c2m_ctx, sizeof (MIR_dbenumerator_t) * ne);
+      uint32_t ei = 0;
+      for (node_t e = NL_HEAD (enum_list->u.ops); e != NULL; e = NL_NEXT (e)) {
+        if (e->code != N_ENUM_CONST) continue;
+        node_t eid = NL_HEAD (e->u.ops);
+        struct enum_value *ev = e->attr;
+        ens[ei].name = (eid != NULL && eid->code == N_ID) ? eid->u.s.s : "?";
+        ens[ei].value = ev ? ev->u.i_val : 0;
+        ei++;
+      }
+      dt.u.enumeration.enumerators = ens;
+    }
+    return MIR_dbinfo_add_type (ctx, mod, &dt);
+  }
+  case TM_FUNC: {
+    struct func_type *ft = type->u.func_type;
+    MIR_dbtype_id_t ret_id = dbinfo_lower_type (c2m_ctx, mod, ft->ret_type);
+    dt.kind = MIR_DBT_FUNC;
+    dt.name = NULL;
+    dt.byte_size = 0;
+    dt.u.func.return_id = ret_id;
+    dt.u.func.variadic = ft->dots_p;
+    /* Count params */
+    uint32_t np = 0;
+    if (ft->param_list != NULL)
+      for (node_t p = NL_HEAD (ft->param_list->u.ops); p != NULL; p = NL_NEXT (p))
+        if (p->code == N_SPEC_DECL && !void_param_p (p)) np++;
+    dt.u.func.num_params = np;
+    dt.u.func.param_ids = NULL;
+    if (np > 0) {
+      MIR_dbtype_id_t *pids = reg_malloc (c2m_ctx, sizeof (MIR_dbtype_id_t) * np);
+      uint32_t pi = 0;
+      for (node_t p = NL_HEAD (ft->param_list->u.ops); p != NULL; p = NL_NEXT (p)) {
+        if (p->code != N_SPEC_DECL || void_param_p (p)) continue;
+        struct decl_spec *ds = get_param_decl_spec (p);
+        pids[pi++] = ds ? dbinfo_lower_type (c2m_ctx, mod, ds->type) : 0;
+      }
+      dt.u.func.param_ids = pids;
+    }
+    return MIR_dbinfo_add_type (ctx, mod, &dt);
+  }
+  case TM_DICT:
+  case TM_SLICE: {
+    /* Opaque pointer types */
+    dt.kind = MIR_DBT_PTR;
+    dt.name = (type->mode == TM_DICT) ? "dict" : "slice";
+    dt.byte_size = sizeof (void *);
+    dt.align = sizeof (void *);
+    dt.u.ref.target_id = 0; /* void* */
+    return MIR_dbinfo_add_type (ctx, mod, &dt);
+  }
+  default: return 0;
+  }
+}
+
+/* Emit MIR_dbvar_t records for all parameters and locals of the current function. */
+void dbinfo_emit_func_vars (c2m_ctx_t c2m_ctx, node_t func_def_node) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_module_t mod = DLIST_TAIL (MIR_module_t, *MIR_get_module_list (ctx));
+  MIR_func_t func = curr_func->u.func;
+  decl_t func_decl = func_def_node->attr;
+  struct type *decl_type = func_decl->decl_spec.type;
+  struct func_type *ft = decl_type->u.func_type;
+  (void) ft; /* used below */
+
+  if (mod == NULL || func == NULL) return;
+
+  /* Parameters */
+  if (ft->param_list != NULL) {
+    for (node_t p = NL_HEAD (ft->param_list->u.ops); p != NULL; p = NL_NEXT (p)) {
+      if (p->code != N_SPEC_DECL || void_param_p (p)) continue;
+      decl_t pd = p->attr;
+      if (pd == NULL) continue;
+      node_t p_decl = NL_EL (p->u.ops, 1);
+      node_t p_id = (p_decl != NULL && p_decl->code == N_DECL) ? NL_HEAD (p_decl->u.ops) : NULL;
+      if (p_id == NULL || p_id->code != N_ID) continue;
+      pos_t pos = POS (p_id);
+      struct node_scope *pns = pd->scope ? pd->scope->attr : NULL;
+      unsigned scope_num = pns ? pns->func_scope_num : 0;
+      MIR_type_t promoted = get_mir_type (c2m_ctx, pd->decl_spec.type);
+      const char *mir_name = get_reg_var_name (c2m_ctx, promoted, p_id->u.s.s, scope_num);
+
+      MIR_dbvar_t dv;
+      memset (&dv, 0, sizeof (dv));
+      dv.source_name = p_id->u.s.s;
+      dv.type_id = dbinfo_lower_type (c2m_ctx, mod, pd->decl_spec.type);
+      dv.loc_kind = MIR_DBLOC_REG;
+      dv.loc.reg_name = mir_name;
+      dv.scope_num = scope_num;
+      dv.decl_line = pos.lno > 0 ? (uint32_t) pos.lno : 0;
+      dv.decl_col = pos.ln_pos > 0 ? (uint16_t) pos.ln_pos : 0;
+      dv.decl_file_id = (pos.fname != NULL && mod != NULL)
+                           ? MIR_module_add_source_file (ctx, mod, pos.fname) : 0;
+      dv.is_param = 1;
+      MIR_dbinfo_add_var (ctx, func, &dv);
+    }
+  }
+
+  /* Locals: walk func_decls_for_allocation (populated during check) */
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
+  for (size_t i = 0; i < VARR_LENGTH (decl_t, func_decls_for_allocation); i++) {
+    decl_t d = VARR_GET (decl_t, func_decls_for_allocation, i);
+    if (d == NULL || d->decl_spec.typedef_p) continue;
+    /* Find the id node from the decl's scope — look through spec_decl nodes */
+    node_t scope = d->scope;
+    struct node_scope *ns = scope ? scope->attr : NULL;
+    unsigned scope_num = ns ? ns->func_scope_num : 0;
+
+    /* We need the source name. The decl was created from a N_SPEC_DECL whose
+       child[1] is N_DECL whose child[0] is N_ID.  We can find it by searching
+       for the name in the decl's MIR reg name. */
+    const char *source_name = NULL;
+    /* Try to extract from func_decls_for_allocation entries — these all have ids */
+    /* The decl was pushed during create_decl which set decl_node->attr = decl.
+       We don't have a back-pointer to the node, so derive the name from the MIR reg name. */
+    if (d->reg_p) {
+      /* Register var: name is encoded as {type_prefix}{scope_num}_{name} */
+      MIR_type_t promoted = get_mir_type (c2m_ctx, d->decl_spec.type);
+      /* We need the original name. For locals created via VARR_PUSH to
+         func_decls_for_allocation, the name comes from their ID node.
+         The simplest approach: iterate func->vars to find a matching reg. */
+      for (size_t vi = func->nargs; vi < VARR_LENGTH (MIR_var_t, func->vars); vi++) {
+        MIR_var_t mv = VARR_GET (MIR_var_t, func->vars, vi);
+        /* MIR local names look like "I0_x", "U0_y", etc. Extract after underscore. */
+        const char *underscore = strchr (mv.name, '_');
+        if (underscore != NULL) {
+          const char *candidate = underscore + 1;
+          /* Match if it could be this decl's scope */
+          MIR_dbvar_t dv;
+          memset (&dv, 0, sizeof (dv));
+          dv.source_name = candidate;
+          dv.type_id = dbinfo_lower_type (c2m_ctx, mod, d->decl_spec.type);
+          dv.loc_kind = MIR_DBLOC_REG;
+          dv.loc.reg_name = mv.name;
+          dv.scope_num = scope_num;
+          dv.decl_file_id = 0;
+          dv.is_param = 0;
+          MIR_dbinfo_add_var (ctx, func, &dv);
+          source_name = candidate; /* mark as found */
+          break;
+        }
+      }
+    } else {
+      /* Frame variable at FP + offset */
+      /* Same issue: need source name. Derive from the first matching VARR entry or skip. */
+      MIR_dbvar_t dv;
+      memset (&dv, 0, sizeof (dv));
+      dv.source_name = NULL; /* unknown — we'll improve this later */
+      dv.type_id = dbinfo_lower_type (c2m_ctx, mod, d->decl_spec.type);
+      dv.loc_kind = MIR_DBLOC_FRAME;
+      dv.loc.frame_offset = (int64_t) d->offset;
+      dv.scope_num = scope_num;
+      dv.is_param = 0;
+      MIR_dbinfo_add_var (ctx, func, &dv);
+    }
+  }
+}
+
+#endif /* !MIR_NO_DBINFO */
 
 static void gen_mir (c2m_ctx_t c2m_ctx, node_t r) {
   MIR_alloc_t alloc = c2m_alloc (c2m_ctx);

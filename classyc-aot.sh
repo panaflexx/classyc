@@ -101,7 +101,7 @@ while [ $# -gt 0 ]; do
     -I|-D|-U|-include)
       shift; [ $# -gt 0 ] || { echo "$prog: $arg needs an argument" >&2; exit 1; }
       c2m_flags+=("$arg" "$1") ;;
-    -I*|-D*|-U*|-std=*|-O*|-w|-pedantic|-fsigned-char|-fno-*)
+    -I*|-D*|-U*|-std=*|-O*|-w|-g|-pedantic|-fsigned-char|-fno-*)
       c2m_flags+=("$arg") ;;
     # linker flags that take a separate argument
     -L|-l)
