@@ -1277,6 +1277,7 @@ static void push_str_char (VARR (char) * temp, uint64_t ch, int type) {
   int i, len = 0;
 
   switch (type) {
+  case 'f': /* f"..." interpolated string: narrow UTF-8 bytes, like a plain string */
   case ' ':
     if (ch <= 0xFF) {
       VARR_PUSH (char, temp, (char) ch);
@@ -10369,6 +10370,8 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
   }
 }
 
+    static void check_dict_init_list (c2m_ctx_t c2m_ctx, node_t initializer, node_t context);
+
     static void check_initializer (c2m_ctx_t c2m_ctx, decl_t member_decl MIR_UNUSED,
                                    struct type **type_ptr, node_t initializer, int const_only_p,
                                    int top_p) {
@@ -10433,6 +10436,17 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
            via gen_dict_create_object() + an empty gen_dict_init_list() pass. */
         if (scalar_type_p (type) && type->mode != TM_DICT)
           error (c2m_ctx, POS (initializer), "empty scalar initializer");
+        return;
+      }
+      if (type->mode == TM_DICT) {
+        /* A dict literal { "k": v, ... } is materialised at run time by
+           gen_dict_init_list(); it does not take part in the aggregate
+           init_object_path walk used for arrays/structs/classes (whose member
+           offsets are compile-time constants).  We only need to type-check the
+           value expressions here.  Running the generic path for a dict pops the
+           dict off init_object_path for the first key and then underflows the
+           VARR_TRUNC on the next key ("wrong trunc for init_object_t"). */
+        check_dict_init_list (c2m_ctx, initializer, initializer);
         return;
       }
       assert (init->code == N_INIT);
@@ -12513,6 +12527,15 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
            r->attr = e;
            break;
          }
+        /* The field-scope symbol_find above can resolve directly to an
+           instance/static method (an N_FUNC_DEF), not just an N_MEMBER: methods
+           are registered in the class scope under their plain name.  When that
+           happens `func` was never assigned (find_def is short-circuited), so
+           route the method into the func-handling path below.  Without this,
+           obj.method() falls into the member branch and trips the N_MEMBER
+           assertion.  The enclosing N_CALL re-resolves the exact overload. */
+        if (func == NULL && sym.def_node != NULL && sym.def_node->code == N_FUNC_DEF)
+          func = sym.def_node;
         if (func) {
           assert (func->code == N_FUNC_DEF);
 #ifdef C2MIR_PREPRO_DEBUG
@@ -13641,6 +13664,42 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
     assert(func != NULL && func->code == N_FUNC);
     param_list = NL_HEAD(func->u.ops);
 
+    /* ClassyC: untyped (K&R identifier-list) parameters are not allowed in class
+       members.  `Point(x, y)` must be written `Point(int x, int y)`.  A bare
+       identifier parameter is parsed as an N_ID node; later passes (the implicit
+       'this' prepend below, named-argument reordering in `new`, and overload
+       selection) all assume N_SPEC_DECL/N_DECL parameter nodes and would read
+       the N_ID's string bytes as a child list -> crash.  Diagnose here while
+       param_list still holds only the user-written params, and replace each
+       offender with a checked `int <name>` placeholder so the AST stays
+       well-formed and we emit exactly one error per untyped parameter (no
+       cascade).  Plain (non-class) C functions keep their legacy K&R support. */
+    if (curr_class != NULL) {
+        const char *kind = "method";
+        if (id->code == N_ID && id->u.s.s != NULL) {
+            if (strncmp(id->u.s.s, "__ctor_", 7) == 0) kind = "constructor";
+            else if (strncmp(id->u.s.s, "__dtor_", 7) == 0) kind = "destructor";
+        }
+        for (p = NL_HEAD(param_list->u.ops); p != NULL; p = next_p) {
+            next_p = NL_NEXT(p);
+            if (p->code != N_ID) continue;
+            error(c2m_ctx, POS(p), "%s parameter '%s' must have a type", kind, p->u.s.s);
+            NL_REMOVE(param_list->u.ops, p);
+            decl_node = new_pos_node5(c2m_ctx, N_SPEC_DECL, POS(p),
+                                      new_node1(c2m_ctx, N_SHARE,
+                                                new_node1(c2m_ctx, N_LIST,
+                                                          new_pos_node(c2m_ctx, N_INT, POS(p)))),
+                                      new_pos_node2(c2m_ctx, N_DECL, POS(p),
+                                                    new_str_node(c2m_ctx, N_ID, p->u.s, POS(p)),
+                                                    new_node(c2m_ctx, N_LIST)),
+                                      new_node(c2m_ctx, N_IGNORE),
+                                      new_node(c2m_ctx, N_IGNORE),
+                                      new_node(c2m_ctx, N_IGNORE));
+            NL_APPEND(param_list->u.ops, decl_node);
+            check(c2m_ctx, decl_node, r);
+        }
+    }
+
         // If it's a class method and NOT a static method, add 'this' parameter.
         // Static class methods (decl_spec.static_p == TRUE) have no implicit receiver.
             if (curr_class && !decl_spec.static_p) {
@@ -14744,6 +14803,12 @@ static void get_type_alias_name (c2m_ctx_t c2m_ctx, struct type *type, VARR (cha
     case TP_FLOAT: VARR_PUSH (char, name, 'f'); break;
     case TP_DOUBLE: VARR_PUSH (char, name, 'd'); break;
     case TP_LDOUBLE: VARR_PUSH (char, name, 'D'); break;
+    case TP_STRING:
+      /* A managed String is a pointer-sized value; alias it as pointer-to-char
+         to match its runtime representation. */
+      VARR_PUSH (char, name, 'p');
+      VARR_PUSH (char, name, 'c');
+      break;
     default: assert (FALSE);
     }
     break;
@@ -15834,7 +15899,8 @@ static mir_size_t get_object_path_offset (c2m_ctx_t c2m_ctx) {
                  * type_size (c2m_ctx, init_object.container_type->u.arr_type->el_type));
     } else {
       assert (init_object.container_type->mode == TM_STRUCT
-              || init_object.container_type->mode == TM_UNION);
+              || init_object.container_type->mode == TM_UNION
+              || init_object.container_type->mode == TM_CLASS);
       assert (init_object.u.curr_member->code == N_MEMBER);
       if (!anon_struct_union_type_member_p (init_object.u.curr_member))
         /* Members inside anon struct/union already have adjusted offset */
@@ -15921,8 +15987,12 @@ check_one_value:
   init_object.field_designator_p = FALSE;
   if (type->mode == TM_ARR) {
     size_val = get_arr_type_size (type);
-    /* we already figured out the array size during check: */
-    assert (size_val >= 0);
+    /* size_val is normally known from check, but it may be -1 for a class' trailing
+       FLEXIBLE array member: create_decl restores that member to its incomplete
+       form after check (so a later instance with a different length is sized
+       correctly).  Element placement below is driven solely by the running index
+       (update_init_object_path treats -1 as unbounded), so an unknown total size
+       is fine here. */
     init_object.u.curr_index = -1;
   } else {
     init_object.u.curr_member = NULL;
@@ -17999,9 +18069,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     struct type *type1 = ((struct expr *) NL_HEAD (r->u.ops)->attr)->type;
     struct type *type2 = ((struct expr *) NL_EL (r->u.ops, 1)->attr)->type;
     struct type type_s, ptr_type_s = get_ptr_int_type (FALSE);
-
-    type_s = arithmetic_conversion (type1->mode == TM_PTR ? &ptr_type_s : type1,
-                                    type2->mode == TM_PTR ? &ptr_type_s : type2);
+    /* dict, slice and managed String are all pointer-sized identity values;
+       compare them as integers/pointers (arithmetic_conversion only accepts
+       arithmetic operands). */
+#define CMP_PTR_LIKE(t)                                                   \
+  ((t)->mode == TM_PTR || (t)->mode == TM_DICT || (t)->mode == TM_SLICE  \
+   || builtin_string_type_p (t))
+    type_s = arithmetic_conversion (CMP_PTR_LIKE (type1) ? &ptr_type_s : type1,
+                                    CMP_PTR_LIKE (type2) ? &ptr_type_s : type2);
+#undef CMP_PTR_LIKE
     set_type_layout (c2m_ctx, &type_s);
     gen_cmp_op (c2m_ctx, r, &type_s, &op1, &op2, &res);
     insn_code = get_mir_type_insn_code (c2m_ctx, &type_s, r);
