@@ -9426,6 +9426,13 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       const char *msg;
 
       if (right == NULL) right = expr->type;
+      /* A dict value (DictValue*) coerces to any scalar lvalue/parameter: gen
+         unwraps the union payload (int64_value / string_value / ...) to the
+         target type at run time.  Assigning into a dict field is handled by the
+         left->mode == TM_DICT case below. */
+      if (right != NULL && right->mode == TM_DICT && left != NULL
+          && (arithmetic_type_p (left) || left->mode == TM_PTR || string_type_p (left)))
+        return;
       if (arithmetic_type_p (left)) {
         if (!arithmetic_type_p (right)
             && !(left->mode == TM_BASIC && left->u.basic_type == TP_BOOL && right->mode == TM_PTR)) {
@@ -10556,7 +10563,7 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
           }
         }
       }
-      if (type->mode == TM_ARR && size_val < 0 && max_index >= 0) {
+      if (type->mode == TM_ARR && incomplete_type_p (c2m_ctx, type) && max_index >= 0) {
         /* Array w/o size: define it.  Copy the type as the incomplete
            type can be shared by declarations with different length
            initializers.  We need only one level of copying as sub-array
@@ -16735,6 +16742,20 @@ static op_t gen_dict_unwrap (c2m_ctx_t c2m_ctx, op_t dop) {
   return res;
 }
 
+/* When `src_node` evaluates to a dict value (a DictValue*) but the consuming
+   context (`target`) is a non-dict type, unwrap the DictValue union payload
+   (int64_value / string_value / number_value) so the right scalar is used.
+   A dict-typed target keeps the box pointer for chaining / dict-to-dict copy.
+   Returns the possibly-unwrapped operand. */
+static op_t maybe_unwrap_dict_value (c2m_ctx_t c2m_ctx, op_t op, node_t src_node,
+                                     struct type *target) {
+  struct expr *se = src_node != NULL ? (struct expr *) src_node->attr : NULL;
+  if (se != NULL && se->type != NULL && se->type->mode == TM_DICT && target != NULL
+      && target->mode != TM_DICT)
+    return gen_dict_unwrap (c2m_ctx, op);
+  return op;
+}
+
 /* Import the UTF-8 String runtime helpers (cstring.h) into the current module,
    once per module.  All String values are char* (passed/returned as I64). */
 static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
@@ -17242,6 +17263,7 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
     assert (local_p && offset == 0 && VARR_LENGTH (init_el_t, init_els) - init_start == 1);
     init_el = VARR_GET (init_el_t, init_els, init_start);
     val = val_gen (c2m_ctx, init_el.init);
+    val = maybe_unwrap_dict_value (c2m_ctx, val, init_el.init, init_el.el_type);
     t = get_op_type (c2m_ctx, var);
     val = cast (c2m_ctx, val, get_mir_type (c2m_ctx, init_el.el_type), FALSE);
     emit_scalar_assign (c2m_ctx, var, &val, t, FALSE);
@@ -18294,6 +18316,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     t = get_op_type (c2m_ctx, var);
     op2 = gen (c2m_ctx, rhs_node, NULL, NULL, t != MIR_T_UNDEF,
                t != MIR_T_UNDEF ? NULL : &var, NULL);
+    op2 = maybe_unwrap_dict_value (c2m_ctx, op2, rhs_node, ((struct expr *) r->attr)->type);
     if ((!val_p && true_label == NULL) || t == MIR_T_UNDEF) {
       res = var;
       val = op2;
@@ -19270,6 +19293,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         assert (param != NULL || NL_HEAD (param_list->u.ops) == NULL
                 || func_type->u.func_type->dots_p);
         arg_type = e->type;
+        /* A dict value (DictValue*) passed where the callee does not expect a
+           dict must be unwrapped to its scalar/string payload first.  This
+           covers variadic arguments (e.g. printf("%s", d.name) — pass the
+           char* payload, not the box pointer) as well as plain pointer or
+           integer parameters.  A dict argument bound to a dict parameter keeps
+           its box so the callee can operate on it. */
+        if (!struct_p && e->type->mode == TM_DICT) {
+          struct type *target = NULL;
+          if (param != NULL) target = get_param_decl_spec (param)->type;
+          if (target == NULL || target->mode != TM_DICT)
+            op2 = gen_dict_unwrap (c2m_ctx, op2);
+        }
         if (struct_p) {
         } else if (param != NULL) {
           assert (param->code == N_SPEC_DECL || param->code == N_TYPE);
@@ -20406,6 +20441,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     }
     val = gen (c2m_ctx, NL_EL (r->u.ops, 1), NULL, NULL, !ret_by_addr_p && scalar_p,
                !ret_by_addr_p || scalar_p ? NULL : &var, NULL);
+    if (!ret_by_addr_p && scalar_p)
+      val = maybe_unwrap_dict_value (c2m_ctx, val, NL_EL (r->u.ops, 1), ret_type);
     if (!ret_by_addr_p && scalar_p) {
       t = get_mir_type (c2m_ctx, ret_type);
       t = promote_mir_int_type (t);

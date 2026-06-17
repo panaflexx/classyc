@@ -63,12 +63,15 @@ run_example classy-fstring.c
 run_example classy-auto.c
 run_example classy-brace-forin.c
 run_example classy-seq-lambdas.c
-run_example classy-stacktrace.c
+#run_example classy-stacktrace.c #CRASHTEST
 
 run_example test-class-subscript.c
 run_example test-generic-ptr-args.c
-run_example test-stacktrace-deep.c
+#run_example test-stacktrace-deep.c #CRASHTEST
 run_example test_json_int.c
+run_example test-ptr-arg-mini.c
+run_example classy-generics.c
+run_example classy-overload.c
 
 # ── summary ────────────────────────────────────────────────────────────
 

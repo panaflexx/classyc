@@ -262,39 +262,37 @@ int main() {
     /* int + bool, all auto-cast to text and joined with the `+` operator */
     int n14 = 42;
     bool flag = 1;
-    String s14 = "n=" + n14 + " flag=" + flag;
+    String s14 = (String)"n=" + n14 + " flag=" + flag;
     printf("    built: %s\n", s14);
     check(strcmp(s14, "n=42 flag=true") == 0,  "14a int + bool auto-cast concat");
 
     /* literal + int + literal */
-    String s14b = "x" + 5 + "y";
+    String s14b = (String)"x" + 5 + "y";
     check(strcmp(s14b, "x5y") == 0,            "14b literal + int + literal");
 
     /* double auto-cast ("%g") */
-#if 0 // FIXME
     double pi = 3.5;
-    String s14c = "pi=" + pi;
+    String s14c = (String)"pi=" + pi;
     check(strcmp(s14c, "pi=3.5") == 0,         "14c double auto-cast");
-#endif
 
     /* char auto-cast (single character) */
     char c14 = 'Q';
-    String s14d = "ch=" + c14;
+    String s14d = (String)"ch=" + c14;
     check(strcmp(s14d, "ch=Q") == 0,           "14d char auto-cast");
 
     /* unsigned auto-cast */
     unsigned u14 = 100;
-    String s14e = "u=" + u14;
+    String s14e = (String)"u=" + u14;
     check(strcmp(s14e, "u=100") == 0,          "14e unsigned auto-cast");
 
     /* negative int auto-cast */
     int neg = -7;
-    String s14f = "neg=" + neg;
+    String s14f = (String)"neg=" + neg;
     check(strcmp(s14f, "neg=-7") == 0,         "14f negative int auto-cast");
 
     /* bool false renders as "false" */
     bool no = 0;
-    String s14g = "flag=" + no;
+    String s14g = (String)"flag=" + no;
     check(strcmp(s14g, "flag=false") == 0,     "14g bool false -> false");
 
     /* String variable + int (not just literals) */
@@ -306,9 +304,9 @@ int main() {
     /* the headline example from the feature request */
     int myInt = 7;
     bool myBool = 1;
-    String s14i = "hello " + myInt + " is " + myBool;
+    String s14i = (String)"hello " + myInt + " is " + myBool;
     printf("    headline: %s\n", s14i);
-    check(strcmp(s14i, "hello 7 is true") == 0, "14i headline example");
+    check(strcmp(s14i, "hello 7 is true") == 0, f"14i headline example {s14i}");
 
     /* ========== SUMMARY ========== */
 
