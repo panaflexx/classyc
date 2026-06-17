@@ -34,6 +34,7 @@
 #include "time.h"
 
 #include "classyc.h"
+#define LOGGER_IMPL /* this TU owns the logger's diagnostic-sink storage */
 #include "logger.h"
 
 #if defined(__x86_64__) || defined(_M_AMD64)
@@ -1040,43 +1041,55 @@ static const char *get_token_name (c2m_ctx_t c2m_ctx, int token_code) {
   }
 }
 
-/* Print "file:line:col: " (bold) followed by the diagnostic label (e.g. "error")
-   in `label_color`, with a trailing " -- ".  Colors are applied only when the
-   stream is an interactive terminal (see logger.h). */
-static void print_diag_prefix (FILE *f, pos_t pos, const char *label, const char *label_color) {
-  int color = log_color_enabled (f);
+/* Shared back-end for error()/warning(): forward a structured diagnostic to the
+   logger sink (for the LSP/editors) and, when a message stream exists, print the
+   colored "file:line:col: <label> -- message" line.  Printing keeps using
+   vfprintf so long messages are never truncated; the sink copy is formatted into
+   a bounded buffer (only when a sink is registered). */
+static void vdiag (c2m_ctx_t c2m_ctx, pos_t pos, int error_p, const char *label,
+                   const char *label_color, const char *format, va_list args) {
+  FILE *f = c2m_options->message_file;
 
-  fprintf (f, "%s", log_c (color, LOG_BOLD));
-  print_pos (f, pos, TRUE);
-  fprintf (f, "%s%s%s -- ", log_c (color, label_color), label, log_c (color, LOG_RESET));
+  if (log_diag_active ()) {
+    char buf[2048];
+    va_list ap;
+    log_diag_t d;
+
+    va_copy (ap, args);
+    vsnprintf (buf, sizeof buf, format, ap);
+    va_end (ap);
+    d.file = pos.fname;
+    d.line = pos.lno;
+    d.col = pos.ln_pos;
+    d.error_p = error_p;
+    d.message = buf;
+    log_emit_diag (&d);
+  }
+  if (f != NULL) {
+    log_print_diag_prefix (f, pos.lno < 0 ? NULL : pos.fname, pos.lno, pos.ln_pos, label,
+                           label_color);
+    vfprintf (f, format, args);
+    fprintf (f, "\n");
+  }
 }
 
 static void error (c2m_ctx_t c2m_ctx, pos_t pos, const char *format, ...) {
   va_list args;
-  FILE *f;
 
-  if ((f = c2m_options->message_file) == NULL) return;
   n_errors++;
   va_start (args, format);
-  print_diag_prefix (f, pos, "error", LOG_BRED);
-  vfprintf (f, format, args);
+  vdiag (c2m_ctx, pos, TRUE, "error", LOG_BRED, format, args);
   va_end (args);
-  fprintf (f, "\n");
 }
 
 static void warning (c2m_ctx_t c2m_ctx, pos_t pos, const char *format, ...) {
   va_list args;
-  FILE *f;
 
-  if ((f = c2m_options->message_file) == NULL) return;
   n_warnings++;
-  if (!c2m_options->ignore_warnings_p) {
-    va_start (args, format);
-    print_diag_prefix (f, pos, "warning", LOG_BYELLOW);
-    vfprintf (f, format, args);
-    va_end (args);
-    fprintf (f, "\n");
-  }
+  if (c2m_options->ignore_warnings_p) return;
+  va_start (args, format);
+  vdiag (c2m_ctx, pos, FALSE, "warning", LOG_BYELLOW, format, args);
+  va_end (args);
 }
 
 static void debug (c2m_ctx_t c2m_ctx, pos_t pos, const char *format, ...) {
@@ -4323,18 +4336,32 @@ static void record_stop (c2m_ctx_t c2m_ctx, size_t mark, int restore_p) {
 
 static void syntax_error (c2m_ctx_t c2m_ctx, const char *expected_name) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
-  FILE *f;
+  FILE *f = c2m_options->message_file;
+  pos_t pos = curr_token->pos;
+  const char *tok = get_token_name (c2m_ctx, curr_token->code);
 
-  if ((f = c2m_options->message_file) == NULL) return;
-  int color = log_color_enabled (f);
-  fprintf (f, "%s", log_c (color, LOG_BOLD));
-  print_pos (f, curr_token->pos, TRUE);
-  fprintf (f, "%ssyntax error%s on %s%s%s", log_c (color, LOG_BRED), log_c (color, LOG_RESET),
-           log_c (color, LOG_BOLD), get_token_name (c2m_ctx, curr_token->code),
-           log_c (color, LOG_RESET));
-  fprintf (f, " (expected '%s%s%s'):\n", log_c (color, LOG_BGREEN), expected_name,
-           log_c (color, LOG_RESET));
   n_errors++;
+  if (log_diag_active ()) {
+    char buf[512];
+    log_diag_t d;
+
+    snprintf (buf, sizeof buf, "syntax error on %s (expected '%s')", tok, expected_name);
+    d.file = pos.fname;
+    d.line = pos.lno;
+    d.col = pos.ln_pos;
+    d.error_p = TRUE;
+    d.message = buf;
+    log_emit_diag (&d);
+  }
+  if (f != NULL) {
+    int color = log_color_enabled (f);
+    fputs (log_c (color, LOG_BOLD), f);
+    if (pos.lno >= 0) fprintf (f, "%s:%d:%d: ", pos.fname, pos.lno, pos.ln_pos);
+    fprintf (f, "%ssyntax error%s on %s%s%s", log_c (color, LOG_BRED), log_c (color, LOG_RESET),
+             log_c (color, LOG_BOLD), tok, log_c (color, LOG_RESET));
+    fprintf (f, " (expected '%s%s%s'):\n", log_c (color, LOG_BGREEN), expected_name,
+             log_c (color, LOG_RESET));
+  }
 }
 
 static int tpname_eq (tpname_t tpname1, tpname_t tpname2, void *arg MIR_UNUSED) {
@@ -22763,6 +22790,9 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
         if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_file, r, 0, FALSE);
         if (c2m_options->verbose_p && c2m_options->message_file != NULL)
           fprintf (c2m_options->message_file, "check - FAIL\n");
+      } else if (c2m_options->no_gen_p) {
+        /* analyze-only (LSP): stop after the context checker, no MIR generated */
+        if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_file, r, 0, TRUE);
       } else {
         if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_file, r, 0, TRUE);
         m = MIR_new_module (ctx, get_module_name (c2m_ctx));

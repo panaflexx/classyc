@@ -289,6 +289,7 @@ static void init_options (int argc, char *argv[]) {
   options.debug_p = options.verbose_p = options.ignore_warnings_p = FALSE;
   options.asm_p = options.object_p = options.no_prepro_p = options.prepro_only_p = FALSE;
   options.syntax_only_p = options.pedantic_p = FALSE;
+  options.no_gen_p = FALSE;
   options.debug_info_p = FALSE;
   gen_debug_level = -1;
   VARR_CREATE (char, temp_string, &default_alloc, 0);

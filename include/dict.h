@@ -230,7 +230,7 @@ C2M_DICT_API DictValue *dict_create_int64_arena(DictArena *arena, int64_t n) {
 C2M_DICT_API DictValue *dict_create_string_arena(DictArena *arena, const char *s) {
     if (!s) return NULL;
     size_t len = strnlen(s, MAX_VALUE_LEN);
-    if (len == 0 || len >= MAX_VALUE_LEN) {
+    if (len >= MAX_VALUE_LEN) {
         return NULL;
     }
 
@@ -743,7 +743,7 @@ C2M_DICT_API char *dict_parse_json_string(DictJsonParser *p) {
             return out;
         }
         if (c == '\\') {
-            if (p->pos >= p->buffer_len) { free(out); return NULL; }
+            if (p->pos >= p->buffer_len) { dict_parser_error(p, "Unterminated escape sequence"); free(out); return NULL; }
             char esc = p->buffer[p->pos++];
             char decoded;
             if (esc == '"' || esc == '\\' || esc == '/') decoded = esc;
@@ -755,13 +755,13 @@ C2M_DICT_API char *dict_parse_json_string(DictJsonParser *p) {
             else if (esc == 'u') {
                 unsigned int codepoint = 0;
                 for (int i = 0; i < 4; i++) {
-                    if (p->pos >= p->buffer_len) { free(out); return NULL; }
+                    if (p->pos >= p->buffer_len) { dict_parser_error(p, "Incomplete unicode escape"); free(out); return NULL; }
                     char h = p->buffer[p->pos++];
                     unsigned int val;
                     if (h >= '0' && h <= '9') val = h - '0';
                     else if (h >= 'a' && h <= 'f') val = 10 + h - 'a';
                     else if (h >= 'A' && h <= 'F') val = 10 + h - 'A';
-                    else { free(out); return NULL; }
+                    else { dict_parser_error(p, "Invalid hex digit in unicode escape"); free(out); return NULL; }
                     codepoint = (codepoint << 4) | val;
                 }
                 if (codepoint <= 0x7F) {
@@ -770,7 +770,7 @@ C2M_DICT_API char *dict_parse_json_string(DictJsonParser *p) {
                     if (out_length + 2 > out_capacity) {
                         size_t new_capacity = out_capacity * 2;
                         char *tmp = (char *)realloc(out, new_capacity);
-                        if (!tmp) { free(out); return NULL; }
+                        if (!tmp) { dict_parser_error(p, "Out of memory in unicode string"); free(out); return NULL; }
                         out = tmp; out_capacity = new_capacity;
                     }
                     out[out_length++] = (char)(0xC0 | (codepoint >> 6));
@@ -780,7 +780,7 @@ C2M_DICT_API char *dict_parse_json_string(DictJsonParser *p) {
                     if (out_length + 3 > out_capacity) {
                         size_t new_capacity = out_capacity * 2;
                         char *tmp = (char *)realloc(out, new_capacity);
-                        if (!tmp) { free(out); return NULL; }
+                        if (!tmp) { dict_parser_error(p, "Out of memory in unicode string"); free(out); return NULL; }
                         out = tmp; out_capacity = new_capacity;
                     }
                     out[out_length++] = (char)(0xE0 | (codepoint >> 12));
@@ -788,11 +788,11 @@ C2M_DICT_API char *dict_parse_json_string(DictJsonParser *p) {
                     out[out_length++] = (char)(0x80 | (codepoint & 0x3F));
                     continue;
                 }
-            } else { free(out); return NULL; }
+            } else { dict_parser_error(p, "Invalid escape sequence"); free(out); return NULL; }
             if (out_length + 1 > out_capacity) {
                 size_t new_capacity = out_capacity * 2;
                 char *tmp = (char *)realloc(out, new_capacity);
-                if (!tmp) { free(out); return NULL; }
+                if (!tmp) { dict_parser_error(p, "Out of memory"); free(out); return NULL; }
                 out = tmp; out_capacity = new_capacity;
             }
             out[out_length++] = decoded;
@@ -800,12 +800,13 @@ C2M_DICT_API char *dict_parse_json_string(DictJsonParser *p) {
             if (out_length + 1 > out_capacity) {
                 size_t new_capacity = out_capacity * 2;
                 char *tmp = (char *)realloc(out, new_capacity);
-                if (!tmp) { free(out); return NULL; }
+                if (!tmp) { dict_parser_error(p, "Out of memory"); free(out); return NULL; }
                 out = tmp; out_capacity = new_capacity;
             }
             out[out_length++] = c;
         }
     }
+    dict_parser_error(p, "Unterminated string literal");
     free(out);
     return NULL;
 }
@@ -821,16 +822,25 @@ C2M_DICT_API int dict_parse_number(DictJsonParser *p, double *out) {
             break;
     }
     size_t num_len = p->pos - start_pos;
-    if (num_len == 0) return 0;
+    if (num_len == 0) {
+        dict_parser_error(p, "Empty or invalid number");
+        return 0;
+    }
 
     char *endptr;
     char num_buf[128];
-    if (num_len >= sizeof(num_buf)) return 0;
+    if (num_len >= sizeof(num_buf)) {
+        dict_parser_error(p, "Number too long");
+        return 0;
+    }
     memcpy(num_buf, p->buffer + start_pos, num_len);
     num_buf[num_len] = '\0';
 
     double val = strtod(num_buf, &endptr);
-    if (*endptr != '\0') return 0;
+    if (*endptr != '\0') {
+        dict_parser_error(p, "Invalid number literal");
+        return 0;
+    }
     *out = val;
     return 1;
 }
@@ -917,6 +927,7 @@ C2M_DICT_API DictValue *dict_parse_array(DictJsonParser *p) {
             size_t new_capacity = capacity * 2;
             DictValue **tmp = (DictValue **)realloc(items, sizeof(DictValue *) * new_capacity);
             if (!tmp) {
+                dict_parser_error(p, "Out of memory expanding array");
                 dict_destroy(item);
                 for (size_t i = 0; i < length; i++) dict_destroy(items[i]);
                 free(items);
@@ -970,6 +981,7 @@ C2M_DICT_API DictValue *dict_parse_object(DictJsonParser *p) {
         dict_parser_skip_whitespace(p);
         char *key = dict_parse_json_string(p);
         if (!key) {
+            dict_parser_error(p, "Failed to parse object key");
             dict_destroy(obj);
             return NULL;
         }
@@ -982,11 +994,17 @@ C2M_DICT_API DictValue *dict_parse_object(DictJsonParser *p) {
         }
         DictValue *value = dict_parse_value(p);
         if (!value) {
+            if (p->error_str == NULL || p->error_str[0] == '\0') {
+                char msg[256];
+                snprintf(msg, sizeof msg, "Failed to parse value for key '%s'", key);
+                dict_parser_error(p, msg);
+            }
             free(key);
             dict_destroy(obj);
             return NULL;
         }
         if (!dict_object_set(obj, key, value)) {
+            dict_parser_error(p, "Failed to set object property");
             free(key);
             dict_destroy(value);
             dict_destroy(obj);
@@ -1006,16 +1024,40 @@ C2M_DICT_API DictValue *dict_parse_object(DictJsonParser *p) {
     return obj;
 }
 
-C2M_DICT_API DictValue *dict_deserialize_json(const char *json, char *err_buf, size_t err_len) {
-    DictJsonParser parser = {json, strlen(json), 0, err_buf, err_len};
+C2M_DICT_API DictValue *dict_deserialize_json(const char *json, char *err_buf, size_t err_len);
+C2M_DICT_API DictValue *dict_deserialize_json_len(const char *json, size_t len, char *err_buf, size_t err_len);
+
+C2M_DICT_API DictValue *dict_deserialize_json_len(const char *json, size_t len, char *err_buf, size_t err_len) {
+    DictJsonParser parser = {json, len, 0, err_buf, err_len};
     DictValue *result = dict_parse_value(&parser);
     dict_parser_skip_whitespace(&parser);
     if (parser.pos != parser.buffer_len) {
-        dict_parser_error(&parser, "Trailing garbage after JSON value");
-        dict_destroy(result);
+        if (result != NULL) {
+            /* A value was parsed but we didn't consume the whole input -- real trailing data. */
+            char detail[128];
+            size_t remain = parser.buffer_len - parser.pos;
+            size_t show = remain > 16 ? 16 : remain;
+            size_t dpos = 0;
+            int written = snprintf(detail, sizeof detail, "Trailing garbage after JSON value at pos %zu (remain %zu):", parser.pos, remain);
+            if (written > 0) dpos = (size_t)written;
+            for (size_t k = 0; k < show && dpos + 5 < sizeof detail; k++) {
+                unsigned char c = (unsigned char)parser.buffer[parser.pos + k];
+                int n = snprintf(detail + dpos, sizeof detail - dpos, " %02x", (int)c);
+                if (n > 0) dpos += (size_t)n;
+            }
+            detail[sizeof detail - 1] = '\0';
+            dict_parser_error(&parser, detail);
+            dict_destroy(result);
+        }
+        /* else: parse_value already failed and recorded a specific error in err_buf; do not clobber it */
         return NULL;
     }
     return result;
+}
+
+C2M_DICT_API DictValue *dict_deserialize_json(const char *json, char *err_buf, size_t err_len) {
+    if (json == NULL) return NULL;
+    return dict_deserialize_json_len(json, strlen(json), err_buf, err_len);
 }
 
 /* BSON support (unchanged for brevity; arena variants can follow the same pattern) */

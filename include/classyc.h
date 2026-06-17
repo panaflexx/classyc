@@ -20,6 +20,7 @@ struct c2mir_options {
   FILE *message_file;
   int debug_p, verbose_p, ignore_warnings_p, no_prepro_p, prepro_only_p;
   int syntax_only_p, pedantic_p, asm_p, object_p;
+  int no_gen_p;     /* run preprocess+parse+check but skip MIR generation (LSP/analysis) */
   int debug_info_p; /* -g: emit source locations and debug info into MIR/bmir */
   size_t module_num;
   FILE *prepro_output_file; /* non-null for prepro_only_p */
