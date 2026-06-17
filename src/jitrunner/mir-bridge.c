@@ -17,6 +17,7 @@
    their addresses to JIT'd code. */
 #include "dict.h"
 #include "cstring.h"
+#include "cobjarena.h"
 
 #include "mir.h"
 #include "mir-gen.h"

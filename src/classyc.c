@@ -685,6 +685,8 @@ typedef enum {
   N_DEFER,  /* defer <stmt> — run statement at enclosing scope exit (LIFO) */
   N_DELETE, /* delete <ptr> — run destructor (if any) then free the heap object */
   N_LAMBDA, /* (params) => body — anonymous function (future: untyped/generic lambdas) */
+  N_INTERFACE, /* interface Name { sig; ... } — named structural method-set contract */
+  N_ANY,    /* any<I>(expr) — wrap a concrete C* as an erased Any<I>* handle */
 } node_code_t;
 
 #undef REP_SEP
@@ -4245,6 +4247,17 @@ typedef struct {
 
 DEF_VARR (generic_spec_t);
 
+/* Interface registry (Phase 1): a named, STRUCTURAL method-set contract.
+   Recording the signatures by name lets later phases ask "does class C satisfy
+   interface I?" structurally — the same duck-typing the compiler already does
+   for List's Count/Get/Add, just named.  Emits no runtime type or layout. */
+typedef struct {
+  const char *name; /* interface name, e.g. "Greeter" */
+  node_t node;      /* N_INTERFACE: id(0), member_list(1 = N_LIST of N_MEMBER) */
+} iface_t;
+
+DEF_VARR (iface_t);
+
 struct parse_ctx {
   int record_level;
   size_t next_token_index;
@@ -4256,6 +4269,7 @@ struct parse_ctx {
   unsigned lambda_uid;             /* counter for unique lambda names */
   VARR (generic_tmpl_t) * generic_templates; /* registered generic class templates */
   VARR (generic_spec_t) * generic_specs;     /* created specializations (dedup cache) */
+  VARR (iface_t) * interfaces;               /* registered interface contracts */
 };
 
 #define record_level parse_ctx->record_level
@@ -4268,6 +4282,7 @@ struct parse_ctx {
 #define lambda_uid parse_ctx->lambda_uid
 #define generic_templates parse_ctx->generic_templates
 #define generic_specs parse_ctx->generic_specs
+#define interfaces parse_ctx->interfaces
 
 static struct node err_struct;
 static const node_t err_node = &err_struct;
@@ -4595,6 +4610,13 @@ static generic_tmpl_t *get_generic_template (c2m_ctx_t c2m_ctx, const char *name
   return NULL;
 }
 
+/* Phase 2: Any<I> erased-handle synthesis (defined after find_interface).
+   Forward-declared here because parse_generic_type_arg / type_spec reference
+   them while parsing type arguments. */
+static node_t synthesize_any_class (c2m_ctx_t c2m_ctx, const char *iface_name, pos_t pos);
+static node_t parse_any_instantiation (c2m_ctx_t c2m_ctx, pos_t pos);
+static node_t parse_synth_func_def (c2m_ctx_t c2m_ctx);
+
 /* Build a mangled specialization name, e.g. List + String -> __generic_List_String */
 static const char *mangle_generic_name (c2m_ctx_t c2m_ctx,
                                          const char *base_name,
@@ -4791,7 +4813,15 @@ static node_t parse_generic_type_arg (c2m_ctx_t c2m_ctx) {
   else if (MP (T_VOID,     pos)) base = new_pos_node (c2m_ctx, N_VOID,   pos);
   else if (MP (T_DICT,     pos)) base = new_pos_node (c2m_ctx, N_DICT,   pos);
   else if (MP (T_BOOL,     pos)) base = new_pos_node (c2m_ctx, N_BOOL,   pos);
-  else if (MN (T_ID, r)) base = r;   /* user class name */
+  else if (MN (T_ID, r)) {
+    /* Any<I> as a type argument (e.g. List<Any<View>*>): synthesize the erased
+       handle class and use its mangled name (a plain N_ID) as the argument, so
+       the outer generic instantiation mangles with no special-casing. */
+    if (strcmp (r->u.s.s, "Any") == 0 && C (T_CMP) && curr_token->node_code == N_LT)
+      base = parse_any_instantiation (c2m_ctx, POS (r));
+    else
+      base = r;   /* user class name */
+  }
   if (base == NULL) return NULL;
   /* Check for trailing '*' — pointer type argument (e.g. int*, Point*) */
   while (MP ('*', pos)) {
@@ -5174,6 +5204,37 @@ D (unary_expr) {
   node_t r, t;
   node_code_t code;
   pos_t pos;
+
+  /* any<Interface>(expr) intrinsic:  wrap a concrete C* as an erased Any<I>*
+     handle.  `any` is a soft keyword: only treated specially when followed by
+     `< Identifier > (`, so it stays usable as an ordinary C identifier. */
+  if (C_SOFT ("any")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t apos = curr_token->pos;
+    node_t iface_id = NULL;
+    M_SOFT ("any");
+    if (C (T_CMP) && curr_token->node_code == N_LT) {
+      M (T_CMP); /* consume '<' */
+      if (MN (T_ID, iface_id) && C (T_CMP) && curr_token->node_code == N_GT) {
+        M (T_CMP); /* consume '>' */
+        if (C ('(')) {
+          node_t arg, struct_id, iface_node_id;
+          record_stop (c2m_ctx, mark, FALSE); /* commit: this is any<I>(...) */
+          M ('(');
+          P (assign_expr);
+          arg = r;
+          PT (')');
+          /* Synthesize __Any_<I> if needed; keep iface + handle names on the node. */
+          struct_id = synthesize_any_class (c2m_ctx, iface_id->u.s.s, apos);
+          iface_node_id = build_id (c2m_ctx, iface_id->u.s.s, apos);
+          r = new_pos_node3 (c2m_ctx, N_ANY, apos, iface_node_id, struct_id, arg);
+          PA (post_expr_part, r);
+          return r;
+        }
+      }
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not any<I>(...): rewind, `any` is an ident */
+  }
 
   /* new-expression:  new ClassName ( arg-list? )   — heap allocation + ctor.
      `new` is a soft keyword: only treated specially when immediately followed
@@ -5975,6 +6036,11 @@ DA (type_spec) {
     /* Index into generic_templates for the pre-registration done before body parsing.
        (size_t)-1 means no pre-registration was done. */
     size_t generic_tmpl_preidx = (size_t)-1;
+    /* Optional structural-conformance clause (Phase 1): class C impl A, B { ... }.
+       Collected as an N_LIST of interface-name N_IDs and attached as the third
+       child of the N_CLASS node; conformance is verified structurally in check.
+       NULL means no clause was written. */
+    node_t impl_list = NULL;
     if (id_p && struct_p == 3 && C (T_CMP) && curr_token->node_code == N_LT) {
       M (T_CMP); /* consume '<' */
       do {
@@ -5987,6 +6053,18 @@ DA (type_spec) {
         }
       } while (M (',') && n_type_params < 4);
       if (C (T_CMP) && curr_token->node_code == N_GT) M (T_CMP); /* consume '>' */
+    }
+
+    /* `impl Iface1, Iface2` — optional, classes only.  `impl` is a soft keyword
+       so it stays usable as an ordinary identifier elsewhere. */
+    if (struct_p == 3 && C_SOFT ("impl")) {
+      M_SOFT ("impl");
+      impl_list = new_pos_node (c2m_ctx, N_LIST, pos);
+      do {
+        node_t iface_id;
+        if (!MN (T_ID, iface_id)) break;
+        op_append (c2m_ctx, impl_list, iface_id);
+      } while (M (','));
     }
 
     if (M ('{')) {
@@ -6036,6 +6114,9 @@ DA (type_spec) {
       r = new_pos_node2 (c2m_ctx, N_UNION, pos, op1, r);
     } else if (struct_p == 3) {
       r = new_pos_node2 (c2m_ctx, N_CLASS, pos, op1, r);
+      /* Attach the optional impl clause as the third child (id(0), members(1),
+         impl_list(2)).  TAG_ID / TAG_MEMBER_LIST still address ops 0 and 1. */
+      if (impl_list != NULL) op_append (c2m_ctx, r, impl_list);
       if (n_type_params > 0) {
         /* Generic class template: store in registry, mark with sentinel attr.
            The base name is registered as a tpname so List<X> can be parsed later. */
@@ -6091,6 +6172,20 @@ DA (type_spec) {
     }
     r = new_pos_node2 (c2m_ctx, N_ENUM, pos, op1, op2);
   } else if (arg == NULL) {
+    /* Any<Interface> erased handle: `Any` is not a registered type name, so
+       intercept it here before typedef_name.  On first reference the __Any_<I>
+       class is synthesized; the result is its mangled N_ID type name, after
+       which the usual pointer/declarator parsing applies (Any<View>* etc.). */
+    if (C (T_ID)) {
+      size_t any_mark = record_start (c2m_ctx);
+      node_t any_id;
+      if (MN (T_ID, any_id) && strcmp (any_id->u.s.s, "Any") == 0
+          && C (T_CMP) && curr_token->node_code == N_LT) {
+        record_stop (c2m_ctx, any_mark, FALSE); /* commit */
+        return parse_any_instantiation (c2m_ctx, POS (any_id));
+      }
+      record_stop (c2m_ctx, any_mark, TRUE); /* not Any<...>: rewind */
+    }
     P (typedef_name);
     /* Generic type instantiation: TypeName<TypeArg>
        If the matched type name is a registered generic class and '<' follows,
@@ -7001,6 +7096,600 @@ err0:
   return err_node;
 }
 
+/* ─────────────────────────── Interfaces (Phase 1) ───────────────────────── */
+
+/* Register an interface contract by name (idempotent; first definition wins). */
+static void register_interface (c2m_ctx_t c2m_ctx, const char *name, node_t node) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  iface_t e;
+
+  if (interfaces == NULL) return;
+  for (size_t i = 0; i < VARR_LENGTH (iface_t, interfaces); i++)
+    if (strcmp (VARR_GET (iface_t, interfaces, i).name, name) == 0) return;
+  e.name = name;
+  e.node = node;
+  VARR_PUSH (iface_t, interfaces, e);
+  if (c2m_options->debug_p)
+    fprintf (stderr, "interface registered: %s (%lu method(s))\n", name,
+             (unsigned long) NL_LENGTH (TAG_MEMBER_LIST (node)->u.ops));
+}
+
+/* Look up a registered interface by name; returns its N_INTERFACE node or NULL. */
+static node_t find_interface (c2m_ctx_t c2m_ctx, const char *name) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+
+  if (interfaces == NULL || name == NULL) return NULL;
+  for (size_t i = 0; i < VARR_LENGTH (iface_t, interfaces); i++)
+    if (strcmp (VARR_GET (iface_t, interfaces, i).name, name) == 0)
+      return VARR_GET (iface_t, interfaces, i).node;
+  return NULL;
+}
+
+/* ───────────────────── Any<I> erased-handle synthesis (Phase 2) ──────────── */
+
+/* Map a primitive type-specifier node code to its C keyword (NULL if not one). */
+static const char *any_basic_type_kw (node_code_t c) {
+  switch (c) {
+  case N_VOID:     return "void";
+  case N_CHAR:     return "char";
+  case N_SHORT:    return "short";
+  case N_INT:      return "int";
+  case N_LONG:     return "long";
+  case N_FLOAT:    return "float";
+  case N_DOUBLE:   return "double";
+  case N_SIGNED:   return "signed";
+  case N_UNSIGNED: return "unsigned";
+  case N_BOOL:     return "bool";
+  case N_STRING:   return "String";
+  case N_DICT:     return "dict";
+  default:         return NULL;
+  }
+}
+
+/* Append the C source for a type-specifier list (the return type of a method or
+   the type of a parameter) to SB.  Class names ride through as plain N_IDs. */
+static void any_append_specs (c2m_ctx_t c2m_ctx MIR_UNUSED, VARR (char) * sb, node_t spec_list) {
+  int first = 1;
+  if (spec_list != NULL && spec_list->code == N_SHARE) spec_list = NL_HEAD (spec_list->u.ops);
+  if (spec_list != NULL && spec_list->code == N_LIST)
+    for (node_t s = NL_HEAD (spec_list->u.ops); s != NULL; s = NL_NEXT (s)) {
+      const char *kw = (s->code == N_ID) ? s->u.s.s : any_basic_type_kw (s->code);
+      if (kw == NULL) continue;
+      if (!first) VARR_PUSH (char, sb, ' ');
+      for (const char *p = kw; *p != '\0'; p++) VARR_PUSH (char, sb, *p);
+      first = 0;
+    }
+  if (first)
+    for (const char *p = "void"; *p != '\0'; p++) VARR_PUSH (char, sb, *p);
+}
+
+/* Number of pointer levels (N_POINTER nodes) in a declarator decoration list. */
+static int any_ptr_depth (node_t decl_list) {
+  int n = 0;
+  if (decl_list != NULL && decl_list->code == N_LIST)
+    for (node_t d = NL_HEAD (decl_list->u.ops); d != NULL; d = NL_NEXT (d))
+      if (d->code == N_POINTER) n++;
+  return n;
+}
+
+/* TRUE if a spec list denotes exactly `void` (used for void-return detection). */
+static int any_specs_are_void (node_t spec_list) {
+  node_t s;
+  if (spec_list != NULL && spec_list->code == N_SHARE) spec_list = NL_HEAD (spec_list->u.ops);
+  if (spec_list == NULL || spec_list->code != N_LIST) return 0;
+  s = NL_HEAD (spec_list->u.ops);
+  return s != NULL && s->code == N_VOID && NL_NEXT (s) == NULL;
+}
+
+/* Extract method shape from an interface N_MEMBER.  Returns 1 and fills the out
+   params (return-type spec list, method-name N_ID, return pointer depth, and the
+   parameter N_LIST) for a function prototype member; 0 otherwise. */
+static int any_extract_method (node_t m, node_t *spec_out, node_t *mid_out,
+                               int *ret_ptr_out, node_t *plist_out) {
+  node_t spec, declr, mid, decl_list, func = NULL;
+  int ret_ptr = 0;
+
+  if (m->code != N_MEMBER) return 0;
+  spec = NL_HEAD (m->u.ops);
+  declr = NL_EL (m->u.ops, 1);
+  if (declr == NULL || declr->code != N_DECL) return 0;
+  mid = NL_HEAD (declr->u.ops);
+  if (mid == NULL || mid->code != N_ID) return 0;
+  decl_list = NL_NEXT (mid);
+  if (decl_list != NULL && decl_list->code == N_LIST)
+    for (node_t d = NL_HEAD (decl_list->u.ops); d != NULL; d = NL_NEXT (d)) {
+      if (d->code == N_POINTER) ret_ptr++;
+      else if (d->code == N_FUNC) func = d;
+    }
+  if (func == NULL) return 0;
+  *spec_out = spec;
+  *mid_out = mid;
+  *ret_ptr_out = ret_ptr;
+  *plist_out = NL_HEAD (func->u.ops);
+  return 1;
+}
+
+/* TRUE if a parameter N_LIST means "no parameters": empty, or a single abstract
+   `void` (i.e. `f(void)`). */
+static int any_plist_empty_p (node_t plist) {
+  node_t p, pspec, pdeclr, pid, pdecorate;
+
+  if (plist == NULL || plist->code != N_LIST) return 1;
+  p = NL_HEAD (plist->u.ops);
+  if (p == NULL) return 1;
+  if (NL_NEXT (p) != NULL || (p->code != N_TYPE && p->code != N_SPEC_DECL)) return 0;
+  pspec = NL_HEAD (p->u.ops);
+  pdeclr = NL_EL (p->u.ops, 1);
+  pid = (pdeclr != NULL && pdeclr->code == N_DECL) ? NL_HEAD (pdeclr->u.ops) : NULL;
+  pdecorate = (pid != NULL) ? NL_NEXT (pid) : NULL;
+  return any_specs_are_void (pspec) && (pid == NULL || pid->code == N_IGNORE)
+         && any_ptr_depth (pdecorate) == 0;
+}
+
+/* Append the source for one parameter (its type plus pointer stars) to SB and,
+   when NAME_OUT is non-NULL, also append " __aIDX" so accessor declarations get
+   synthesized parameter names. */
+static void any_append_param (c2m_ctx_t c2m_ctx, VARR (char) * sb, node_t pn, int idx,
+                              int with_name) {
+  node_t pspec, pdeclr, pdecorate;
+  int p_ptr;
+  char nb[32];
+
+  pspec = NL_HEAD (pn->u.ops);
+  pdeclr = NL_EL (pn->u.ops, 1);
+  pdecorate = (pdeclr != NULL && pdeclr->code == N_DECL) ? NL_NEXT (NL_HEAD (pdeclr->u.ops)) : NULL;
+  p_ptr = any_ptr_depth (pdecorate);
+  any_append_specs (c2m_ctx, sb, pspec);
+  for (int i = 0; i < p_ptr; i++) VARR_PUSH (char, sb, '*');
+  if (with_name) {
+    snprintf (nb, sizeof (nb), " __a%d", idx);
+    for (const char *p = nb; *p != '\0'; p++) VARR_PUSH (char, sb, *p);
+  }
+}
+
+/* Lex a complete ClassyC source fragment SRC into tokens appended to
+   recorded_tokens; returns the index of the first appended token.  Reuses the
+   string-stream re-lexer (same machinery as f-string expansion / ## concat). */
+static size_t lex_source_into_tokens (c2m_ctx_t c2m_ctx, const char *src, pos_t pos) {
+  MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+  VARR (char) * buf;
+  size_t start = VARR_LENGTH (token_t, recorded_tokens);
+
+  VARR_CREATE (char, buf, alloc, 256);
+  for (const char *p = src; *p != '\0'; p++) VARR_PUSH (char, buf, *p);
+  VARR_PUSH (char, buf, '\0');
+  reverse (buf); /* the string-stream consumer reads characters in reverse */
+  set_string_stream (c2m_ctx, VARR_ADDR (char, buf), pos, NULL);
+  for (;;) {
+    token_t pt = get_next_pptoken (c2m_ctx);
+    token_t cv;
+    if (pt->code == T_EOFILE || pt->code == T_EOU) break;
+    if ((cv = pptoken2token (c2m_ctx, pt, TRUE)) == NULL) continue;
+    VARR_PUSH (token_t, recorded_tokens, cv);
+  }
+  VARR_DESTROY (char, buf);
+  return start;
+}
+
+/* Step 2.1 — synthesize the erased handle class __Any_<I> on first reference.
+   Layout: `void* data; void (*dtor)(void*);` plus one `(*<m>_fn)(...)` slot per
+   interface method, one accessor method per slot that forwards through it, and a
+   destructor that calls dtor.  Built as ClassyC source and reparsed through the
+   normal class path so all existing layout/scope/check/gen machinery applies.
+   Returns an N_ID naming the synthesized class. */
+static node_t synthesize_any_class (c2m_ctx_t c2m_ctx, const char *iface_name, pos_t pos) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+  char struct_name[256];
+  const char *struct_name_u;
+  node_t iface, members, cls;
+  VARR (char) * sb;
+  size_t tstart, saved_idx;
+  token_t saved_tok;
+  node_t saved_scope, saved_class;
+
+  snprintf (struct_name, sizeof (struct_name), "__Any_%s", iface_name);
+  struct_name_u = uniq_cstr (c2m_ctx, struct_name).s;
+
+  /* Dedup: the handle is synthesized once per interface (cached in the generic
+     specialization registry, keyed by the mangled class name). */
+  for (size_t i = 0; i < VARR_LENGTH (generic_spec_t, generic_specs); i++)
+    if (strcmp (VARR_GET (generic_spec_t, generic_specs, i).spec_name, struct_name_u) == 0)
+      return build_id (c2m_ctx, struct_name_u, pos);
+
+  iface = find_interface (c2m_ctx, iface_name);
+  if (iface == NULL || iface->code != N_INTERFACE) {
+    error (c2m_ctx, pos, "Any<%s>: '%s' is not a declared interface", iface_name, iface_name);
+    return build_id (c2m_ctx, struct_name_u, pos);
+  }
+  members = TAG_MEMBER_LIST (iface);
+
+#define SB_PUTS(s)                                            \
+  do {                                                        \
+    for (const char *_p = (s); *_p != '\0'; _p++)             \
+      VARR_PUSH (char, sb, *_p);                              \
+  } while (0)
+
+  VARR_CREATE (char, sb, alloc, 1024);
+  SB_PUTS ("class ");
+  SB_PUTS (struct_name_u);
+  SB_PUTS (" {\n");
+  SB_PUTS ("void* data;\n");
+  SB_PUTS ("void (*dtor)(void*);\n");
+
+  /* One function-pointer slot per interface method:
+        <ret> (*<name>_fn)(void* [, <ptype>...]); */
+  for (node_t m = NL_HEAD (members->u.ops); m != NULL; m = NL_NEXT (m)) {
+    node_t spec, mid, plist;
+    int ret_ptr, idx = 0;
+    if (!any_extract_method (m, &spec, &mid, &ret_ptr, &plist)) continue;
+    any_append_specs (c2m_ctx, sb, spec);
+    VARR_PUSH (char, sb, ' ');
+    for (int p = 0; p < ret_ptr; p++) VARR_PUSH (char, sb, '*');
+    SB_PUTS ("(*");
+    SB_PUTS (mid->u.s.s);
+    SB_PUTS ("_fn)(void*");
+    if (!any_plist_empty_p (plist))
+      for (node_t pn = NL_HEAD (plist->u.ops); pn != NULL; pn = NL_NEXT (pn)) {
+        if (pn->code != N_SPEC_DECL && pn->code != N_TYPE) continue;
+        SB_PUTS (", ");
+        any_append_param (c2m_ctx, sb, pn, idx++, FALSE);
+      }
+    SB_PUTS (");\n");
+  }
+
+  /* One accessor method per interface method, forwarding through its slot:
+        <ret> <name>(<params>) { [return] this.<name>_fn(this.data [, __aN...]); } */
+  for (node_t m = NL_HEAD (members->u.ops); m != NULL; m = NL_NEXT (m)) {
+    node_t spec, mid, plist;
+    int ret_ptr, idx, nparams = 0, is_void;
+    if (!any_extract_method (m, &spec, &mid, &ret_ptr, &plist)) continue;
+    is_void = (ret_ptr == 0 && any_specs_are_void (spec));
+    any_append_specs (c2m_ctx, sb, spec);
+    VARR_PUSH (char, sb, ' ');
+    for (int p = 0; p < ret_ptr; p++) VARR_PUSH (char, sb, '*');
+    SB_PUTS (mid->u.s.s);
+    VARR_PUSH (char, sb, '(');
+    idx = 0;
+    if (!any_plist_empty_p (plist))
+      for (node_t pn = NL_HEAD (plist->u.ops); pn != NULL; pn = NL_NEXT (pn)) {
+        if (pn->code != N_SPEC_DECL && pn->code != N_TYPE) continue;
+        if (idx > 0) SB_PUTS (", ");
+        any_append_param (c2m_ctx, sb, pn, idx, TRUE);
+        idx++;
+      }
+    nparams = idx;
+    SB_PUTS (") { ");
+    if (is_void) {
+      SB_PUTS ("if (this.");
+      SB_PUTS (mid->u.s.s);
+      SB_PUTS ("_fn) this.");
+    } else {
+      SB_PUTS ("return this.");
+    }
+    SB_PUTS (mid->u.s.s);
+    SB_PUTS ("_fn(this.data");
+    for (int a = 0; a < nparams; a++) {
+      char nb[32];
+      snprintf (nb, sizeof (nb), ", __a%d", a);
+      SB_PUTS (nb);
+    }
+    SB_PUTS ("); }\n");
+  }
+
+  /* Destructor: owns the concrete object, freeing it through dtor. */
+  SB_PUTS ("~");
+  SB_PUTS (struct_name_u);
+  SB_PUTS ("() { if (this.dtor) this.dtor(this.data); }\n");
+  SB_PUTS ("};\n");
+  /* Per-interface destructor thunk used by the object arena: `delete handle`
+     runs ~__Any_I (freeing the wrapped concrete) then frees the handle. */
+  SB_PUTS ("static void __anyfree_");
+  SB_PUTS (iface_name);
+  SB_PUTS ("(void* __p) { delete (");
+  SB_PUTS (struct_name_u);
+  SB_PUTS ("*)__p; }\n;\n"); /* trailing ';' is spare lookahead */
+  VARR_PUSH (char, sb, '\0');
+
+  if (c2m_options->debug_p)
+    fprintf (stderr, "=== synthesized Any<%s> ===\n%s\n", iface_name, VARR_ADDR (char, sb));
+
+  /* Lex the synthesized source and reparse it (the handle class plus its arena
+     destructor thunk), with a fresh top-level parse scope so they register
+     globally. */
+  tstart = lex_source_into_tokens (c2m_ctx, VARR_ADDR (char, sb), pos);
+  VARR_DESTROY (char, sb);
+
+  saved_idx = next_token_index;
+  saved_tok = curr_token;
+  saved_scope = curr_scope;
+  saved_class = parse_ctx->curr_class;
+  curr_scope = NULL;
+  parse_ctx->curr_class = NULL;
+  next_token_index = tstart;
+  read_token (c2m_ctx);
+  cls = new_node (c2m_ctx, N_LIST);
+  while (!C (';') && !C (T_EOFILE)) {
+    node_t item = TRY (declaration);
+    if (item == err_node) item = parse_synth_func_def (c2m_ctx);
+    if (item == NULL || item == err_node) break;
+    op_flat_append (c2m_ctx, cls, item);
+  }
+  curr_scope = saved_scope;
+  parse_ctx->curr_class = saved_class;
+  next_token_index = saved_idx;
+  curr_token = saved_tok;
+
+  /* Cache and enqueue for module-level injection (so their MIR is generated). */
+  {
+    generic_spec_t gs;
+    gs.orig_name = "Any";
+    gs.spec_name = struct_name_u;
+    VARR_PUSH (generic_spec_t, generic_specs, gs);
+  }
+  for (node_t it = NL_HEAD (cls->u.ops); it != NULL;) {
+    node_t nxt = NL_NEXT (it);
+    NL_REMOVE (cls->u.ops, it);
+    VARR_PUSH (node_t, pending_lambdas, it);
+    it = nxt;
+  }
+
+  return build_id (c2m_ctx, struct_name_u, pos);
+#undef SB_PUTS
+}
+
+/* Parse `< Interface >` after the `Any` keyword and synthesize __Any_<I>.
+   Returns an N_ID for the synthesized class name (Step 2.1 + 2.2). */
+static node_t parse_any_instantiation (c2m_ctx_t c2m_ctx, pos_t pos) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  node_t iface_id = NULL;
+
+  M (T_CMP); /* consume '<' */
+  if (!MN (T_ID, iface_id)) {
+    error (c2m_ctx, pos, "expected an interface name in Any<...>");
+    return build_id (c2m_ctx, "Any", pos);
+  }
+  if (C (T_CMP) && curr_token->node_code == N_GT)
+    M (T_CMP); /* consume '>' */
+  else
+    error (c2m_ctx, pos, "expected '>' to close Any<...>");
+  return synthesize_any_class (c2m_ctx, iface_id->u.s.s, pos);
+}
+
+/* Parse one synthesized top-level function definition from the current token
+   position (used to reparse generated thunks/factories).  Mirrors the
+   function-definition branch of transl_unit but without its error-label macros.
+   Returns the N_FUNC_DEF node, or err_node on failure. */
+static node_t parse_synth_func_def (c2m_ctx_t c2m_ctx) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  node_t ds, d, dl, r, func, param_list, p, par_declarator, id, fd;
+
+  ds = declaration_specs (c2m_ctx, FALSE, (node_t) 1);
+  if (ds == err_node) return err_node;
+  d = declarator (c2m_ctx, FALSE);
+  if (d == err_node) return err_node;
+  dl = new_node (c2m_ctx, N_LIST);
+  d->attr = curr_scope;
+  curr_scope = d;
+  while (!C ('{') && !C (T_EOFILE)) {
+    r = declaration (c2m_ctx, FALSE);
+    if (r == err_node) { curr_scope = d->attr; return err_node; }
+    op_flat_append (c2m_ctx, dl, r);
+  }
+  func = NL_HEAD (NL_EL (d->u.ops, 1)->u.ops);
+  if (func != NULL && func->code == N_FUNC) {
+    param_list = NL_HEAD (func->u.ops);
+    for (p = NL_HEAD (param_list->u.ops); p != NULL; p = NL_NEXT (p)) {
+      if (p->code == N_ID) {
+        tpname_add (c2m_ctx, p, curr_scope, FALSE);
+      } else if (p->code == N_SPEC_DECL) {
+        par_declarator = NL_EL (p->u.ops, 1);
+        id = NL_HEAD (par_declarator->u.ops);
+        tpname_add (c2m_ctx, id, curr_scope, FALSE);
+      }
+    }
+  }
+  r = compound_stmt (c2m_ctx, FALSE);
+  if (r == err_node) { curr_scope = d->attr; return err_node; }
+  fd = new_pos_node4 (c2m_ctx, N_FUNC_DEF, POS (d), ds, d, dl, r);
+  curr_scope = d->attr;
+  return fd;
+}
+
+/* Step 2.4 — monomorphize the per-(C, I) thunks and factory for any<I>(C*).
+   Generates, as ClassyC source reparsed through the normal paths:
+     static <R> __thunk_<m>_<C>(void* p, ...) { [return] ((C*)p)->m(...); }
+     static void __thunk_dtor_<C>(void* p)     { delete (C*)p; }
+     static __Any_<I>* __any_make_<I>_<C>(C* o) { heap handle + slot fills; }
+   Returns an N_LIST of the new top-level items to inject (NULL if already
+   generated for this (C, I)).  *FACTORY_NAME_OUT receives the factory name in
+   both cases.  No closures: each thunk captures only the concrete TYPE. */
+static node_t synthesize_any_thunks (c2m_ctx_t c2m_ctx, const char *iface_name,
+                                     const char *struct_name, const char *concrete_name,
+                                     const char **factory_name_out) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+  char fname[512];
+  const char *factory_name;
+  node_t iface, members, items;
+  VARR (char) * sb;
+  size_t tstart, saved_idx;
+  token_t saved_tok;
+  node_t saved_scope, saved_class;
+
+  snprintf (fname, sizeof (fname), "__any_make_%s_%s", iface_name, concrete_name);
+  factory_name = uniq_cstr (c2m_ctx, fname).s;
+  if (factory_name_out != NULL) *factory_name_out = factory_name;
+
+  /* Dedup: generate the (C, I) thunks + factory at most once. */
+  for (size_t i = 0; i < VARR_LENGTH (generic_spec_t, generic_specs); i++)
+    if (strcmp (VARR_GET (generic_spec_t, generic_specs, i).spec_name, factory_name) == 0)
+      return NULL;
+
+  iface = find_interface (c2m_ctx, iface_name);
+  if (iface == NULL || iface->code != N_INTERFACE) return NULL;
+  members = TAG_MEMBER_LIST (iface);
+
+#define SB_PUTS(s)                                            \
+  do {                                                        \
+    for (const char *_p = (s); *_p != '\0'; _p++)             \
+      VARR_PUSH (char, sb, *_p);                              \
+  } while (0)
+
+  VARR_CREATE (char, sb, alloc, 1024);
+  SB_PUTS ("void* malloc(unsigned long);\n");
+  SB_PUTS ("void* c2m_obj_track(void*, void(*)(void*));\n");
+
+  /* One forwarding thunk per interface method. */
+  for (node_t m = NL_HEAD (members->u.ops); m != NULL; m = NL_NEXT (m)) {
+    node_t spec, mid, plist;
+    int ret_ptr, idx, nparams, is_void;
+    if (!any_extract_method (m, &spec, &mid, &ret_ptr, &plist)) continue;
+    is_void = (ret_ptr == 0 && any_specs_are_void (spec));
+    SB_PUTS ("static ");
+    any_append_specs (c2m_ctx, sb, spec);
+    VARR_PUSH (char, sb, ' ');
+    for (int p = 0; p < ret_ptr; p++) VARR_PUSH (char, sb, '*');
+    SB_PUTS ("__thunk_");
+    SB_PUTS (mid->u.s.s);
+    VARR_PUSH (char, sb, '_');
+    SB_PUTS (concrete_name);
+    SB_PUTS ("(void* __p");
+    idx = 0;
+    if (!any_plist_empty_p (plist))
+      for (node_t pn = NL_HEAD (plist->u.ops); pn != NULL; pn = NL_NEXT (pn)) {
+        if (pn->code != N_SPEC_DECL && pn->code != N_TYPE) continue;
+        SB_PUTS (", ");
+        any_append_param (c2m_ctx, sb, pn, idx++, TRUE);
+      }
+    nparams = idx;
+    SB_PUTS (") { ");
+    if (!is_void) SB_PUTS ("return ");
+    SB_PUTS ("((");
+    SB_PUTS (concrete_name);
+    SB_PUTS ("*)__p)->");
+    SB_PUTS (mid->u.s.s);
+    VARR_PUSH (char, sb, '(');
+    for (int a = 0; a < nparams; a++) {
+      char nb[32];
+      snprintf (nb, sizeof (nb), "%s__a%d", a == 0 ? "" : ", ", a);
+      SB_PUTS (nb);
+    }
+    SB_PUTS ("); }\n");
+  }
+
+  /* Destructor thunk: owns and frees the concrete object. */
+  SB_PUTS ("static void __thunk_dtor_");
+  SB_PUTS (concrete_name);
+  SB_PUTS ("(void* __p) { delete (");
+  SB_PUTS (concrete_name);
+  SB_PUTS ("*)__p; }\n");
+
+  /* Factory: allocate the handle and wire up its slots. */
+  SB_PUTS ("static ");
+  SB_PUTS (struct_name);
+  SB_PUTS ("* ");
+  SB_PUTS (factory_name);
+  SB_PUTS ("(");
+  SB_PUTS (concrete_name);
+  SB_PUTS ("* __obj) {\n");
+  SB_PUTS (struct_name);
+  SB_PUTS ("* __h = (");
+  SB_PUTS (struct_name);
+  SB_PUTS ("*)malloc(sizeof(");
+  SB_PUTS (struct_name);
+  SB_PUTS ("));\n");
+  SB_PUTS ("__h->data = (void*)__obj;\n");
+  SB_PUTS ("__h->dtor = __thunk_dtor_");
+  SB_PUTS (concrete_name);
+  SB_PUTS (";\n");
+  for (node_t m = NL_HEAD (members->u.ops); m != NULL; m = NL_NEXT (m)) {
+    node_t spec, mid, plist;
+    int ret_ptr;
+    if (!any_extract_method (m, &spec, &mid, &ret_ptr, &plist)) continue;
+    SB_PUTS ("__h->");
+    SB_PUTS (mid->u.s.s);
+    SB_PUTS ("_fn = __thunk_");
+    SB_PUTS (mid->u.s.s);
+    VARR_PUSH (char, sb, '_');
+    SB_PUTS (concrete_name);
+    SB_PUTS (";\n");
+  }
+  /* Register the handle in the scope-bound object arena so it is reclaimed
+     automatically when its scope exits (running ~__Any_I, which frees the
+     wrapped concrete object via the dtor slot). */
+  SB_PUTS ("c2m_obj_track(__h, __anyfree_");
+  SB_PUTS (iface_name);
+  SB_PUTS (");\n");
+  SB_PUTS ("return __h;\n}\n;\n"); /* trailing ';' is a spare sentinel token */
+  VARR_PUSH (char, sb, '\0');
+
+  if (c2m_options->debug_p)
+    fprintf (stderr, "=== synthesized thunks/factory for any<%s>(%s*) ===\n%s\n",
+             iface_name, concrete_name, VARR_ADDR (char, sb));
+
+  /* Lex and reparse the items (a malloc prototype declaration, the thunks, and
+     the factory function definition). */
+  tstart = lex_source_into_tokens (c2m_ctx, VARR_ADDR (char, sb), no_pos);
+  VARR_DESTROY (char, sb);
+
+  saved_idx = next_token_index;
+  saved_tok = curr_token;
+  saved_scope = curr_scope;
+  saved_class = parse_ctx->curr_class;
+  curr_scope = NULL;
+  parse_ctx->curr_class = NULL;
+  next_token_index = tstart;
+  read_token (c2m_ctx);
+  items = new_node (c2m_ctx, N_LIST);
+  while (!C (';') && !C (T_EOFILE)) {
+    node_t item = TRY (declaration);
+    if (item == err_node) item = parse_synth_func_def (c2m_ctx);
+    if (item == NULL || item == err_node) break;
+    op_flat_append (c2m_ctx, items, item);
+  }
+  curr_scope = saved_scope;
+  parse_ctx->curr_class = saved_class;
+  next_token_index = saved_idx;
+  curr_token = saved_tok;
+
+  /* Cache so the (C, I) thunks + factory are emitted only once. */
+  {
+    generic_spec_t gs;
+    gs.orig_name = iface_name;
+    gs.spec_name = factory_name;
+    VARR_PUSH (generic_spec_t, generic_specs, gs);
+  }
+  return items;
+#undef SB_PUTS
+}
+
+/* interface Name { ret meth(params); ... }
+   Parsed like a struct body (each prototype becomes an N_MEMBER carrying a
+   function declarator).  Builds N_INTERFACE { id(0), member_list(1) } and
+   registers it.  Emits no runtime type, vtable, or layout. */
+D (interface_declaration) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  node_t id, members, r;
+  pos_t pos;
+
+  if (!MP_SOFT ("interface", pos)) return err_node;
+  PTN (T_ID); /* interface name -> r */
+  id = r;
+  PT ('{');
+  if (C ('}')) {
+    members = new_node (c2m_ctx, N_LIST);
+  } else {
+    P (struct_declaration_list); /* r = N_LIST of N_MEMBER prototypes */
+    members = r;
+  }
+  PT ('}');
+  M (';'); /* optional trailing semicolon */
+  r = new_pos_node2 (c2m_ctx, N_INTERFACE, pos, id, members);
+  register_interface (c2m_ctx, id->u.s.s, r);
+  return r;
+}
+
 D (transl_unit) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t list, ds, d, dl, r, func, param_list, p, par_declarator, id;
@@ -7008,7 +7697,9 @@ D (transl_unit) {
   read_token (c2m_ctx);
   list = new_node (c2m_ctx, N_LIST);
   while (!C (T_EOFILE)) { /* external-declaration */
-    if ((r = TRY (declaration)) != err_node) {
+    if (C_SOFT ("interface")) {
+      PE (interface_declaration, err);
+    } else if ((r = TRY (declaration)) != err_node) {
       // Successfully parsed a declaration (e.g., "int x;")
       //printf("DECL found\n");
     } else if ((r = TRY (class_declaration)) != err_node) {
@@ -7147,6 +7838,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   lambda_uid = 0;
   VARR_CREATE (generic_tmpl_t, generic_templates, alloc, 4);
   VARR_CREATE (generic_spec_t, generic_specs, alloc, 8);
+  VARR_CREATE (iface_t, interfaces, alloc, 4);
 }
 
 static void add_standard_includes (c2m_ctx_t c2m_ctx) {
@@ -7176,6 +7868,7 @@ static void parse_finish (c2m_ctx_t c2m_ctx) {
     parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
     if (pending_lambdas != NULL)
       VARR_DESTROY (node_t, pending_lambdas);
+    if (interfaces != NULL) VARR_DESTROY (iface_t, interfaces);
     if (generic_templates != NULL)
       VARR_DESTROY (generic_tmpl_t, generic_templates);
     if (generic_specs != NULL)
@@ -8528,6 +9221,10 @@ static void set_class_layout (c2m_ctx_t c2m_ctx, node_t decl_node, struct type *
 
 static void init_decl (c2m_ctx_t c2m_ctx, decl_t decl);
 
+/* Phase 1: verify a class's optional `impl` clauses (defined after the protocol
+   helpers below).  Forward-declared so the N_CLASS finalization paths can call it. */
+static void verify_class_impls (c2m_ctx_t c2m_ctx, node_t class_node, node_t class_tag);
+
 static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t decl_node) {
   check_ctx_t check_ctx = c2m_ctx->check_ctx;
   int n_sc = 0, sign = 0, size = 0, func_p = FALSE;
@@ -8798,6 +9495,9 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
                 }
                 curr_unnamed_anon_struct_union_member = saved_unnamed_anon_struct_union_member;
                 set_class_layout(c2m_ctx, n, type);
+                /* Phase 1: structurally verify any `impl I, J` clauses now that
+                   the class's methods are registered in its scope. */
+                verify_class_impls (c2m_ctx, n, res_tag_type);
                 break;
             }
             case N_DICT: {
@@ -9424,6 +10124,122 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
         if (n == n_user_params) return def;
       }
       return NULL;
+    }
+
+    /* Phase 1 conformance: does class CLASS_TAG structurally satisfy interface
+       IFACE_NODE?  For each interface method (matched by name + user-arg count,
+       the same structural rule find_class_protocol_method uses for Count/Get/
+       Add), the class must have a matching instance method.  Returns 1 on
+       success; on failure returns 0 and sets *MISSING_OUT to the unsatisfied
+       method's name.  This is the single source of truth for "is C an I?". */
+    static int class_satisfies_interface_p (c2m_ctx_t c2m_ctx, node_t class_tag,
+                                            node_t iface_node, const char **missing_out) {
+      node_t members;
+
+      if (missing_out != NULL) *missing_out = NULL;
+      if (class_tag == NULL || iface_node == NULL || iface_node->code != N_INTERFACE) return 1;
+      members = TAG_MEMBER_LIST (iface_node); /* N_LIST of N_MEMBER prototypes */
+      for (node_t m = NL_HEAD (members->u.ops); m != NULL; m = NL_NEXT (m)) {
+        node_t declr, mid, decl_list, func;
+        int nparams = 0;
+
+        if (m->code != N_MEMBER) continue;
+        declr = NL_EL (m->u.ops, 1); /* declarator */
+        if (declr == NULL || declr->code != N_DECL) continue;
+        mid = NL_HEAD (declr->u.ops); /* method name */
+        if (mid == NULL || mid->code != N_ID) continue;
+        /* Count user parameters from the function declarator. */
+        decl_list = NL_NEXT (mid);
+        func = decl_list != NULL ? NL_HEAD (decl_list->u.ops) : NULL;
+        if (func != NULL && func->code == N_FUNC) {
+          node_t plist = NL_HEAD (func->u.ops);
+          for (node_t p = NL_HEAD (plist->u.ops); p != NULL; p = NL_NEXT (p)) {
+            if (p->code != N_SPEC_DECL && p->code != N_TYPE) { nparams = -1; break; }
+            nparams++;
+          }
+        }
+        if (find_class_protocol_method (c2m_ctx, class_tag, mid->u.s.s, nparams, POS (mid))
+            == NULL) {
+          if (missing_out != NULL) *missing_out = mid->u.s.s;
+          return 0;
+        }
+      }
+      return 1;
+    }
+
+    /* Verify every `impl` clause on a class definition (the optional 3rd child
+       of the N_CLASS node).  Emits a precise diagnostic for each unsatisfied or
+       unknown interface.  No-op when the class has no impl clause.  Conformance
+       does not depend on `impl`; this only provides EARLY, opt-in checking. */
+    static void verify_class_impls (c2m_ctx_t c2m_ctx, node_t class_node, node_t class_tag) {
+      node_t impl_list, cid;
+      const char *cname;
+
+      if (class_node == NULL || class_node->code != N_CLASS) return;
+      impl_list = NL_EL (class_node->u.ops, 2); /* 3rd child or NULL */
+      if (impl_list == NULL || impl_list->code != N_LIST) return;
+      cid = NL_HEAD (class_node->u.ops);
+      cname = (cid != NULL && cid->code == N_ID) ? cid->u.s.s : "<class>";
+      for (node_t in = NL_HEAD (impl_list->u.ops); in != NULL; in = NL_NEXT (in)) {
+        node_t iface;
+        const char *missing = NULL;
+
+        if (in->code != N_ID) continue;
+        iface = find_interface (c2m_ctx, in->u.s.s);
+        if (iface == NULL) {
+          error (c2m_ctx, POS (in), "class %s impl unknown interface %s", cname, in->u.s.s);
+          continue;
+        }
+        if (!class_satisfies_interface_p (c2m_ctx, class_tag, iface, &missing))
+          error (c2m_ctx, POS (in),
+                 "class %s does not satisfy interface %s: missing %s()", cname, in->u.s.s,
+                 missing != NULL ? missing : "method");
+      }
+    }
+
+    /* Implicit erasure: when ARG (currently a concrete C*) is being placed where
+       an erased handle __Any_I* is expected, and C structurally satisfies I,
+       transparently rewrite ARG in PARENT_LIST as `any<I>(arg)` and check it.
+       This lets a developer write `list->Add(new Button(...))` or a brace
+       initializer `new List<Any<View>*>{ new Button(...), ... }` without an
+       explicit any<View>(...) at every element.  Returns the new N_ANY node on
+       success (now occupying ARG's slot in PARENT_LIST), or NULL if no coercion
+       applies. */
+    static node_t try_coerce_to_any (c2m_ctx_t c2m_ctx, node_t parent_list, node_t arg,
+                                     struct type *target) {
+      struct expr *ae;
+      struct type *ccls, *tcls;
+      const char *sname, *cname, *iface_name;
+      node_t iface, anyn, iface_id, struct_id;
+      pos_t pos;
+
+      if (parent_list == NULL || arg == NULL || target == NULL || target->mode != TM_PTR) return NULL;
+      tcls = target->u.ptr_type;
+      if (tcls == NULL || tcls->mode != TM_CLASS) return NULL;
+      sname = class_type_name (tcls); /* e.g. "__Any_View" */
+      if (sname == NULL || strncmp (sname, "__Any_", 6) != 0) return NULL;
+
+      ae = arg->attr;
+      if (ae == NULL || ae->type == NULL || ae->type->mode != TM_PTR) return NULL;
+      ccls = ae->type->u.ptr_type;
+      if (ccls == NULL || ccls->mode != TM_CLASS || ccls->u.tag_type == NULL) return NULL;
+      cname = class_type_name (ccls);
+      if (cname != NULL && strncmp (cname, "__Any_", 6) == 0) return NULL; /* already erased */
+
+      iface_name = sname + 6; /* strip the "__Any_" prefix */
+      iface = find_interface (c2m_ctx, iface_name);
+      if (iface == NULL) return NULL;
+      if (!class_satisfies_interface_p (c2m_ctx, ccls->u.tag_type, iface, NULL)) return NULL;
+
+      pos = POS (arg);
+      iface_id = build_id (c2m_ctx, iface_name, pos);
+      struct_id = build_id (c2m_ctx, sname, pos);
+      anyn = new_pos_node2 (c2m_ctx, N_ANY, pos, iface_id, struct_id);
+      DLIST_INSERT_BEFORE (node_t, parent_list->u.ops, arg, anyn);
+      NL_REMOVE (parent_list->u.ops, arg);
+      op_append (c2m_ctx, anyn, arg); /* arg becomes the N_ANY's 3rd child (already checked) */
+      check (c2m_ctx, anyn, parent_list);
+      return anyn;
     }
 
     static void check_assignment_types (c2m_ctx_t c2m_ctx, struct type *left, struct type *right,
@@ -11210,6 +12026,7 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
         REP6 (NODE_CASE, EXPR_SIZEOF, CAST, COMPOUND_LITERAL, CALL, GENERIC, GENERIC_ASSOC)
         NODE_CASE (IN)
         NODE_CASE (NEW)
+        NODE_CASE (ANY)
         NODE_CASE (LAMBDA)
         NODE_CASE (CONCAT)
         *expr_attr_p = TRUE;
@@ -11228,6 +12045,7 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
         REP8 (NODE_CASE, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR, POINTER, DOTS, ARR)
         REP7 (NODE_CASE, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF, MODULE, DICT)
         REP4 (NODE_CASE, CLASS, STRING, ASM, ATTR)
+        NODE_CASE (INTERFACE)
         break;
       default: assert (FALSE);
       }
@@ -12009,6 +12827,80 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
         }
         break;
       }
+      case N_ANY: {
+        /* any<I>(expr): wrap a concrete C* into an erased Any<I>* handle.
+           Children at parse: iface_id(0), struct_id(1, __Any_I), arg(2).
+           Conformance is verified STRUCTURALLY (no `impl` required, Step 1.3);
+           the node is then lowered to a call to a monomorphized factory
+           __any_make_<I>_<C>(arg) whose thunks/factory are injected at module
+           scope (Step 2.4).  After lowering r->ops = [iface_id, struct_id, call]. */
+        node_t iface_id = NL_HEAD (r->u.ops);
+        node_t struct_id = NL_NEXT (iface_id);
+        node_t arg = NL_NEXT (struct_id);
+        struct expr *ae;
+        struct type *at;
+        node_t c_tag, iface, callee, args, call;
+        const char *cname, *missing = NULL, *factory_name = NULL;
+
+        if (!arg->attr) check (c2m_ctx, arg, r);
+        ae = arg->attr;
+        at = ae->type;
+        e = create_expr (c2m_ctx, r);
+        e->type->mode = TM_UNDEF;
+        if (at == NULL || at->mode != TM_PTR || at->u.ptr_type->mode != TM_CLASS) {
+          error (c2m_ctx, POS (r), "any<%s>(x): argument must be a pointer to a class",
+                 iface_id->u.s.s);
+          break;
+        }
+        c_tag = at->u.ptr_type->u.tag_type;
+        cname = class_type_name (at->u.ptr_type);
+        iface = find_interface (c2m_ctx, iface_id->u.s.s);
+        if (iface == NULL) {
+          error (c2m_ctx, POS (r), "any<%s>: '%s' is not a declared interface",
+                 iface_id->u.s.s, iface_id->u.s.s);
+          break;
+        }
+        if (cname == NULL || !class_satisfies_interface_p (c2m_ctx, c_tag, iface, &missing)) {
+          error (c2m_ctx, POS (r),
+                 "any<%s>: class %s does not satisfy interface %s: missing %s()",
+                 iface_id->u.s.s, cname ? cname : "?", iface_id->u.s.s,
+                 missing ? missing : "method");
+          break;
+        }
+        /* Monomorphize the (C, I) thunks + factory once and inject them into the
+           module item list just before the item currently being checked, so their
+           MIR is generated ahead of this call site.  Each item is checked through
+           check_lambda_func_def, which saves/restores the enclosing function's
+           check context (curr_func_def, func_decls_for_allocation, ...) — the same
+           machinery sequence-lambda instantiation uses. */
+        {
+          node_t items = synthesize_any_thunks (c2m_ctx, iface_id->u.s.s, struct_id->u.s.s,
+                                                cname, &factory_name);
+          if (items != NULL && module_item_list != NULL && curr_module_item != NULL) {
+            node_t arr[64];
+            int n = 0;
+            for (node_t it = NL_HEAD (items->u.ops); it != NULL && n < 64; it = NL_NEXT (it))
+              arr[n++] = it;
+            for (int k = 0; k < n; k++) {
+              NL_REMOVE (items->u.ops, arr[k]);
+              DLIST_INSERT_BEFORE (node_t, module_item_list->u.ops, curr_module_item, arr[k]);
+              check_lambda_func_def (c2m_ctx, arr[k]);
+            }
+          }
+        }
+        if (factory_name == NULL) break;
+        /* Lower to the factory call: factory_name(arg).  Move arg out of r into
+           the call's arg list (a node lives in exactly one op list). */
+        NL_REMOVE (r->u.ops, arg);
+        callee = build_id (c2m_ctx, factory_name, POS (r));
+        args = new_node (c2m_ctx, N_LIST);
+        op_append (c2m_ctx, args, arg);
+        call = new_pos_node2 (c2m_ctx, N_CALL, POS (r), callee, args);
+        op_append (c2m_ctx, r, call);
+        check (c2m_ctx, call, r);
+        if (call->attr != NULL) *e->type = *((struct expr *) call->attr)->type;
+        break;
+      }
       case N_NEW: {
         /* new ClassName(args): allocate on the heap and run the constructor.
            children: type_id(0, N_ID of class), arg_list(1, N_LIST).
@@ -12242,8 +13134,16 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
                        "void or a scalar type",
                        type_id->u.s.s);
               } else {
-                for (el = NL_HEAD (init_list->u.ops); el != NULL; el = NL_NEXT (el))
+                node_t el_next;
+                for (el = NL_HEAD (init_list->u.ops); el != NULL; el = el_next) {
+                  node_t coerced;
+                  el_next = NL_NEXT (el);
+                  /* Implicitly erase a concrete element into Any<I> when Add's
+                     parameter is an erased handle (declarative builder sugar). */
+                  if ((coerced = try_coerce_to_any (c2m_ctx, init_list, el, apds->type)) != NULL)
+                    el = coerced;
                   check_assignment_types (c2m_ctx, apds->type, NULL, el->attr, el);
+                }
               }
             }
           }
@@ -13209,6 +14109,17 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
 	                  break;
 	                }
 	                if (func_def->code != N_FUNC_DEF) {
+	                  /* Not a method but a data member.  If it is a function-pointer
+	                     field (e.g. the synthesized Any<I> slots, or a delegate
+	                     stored in a class), resolve `obj.fp(args)` as an ordinary
+	                     indirect call through the field's value: no implicit 'this',
+	                     dispatched via the loaded pointer at gen time.  This reuses
+	                     the regular delegate-call path at seq_method_done. */
+	                  if (t1->mode == TM_PTR && t1->u.ptr_type->mode == TM_FUNC) {
+	                    func_type = t1->u.ptr_type->u.func_type;
+	                    ret_type = func_type->ret_type;
+	                    goto seq_method_done;
+	                  }
 	                  error(c2m_ctx, POS(r), "member '%s' is not a function", method_id->u.s.s);
 	                  break;
 	                }
@@ -13289,18 +14200,28 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
 	                // for static methods, param_list starts directly at the user params.
 	                param_list = func_type->param_list;
 	                param = NL_HEAD(param_list->u.ops);
-	                for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg)) {
+	                for (arg = NL_HEAD(arg_list->u.ops); arg != NULL;) {
+	                  node_t arg_next = NL_NEXT(arg);
 	                  if (!arg->attr) check(c2m_ctx, arg, r);
 	                  e2 = arg->attr;
 	                  if (param == NULL) {
 	                    if (!func_type->dots_p) {
 	                      error(c2m_ctx, POS(arg), "too many arguments in method call");
 	                    }
+	                    arg = arg_next;
 	                    continue;
 	                  }
 	                  struct decl_spec *decl_spec = get_param_decl_spec(param);
+	                  /* Implicitly erase a concrete C* argument into Any<I> when the
+	                     parameter is an erased handle, so `list->Add(new Button(...))`
+	                     works without an explicit any<View>(...). */
+	                  {
+	                    node_t coerced = try_coerce_to_any(c2m_ctx, arg_list, arg, decl_spec->type);
+	                    if (coerced != NULL) { arg = coerced; e2 = arg->attr; }
+	                  }
 	                  check_assignment_types(c2m_ctx, decl_spec->type, NULL, e2, r);
 	                  param = NL_NEXT(param);
+	                  arg = arg_next;
 	                }
 	                if (param != NULL) {
 	                  error(c2m_ctx, POS(r), "too few arguments in method call");
@@ -13420,19 +14341,28 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
           break;
         }
         saved_call_arg_area_offset_before_args = curr_call_arg_area_offset;
-        for (arg = first_arg; arg != NULL; arg = NL_NEXT(arg)) {
+        for (arg = first_arg; arg != NULL;) {
+          node_t arg_next = NL_NEXT(arg);
           check(c2m_ctx, arg, r);
           e2 = arg->attr;
-          if (start_param == NULL || start_param->code == N_ID) continue; /* no params or ident list */
+          if (start_param == NULL || start_param->code == N_ID) { arg = arg_next; continue; } /* no params or ident list */
           if (param == NULL) {
             if (!func_type->dots_p) warning(c2m_ctx, POS(arg), "too many arguments (extra ignored)");
             start_param = NULL; /* ignore the rest args */
+            arg = arg_next;
             continue;
           }
           assert(param->code == N_SPEC_DECL || param->code == N_TYPE);
           decl_spec = get_param_decl_spec(param);
+          /* Implicitly erase a concrete C* argument into Any<I> when the
+             parameter is an erased handle. */
+          {
+            node_t coerced = try_coerce_to_any(c2m_ctx, arg_list, arg, decl_spec->type);
+            if (coerced != NULL) { arg = coerced; e2 = arg->attr; }
+          }
           check_assignment_types(c2m_ctx, decl_spec->type, NULL, e2, r);
           param = NL_NEXT(param);
+          arg = arg_next;
         }
         curr_call_arg_area_offset = saved_call_arg_area_offset_before_args;
         if (param != NULL) error(c2m_ctx, POS(r), "too few arguments");
@@ -14394,6 +15324,10 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
     }
     break;
   }
+  case N_INTERFACE:
+    /* A pure compile-time contract: no type, no layout, no code.  Conformance
+       (impl checks) is verified elsewhere; nothing to do here. */
+    break;
   case N_CLASS: {
     /* Skip generic class templates — they have a sentinel attr and are only
        instantiated as specialized concrete classes via get_or_create_specialization. */
@@ -14431,6 +15365,8 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
       curr_class = prev_class;
       finish_scope (c2m_ctx);
       make_type_complete (c2m_ctx, class_type);
+      /* Phase 1: structurally verify any `impl I, J` clauses. */
+      verify_class_impls (c2m_ctx, r, class_type->u.tag_type);
     }
     break;
   }
@@ -14641,6 +15577,12 @@ struct gen_ctx {
   /* automatic String scope reclamation state for the current function */
   op_t str_scope_mark;
   int str_scope_active;
+  /* object arena (Any<I> handle) scope reclamation for the current function */
+  MIR_item_t obj_checkpoint_proto, obj_checkpoint_item;
+  MIR_item_t obj_release_to_proto, obj_release_to_item;
+  MIR_item_t obj_detach_proto, obj_detach_item;
+  op_t obj_scope_mark;
+  int obj_scope_active;
   VARR (MIR_op_t) * call_ops, *ret_ops, *switch_ops;
   VARR (case_t) * switch_cases;
   int curr_mir_proto_num;
@@ -14753,6 +15695,14 @@ struct gen_ctx {
 #define str_from_double_item gen_ctx->str_from_double_item
 #define str_scope_mark gen_ctx->str_scope_mark
 #define str_scope_active gen_ctx->str_scope_active
+#define obj_checkpoint_proto gen_ctx->obj_checkpoint_proto
+#define obj_checkpoint_item gen_ctx->obj_checkpoint_item
+#define obj_release_to_proto gen_ctx->obj_release_to_proto
+#define obj_release_to_item gen_ctx->obj_release_to_item
+#define obj_detach_proto gen_ctx->obj_detach_proto
+#define obj_detach_item gen_ctx->obj_detach_item
+#define obj_scope_mark gen_ctx->obj_scope_mark
+#define obj_scope_active gen_ctx->obj_scope_active
 #define call_ops gen_ctx->call_ops
 #define ret_ops gen_ctx->ret_ops
 #define switch_ops gen_ctx->switch_ops
@@ -17187,6 +18137,84 @@ static op_t gen_string_call (c2m_ctx_t c2m_ctx, enum str_method sm, MIR_op_t *va
   return res;
 }
 
+/* Import the object-arena runtime helpers (c2m_obj_checkpoint / release_to) the
+   first time the automatic scope reclamation needs them.  c2m_obj_track itself
+   is referenced from generated factory source, so it is imported through the
+   normal extern path. */
+static void object_ensure_imports (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_module_t module = curr_func->module;
+  MIR_type_t ptr_t = MIR_T_I64;
+  MIR_var_t vars[1];
+
+  if (obj_checkpoint_item != NULL) return;
+
+  /* size_t c2m_obj_checkpoint(void) */
+  obj_checkpoint_proto = MIR_new_proto_arr (ctx, "__c2m_obj_checkpoint_p", 1, &ptr_t, 0, NULL);
+  obj_checkpoint_item = MIR_new_import (ctx, "c2m_obj_checkpoint");
+  move_item_to_module_start (module, obj_checkpoint_proto);
+  move_item_to_module_start (module, obj_checkpoint_item);
+
+  /* void c2m_obj_release_to(size_t mark) */
+  vars[0].name = "mark"; vars[0].type = MIR_T_I64;
+  obj_release_to_proto = MIR_new_proto_arr (ctx, "__c2m_obj_release_to_p", 0, NULL, 1, vars);
+  obj_release_to_item = MIR_new_import (ctx, "c2m_obj_release_to");
+  move_item_to_module_start (module, obj_release_to_proto);
+  move_item_to_module_start (module, obj_release_to_item);
+
+  /* void *c2m_obj_detach(void *p)  (result ignored) */
+  vars[0].name = "p"; vars[0].type = MIR_T_I64;
+  obj_detach_proto = MIR_new_proto_arr (ctx, "__c2m_obj_detach_p", 1, &ptr_t, 1, vars);
+  obj_detach_item = MIR_new_import (ctx, "c2m_obj_detach");
+  move_item_to_module_start (module, obj_detach_proto);
+  move_item_to_module_start (module, obj_detach_item);
+}
+
+/* c2m_obj_detach(p) : remove p from the object arena without destroying it, so a
+   subsequent explicit `delete` (or escape) does not double-free at scope exit. */
+static void gen_obj_detach (c2m_ctx_t c2m_ctx, MIR_op_t p) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[4];
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+
+  object_ensure_imports (c2m_ctx);
+  args[0] = MIR_new_ref_op (ctx, obj_detach_proto);
+  args[1] = MIR_new_ref_op (ctx, obj_detach_item);
+  args[2] = res.mir_op; /* ignored */
+  args[3] = p;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+}
+
+/* res = c2m_obj_checkpoint() : current object-arena high-water mark. */
+static op_t gen_obj_checkpoint (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[3];
+
+  object_ensure_imports (c2m_ctx);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  args[0] = MIR_new_ref_op (ctx, obj_checkpoint_proto);
+  args[1] = MIR_new_ref_op (ctx, obj_checkpoint_item);
+  args[2] = res.mir_op;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+  return res;
+}
+
+/* c2m_obj_release_to(mark) : destroy every Any<I> handle tracked since mark. */
+static void gen_obj_release_to (c2m_ctx_t c2m_ctx, MIR_op_t mark) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[3];
+
+  object_ensure_imports (c2m_ctx);
+  args[0] = MIR_new_ref_op (ctx, obj_release_to_proto);
+  args[1] = MIR_new_ref_op (ctx, obj_release_to_item);
+  args[2] = mark;
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+}
+
 /* res = c2m_str_checkpoint() : current allocation high-water mark. */
 static op_t gen_str_checkpoint (c2m_ctx_t c2m_ctx) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
@@ -17278,6 +18306,18 @@ static int subtree_allocates_string_p (node_t n) {
   for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c)) {
     if (c->code == N_FUNC_DEF) continue; /* separate scope */
     if (subtree_allocates_string_p (c)) return TRUE;
+  }
+  return FALSE;
+}
+
+/* TRUE if the subtree constructs an Any<I> handle (any<I>(...)), i.e. tracks an
+   object in the scope-bound arena that needs releasing at scope exit. */
+static int subtree_allocates_object_p (node_t n) {
+  if (n == NULL || node_is_leaf_p (n->code)) return FALSE;
+  if (n->code == N_ANY) return TRUE;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c)) {
+    if (c->code == N_FUNC_DEF) continue; /* separate scope */
+    if (subtree_allocates_object_p (c)) return TRUE;
   }
   return FALSE;
 }
@@ -18973,6 +20013,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     res = var;
     break;
   }
+  case N_ANY: {
+    /* any<I>(expr) was lowered in check to a factory call (3rd child); emit it. */
+    node_t call = NL_EL (r->u.ops, 2);
+    if (call != NULL && call->code == N_CALL)
+      res = gen (c2m_ctx, call, true_label, false_label, val_p, desirable_dest, expect_res);
+    break;
+  }
   case N_NEW: {
     /* new ClassName(args): obj = malloc(sizeof(Class)); memset 0; ctor(obj,args). */
     struct expr *ne = r->attr;
@@ -19784,6 +20831,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   }
   case N_ST_ASSERT: /* do nothing */ break;
   case N_INIT: break;  // ???
+  case N_INTERFACE: break; /* compile-time contract only; emits no code */
   case N_CLASS: {
     /* Skip generic templates — only their monomorphized specializations are generated */
     if (r->attr == (void *)((intptr_t)-1)) break;
@@ -19982,22 +21030,41 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     {
       int saved_str_scope_active = str_scope_active;
       op_t saved_str_scope_mark = str_scope_mark;
+      int saved_obj_scope_active = obj_scope_active;
+      op_t saved_obj_scope_mark = obj_scope_mark;
       str_scope_active = FALSE;
+      obj_scope_active = FALSE;
       if (subtree_allocates_string_p (stmt)) {
         str_scope_mark = gen_str_checkpoint (c2m_ctx);
         str_scope_active = TRUE;
+      }
+      /* Automatic object-arena (Any<I> handle) reclamation: checkpoint here and
+         release at every exit so handles placed into collections are destroyed
+         (running ~__Any_I, freeing the wrapped concrete) when the scope ends. */
+      if (subtree_allocates_object_p (stmt)) {
+        obj_scope_mark = gen_obj_checkpoint (c2m_ctx);
+        obj_scope_active = TRUE;
       }
       gen (c2m_ctx, stmt, NULL, NULL, FALSE, NULL, NULL);
       if ((insn = DLIST_TAIL (MIR_insn_t, curr_func->u.func->insns)) == NULL
           || (insn->code != MIR_RET && insn->code != MIR_JRET && insn->code != MIR_JMP)) {
         /* fall-through exit: reclaim before the synthesized return */
+        if (obj_scope_active) gen_obj_release_to (c2m_ctx, obj_scope_mark.mir_op);
         if (str_scope_active) gen_str_release_to (c2m_ctx, str_scope_mark.mir_op);
       }
       str_scope_active = saved_str_scope_active;
       str_scope_mark = saved_str_scope_mark;
+      obj_scope_active = saved_obj_scope_active;
+      obj_scope_mark = saved_obj_scope_mark;
     }
     if ((insn = DLIST_TAIL (MIR_insn_t, curr_func->u.func->insns)) == NULL
         || (insn->code != MIR_RET && insn->code != MIR_JRET && insn->code != MIR_JMP)) {
+      /* The body may have called other functions/methods, each of which
+         repopulates the shared proto_info for its own signature.  Restore this
+         function's return signature before synthesizing the fall-through return,
+         so e.g. a void function ending in a non-void method call still emits
+         `ret` (0 operands) rather than a stray `ret <val>`. */
+      collect_args_and_func_types (c2m_ctx, decl_type->u.func_type);
       if (VARR_LENGTH (MIR_type_t, proto_info.ret_types) == 0) {
         if (jump_ret_p)
           emit1 (c2m_ctx, MIR_JRET, MIR_new_int_op (ctx, 0));
@@ -20590,6 +21657,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     emit_label (c2m_ctx, r);
     if (NL_EL (r->u.ops, 1)->code == N_IGNORE) {
       gen_run_defers (c2m_ctx, 0); /* run all pending defers before returning */
+      if (obj_scope_active) gen_obj_release_to (c2m_ctx, obj_scope_mark.mir_op);
       if (str_scope_active) gen_str_release_to (c2m_ctx, str_scope_mark.mir_op);
       emit_insn (c2m_ctx, MIR_new_ret_insn (ctx, 0));
       break;
@@ -20609,6 +21677,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       val = promote (c2m_ctx, val, t, FALSE);
     }
     gen_run_defers (c2m_ctx, 0); /* run all pending defers after computing result */
+    /* Reclaim this scope's Any<I> handles before returning.  NOTE: a handle (or a
+       collection of handles) returned up the stack is freed here — escaping a
+       handle past its constructing scope needs explicit management. */
+    if (obj_scope_active) gen_obj_release_to (c2m_ctx, obj_scope_mark.mir_op);
     /* Reclaim this scope's Strings before returning; protect a returned String
        so it survives into the caller's scope (no use-after-free). */
     if (str_scope_active) {
@@ -20652,6 +21724,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       if (del_e && del_e->type && del_e->type->mode == TM_DICT) {
         gen_dict_destroy (c2m_ctx, op1.mir_op);
         break;
+      }
+      /* Explicitly deleting an arena-managed Any<I> handle: detach it first so
+         the scope-exit release does not free it a second time. */
+      if (del_e != NULL && del_e->type != NULL && del_e->type->mode == TM_PTR) {
+        const char *cn = class_type_name (del_e->type->u.ptr_type);
+        if (cn != NULL && strncmp (cn, "__Any_", 6) == 0)
+          gen_obj_detach (c2m_ctx, op1.mir_op);
       }
     }
     if (dtor_def != NULL) {
@@ -21351,7 +22430,7 @@ static const char *get_node_name (node_code_t code) {
     REP8 (C, RESTRICT, VOLATILE, ATOMIC, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR);
     REP8 (C, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF);
     REP7 (C, MODULE, ASM, ATTR, CLASS, STRING, CONCAT, DICT);
-    C (IN); C (FORIN); C (NEW); C (DEFER); C (DELETE); C (LAMBDA);
+    C (IN); C (FORIN); C (NEW); C (DEFER); C (DELETE); C (LAMBDA); C (INTERFACE); C (ANY);
   default: abort ();
   }
 #undef C
@@ -21419,6 +22498,8 @@ static void print_basic_type (FILE *f, enum basic_type basic_type) {
   case TP_FLOAT: fprintf (f, "float"); break;
   case TP_DOUBLE: fprintf (f, "double"); break;
   case TP_LDOUBLE: fprintf (f, "long double"); break;
+  case TP_STRING: fprintf (f, "String"); break;
+  case TP_GENERIC: fprintf (f, "generic"); break;
   default: assert (FALSE);
   }
 }
@@ -21616,6 +22697,7 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_LABEL_ADDR:
   case N_IN:
   case N_NEW:
+  case N_ANY:
   case N_LAMBDA:
     if (attr_p && n->attr != NULL) print_expr (c2m_ctx, f, n->attr);
     fprintf (f, "\n");
@@ -21676,6 +22758,10 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
     print_ops (c2m_ctx, f, n, indent, attr_p);
     break;
   case N_ATTR:
+    fprintf (f, "\n");
+    print_ops (c2m_ctx, f, n, indent, attr_p);
+    break;
+  case N_INTERFACE: /* id(0), member_list(1) — no attr/scope */
     fprintf (f, "\n");
     print_ops (c2m_ctx, f, n, indent, attr_p);
     break;

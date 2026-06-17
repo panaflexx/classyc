@@ -139,8 +139,8 @@ objects=()
 if [ -f "$csrc_dir/mir-aot-runtime.c" ]; then
   echo Compile runtime support $csrc_dir
   rt_obj="$workdir/mir-aot-runtime.o"
-  echo "$CC" -O2 -I include -c "${csrc_dir}/mir-aot-runtime.c" -o "$rt_obj"
-  "$CC" -O2 -c -I include "$csrc_dir/mir-aot-runtime.c" -o "$rt_obj"
+  echo "$CC" -O2 -I include -I ${mir_dir} -c "${csrc_dir}/mir-aot-runtime.c" -o "$rt_obj"
+  "$CC" -O2 -c -I include -I ${mir_dir} "$csrc_dir/mir-aot-runtime.c" -o "$rt_obj"
   link_objects+=("$rt_obj")
 fi
 

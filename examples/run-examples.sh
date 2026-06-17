@@ -72,6 +72,10 @@ run_example test_json_int.c
 run_example test-ptr-arg-mini.c
 run_example classy-generics.c
 run_example classy-overload.c
+run_example test-interface.c
+run_example test-any.c
+run_example test-any-arena.c
+run_example test-any-implicit.c
 run_example t_raii.c
 
 # ── summary ────────────────────────────────────────────────────────────

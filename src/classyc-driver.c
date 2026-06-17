@@ -11,6 +11,8 @@
 #include "dict.h"
 /* Include cstring.h to make the UTF-8 String runtime available to the resolver */
 #include "cstring.h"
+/* Include cobjarena.h for the scope-bound object arena (Any<I> handles) */
+#include "cobjarena.h"
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -505,6 +507,12 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "c2m_str_checkpoint") == 0) return (void *) c2m_str_checkpoint;
     if (strcmp (name, "c2m_str_release_to") == 0) return (void *) c2m_str_release_to;
     if (strcmp (name, "c2m_str_release_keeping") == 0) return (void *) c2m_str_release_keeping;
+    /* Object arena (Any<I> handles / arena-managed collections) */
+    if (strcmp (name, "c2m_obj_track") == 0) return (void *) c2m_obj_track;
+    if (strcmp (name, "c2m_obj_checkpoint") == 0) return (void *) c2m_obj_checkpoint;
+    if (strcmp (name, "c2m_obj_release_to") == 0) return (void *) c2m_obj_release_to;
+    if (strcmp (name, "c2m_obj_detach") == 0) return (void *) c2m_obj_detach;
+    if (strcmp (name, "c2m_obj_cleanup") == 0) return (void *) c2m_obj_cleanup;
     /* String '+' concatenation / basic-type auto-cast helpers */
     if (strcmp (name, "c2m_str_concat") == 0) return (void *) c2m_str_concat;
     if (strcmp (name, "c2m_str_from_int") == 0) return (void *) c2m_str_from_int;
