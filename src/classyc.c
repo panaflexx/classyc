@@ -4274,7 +4274,6 @@ struct parse_ctx {
 
 #define record_level parse_ctx->record_level
 #define next_token_index parse_ctx->next_token_index
-#define next_token_index parse_ctx->next_token_index
 #define curr_token parse_ctx->curr_token
 #define curr_scope parse_ctx->curr_scope
 #define tpname_tab parse_ctx->tpname_tab
@@ -4312,88 +4311,14 @@ static void record_stop (c2m_ctx_t c2m_ctx, size_t mark, int restore_p) {
   read_token (c2m_ctx);
 }
 
-static void syntax_error(c2m_ctx_t c2m_ctx, const char *expected_name) {
+static void syntax_error (c2m_ctx_t c2m_ctx, const char *expected_name) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   FILE *f;
 
   if ((f = c2m_options->message_file) == NULL) return;
-
-  //print_streams(c2m_ctx);
-  // Print the position (file:line:column)
-  print_pos(f, curr_token->pos, TRUE);
-
-  // Print the error message
-  fprintf(f, "syntax error on %s", get_token_name(c2m_ctx, curr_token->code));
-  fprintf(f, " (expected '%s'):\n", expected_name);
-
-  // Assume curr_token->pos has line and column fields
-  unsigned int error_line = curr_token->pos.lno;
-  unsigned int error_column = curr_token->pos.ln_pos;
-
-  // Access the source code buffer from curr_input
-  // FIXME
-  const char *source = NULL;// curr_input->code;
-  size_t source_len = 0; //curr_input.code_len;
-
-  if (source != NULL && source_len > 0) {
-    // Scan the source to find the line
-    unsigned int current_line = 1;
-    const char *line_start = source;
-    const char *line_end = source;
-    int line_found = 0;
-
-    // Iterate through the source to find the error line
-    for (size_t i = 0; i < source_len && source[i] != '\0'; i++) {
-      if (source[i] == '\n') {
-        if (current_line == error_line) {
-          // Found the line; line_end is just before the newline
-          line_end = source + i;
-          line_found = 1;
-          break;
-        }
-        current_line++;
-        line_start = source + i + 1; // Start of next line
-      }
-    }
-
-    // If we reached the end without a newline, check if it’s the error line
-    if (!line_found && current_line == error_line) {
-      line_end = source + source_len; // End of buffer
-      line_found = 1;
-    }
-
-    if (line_found && line_end >= line_start) {
-      // Copy the line to a buffer for printing (exclude newline)
-      size_t line_len = line_end - line_start;
-      char line_buffer[1024]; // Adjust size as needed
-      if (line_len >= sizeof(line_buffer)) {
-        line_len = sizeof(line_buffer) - 1; // Truncate if too long
-      }
-      strncpy(line_buffer, line_start, line_len);
-      line_buffer[line_len] = '\0';
-
-      // Print the source line
-      fprintf(f, "%s\n", line_buffer);
-
-      // Print a caret (^) at the error column
-      for (unsigned int i = 0; i < error_column - 1; i++) {
-        // Preserve tabs for alignment
-        if (i < line_len && line_buffer[i] == '\t') {
-          fprintf(f, "\t");
-        } else {
-          fprintf(f, " ");
-        }
-      }
-      fprintf(f, "^\n");
-    } else {
-      fprintf(f, "<could not display source line>\n");
-    }
-  } else {
-    // Fallback if source is unavailable
-    //fprintf(f, "<source line unavailable>\n");
-  }
-
-  // Increment error count
+  print_pos (f, curr_token->pos, TRUE);
+  fprintf (f, "syntax error on %s", get_token_name (c2m_ctx, curr_token->code));
+  fprintf (f, " (expected '%s'):\n", expected_name);
   n_errors++;
 }
 
@@ -5492,8 +5417,6 @@ D (sc_spec);
 DA (type_spec);
 D (struct_declaration_list);
 D (struct_declaration);
-D (class_struct_declarator_list);
-D (class_struct_declarator);
 D (spec_qual_list);
 D (type_qual);
 D (func_spec);
@@ -5803,6 +5726,20 @@ D (sc_spec) {
 }
 
 
+/* Build an N_FUNC_DEF for a constructor or destructor parsed inside a class body:
+   `void <mangled> (plist) <block>`.  The implicit `this` parameter is prepended
+   later (like any other method) and the real ctor/dtor lowering happens in
+   check/gen.  `cpos` is the name position and `ppos` the parameter-list pos. */
+static node_t build_ctor_dtor_def (c2m_ctx_t c2m_ctx, const char *mangled, node_t plist,
+                                   node_t block, pos_t cpos, pos_t ppos) {
+  node_t func_node = new_pos_node1 (c2m_ctx, N_FUNC, ppos, plist);
+  node_t decl_list = new_node1 (c2m_ctx, N_LIST, func_node);
+  node_t id = build_id (c2m_ctx, mangled, cpos);
+  node_t declr = new_pos_node2 (c2m_ctx, N_DECL, cpos, id, decl_list);
+  node_t spec = new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_VOID, cpos));
+  return build_func_def (c2m_ctx, cpos, spec, declr, new_node (c2m_ctx, N_LIST), block);
+}
+
 D (class_member_declaration) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t r, spec, decl;
@@ -5823,24 +5760,17 @@ D (class_member_declaration) {
         && strcmp (curr_token->repr, parse_ctx->curr_class->u.s.s) == 0) {
       M (T_ID); /* consume the class name */
       if (C ('(')) {
-        node_t plist, func_node, decl_list, dtor_id, declr, dspec, block;
+        node_t plist;
         pos_t ppos;
         char dtor_name[300];
         record_stop (c2m_ctx, mark, FALSE); /* commit: this is a destructor */
         MP ('(', ppos);
         PT (')'); /* destructors take no parameters */
         plist = new_node (c2m_ctx, N_LIST);
-        func_node = new_pos_node1 (c2m_ctx, N_FUNC, ppos, plist);
-        decl_list = new_node1 (c2m_ctx, N_LIST, func_node);
         snprintf (dtor_name, sizeof (dtor_name), "__dtor_%s",
                   parse_ctx->curr_class->u.s.s);
-        dtor_id = build_id (c2m_ctx, dtor_name, cpos);
-        declr = new_pos_node2 (c2m_ctx, N_DECL, cpos, dtor_id, decl_list);
-        dspec = new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_VOID, cpos));
         P (compound_stmt);
-        block = r;
-        return build_func_def (c2m_ctx, cpos, dspec, declr,
-                               new_node (c2m_ctx, N_LIST), block);
+        return build_ctor_dtor_def (c2m_ctx, dtor_name, plist, r, cpos, ppos);
       }
     }
     record_stop (c2m_ctx, mark, TRUE); /* not a destructor: rewind */
@@ -5856,7 +5786,7 @@ D (class_member_declaration) {
     pos_t cpos = curr_token->pos;
     M (T_ID); /* consume the class name */
     if (C ('(')) {
-      node_t plist, func_node, decl_list, ctor_id, declr, cspec, block;
+      node_t plist;
       pos_t ppos;
       char ctor_name[300];
       record_stop (c2m_ctx, mark, FALSE); /* commit: this is a constructor */
@@ -5868,17 +5798,10 @@ D (class_member_declaration) {
         plist = r;
       }
       PT (')');
-      func_node = new_pos_node1 (c2m_ctx, N_FUNC, ppos, plist);
-      decl_list = new_node1 (c2m_ctx, N_LIST, func_node);
       snprintf (ctor_name, sizeof (ctor_name), "__ctor_%s",
                 parse_ctx->curr_class->u.s.s);
-      ctor_id = build_id (c2m_ctx, ctor_name, cpos);
-      declr = new_pos_node2 (c2m_ctx, N_DECL, cpos, ctor_id, decl_list);
-      cspec = new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_VOID, cpos));
       P (compound_stmt);
-      block = r;
-      return build_func_def (c2m_ctx, cpos, cspec, declr,
-                             new_node (c2m_ctx, N_LIST), block);
+      return build_ctor_dtor_def (c2m_ctx, ctor_name, plist, r, cpos, ppos);
     }
     record_stop (c2m_ctx, mark, TRUE); /* not a constructor: rewind */
   }
@@ -5949,9 +5872,9 @@ D (class_member_declaration) {
   // If no declarator, just a type declaration
   PT(';');
   return build_shared_member(c2m_ctx, POS(spec), spec, decl, NULL, NULL, NULL);
-    }
+}
 
-    D (class_member_list) {
+D (class_member_list) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t list, r;
 
@@ -6265,109 +6188,12 @@ D (struct_declaration) {
   return r;
 }
 
-D (declarator);
+/* Class bodies are parsed by type_spec -> class_member_list; a standalone
+   `class_declaration` external-definition rule used to exist here but never
+   produced a real node (every class definition is already handled by
+   `declaration`), so it was removed along with its private helpers. */
 
-D(class_struct_declarator) {
-    node_t declar, cexpr, init, r;
-    if (c2m_options->debug_p) printf("class_struct_declarator 1\n");
-
-    P(declarator);
-    if (r == err_node) return err_node;
-    declar = r;
-
-    if (M(':')) {
-        if (c2m_options->debug_p) printf("class_struct_declarator :\n");
-        P(const_expr);
-        if (r == err_node) return err_node;
-        cexpr = r;
-        init = new_ignore(c2m_ctx);
-    } else if (M('=')) {
-        if (c2m_options->debug_p) printf("class_struct_declarator =\n");
-        P(initializer);
-        if (r == err_node) return err_node;
-        init = r;
-        cexpr = new_ignore(c2m_ctx);
-    } else {
-        if (c2m_options->debug_p) printf("class_struct_declarator cexpr\n");
-        cexpr = new_ignore(c2m_ctx);
-        init = new_ignore(c2m_ctx);
-    }
-
-    r = new_pos_node3(c2m_ctx, N_SPEC_DECL, POS(declar), declar, cexpr, init);
-    return r;
-}
-
-D(class_struct_declarator_list) {
-    node_t list, decl, r;
-    if (c2m_options->debug_p) printf("class_struct_declarator_list 1\n");
-
-    P(class_struct_declarator);
-    if (r == err_node) return err_node;
-    list = new_node1(c2m_ctx, N_LIST, r);
-
-    while (M(',')) {
-        P(class_struct_declarator);
-        if (r != err_node) {
-            op_append(c2m_ctx, list, r);
-        } else {
-            break;
-        }
-    }
-    return list;
-}
-
-
-D(class_declaration) {
-    parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
-    node_t r, spec, declarator_list, attr_node, members;
-    if (c2m_options->debug_p) printf("class_declaration 1\n");
-
-    if ((r = TRY(st_assert)) != err_node) {
-        return r; // Handle static assertion
-    }
-
-    P(spec_qual_list);
-    if (r == err_node) {
-        P(declaration);
-        if (r != err_node) {
-            if (M(';')) {
-                return r; // Function declaration
-            } else if (C('{')) {
-                P(compound_stmt);
-                r = new_node2(c2m_ctx, N_FUNC_DEF, r, r);
-                return r;
-            }
-        }
-        error_recovery(c2m_ctx, 1, "<struct_declaration> or <function_declaration/definition>");
-        return err_node;
-    }
-    spec = r;
-
-    P(class_struct_declarator_list);
-    if (r == err_node) {
-        error_recovery(c2m_ctx, 1, "<struct_declaration>");
-        return err_node;
-    }
-    declarator_list = r;
-
-    // Parse attributes and store the result in attr_node
-    P(attr); // Assuming 'attrs' is the parsing function name
-    attr_node = r;
-
-    members = new_node(c2m_ctx, N_LIST);
-    for (node_t decl = NL_HEAD(declarator_list->u.ops); decl != NULL; decl = NL_NEXT(decl)) {
-        node_t declarator = NL_HEAD(decl->u.ops);
-        node_t const_expr = NL_NEXT(declarator);
-        node_t initializer = NL_NEXT(const_expr);
-        node_t member = new_pos_node5(c2m_ctx, N_MEMBER, POS(declarator), spec, declarator, attr_node, const_expr, initializer);
-        op_append(c2m_ctx, members, member);
-    }
-
-    PT(';');
-        return NL_HEAD(members->u.ops) != NULL && NL_NEXT(NL_HEAD(members->u.ops)) == NULL ? NL_HEAD(members->u.ops) : members;
-    }
-
-    D (spec_qual_list) {
+D (spec_qual_list) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t list, op, r, arg = NULL;
   int first_p;
@@ -7700,12 +7526,8 @@ D (transl_unit) {
     if (C_SOFT ("interface")) {
       PE (interface_declaration, err);
     } else if ((r = TRY (declaration)) != err_node) {
-      // Successfully parsed a declaration (e.g., "int x;")
-      //printf("DECL found\n");
-    } else if ((r = TRY (class_declaration)) != err_node) {
-      // FIXME calling class_declaration here is very likely WRONG
-      // Successfully parsed a class definition (e.g., "class MyClass { ... };")
-      if (c2m_options->debug_p) printf("class_declaration found\n");
+      // Successfully parsed a declaration or class definition (e.g. "int x;"
+      // or "class MyClass { ... };") -- declaration handles class bodies too.
     } else {
       // Attempt to parse a function definition
       PAE (declaration_specs, (node_t) 1, err);
@@ -16004,6 +15826,9 @@ static MIR_alias_t get_type_alias (c2m_ctx_t c2m_ctx, struct type *type) {
 
 static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_t false_label,
                  int val_p, op_t *desirable_dest, int *expect_res);
+#if !MIR_NO_DBINFO
+static void dbinfo_emit_func_vars (c2m_ctx_t c2m_ctx, node_t func_def_node);
+#endif
 
 static op_t val_gen (c2m_ctx_t c2m_ctx, node_t r) {
   return gen (c2m_ctx, r, NULL, NULL, TRUE, NULL, NULL);
@@ -22347,7 +22172,7 @@ static void dbinfo_walk_stmt (c2m_ctx_t c2m_ctx, MIR_module_t mod, MIR_func_t fu
   }
 }
 
-void dbinfo_emit_func_vars (c2m_ctx_t c2m_ctx, node_t func_def_node) {
+static void dbinfo_emit_func_vars (c2m_ctx_t c2m_ctx, node_t func_def_node) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
   MIR_module_t mod = DLIST_TAIL (MIR_module_t, *MIR_get_module_list (ctx));
