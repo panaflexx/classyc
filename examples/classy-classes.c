@@ -26,8 +26,8 @@ class Point {
     int sum() { return this.x + this.y; }
 
     /* fluent setters return the object for chaining */
-    Point* withX(int v) { this.x = v; return this; }
-    Point* withY(int v) { this.y = v; return this; }
+    Point* withX(int v) { x = v; return this; }
+    Point* withY(int v) { y = v; return this; }
 };
 
 int main() {

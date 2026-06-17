@@ -13112,24 +13112,27 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
 
 	                if (!is_static_meth) {
 	                  // Non-static method: prepend 'this' argument.
-	                  // Create a copy of obj so we don't unlink it from the N_FIELD child list.
-	                  // Reuse the already-checked attr to avoid re-checking side effects.
-	                  node_t this_arg;
-	                  node_t obj_copy = copy_node(c2m_ctx, obj);
-	                  obj_copy->attr = obj->attr;
-	                  if (op1->code == N_FIELD) {
-	                    // obj.method(): pass the address of the (value) class object.
-	                    this_arg = new_node1(c2m_ctx, N_ADDR, obj_copy);
-	                    struct expr *ae = create_expr(c2m_ctx, this_arg);
-	                    ae->type->mode = TM_PTR;
-	                    ae->type->u.ptr_type = obj_type;
-	                    set_type_layout(c2m_ctx, ae->type);
-	                  } else {
-	                    // ptr->method(): the receiver is already a pointer value.
-	                    this_arg = obj_copy;
+	                  // Guard: do this only on the first visit to this CALL node.
+	                  // Re-checks (e.g. from check_dict_init_list + N_INIT tree walk
+	                  // for dict initializers) would otherwise prepend multiple times.
+	                  if (r->attr == NULL) {
+	                    node_t this_arg;
+	                    node_t obj_copy = copy_node(c2m_ctx, obj);
+	                    obj_copy->attr = obj->attr;
+	                    if (op1->code == N_FIELD) {
+	                      // obj.method(): pass the address of the (value) class object.
+	                      this_arg = new_node1(c2m_ctx, N_ADDR, obj_copy);
+	                      struct expr *ae = create_expr(c2m_ctx, this_arg);
+	                      ae->type->mode = TM_PTR;
+	                      ae->type->u.ptr_type = obj_type;
+	                      set_type_layout(c2m_ctx, ae->type);
+	                    } else {
+	                      // ptr->method(): the receiver is already a pointer value.
+	                      this_arg = obj_copy;
+	                    }
+	                    // Prepend 'this' argument into the call's arg_list
+	                    NL_PREPEND(arg_list->u.ops, this_arg);
 	                  }
-	                  // Prepend 'this' argument into the call's arg_list
-	                  NL_PREPEND(arg_list->u.ops, this_arg);
 	                }
 	                // For static methods: no 'this' is added; args are passed as-is.
 
