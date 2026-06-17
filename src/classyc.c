@@ -34,6 +34,7 @@
 #include "time.h"
 
 #include "classyc.h"
+#include "logger.h"
 
 #if defined(__x86_64__) || defined(_M_AMD64)
 #include "x86_64/cx86_64.h"
@@ -1039,6 +1040,17 @@ static const char *get_token_name (c2m_ctx_t c2m_ctx, int token_code) {
   }
 }
 
+/* Print "file:line:col: " (bold) followed by the diagnostic label (e.g. "error")
+   in `label_color`, with a trailing " -- ".  Colors are applied only when the
+   stream is an interactive terminal (see logger.h). */
+static void print_diag_prefix (FILE *f, pos_t pos, const char *label, const char *label_color) {
+  int color = log_color_enabled (f);
+
+  fprintf (f, "%s", log_c (color, LOG_BOLD));
+  print_pos (f, pos, TRUE);
+  fprintf (f, "%s%s%s -- ", log_c (color, label_color), label, log_c (color, LOG_RESET));
+}
+
 static void error (c2m_ctx_t c2m_ctx, pos_t pos, const char *format, ...) {
   va_list args;
   FILE *f;
@@ -1046,8 +1058,7 @@ static void error (c2m_ctx_t c2m_ctx, pos_t pos, const char *format, ...) {
   if ((f = c2m_options->message_file) == NULL) return;
   n_errors++;
   va_start (args, format);
-  print_pos (f, pos, TRUE);
-  fprintf (f, "error -- ");
+  print_diag_prefix (f, pos, "error", LOG_BRED);
   vfprintf (f, format, args);
   va_end (args);
   fprintf (f, "\n");
@@ -1061,8 +1072,7 @@ static void warning (c2m_ctx_t c2m_ctx, pos_t pos, const char *format, ...) {
   n_warnings++;
   if (!c2m_options->ignore_warnings_p) {
     va_start (args, format);
-    print_pos (f, pos, TRUE);
-    fprintf (f, "warning -- ");
+    print_diag_prefix (f, pos, "warning", LOG_BYELLOW);
     vfprintf (f, format, args);
     va_end (args);
     fprintf (f, "\n");
@@ -4316,9 +4326,14 @@ static void syntax_error (c2m_ctx_t c2m_ctx, const char *expected_name) {
   FILE *f;
 
   if ((f = c2m_options->message_file) == NULL) return;
+  int color = log_color_enabled (f);
+  fprintf (f, "%s", log_c (color, LOG_BOLD));
   print_pos (f, curr_token->pos, TRUE);
-  fprintf (f, "syntax error on %s", get_token_name (c2m_ctx, curr_token->code));
-  fprintf (f, " (expected '%s'):\n", expected_name);
+  fprintf (f, "%ssyntax error%s on %s%s%s", log_c (color, LOG_BRED), log_c (color, LOG_RESET),
+           log_c (color, LOG_BOLD), get_token_name (c2m_ctx, curr_token->code),
+           log_c (color, LOG_RESET));
+  fprintf (f, " (expected '%s%s%s'):\n", log_c (color, LOG_BGREEN), expected_name,
+           log_c (color, LOG_RESET));
   n_errors++;
 }
 
@@ -22288,16 +22303,18 @@ static void print_expr (c2m_ctx_t c2m_ctx, FILE *f, struct expr *e) {
 
 static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int attr_p) {
   int i;
+  int color = log_color_enabled (f);
 
-  fprintf (f, "%6u: ", n->uid);
+  fprintf (f, "%s%6u:%s ", log_c (color, LOG_GRAY), n->uid, log_c (color, LOG_RESET));
   for (i = 0; i < indent; i++) fprintf (f, " ");
   if (n == err_node) {
-    fprintf (f, "<error>\n");
+    fprintf (f, "%s<error>%s\n", log_c (color, LOG_BRED), log_c (color, LOG_RESET));
     return;
   }
-  fprintf (f, "%s (", get_node_name (n->code));
+  fprintf (f, "%s%s%s %s(", log_c (color, LOG_BCYAN), get_node_name (n->code),
+           log_c (color, LOG_RESET), log_c (color, LOG_GRAY));
   print_pos (f, POS (n), FALSE);
-  fprintf (f, ")");
+  fprintf (f, ")%s", log_c (color, LOG_RESET));
   switch (n->code) {
   case N_IGNORE: fprintf (f, "ignore\n"); break;
   case N_I: fprintf (f, " %lld", (long long) n->u.l); goto expr;
@@ -22312,21 +22329,23 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_CH:
   case N_CH16:
   case N_CH32:
-    fprintf (f, " %s'", n->code == N_CH ? "" : n->code == N_CH16 ? "u" : "U");
+    fprintf (f, " %s%s'", log_c (color, LOG_GREEN),
+             n->code == N_CH ? "" : n->code == N_CH16 ? "u" : "U");
     print_char (f, n->u.ch);
-    fprintf (f, "'");
+    fprintf (f, "'%s", log_c (color, LOG_RESET));
     goto expr;
   case N_STR:
   case N_STR16:
   case N_STR32:
-    fprintf (f, " %s\"", n->code == N_STR ? "" : n->code == N_STR16 ? "u" : "U");
+    fprintf (f, " %s%s\"", log_c (color, LOG_GREEN),
+             n->code == N_STR ? "" : n->code == N_STR16 ? "u" : "U");
     (n->code == N_STR     ? print_chars
      : n->code == N_STR16 ? print_chars16
                           : print_chars32) (f, n->u.s.s, n->u.s.len);
-    fprintf (f, "\"");
+    fprintf (f, "\"%s", log_c (color, LOG_RESET));
     goto expr;
   case N_ID:
-    fprintf (f, " %s", n->u.s.s);
+    fprintf (f, " %s%s%s", log_c (color, LOG_YELLOW), n->u.s.s, log_c (color, LOG_RESET));
   expr:
     if (attr_p && n->attr != NULL) print_expr (c2m_ctx, f, n->attr);
     fprintf (f, "\n");
@@ -22688,6 +22707,17 @@ static void compile_finish (c2m_ctx_t c2m_ctx) {
 
 #include "real-time.h"
 
+/* Return the time (usec) elapsed since *prev and advance *prev to now.  Used to
+   measure each compile stage; the durations are reported together on one line at
+   the end of c2mir_compile (see the -v summary). */
+static double stage_time (double *prev) {
+  double now = real_usec_time ();
+  double dur = now - *prev;
+
+  *prev = now;
+  return dur;
+}
+
 static const char *get_module_name (c2m_ctx_t c2m_ctx) {
   sprintf (temp_str_buff, "M%ld", (long) c2m_options->module_num);
   return temp_str_buff;
@@ -22699,6 +22729,8 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
                    void *getc_data, const char *source_name, FILE *output_file) {
   struct c2m_ctx *c2m_ctx = *c2m_ctx_loc (ctx);
   double start_time = real_usec_time ();
+  double prev_time = start_time; /* advanced per stage by stage_time() */
+  double t_init = 0, t_pre = 0, t_parse = 0, t_check = 0, t_gen = 0;
   node_t r;
   unsigned n_error_before;
   MIR_module_t m;
@@ -22709,25 +22741,20 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
     return 0;
   }
   compile_init (c2m_ctx, ops, getc_func, getc_data);
-  if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-    fprintf (c2m_options->message_file, "C2MIR init end           -- %.0f usec\n",
-             real_usec_time () - start_time);
+  t_init = stage_time (&prev_time);
   add_stream (c2m_ctx, NULL, source_name, top_level_getc);
   if (!c2m_options->no_prepro_p) add_standard_includes (c2m_ctx);
   pre (c2m_ctx);
-  if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-    fprintf (c2m_options->message_file, "  C2MIR preprocessor end    -- %.0f usec\n",
-             real_usec_time () - start_time);
+  t_pre = stage_time (&prev_time);
   if (!c2m_options->prepro_only_p) {
     r = parse (c2m_ctx);
-    if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-      fprintf (c2m_options->message_file, "  C2MIR parser end          -- %.0f usec\n",
-               real_usec_time () - start_time);
+    t_parse = stage_time (&prev_time);
     if (c2m_options->verbose_p && c2m_options->message_file != NULL && n_errors)
-      fprintf (c2m_options->message_file, "parser - FAIL\n");
+      fprintf (c2m_options->message_file, "parse - FAIL\n");
     if (!c2m_options->syntax_only_p) {
       n_error_before = n_errors;
       do_context (c2m_ctx, r);
+      t_check = stage_time (&prev_time);
       if (c2m_options->verbose_p) {
           symbol_dump(c2m_ctx, stderr); // Dump all symbols
           tpname_dump(c2m_ctx, stderr); // Dump all typenames
@@ -22735,12 +22762,9 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
       if (n_errors > n_error_before) {
         if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_file, r, 0, FALSE);
         if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-          fprintf (c2m_options->message_file, "C2MIR context checker - FAIL\n");
+          fprintf (c2m_options->message_file, "check - FAIL\n");
       } else {
         if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_file, r, 0, TRUE);
-        if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-          fprintf (c2m_options->message_file, "  C2MIR context checker end -- %.0f usec\n",
-                   real_usec_time () - start_time);
         m = MIR_new_module (ctx, get_module_name (c2m_ctx));
         gen_mir (c2m_ctx, r);
         if ((c2m_options->asm_p || c2m_options->object_p) && n_errors == 0) {
@@ -22756,16 +22780,24 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
           }
         }
         MIR_finish_module (ctx);
-        if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-          fprintf (c2m_options->message_file, "  C2MIR generator end       -- %.0f usec\n",
-                   real_usec_time () - start_time);
+        t_gen = stage_time (&prev_time);
       }
     }
   }
   compile_finish (c2m_ctx);
-  if (c2m_options->verbose_p && c2m_options->message_file != NULL)
-    fprintf (c2m_options->message_file, "C2MIR compiler end                -- %.0f usec\n",
-             real_usec_time () - start_time);
+  if (c2m_options->verbose_p && c2m_options->message_file != NULL) {
+    /* One-line per-stage timing summary (skipped stages read 0). */
+    FILE *f = c2m_options->message_file;
+    int color = log_color_enabled (f);
+    const char *names[] = {"init", "preprocess", "parse", "check", "generate", "total"};
+    double vals[] = {t_init, t_pre, t_parse, t_check, t_gen, real_usec_time () - start_time};
+
+    fprintf (f, "  %stimings (usec):%s", log_c (color, LOG_BOLD), log_c (color, LOG_RESET));
+    for (int i = 0; i < 6; i++)
+      fprintf (f, " %s%s%s=%s%.0f%s", log_c (color, LOG_CYAN), names[i], log_c (color, LOG_RESET),
+               log_c (color, LOG_BOLD), vals[i], log_c (color, LOG_RESET));
+    fprintf (f, "\n");
+  }
   return n_errors == 0;
 }
 
