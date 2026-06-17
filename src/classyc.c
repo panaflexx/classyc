@@ -7688,6 +7688,12 @@ struct decl {
   /* Unnamed member if this scope is anon struct/union for the member,
      NULL otherwise: */
   node_t containing_unnamed_anon_struct_union_member;
+  /* RAII support for automatic (stack) class objects: when a local variable of
+     a class type with a constructor/destructor is declared, these hold checked
+     `var.__ctor_C(...)` / `var.__dtor_C()` method-call nodes (NULL otherwise).
+     gen emits the ctor at the declaration and registers the dtor at scope exit
+     (via the defer machinery) — no free, since the storage is automatic. */
+  node_t ctor_call, dtor_call;
   union {
     const char *asm_str; /* register name for global reg used and defined only if asm_p */
     MIR_item_t item;     /* MIR_item for some declarations */
@@ -10603,6 +10609,7 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
       decl->flex_extra_size = 0;
       decl->bit_offset = -1;
       decl->param_args_start = decl->param_args_num = 0;
+      decl->ctor_call = decl->dtor_call = NULL;
       decl->scope = curr_scope;
       decl->containing_unnamed_anon_struct_union_member = curr_unnamed_anon_struct_union_member;
       decl->u.item = NULL;
@@ -10678,6 +10685,75 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
           if (c2m_options->message_file != NULL) {
             if (id->code != N_IGNORE) fprintf (c2m_options->message_file, " of %s", id->u.s.s);
             fprintf (c2m_options->message_file, "\n");
+          }
+        }
+      }
+      /* RAII for automatic (stack) class objects.  A local variable of a class
+         type that has a constructor and/or destructor runs its ctor when it
+         comes into scope and its dtor at scope exit (no free).  Synthesize the
+         `var.__ctor_C()` / `var.__dtor_C()` method calls here (resolved through
+         the normal member-call machinery) and stash them on the decl; gen emits
+         the ctor at the declaration point and registers the dtor with the defer
+         machinery so it runs at every scope exit, in reverse declaration order.
+         Only plain class objects qualify (not pointers, params, members,
+         statics, or `new`-initialized declarations). */
+      if (decl_node->code == N_SPEC_DECL && declarator->code == N_DECL && id != NULL
+          && id->code == N_ID && scope != NULL && scope->code == N_BLOCK && !param_p
+          && !decl->decl_spec.typedef_p && !decl->decl_spec.static_p
+          && !decl->decl_spec.extern_p && !decl->decl_spec.thread_local_p
+          && decl->decl_spec.type->mode == TM_CLASS && decl->decl_spec.type->u.tag_type != NULL
+          && (initializer == NULL || initializer->code == N_IGNORE)) {
+        node_t tag = decl->decl_spec.type->u.tag_type;
+        node_t cid = NL_HEAD (tag->u.ops);
+        if (cid != NULL && cid->code == N_ID) {
+          char nm[320];
+          unsigned saved_errs;
+          node_t cdtor_id, call;
+          symbol_t ctor_sym;
+          int has_default_ctor = FALSE;
+          /* Constructor: auto-invoke only when a zero-argument (default) ctor
+             exists, so a class with only parametrized ctors is not flagged with
+             a spurious "too few arguments" error for a plain `C c;`. */
+          snprintf (nm, sizeof (nm), "__ctor_%s", cid->u.s.s);
+          cdtor_id = build_id (c2m_ctx, nm, POS (id));
+          if (find_overload_sym (c2m_ctx, cdtor_id, scope, &ctor_sym)) {
+            for (size_t ci = 0; ci < VARR_LENGTH (node_t, ctor_sym.defs); ci++) {
+              node_t cand = VARR_GET (node_t, ctor_sym.defs, ci);
+              decl_t cd;
+              struct func_type *cft;
+              node_t cp;
+              if (cand == NULL || cand->code != N_FUNC_DEF) continue;
+              cd = cand->attr;
+              if (cd == NULL || cd->decl_spec.type == NULL
+                  || cd->decl_spec.type->mode != TM_FUNC) continue;
+              cft = cd->decl_spec.type->u.func_type;
+              cp = NL_HEAD (cft->param_list->u.ops);
+              if (cp != NULL) cp = NL_NEXT (cp); /* skip implicit 'this' */
+              if (cp == NULL) { has_default_ctor = TRUE; break; } /* no user params */
+            }
+          }
+          if (has_default_ctor) {
+            call = new_pos_node2 (c2m_ctx, N_CALL, POS (id),
+                                  new_pos_node2 (c2m_ctx, N_FIELD, POS (id),
+                                                 copy_node (c2m_ctx, id),
+                                                 build_id (c2m_ctx, nm, POS (id))),
+                                  new_node (c2m_ctx, N_LIST));
+            saved_errs = n_errors;
+            check (c2m_ctx, call, decl_node);
+            if (n_errors == saved_errs) decl->ctor_call = call;
+          }
+          /* Destructor. */
+          snprintf (nm, sizeof (nm), "__dtor_%s", cid->u.s.s);
+          cdtor_id = build_id (c2m_ctx, nm, POS (id));
+          if (find_def (c2m_ctx, S_REGULAR, cdtor_id, scope, NULL) != NULL) {
+            call = new_pos_node2 (c2m_ctx, N_CALL, POS (id),
+                                  new_pos_node2 (c2m_ctx, N_FIELD, POS (id),
+                                                 copy_node (c2m_ctx, id),
+                                                 build_id (c2m_ctx, nm, POS (id))),
+                                  new_node (c2m_ctx, N_LIST));
+            saved_errs = n_errors;
+            check (c2m_ctx, call, decl_node);
+            if (n_errors == saved_errs) decl->dtor_call = call;
           }
         }
       }
@@ -11339,6 +11415,51 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
 	  return FALSE;
 	}
 
+    /* Implicit-`this` resolution for class scope.  Inside a (non-static) method,
+       a bare identifier `m` may name a data member or another method of the
+       enclosing class instead of a global/local.  Such identifiers are NOT in
+       the method's lexical scope chain (methods/members are registered under the
+       class node itself, see the N_FUNC_DEF handler), so an ordinary find_def
+       fails.  When that happens this helper rewrites the N_ID `r` in place into
+       `this.m` (an N_DEREF_FIELD whose base is the implicit `this` pointer) so
+       the normal member/method-access machinery resolves it.  Returns TRUE iff
+       a rewrite was performed.  Only fires when (a) we are inside a class, (b)
+       an implicit `this` is in scope (i.e. a non-static method), and (c) `m` is
+       actually a member or method of that class. */
+    static int try_rewrite_implicit_this (c2m_ctx_t c2m_ctx, node_t r) {
+      check_ctx_t check_ctx = c2m_ctx->check_ctx;
+      node_t class_tag, this_id, member_id;
+      symbol_t sym;
+
+      if (r->code != N_ID || curr_class == NULL) return FALSE;
+      /* Resolve curr_class to the actual N_CLASS tag node. */
+      class_tag = (curr_class->code == N_CLASS) ? curr_class : NULL;
+      if (class_tag == NULL) {
+        node_t cid = NL_HEAD (curr_class->u.ops);
+        if (cid != NULL && cid->code == N_ID) {
+          class_tag = find_def (c2m_ctx, S_REGULAR, cid, curr_scope, NULL);
+          if (class_tag == NULL) class_tag = find_def (c2m_ctx, S_TAG, cid, curr_scope, NULL);
+        }
+      }
+      if (class_tag == NULL || class_tag->code != N_CLASS) return FALSE;
+      /* `m` must be a data member or method registered in the class scope. */
+      if (!symbol_find (c2m_ctx, S_REGULAR, r, class_tag, &sym) || sym.def_node == NULL
+          || (sym.def_node->code != N_MEMBER && sym.def_node->code != N_FUNC_DEF))
+        return FALSE;
+      /* An implicit `this` receiver must be in scope (non-static method). */
+      this_id = build_id (c2m_ctx, "this", POS (r));
+      if (find_def (c2m_ctx, S_REGULAR, this_id, curr_scope, NULL) == NULL) return FALSE;
+      /* Rewrite `m` (N_ID) in place into `this.m` (N_DEREF_FIELD(this, m)).
+         Capture the member name before reusing r's union for the op list. */
+      member_id = new_str_node (c2m_ctx, N_ID, r->u.s, POS (r));
+      r->code = N_DEREF_FIELD;
+      DLIST_INIT (node_t, r->u.ops);
+      op_append (c2m_ctx, r, this_id);
+      op_append (c2m_ctx, r, member_id);
+      r->attr = NULL;
+      return TRUE;
+    }
+
     static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
       check_ctx_t check_ctx = c2m_ctx->check_ctx;
       node_t op1, op2;
@@ -11456,6 +11577,17 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
         decl_t decl;
 
         op1 = find_def (c2m_ctx, S_REGULAR, r, curr_scope, &aux_node);
+        /* Inside a class method, an unqualified identifier that names a data
+           member (resolved here as an N_MEMBER) or is otherwise unresolved but
+           names a method (op1 == NULL — methods are registered under the class
+           node, not the lexical chain) is treated as `this.<id>`. */
+        if ((op1 == NULL || op1->code == N_MEMBER) && try_rewrite_implicit_this (c2m_ctx, r)) {
+          /* `r` was rewritten in place to `this.<id>`; re-check it and adopt
+             the field-access result. */
+          check (c2m_ctx, r, context);
+          e = r->attr;
+          break;
+        }
         e = create_expr (c2m_ctx, r);
         e->def_node = op1;
         if (op1 == NULL) {
@@ -12814,6 +12946,22 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
           prop_eq_p = strcmp(op1->u.s.s, PROP_EQ) == 0;
           prop_ne_p = strcmp(op1->u.s.s, PROP_NE) == 0;
           json_p = strcmp(op1->u.s.s, BUILTIN_JSON) == 0;
+        }
+        /* Unqualified call to a method of the enclosing class: rewrite the
+           callee `m(...)` to `this.m(...)` before the implicit-declaration
+           fallback below treats `m` as an unknown global function (and before
+           the regular-call path treats a resolved method as a plain function,
+           dropping the implicit `this`).  try_rewrite_implicit_this only fires
+           when `m` is genuinely a member/method of the enclosing class, so a
+           real global function of the same name is left untouched.  We attempt
+           it whenever `m` is unresolved or resolves to a member/method (not to
+           a genuine local/global object, which would shadow the member). */
+        if (op1->code == N_ID) {
+          node_t cdef = find_def(c2m_ctx, S_REGULAR, op1, curr_scope, NULL);
+          if ((cdef == NULL || cdef->code == N_MEMBER || cdef->code == N_FUNC_DEF)
+              && try_rewrite_implicit_this(c2m_ctx, op1)) {
+            /* op1 is now N_DEREF_FIELD(this, m); the method-call path handles it. */
+          }
         }
         if (op1->code == N_ID && find_def(c2m_ctx, S_REGULAR, op1, curr_scope, NULL) == NULL) {
           va_arg_p = str_eq_p(op1->u.s.s, BUILTIN_VA_ARG);
@@ -19488,6 +19636,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
               }
             }
           }
+          /* RAII for automatic (stack) class objects: run the constructor now
+             (after the storage has been zeroed / default-member-initialized
+             above) and register the destructor to run at scope exit via the
+             defer machinery (LIFO, also unwound on return/break/continue).
+             Both calls were synthesized and type-checked in create_decl. */
+          if (decl->ctor_call != NULL)
+            gen (c2m_ctx, decl->ctor_call, NULL, NULL, FALSE, NULL, NULL);
+          if (decl->dtor_call != NULL)
+            VARR_PUSH (node_t, defer_stmts, decl->dtor_call);
           /* Null-initialize uninitialized local String variables, so that
              `String x;` is a well-defined null String (x == null is true and
              x.empty() is safe). */
