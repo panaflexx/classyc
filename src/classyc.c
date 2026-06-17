@@ -17119,13 +17119,18 @@ static void gen_memcpy (c2m_ctx_t c2m_ctx, MIR_disp_t disp, MIR_reg_t base, op_t
   emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 6 /* args + proto + func + res */, args));
 }
 
+/* Runtime-helper call emission (defined with the dict helpers below). */
+static op_t gen_rt_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, MIR_item_t item, size_t nargs,
+                         const MIR_op_t *arg_ops);
+static void gen_rt_call_void (c2m_ctx_t c2m_ctx, MIR_item_t proto, MIR_item_t item, size_t nargs,
+                              const MIR_op_t *arg_ops);
+
 /* Emit a call to the C library malloc and return a temp register holding the
    resulting pointer.  Used to back `new ClassName(...)` heap allocations. */
 static op_t gen_heap_alloc (c2m_ctx_t c2m_ctx, mir_size_t size) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[4];
-  op_t res;
+  MIR_op_t size_op;
 
   if (malloc_item == NULL) {
     MIR_type_t ret_type = MIR_T_I64;
@@ -17138,20 +17143,14 @@ static op_t gen_heap_alloc (c2m_ctx_t c2m_ctx, mir_size_t size) {
     move_item_to_module_start (module, malloc_proto);
     move_item_to_module_start (module, malloc_item);
   }
-  res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, malloc_proto);
-  args[1] = MIR_new_ref_op (ctx, malloc_item);
-  args[2] = res.mir_op;
-  args[3] = MIR_new_uint_op (ctx, size);
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
-  return res;
+  size_op = MIR_new_uint_op (ctx, size);
+  return gen_rt_call (c2m_ctx, malloc_proto, malloc_item, 1, &size_op);
 }
 
 /* free (ptr) : release a `new`-allocated object (used by `delete`). */
 static void gen_heap_free (c2m_ctx_t c2m_ctx, MIR_op_t ptr) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[3];
 
   if (free_item == NULL) {
     MIR_var_t var;
@@ -17163,10 +17162,7 @@ static void gen_heap_free (c2m_ctx_t c2m_ctx, MIR_op_t ptr) {
     move_item_to_module_start (module, free_proto);
     move_item_to_module_start (module, free_item);
   }
-  args[0] = MIR_new_ref_op (ctx, free_proto);
-  args[1] = MIR_new_ref_op (ctx, free_item);
-  args[2] = ptr;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+  gen_rt_call_void (c2m_ctx, free_proto, free_item, 1, &ptr);
 }
 
 /* Emit the deferred statements registered above stack depth `from`, in LIFO
@@ -17308,209 +17304,145 @@ static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, dict_create_heap_arena_item);
 }
 
+/* ───────── Runtime-helper call emission ─────────
+   The String/dict/object runtime helpers are all called the same way: a
+   MIR_CALL whose operands are the helper's proto ref, its import ref, an
+   optional single I64 result, then the argument ops.  These two helpers
+   centralise that boilerplate (every `gen_dict_*`/`gen_str_*`/`gen_obj_*`
+   wrapper below is a thin call to one of them).  Both allocate the result temp
+   before filling the operand array, matching the hand-written call sites they
+   replaced, so the emitted MIR is unchanged. */
+#define GEN_RT_MAX_ARGS 8
+
+/* res = (*proto/item)(arg_ops[0..nargs-1]) for a helper returning one I64 value.
+   Returns the result temp; callers that ignore it (void-returning-but-discarded
+   helpers) simply drop the return. */
+static op_t gen_rt_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, MIR_item_t item, size_t nargs,
+                         const MIR_op_t *arg_ops) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[3 + GEN_RT_MAX_ARGS];
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+
+  assert (nargs <= GEN_RT_MAX_ARGS);
+  args[0] = MIR_new_ref_op (ctx, proto);
+  args[1] = MIR_new_ref_op (ctx, item);
+  args[2] = res.mir_op;
+  for (size_t i = 0; i < nargs; i++) args[3 + i] = arg_ops[i];
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3 + nargs, args));
+  return res;
+}
+
+/* (*proto/item)(arg_ops[0..nargs-1]) for a helper returning void (proto nres 0). */
+static void gen_rt_call_void (c2m_ctx_t c2m_ctx, MIR_item_t proto, MIR_item_t item, size_t nargs,
+                              const MIR_op_t *arg_ops) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[2 + GEN_RT_MAX_ARGS];
+
+  assert (nargs <= GEN_RT_MAX_ARGS);
+  args[0] = MIR_new_ref_op (ctx, proto);
+  args[1] = MIR_new_ref_op (ctx, item);
+  for (size_t i = 0; i < nargs; i++) args[2 + i] = arg_ops[i];
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 2 + nargs, args));
+}
+
 /* Emit: res = dict_create_object() */
 static op_t gen_dict_create_object (c2m_ctx_t c2m_ctx) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[3];
 
   dict_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, dict_create_object_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_create_object_item);
-  args[2] = res.mir_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
-  return res;
+  return gen_rt_call (c2m_ctx, dict_create_object_proto, dict_create_object_item, 0, NULL);
 }
 
 /* Emit: dict_destroy(val)  — called by `delete d` for dict values. */
 static void gen_dict_destroy (c2m_ctx_t c2m_ctx, MIR_op_t val_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[3];
-
   dict_ensure_imports (c2m_ctx);
-  args[0] = MIR_new_ref_op (ctx, dict_destroy_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_destroy_item);
-  args[2] = val_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+  gen_rt_call_void (c2m_ctx, dict_destroy_proto, dict_destroy_item, 1, &val_op);
 }
 
 /* Emit: res = dict_create_heap_arena(bytes)  — called by `new dict(size?)`. */
 static op_t gen_dict_create_heap_arena_call (c2m_ctx_t c2m_ctx, MIR_op_t size_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[4];
-
   dict_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, dict_create_heap_arena_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_create_heap_arena_item);
-  args[2] = res.mir_op;
-  args[3] = size_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
-  return res;
+  return gen_rt_call (c2m_ctx, dict_create_heap_arena_proto, dict_create_heap_arena_item, 1,
+                      &size_op);
 }
 
-/* Emit: res = dict_create_int64(val) */
 /* Emit: res = dict_create_bool(val) — produces JSON true/false */
 static op_t gen_dict_create_bool (c2m_ctx_t c2m_ctx, MIR_op_t val_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[4];
-
   dict_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, dict_create_bool_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_create_bool_item);
-  args[2] = res.mir_op;
-  args[3] = val_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
-  return res;
+  return gen_rt_call (c2m_ctx, dict_create_bool_proto, dict_create_bool_item, 1, &val_op);
 }
 
+/* Emit: res = dict_create_int64(val) */
 static op_t gen_dict_create_int64 (c2m_ctx_t c2m_ctx, MIR_op_t val_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[4];
-
   dict_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, dict_create_int64_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_create_int64_item);
-  args[2] = res.mir_op;
-  args[3] = val_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
-  return res;
+  return gen_rt_call (c2m_ctx, dict_create_int64_proto, dict_create_int64_item, 1, &val_op);
 }
 
 /* Emit: res = dict_create_number(val) */
 static op_t gen_dict_create_number (c2m_ctx_t c2m_ctx, MIR_op_t val_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[4];
-
   dict_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, dict_create_number_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_create_number_item);
-  args[2] = res.mir_op;
-  args[3] = val_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
-  return res;
+  return gen_rt_call (c2m_ctx, dict_create_number_proto, dict_create_number_item, 1, &val_op);
 }
 
 /* Emit: res = dict_create_string(str_op) */
 static op_t gen_dict_create_string (c2m_ctx_t c2m_ctx, MIR_op_t str_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[4];
-
   dict_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, dict_create_string_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_create_string_item);
-  args[2] = res.mir_op;
-  args[3] = str_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
-  return res;
+  return gen_rt_call (c2m_ctx, dict_create_string_proto, dict_create_string_item, 1, &str_op);
 }
 
-/* Emit: dict_object_set(obj_op, key_str_op, val_op) */
+/* Emit: dict_object_set(obj_op, key_str_op, val_op)  (int result discarded) */
 static void gen_dict_object_set (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op_t key_op,
                                  MIR_op_t val_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[6];
-
+  MIR_op_t a[3] = {obj_op, key_op, val_op};
   dict_ensure_imports (c2m_ctx);
-  args[0] = MIR_new_ref_op (ctx, dict_object_set_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_object_set_item);
-  args[2] = get_new_temp (c2m_ctx, MIR_T_I64).mir_op; /* return value (int), discarded */
-  args[3] = obj_op;
-  args[4] = key_op;
-  args[5] = val_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 6, args));
+  gen_rt_call (c2m_ctx, dict_object_set_proto, dict_object_set_item, 3, a);
 }
 
 /* Emit: res = dict_object_get(obj_op, key_str_op) */
 static op_t gen_dict_object_get (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op_t key_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[5];
-
+  MIR_op_t a[2] = {obj_op, key_op};
   dict_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, dict_object_get_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_object_get_item);
-  args[2] = res.mir_op;
-  args[3] = obj_op;
-  args[4] = key_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 5, args));
-  return res;
+  return gen_rt_call (c2m_ctx, dict_object_get_proto, dict_object_get_item, 2, a);
 }
 
 /* Emit: res = dict_value_copy(src_op)  (deep clone of a DictValue*) */
 static op_t gen_dict_value_copy (c2m_ctx_t c2m_ctx, MIR_op_t src_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[4];
-
   dict_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, dict_value_copy_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_value_copy_item);
-  args[2] = res.mir_op;
-  args[3] = src_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
-  return res;
+  return gen_rt_call (c2m_ctx, dict_value_copy_proto, dict_value_copy_item, 1, &src_op);
 }
 
 /* Emit: res = dict_object_count(obj_op) */
 static op_t gen_dict_object_count (c2m_ctx_t c2m_ctx, MIR_op_t obj_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[4];
   dict_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, dict_object_count_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_object_count_item);
-  args[2] = res.mir_op;
-  args[3] = obj_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
-  return res;
+  return gen_rt_call (c2m_ctx, dict_object_count_proto, dict_object_count_item, 1, &obj_op);
 }
 
 /* Emit: res = dict_object_key_at(obj_op, idx_op) */
 static op_t gen_dict_object_key_at (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op_t idx_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[5];
+  MIR_op_t a[2] = {obj_op, idx_op};
   dict_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, dict_object_key_at_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_object_key_at_item);
-  args[2] = res.mir_op;
-  args[3] = obj_op;
-  args[4] = idx_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 5, args));
-  return res;
+  return gen_rt_call (c2m_ctx, dict_object_key_at_proto, dict_object_key_at_item, 2, a);
 }
 
 /* Emit: res = dict_object_value_at(obj_op, idx_op) */
 static op_t gen_dict_object_value_at (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op_t idx_op) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[5];
+  MIR_op_t a[2] = {obj_op, idx_op};
   dict_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, dict_object_value_at_proto);
-  args[1] = MIR_new_ref_op (ctx, dict_object_value_at_item);
-  args[2] = res.mir_op;
-  args[3] = obj_op;
-  args[4] = idx_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 5, args));
-  return res;
+  return gen_rt_call (c2m_ctx, dict_object_value_at_proto, dict_object_value_at_item, 2, a);
 }
 
 /* Create a named (uniquely-named) string-data item holding a dict key, returning
@@ -17858,18 +17790,9 @@ static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
 /* Emit: res = c2m_str_concat(a, b).  Both operands are char* (I64). */
 static op_t gen_str_concat_call (c2m_ctx_t c2m_ctx, MIR_op_t a, MIR_op_t b) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[5];
-
+  MIR_op_t ops[2] = {a, b};
   string_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, str_concat_proto);
-  args[1] = MIR_new_ref_op (ctx, str_concat_item);
-  args[2] = res.mir_op;
-  args[3] = a;
-  args[4] = b;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 5, args));
-  return res;
+  return gen_rt_call (c2m_ctx, str_concat_proto, str_concat_item, 2, ops);
 }
 
 /* Emit: res = <one-arg String conversion helper>(val).  `proto`/`item` select
@@ -17877,17 +17800,7 @@ static op_t gen_str_concat_call (c2m_ctx_t c2m_ctx, MIR_op_t a, MIR_op_t b) {
    helper uses str_from_double_proto). */
 static op_t gen_str_from_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, MIR_item_t item,
                                MIR_op_t val) {
-  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[4];
-
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, proto);
-  args[1] = MIR_new_ref_op (ctx, item);
-  args[2] = res.mir_op;
-  args[3] = val;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
-  return res;
+  return gen_rt_call (c2m_ctx, proto, item, 1, &val);
 }
 
 /* Generate a single operand of a String `+` concatenation as a char* (I64).
@@ -17930,36 +17843,27 @@ static op_t gen_string_concat_operand (c2m_ctx_t c2m_ctx, node_t op) {
    operands, returning the I64 result register. */
 static op_t gen_string_call (c2m_ctx_t c2m_ctx, enum str_method sm, MIR_op_t *vals, int n) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
   MIR_item_t proto = NULL, item = NULL;
-  MIR_op_t args[7];
-  int i;
 
   string_ensure_imports (c2m_ctx); /* must run before reading the proto/item refs */
   switch (sm) {
-  case SM_LENGTH:  proto = str_length_proto;  item = str_length_item;  break;
-  case SM_EMPTY:   proto = str_empty_proto;   item = str_empty_item;   break;
-  case SM_SUBSTR:  proto = str_substr_proto;  item = str_substr_item;  break;
-  case SM_FIND:    proto = str_find_proto;    item = str_find_item;    break;
-	  case SM_REPLACE: proto = str_replace_proto; item = str_replace_item; break;
-		  case SM_UPPER:   proto = str_upper_proto;   item = str_upper_item;   break;
-		  case SM_LOWER:   proto = str_lower_proto;   item = str_lower_item;   break;
-		  case SM_DETACH:      proto = str_detach_proto;      item = str_detach_item;      break;
-				  case SM_ATTACH:      proto = str_attach_proto;      item = str_attach_item;      break;
-				  case SM_COPY:        proto = str_copy_proto;        item = str_copy_item;        break;
-				  case SM_STARTS_WITH: proto = str_starts_with_proto; item = str_starts_with_item; break;
-				  case SM_ENDS_WITH:   proto = str_ends_with_proto;   item = str_ends_with_item;   break;
-				  case SM_CONTAINS:    proto = str_contains_proto;    item = str_contains_item;    break;
-				  case SM_TRIM:        proto = str_trim_proto;        item = str_trim_item;        break;
-				  default: assert (0); break;
-	}
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, proto);
-  args[1] = MIR_new_ref_op (ctx, item);
-  args[2] = res.mir_op;
-  for (i = 0; i < n; i++) args[3 + i] = vals[i];
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, (size_t) (3 + n), args));
-  return res;
+  case SM_LENGTH:      proto = str_length_proto;      item = str_length_item;      break;
+  case SM_EMPTY:       proto = str_empty_proto;       item = str_empty_item;       break;
+  case SM_SUBSTR:      proto = str_substr_proto;      item = str_substr_item;      break;
+  case SM_FIND:        proto = str_find_proto;        item = str_find_item;        break;
+  case SM_REPLACE:     proto = str_replace_proto;     item = str_replace_item;     break;
+  case SM_UPPER:       proto = str_upper_proto;       item = str_upper_item;       break;
+  case SM_LOWER:       proto = str_lower_proto;       item = str_lower_item;       break;
+  case SM_DETACH:      proto = str_detach_proto;      item = str_detach_item;      break;
+  case SM_ATTACH:      proto = str_attach_proto;      item = str_attach_item;      break;
+  case SM_COPY:        proto = str_copy_proto;        item = str_copy_item;        break;
+  case SM_STARTS_WITH: proto = str_starts_with_proto; item = str_starts_with_item; break;
+  case SM_ENDS_WITH:   proto = str_ends_with_proto;   item = str_ends_with_item;   break;
+  case SM_CONTAINS:    proto = str_contains_proto;    item = str_contains_item;    break;
+  case SM_TRIM:        proto = str_trim_proto;        item = str_trim_item;        break;
+  default:             assert (0);                                                 break;
+  }
+  return gen_rt_call (c2m_ctx, proto, item, (size_t) n, vals);
 }
 
 /* Import the object-arena runtime helpers (c2m_obj_checkpoint / release_to) the
@@ -18000,87 +17904,45 @@ static void object_ensure_imports (c2m_ctx_t c2m_ctx) {
    subsequent explicit `delete` (or escape) does not double-free at scope exit. */
 static void gen_obj_detach (c2m_ctx_t c2m_ctx, MIR_op_t p) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[4];
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-
   object_ensure_imports (c2m_ctx);
-  args[0] = MIR_new_ref_op (ctx, obj_detach_proto);
-  args[1] = MIR_new_ref_op (ctx, obj_detach_item);
-  args[2] = res.mir_op; /* ignored */
-  args[3] = p;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+  gen_rt_call (c2m_ctx, obj_detach_proto, obj_detach_item, 1, &p); /* result ignored */
 }
 
 /* res = c2m_obj_checkpoint() : current object-arena high-water mark. */
 static op_t gen_obj_checkpoint (c2m_ctx_t c2m_ctx) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[3];
-
   object_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, obj_checkpoint_proto);
-  args[1] = MIR_new_ref_op (ctx, obj_checkpoint_item);
-  args[2] = res.mir_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
-  return res;
+  return gen_rt_call (c2m_ctx, obj_checkpoint_proto, obj_checkpoint_item, 0, NULL);
 }
 
 /* c2m_obj_release_to(mark) : destroy every Any<I> handle tracked since mark. */
 static void gen_obj_release_to (c2m_ctx_t c2m_ctx, MIR_op_t mark) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[3];
-
   object_ensure_imports (c2m_ctx);
-  args[0] = MIR_new_ref_op (ctx, obj_release_to_proto);
-  args[1] = MIR_new_ref_op (ctx, obj_release_to_item);
-  args[2] = mark;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+  gen_rt_call_void (c2m_ctx, obj_release_to_proto, obj_release_to_item, 1, &mark);
 }
 
 /* res = c2m_str_checkpoint() : current allocation high-water mark. */
 static op_t gen_str_checkpoint (c2m_ctx_t c2m_ctx) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[3];
-
   string_ensure_imports (c2m_ctx);
-  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
-  args[0] = MIR_new_ref_op (ctx, str_checkpoint_proto);
-  args[1] = MIR_new_ref_op (ctx, str_checkpoint_item);
-  args[2] = res.mir_op;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
-  return res;
+  return gen_rt_call (c2m_ctx, str_checkpoint_proto, str_checkpoint_item, 0, NULL);
 }
 
 /* c2m_str_release_to(mark) : free every String allocated since the mark. */
 static void gen_str_release_to (c2m_ctx_t c2m_ctx, MIR_op_t mark) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[3];
-
   string_ensure_imports (c2m_ctx);
-  args[0] = MIR_new_ref_op (ctx, str_release_to_proto);
-  args[1] = MIR_new_ref_op (ctx, str_release_to_item);
-  args[2] = mark;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 3, args));
+  gen_rt_call_void (c2m_ctx, str_release_to_proto, str_release_to_item, 1, &mark);
 }
 
 /* c2m_str_release_keeping(mark, keep) : free everything since the mark except
    `keep`, which is retained for the enclosing scope (safe String return). */
 static void gen_str_release_keeping (c2m_ctx_t c2m_ctx, MIR_op_t mark, MIR_op_t keep) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t args[4];
-
+  MIR_op_t ops[2] = {mark, keep};
   string_ensure_imports (c2m_ctx);
-  args[0] = MIR_new_ref_op (ctx, str_release_keeping_proto);
-  args[1] = MIR_new_ref_op (ctx, str_release_keeping_item);
-  args[2] = mark;
-  args[3] = keep;
-  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 4, args));
+  gen_rt_call_void (c2m_ctx, str_release_keeping_proto, str_release_keeping_item, 2, ops);
 }
 
 /* True for AST leaf nodes whose `u` union holds a scalar (not an op list), so
