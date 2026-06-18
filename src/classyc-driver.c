@@ -780,8 +780,50 @@ int main (int argc, char *argv[], char *env[]) {
     VARR_PUSH (char_ptr_t, lib_dirs, std_lib_dirs[n]);
   VARR_CREATE (input_t, inputs_to_compile, &default_alloc, 32);
   options.prepro_output_file = NULL;
-  init_options (argc, argv);
-  main_ctx = MIR_init ();
+	  init_options (argc, argv);
+
+	  /* On macOS, always predefine the GNUC family + Apple platform macros
+	     that the SDK headers expect.  This prevents cdefs.h from
+	     emitting "#warning Unsupported compiler detected".  These
+	     are injected as if the user had written -D on the command line.  */
+#if defined(__APPLE__)
+	  {
+	    struct c2mir_macro_command mc = {TRUE, NULL, NULL};
+	    char *n;
+
+	    n = reg_malloc (sizeof "__GNUC__");
+	    strcpy (n, "__GNUC__");
+	    mc.name = n;
+	    mc.def = "4";
+	    VARR_PUSH (macro_command_t, macro_commands, mc);
+
+	    n = reg_malloc (sizeof "__GNUC_MINOR__");
+	    strcpy (n, "__GNUC_MINOR__");
+	    mc.name = n;
+	    mc.def = "2";
+	    VARR_PUSH (macro_command_t, macro_commands, mc);
+
+	    n = reg_malloc (sizeof "__GNUC_PATCHLEVEL__");
+	    strcpy (n, "__GNUC_PATCHLEVEL__");
+	    mc.name = n;
+	    mc.def = "1";
+	    VARR_PUSH (macro_command_t, macro_commands, mc);
+
+	    n = reg_malloc (sizeof "__APPLE__");
+	    strcpy (n, "__APPLE__");
+	    mc.name = n;
+	    mc.def = "1";
+	    VARR_PUSH (macro_command_t, macro_commands, mc);
+
+	    n = reg_malloc (sizeof "__MACH__");
+	    strcpy (n, "__MACH__");
+	    mc.name = n;
+	    mc.def = "1";
+	    VARR_PUSH (macro_command_t, macro_commands, mc);
+	  }
+#endif
+
+	  main_ctx = MIR_init ();
   if (!C2MIR_PARALLEL || threads_num <= 0) c2mir_init (main_ctx);
   init_compilers ();
   result_code = 0;
