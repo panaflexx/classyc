@@ -22,6 +22,7 @@ struct c2mir_options {
   int syntax_only_p, pedantic_p, asm_p, object_p;
   int no_gen_p;     /* run preprocess+parse+check but skip MIR generation (LSP/analysis) */
   int debug_info_p; /* -g: emit source locations and debug info into MIR/bmir */
+  int keep_syms_p;  /* keep symbol table + node positions after no_gen_p analysis (for LSP go-to-def etc.) */
   size_t module_num;
   FILE *prepro_output_file; /* non-null for prepro_only_p */
   const char *output_file_name;
@@ -34,5 +35,36 @@ void c2mir_init (MIR_context_t ctx);
 void c2mir_finish (MIR_context_t ctx);
 int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func) (void *),
                    void *getc_data, const char *source_name, FILE *output_file);
+
+typedef struct c2mir_pos {
+  const char *fname;
+  int lno, ln_pos;
+} c2mir_pos_t;
+
+/* 
+ * Retained-analysis API for LSP / tools (use only with keep_syms_p + no_gen_p):
+ * After a successful compile with keep_syms_p, the symbol table + node positions remain.
+ * Call c2mir_release_analysis when switching documents or before next kept compile.
+ */
+void c2mir_release_analysis (MIR_context_t ctx);
+
+/* Get the retained translation unit root node (N_MODULE) if available, NULL otherwise. */
+struct node *c2mir_get_analysis_root (MIR_context_t ctx);
+
+/* 
+ * Find the definition location of a top-level identifier (e.g. function, class, global var).
+ * Walks symbol table. Coordinates are 1-based (compiler convention).
+ * Returns non-zero and fills out if found; out->fname will be the original source_name.
+ */
+int c2mir_find_definition (MIR_context_t ctx, const char *ident, c2mir_pos_t *out);
+
+/*
+ * Find the definition location for obj.member (or obj->member) using type of receiver.
+ * Returns 1 and fills out (1-based) on success; 0 otherwise.
+ */
+int c2mir_find_member_definition (MIR_context_t ctx,
+                                  const char *receiver,
+                                  const char *member,
+                                  c2mir_pos_t *out);
 
 #endif

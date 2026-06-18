@@ -43,8 +43,15 @@ run_test() {
 # ── tests ───────────────────────────────────────────────────────────
 
 # Generate and run all 100 test cases
+# Generate and run all 100 test cases
 for i in $(seq -f "%03g" 0 99); do
-    run_test "cy-$i.c"
+    file="cy-$i.cy"
+    
+    if [ -f "$DIR/$file" ]; then
+        run_test "$file"
+    else
+        echo "Missing: $file"
+    fi
 done
 
 # ── summary ────────────────────────────────────────────────────────────

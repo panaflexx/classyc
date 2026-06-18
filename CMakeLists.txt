@@ -66,6 +66,36 @@ else()
   target_link_libraries(classyc PRIVATE m)
 endif()
 
+# ------------------ classyc-lsp Language Server ------------------
+# A second front end: reuses the compiler (src/classyc.c) but provides its own
+# main (no codegen / exec).  Speaks LSP over stdio for editors (Zed / VS Code).
+add_executable(classyc-lsp
+    src/classyc.c
+    src/classyc-lsp.c
+)
+
+target_include_directories(classyc-lsp PRIVATE
+    ${CMAKE_SOURCE_DIR}/${MIRDIR}
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+target_link_libraries(classyc-lsp PRIVATE mir_static)
+target_compile_definitions(classyc-lsp PRIVATE $<$<NOT:$<CONFIG:Debug>>:NDEBUG>)
+
+if(APPLE)
+  target_compile_options(classyc-lsp PRIVATE -std=gnu11 -Wno-abi -fsigned-char -fPIC)
+else()
+  target_compile_options(classyc-lsp PRIVATE
+        -std=gnu11
+        -Wno-abi
+        -fsigned-char
+        -fPIC
+        $<$<CONFIG:RELEASE>:-O3>
+        $<$<CONFIG:RelWithDebInfo>:-O3>
+    )
+  target_link_libraries(classyc-lsp PRIVATE m)
+endif()
+
 # ------------------ b2obj / b2objmac -----------------------
 # b2obj (ELF) for Linux; b2objmac (Mach-O) for macOS
 if( APPLE )

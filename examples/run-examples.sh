@@ -40,43 +40,43 @@ run_example() {
 
 # ── examples ───────────────────────────────────────────────────────────
 
-run_example classy.c
-run_example classy2.c
-run_example classy3.c
-run_example classy4.c
-run_example classy5.c
-run_example classy6.c
-run_example classy7.c
-run_example classy8.c
-run_example classy-classes.c
-run_example classy-defer.c
-run_example classy-dict.c
-run_example classy-dict-arena.c
-run_example classy-file.c
-run_example classy-file2.c
-run_example classy-strings.c
-run_example classy-string-copy-test.c
-run_example string_methods_test.c
-run_example test_dict_arena.c
-run_example class-arrays.c
-run_example classy-fstring.c
-run_example classy-auto.c
-run_example classy-brace-forin.c
-run_example classy-seq-lambdas.c
+run_example classy.cy
+run_example classy2.cy
+run_example classy3.cy
+run_example classy4.cy
+run_example classy5.cy
+run_example classy6.cy
+run_example classy7.cy
+run_example classy8.cy
+run_example classy-classes.cy
+run_example classy-defer.cy
+run_example classy-dict.cy
+run_example classy-dict-arena.cy
+run_example classy-file.cy
+run_example classy-file2.cy
+run_example classy-strings.cy
+run_example classy-string-copy-test.cy
+run_example string_methods_test.cy
+run_example test_dict_arena.cy
+run_example class-arrays.cy
+run_example classy-fstring.cy
+run_example classy-auto.cy
+run_example classy-brace-forin.cy
+run_example classy-seq-lambdas.cy
 #run_example classy-stacktrace.c #CRASHTEST
 
-run_example test-class-subscript.c
-run_example test-generic-ptr-args.c
+run_example test-class-subscript.cy
+run_example test-generic-ptr-args.cy
 #run_example test-stacktrace-deep.c #CRASHTEST
-run_example test_json_int.c
-run_example test-ptr-arg-mini.c
-run_example classy-generics.c
-run_example classy-overload.c
-run_example test-interface.c
-run_example test-any.c
-run_example test-any-arena.c
-run_example test-any-implicit.c
-run_example t_raii.c
+run_example test_json_int.cy
+run_example test-ptr-arg-mini.cy
+run_example classy-generics.cy
+run_example classy-overload.cy
+run_example test-interface.cy
+run_example test-any.cy
+run_example test-any-arena.cy
+run_example test-any-implicit.cy
+run_example t_raii.cy
 
 # ── summary ────────────────────────────────────────────────────────────
 

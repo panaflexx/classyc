@@ -118,6 +118,7 @@ static void analyze (const char *path, const char *text) {
   memset (&opts, 0, sizeof opts);
   opts.message_file = NULL;        /* no textual diagnostics — sink only */
   opts.no_gen_p = 1;               /* analyze only: stop after the checker */
+  opts.keep_syms_p = 1;            /* keep symbol table for definition queries */
   opts.module_num = g_module_num++;
 
   sb.code = text;
@@ -179,6 +180,13 @@ static char *json_to_string (const DictValue *v) {
 static const char *obj_str (const DictValue *obj, const char *key) {
   DictValue *v = dict_object_get (obj, key);
   return (v != NULL && v->type == DICT_STRING) ? v->string_value : NULL;
+}
+
+static int64_t obj_int (const DictValue *obj, const char *key) {
+  DictValue *v = dict_object_get (obj, key);
+  if (v != NULL && v->type == DICT_INT64) return v->int64_value;
+  if (v != NULL && v->type == DICT_NUMBER) return (int64_t) v->number_value;
+  return -1;
 }
 
 /* Deep-copy a JSON-RPC id (integer or string) so it can be echoed in a response;
@@ -255,6 +263,17 @@ static char *read_message (size_t *out_len) {
 
 static int g_shutdown_requested;
 
+/* Keep the open document text(s) so we can answer definition requests.
+   Simple fixed-size cache (keyed by URI). */
+#define MAX_DOCS 16
+static char *g_doc_uris[MAX_DOCS];
+static char *g_doc_texts[MAX_DOCS];
+static int g_num_docs = 0;
+
+/* Convenience aliases for the most-recently seen document (used by some older paths) */
+static char *g_doc_uri;
+static char *g_doc_text;
+
 /* Build the publishDiagnostics params for `uri` from the current g_diags. */
 static DictValue *build_diagnostics_params (const char *uri) {
   DictValue *params = dict_create_object ();
@@ -294,9 +313,60 @@ static void publish_diagnostics (const char *uri) {
 }
 
 /* Analyze the document text and immediately publish its diagnostics. */
+static void store_document (const char *uri, const char *text) {
+  if (uri == NULL) return;
+  for (int i = 0; i < g_num_docs; i++) {
+    if (g_doc_uris[i] && strcmp(g_doc_uris[i], uri) == 0) {
+      free(g_doc_texts[i]);
+      g_doc_texts[i] = text ? xstrdup(text) : NULL;
+      g_doc_uri = g_doc_uris[i];
+      g_doc_text = g_doc_texts[i];
+      return;
+    }
+  }
+  if (g_num_docs < MAX_DOCS) {
+    g_doc_uris[g_num_docs] = xstrdup(uri);
+    g_doc_texts[g_num_docs] = text ? xstrdup(text) : NULL;
+    g_doc_uri = g_doc_uris[g_num_docs];
+    g_doc_text = g_doc_texts[g_num_docs];
+    g_num_docs++;
+    return;
+  }
+  // cache full, overwrite the last slot
+  free(g_doc_uris[g_num_docs-1]);
+  free(g_doc_texts[g_num_docs-1]);
+  g_doc_uris[g_num_docs-1] = xstrdup(uri);
+  g_doc_texts[g_num_docs-1] = text ? xstrdup(text) : NULL;
+  g_doc_uri = g_doc_uris[g_num_docs-1];
+  g_doc_text = g_doc_texts[g_num_docs-1];
+}
+
+static void remove_document (const char *uri) {
+  if (uri == NULL) return;
+  for (int i = 0; i < g_num_docs; i++) {
+    if (g_doc_uris[i] && strcmp(g_doc_uris[i], uri) == 0) {
+      free(g_doc_uris[i]);
+      free(g_doc_texts[i]);
+      for (int j = i; j < g_num_docs - 1; j++) {
+        g_doc_uris[j] = g_doc_uris[j+1];
+        g_doc_texts[j] = g_doc_texts[j+1];
+      }
+      g_num_docs--;
+      if (g_doc_uri && strcmp(g_doc_uri, uri) == 0) {
+        g_doc_uri = (g_num_docs > 0 ? g_doc_uris[g_num_docs-1] : NULL);
+        g_doc_text = (g_num_docs > 0 ? g_doc_texts[g_num_docs-1] : NULL);
+      }
+      return;
+    }
+  }
+}
+
 static void analyze_and_publish (const char *uri, const char *text) {
+  store_document(uri, text);
   char *path = uri_to_path (uri);
-  analyze (path, text != NULL ? text : "");
+  /* Keep symbols in the compiler context for subsequent definition queries. */
+  /* We achieve this by setting keep_syms_p=1 in the opts used by analyze(). */
+  analyze (path, text ? text : "");
   free (path);
   publish_diagnostics (uri);
 }
@@ -316,6 +386,7 @@ static void handle_initialize (DictValue *id) {
 
   /* textDocumentSync = 1 (full): the client sends the whole document on change. */
   dict_object_set (caps, "textDocumentSync", dict_create_int64 (1));
+  dict_object_set (caps, "definitionProvider", dict_create_bool (1));
   dict_object_set (info, "name", dict_create_string ("classyc-lsp"));
   dict_object_set (info, "version", dict_create_string ("0.1"));
   dict_object_set (result, "capabilities", caps);
@@ -324,15 +395,252 @@ static void handle_initialize (DictValue *id) {
   log_debug ("initialize: replied with capabilities");
 }
 
-/* didChange (full sync): params.contentChanges is an array; the last element's
-   "text" is the new full document. */
-static const char *last_change_text (DictValue *params) {
+/* Extract an identifier ( [A-Za-z_][A-Za-z0-9_]* ) around the 0-based character position
+   on the given 0-based line. Returns 1 on success and fills out_name + [start0,end0).
+   Simple ascii-only scanner — sufficient for ClassyC identifiers. */
+static int extract_identifier_at (const char *text, int line0, int ch0,
+                                  char *out_name, size_t name_cap,
+                                  int *start0, int *end0) {
+  if (text == NULL || out_name == NULL || name_cap == 0) return 0;
+  const char *p = text;
+  int l = 0;
+  while (*p && l < line0) { if (*p++ == '\n') l++; }
+  if (l != line0) return 0;
+  const char *line_start = p;
+  /* advance to the column */
+  while (*p && *p != '\n' && (p - line_start) < ch0) p++;
+  /* check we are on an identifier char */
+  if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || *p == '_' ||
+        (*p >= '0' && *p <= '9'))) {
+    /* allow scanning into a word if the cursor is on the boundary after the word */
+    if (ch0 > 0) {
+      const char *left = p - 1;
+      if (left > line_start && ((*left >= 'A'&&*left<='Z')||(*left>='a'&&*left<='z')||*left=='_' )) {
+        p = left;
+      } else return 0;
+    } else return 0;
+  }
+  /* scan left to word start */
+  const char *q = p;
+  while (q > line_start &&
+         ((* (q-1) >= 'A' && *(q-1) <= 'Z') || (*(q-1) >= 'a' && *(q-1) <= 'z') ||
+          *(q-1) == '_' || (*(q-1) >= '0' && *(q-1) <= '9'))) q--;
+  /* scan right */
+  const char *r = p;
+  while (*r && ((*r >= 'A' && *r <= 'Z') || (*r >= 'a' && *r <= 'z') || *r == '_' ||
+                (*r >= '0' && *r <= '9'))) r++;
+  	size_t len = r - q;
+  	if (len == 0 || len >= name_cap) return 0;
+  	memcpy(out_name, q, len);
+  	out_name[len] = '\0';
+  	if (start0) *start0 = (int)(q - line_start);
+  	if (end0) *end0 = (int)(r - line_start);
+  	return 1;
+  }
+
+  /* Detect obj.member or obj->member at/around the cursor (supports simple chaining and call parens).
+     Fills out_receiver (the left base identifier, e.g. "snatch" even for snatch.find().trim)
+     and out_member (the identifier under cursor).
+     Returns 1 on success (member access seen; receiver may be "" if complex expr before dot).
+     Returns 0 if no preceding dot/arrow before the identifier (bare name). */
+  static int extract_member_access (const char *text, int line0, int ch0,
+                                    char *out_receiver, size_t rec_cap,
+                                    char *out_member, size_t mem_cap) {
+  	if (text == NULL || out_receiver == NULL || rec_cap == 0 ||
+  	    out_member == NULL || mem_cap == 0) return 0;
+  	char member[256];
+  	int mstart = -1, mend = -1;
+  	if (!extract_identifier_at (text, line0, ch0, member, sizeof member, &mstart, &mend))
+  	  return 0;
+  	/* locate the line */
+  	const char *p = text;
+  	int l = 0;
+  	while (*p && l < line0) { if (*p++ == '\n') l++; }
+  	if (l != line0) return 0;
+  	const char *line = p;
+  	/* look immediately left of the member for . or -> (after optional ws) */
+  	int i = mstart - 1;
+  	while (i >= 0 && isspace ((unsigned char)line[i])) --i;
+  	if (i < 0) return 0;
+  	if (line[i] != '.' && !(line[i] == '>' && i > 0 && line[i-1] == '-'))
+  	  return 0;  /* bare identifier */
+  	/* copy the ident under cursor as the member name */
+  	strncpy (out_member, member, mem_cap - 1);
+  	out_member[mem_cap - 1] = '\0';
+  	/* walk left from before the dot/arrow to find base receiver ident */
+  	int pos = (line[i] == '.' ? i - 1 : i - 2);
+  	for (;;) {
+  	  while (pos >= 0 && isspace ((unsigned char)line[pos])) --pos;
+  	  if (pos < 0) break;
+  	  char ch = line[pos];
+  	  if (ch == ')') {
+  	    int depth = 1; --pos;
+  	    while (pos >= 0 && depth > 0) {
+  	      if (line[pos] == ')') ++depth;
+  	      else if (line[pos] == '(') --depth;
+  	      --pos;
+  	    }
+  	    continue;
+  	  }
+  	  if (ch == ']') {
+  	    int depth = 1; --pos;
+  	    while (pos >= 0 && depth > 0) {
+  	      if (line[pos] == ']') ++depth;
+  	      else if (line[pos] == '[') --depth;
+  	      --pos;
+  	    }
+  	    continue;
+  	  }
+  	  if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' ||
+  	        (ch >= '0' && ch <= '9'))) {
+  	    break;
+  	  }
+  	  /* collect whole preceding identifier */
+  	  int id_end = pos + 1;
+  	  while (pos >= 0) {
+  	    ch = line[pos];
+  	    if (!((ch >= 'a'&&ch<='z')||(ch>='A'&&ch<='Z')||ch=='_'||(ch>='0'&&ch<='9'))) break;
+  	    --pos;
+  	  }
+  	  int id_start = pos + 1;
+  	  size_t len = (id_end > id_start) ? (id_end - id_start) : 0;
+  	  if (len == 0) break;
+  	  /* is this id preceded by a dot? (chained expr) */
+  	  int k = id_start - 1;
+  	  while (k >= 0 && isspace ((unsigned char)line[k])) --k;
+  	  int chained = 0;
+  	  if (k >= 0) {
+  	    if (line[k] == '.') chained = 1;
+  	    else if (k > 0 && line[k] == '>' && line[k-1] == '-') chained = 1;
+  	  }
+  	  if (chained) {
+  	    /* skip this intermediate id (a method in chain) and its preceding dot; continue left */
+  	    pos = k - 1;
+  	    continue;
+  	  }
+  	  /* root receiver name */
+  	  if (len >= rec_cap) return 0;
+  	  memcpy (out_receiver, &line[id_start], len);
+  	  out_receiver[len] = '\0';
+  	  return 1;
+  	}
+  	/* dot seen but no simple root receiver ident (complex expr or literal etc) */
+  	out_receiver[0] = '\0';
+  	return 1;
+  }
+
+  /* didChange (full sync): params.contentChanges is an array; the last element's
+     "text" is the new full document. */
+  static const char *last_change_text (DictValue *params) {
   DictValue *changes = dict_object_get (params, "contentChanges");
   if (changes == NULL || changes->type != DICT_ARRAY || changes->array_value.length == 0)
     return NULL;
   DictValue *last = changes->array_value.items[changes->array_value.length - 1];
   if (last == NULL || last->type != DICT_OBJECT) return NULL;
   return obj_str (last, "text");
+}
+
+static void handle_definition (DictValue *id, DictValue *params) {
+  if (id == NULL) {
+    log_debug("handle_definition: no id (ignored)");
+    return;
+  }
+  log_debug("handle_definition: entered (id present)");
+
+  DictValue *doc = dict_object_get (params, "textDocument");
+  const char *uri = doc != NULL ? obj_str (doc, "uri") : NULL;
+  log_debug("handle_definition: request uri=%s", uri ? uri : "<null>");
+
+  char *doc_text = NULL;
+  for (int i = 0; i < g_num_docs; i++) {
+    if (g_doc_uris[i] && strcmp(g_doc_uris[i], uri) == 0) {
+      doc_text = g_doc_texts[i];
+      break;
+    }
+  }
+
+  if (doc_text == NULL) {
+    log_debug("handle_definition: no cached text for uri=%s -> returning null", uri ? uri : "<null>");
+    send_result (id, dict_create_null ());
+    return;
+  }
+  log_debug("handle_definition: found cached text for uri (len=%zu)", strlen(doc_text));
+
+  	DictValue *pos = dict_object_get (params, "position");
+  	int line = (int) obj_int (pos, "line");
+  	int ch   = (int) obj_int (pos, "character");
+  	log_debug("handle_definition: got request line=%d ch=%d (0-based) uri=%s", line, ch, uri);
+  	if (line < 0 || ch < 0) {
+  	  log_debug("handle_definition: invalid position");
+  	  send_result (id, dict_create_null ());
+  	  return;
+  	}
+
+  	/* Try to detect a receiver.member (or ->) access first. Supports chained calls. */
+  	char receiver[256] = {0};
+  	char member[256]   = {0};
+  	int has_member = extract_member_access (doc_text, line, ch, receiver, sizeof receiver, member, sizeof member);
+  	char name[256];
+  	int start0 = -1, end0 = -1;
+  	if (has_member) {
+  	  log_debug("handle_definition: member access: receiver='%s' member='%s'", receiver, member);
+  	  if (!extract_identifier_at (doc_text, line, ch, name, sizeof name, &start0, &end0))
+  	    strncpy (name, member, sizeof name - 1);
+  	} else {
+  	  if (!extract_identifier_at (doc_text, line, ch, name, sizeof name, &start0, &end0)) {
+  	    log_debug("handle_definition: no identifier found at line=%d ch=%d", line, ch);
+  	    send_result (id, dict_create_null ());
+  	    return;
+  	  }
+  	  log_debug("handle_definition: extracted identifier '%s' (line=%d ch0=%d..%d)", name, line, start0, end0);
+  	}
+
+  	/* Ensure the compiler has up-to-date kept symbols for this doc */
+  	log_debug("handle_definition: forcing re-analyze for kept symbols (text len=%zu)", strlen(doc_text));
+  	{
+  	  char *path = uri_to_path (uri);
+  	  analyze (path, doc_text);
+  	  free (path);
+  	}
+
+  	c2mir_pos_t loc;
+  	int found = 0;
+  	if (has_member && receiver[0] != '\0') {
+  	  found = c2mir_find_member_definition (g_ctx, receiver, member, &loc);
+  	  if (found)
+  	    log_debug("handle_definition: c2mir_find_member_definition returned 1 for %s.%s", receiver, member);
+  	}
+  	if (!found) {
+  	  /* plain name (top-level, or fallback for members, or bare name case) */
+  	  found = c2mir_find_definition (g_ctx, name, &loc);
+  	  log_debug("handle_definition: c2mir_find_definition returned %d for '%s'", found, name);
+  	}
+
+  	if (!found) {
+  	  log_debug("handle_definition: symbol '%s' NOT FOUND", name);
+  	  send_result (id, dict_create_null ());
+  	  return;
+  	}
+  	log_debug("handle_definition: symbol '%s' FOUND at %s:%d:%d (1-based)",
+  	          name, loc.fname ? loc.fname : "<null>", loc.lno, loc.ln_pos);
+  /* Build LSP Location. Compiler loc is 1-based; LSP range is 0-based. */
+  DictValue *loc_obj = dict_create_object ();
+  DictValue *range = dict_create_object ();
+  DictValue *start = dict_create_object ();
+  DictValue *end = dict_create_object ();
+  int dline = loc.lno > 0 ? loc.lno - 1 : 0;
+  int dcol  = loc.ln_pos > 0 ? loc.ln_pos - 1 : 0;
+  int name_len = (int) strlen (name);
+  if (name_len < 1) name_len = 1;
+  dict_object_set (start, "line", dict_create_int64 (dline));
+  dict_object_set (start, "character", dict_create_int64 (dcol));
+  dict_object_set (end, "line", dict_create_int64 (dline));
+  dict_object_set (end, "character", dict_create_int64 (dcol + name_len));
+  dict_object_set (range, "start", start);
+  dict_object_set (range, "end", end);
+  dict_object_set (loc_obj, "uri", dict_create_string (uri));
+  dict_object_set (loc_obj, "range", range);
+  send_result (id, loc_obj);
 }
 
 static void handle_message (DictValue *root) {
@@ -346,8 +654,14 @@ static void handle_message (DictValue *root) {
   }
   log_debug ("recv method=%s%s", method, id != NULL ? " (request)" : " (notification)");
 
+  log_debug("handle_message: about to dispatch method=%s (params type=%d, id=%p)", 
+            method, (int)(params ? params->type : -1), (void*)id);
+
+  int handled = 0;
+
   if (strcmp (method, "initialize") == 0) {
     handle_initialize (id);
+    handled = 1;
   } else if (strcmp (method, "shutdown") == 0) {
     g_shutdown_requested = 1;
     send_result (id, dict_create_null ());
@@ -376,6 +690,15 @@ static void handle_message (DictValue *root) {
     if (uri != NULL) { /* clear diagnostics for the closed document */
       diags_reset ();
       publish_diagnostics (uri);
+      remove_document (uri);
+      c2mir_release_analysis (g_ctx);
+    }
+  } else if (strcmp (method, "textDocument/definition") == 0) {
+    log_debug("handle_message: dispatching textDocument/definition (will call handle_definition)");
+    handle_definition (id, params);
+  } else {
+    if (id != NULL) {
+      log_debug("handle_message: unhandled request method=%s", method ? method : "(null)");
     }
   }
   /* Unknown requests (with an id) are ignored; a fuller server would reply with
@@ -386,7 +709,7 @@ int main (void) {
   const char *log_path = getenv ("CLASSYC_LSP_LOG");
   if (log_path == NULL) log_path = "/tmp/classyc-lsp.log";
   log_debug_open (log_path);
-  log_debug ("=== classyc-lsp started (pid %ld) ===", (long) getpid ());
+  log_debug ("=== classyc-lsp started (pid %ld) === (BUILD WITH DEFINITION DEBUG LOGS)", (long) getpid ());
 
   g_ctx = MIR_init ();
   c2mir_init (g_ctx);

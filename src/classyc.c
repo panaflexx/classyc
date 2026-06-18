@@ -171,6 +171,9 @@ struct c2m_ctx {
   node_t top_scope;
   HTAB (symbol_t) * symbol_tab;
   VARR (pos_t) * node_positions;
+  node_t analysis_root;     /* retained root when keep_syms_p was used */
+  size_t analysis_reg_mark; /* reg_memory length at start of kept analysis run */
+  int  analysis_kept_p;
   VARR (node_t) * call_nodes;
   VARR (node_t) * containing_anon_members;
   VARR (init_object_t) * init_object_path;
@@ -8073,21 +8076,23 @@ static enum str_method get_string_method (const char *name, int *nargs,
   int n;
   const char *rt;
   enum str_method m;
+
   if (strcmp (name, "length") == 0)       { m = SM_LENGTH;  n = 0; rt = "c2m_str_length"; }
   else if (strcmp (name, "empty") == 0)   { m = SM_EMPTY;   n = 0; rt = "c2m_str_empty"; }
   else if (strcmp (name, "substr") == 0)  { m = SM_SUBSTR;  n = 2; rt = "c2m_str_substr"; }
   else if (strcmp (name, "find") == 0)    { m = SM_FIND;    n = 1; rt = "c2m_str_find"; }
   else if (strcmp (name, "replace") == 0) { m = SM_REPLACE; n = 3; rt = "c2m_str_replace"; }
-	  else if (strcmp (name, "upper") == 0)   { m = SM_UPPER;   n = 0; rt = "c2m_str_upper"; }
-	  else if (strcmp (name, "lower") == 0)   { m = SM_LOWER;   n = 0; rt = "c2m_str_lower"; }
-	  else if (strcmp (name, "copy") == 0)     { m = SM_COPY;    n = 2; rt = "c2m_str_copy"; }
-		  else if (strcmp (name, "detach") == 0)  { m = SM_DETACH;  n = 0; rt = "c2m_str_detach"; }
-			  else if (strcmp (name, "attach") == 0)      { m = SM_ATTACH;      n = 1; rt = "c2m_str_attach"; }
-			  else if (strcmp (name, "starts_with") == 0) { m = SM_STARTS_WITH; n = 1; rt = "c2m_str_starts_with"; }
-			  else if (strcmp (name, "ends_with") == 0)   { m = SM_ENDS_WITH;   n = 1; rt = "c2m_str_ends_with"; }
-			  else if (strcmp (name, "contains") == 0)    { m = SM_CONTAINS;    n = 1; rt = "c2m_str_contains"; }
-			  else if (strcmp (name, "trim") == 0)        { m = SM_TRIM;        n = 0; rt = "c2m_str_trim"; }
-			  else                                        { m = SM_NONE;        n = 0; rt = NULL; }
+  else if (strcmp (name, "upper") == 0)   { m = SM_UPPER;   n = 0; rt = "c2m_str_upper"; }
+  else if (strcmp (name, "lower") == 0)   { m = SM_LOWER;   n = 0; rt = "c2m_str_lower"; }
+  else if (strcmp (name, "copy") == 0)     { m = SM_COPY;    n = 2; rt = "c2m_str_copy"; }
+  else if (strcmp (name, "detach") == 0)  { m = SM_DETACH;  n = 0; rt = "c2m_str_detach"; }
+  else if (strcmp (name, "attach") == 0)      { m = SM_ATTACH;      n = 1; rt = "c2m_str_attach"; }
+  else if (strcmp (name, "starts_with") == 0) { m = SM_STARTS_WITH; n = 1; rt = "c2m_str_starts_with"; }
+  else if (strcmp (name, "ends_with") == 0)   { m = SM_ENDS_WITH;   n = 1; rt = "c2m_str_ends_with"; }
+  else if (strcmp (name, "contains") == 0)    { m = SM_CONTAINS;    n = 1; rt = "c2m_str_contains"; }
+  else if (strcmp (name, "trim") == 0)        { m = SM_TRIM;        n = 0; rt = "c2m_str_trim"; }
+  else                                        { m = SM_NONE;        n = 0; rt = NULL; }
+
   if (nargs != NULL) *nargs = n;
   if (rt_name != NULL) *rt_name = rt;
   return m;
@@ -22763,11 +22768,25 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
   MIR_module_t m;
 
   if (c2m_ctx == NULL) return 0;
+
+  /* If a previous analysis was retained (keep_syms_p), release it before starting a new run. */
+  if (c2m_ctx->analysis_kept_p) {
+    c2mir_release_analysis (ctx);
+  }
+
   if (setjmp (c2m_ctx->env)) {
     compile_finish (c2m_ctx);
+    c2m_ctx->analysis_kept_p = 0;
     return 0;
   }
   compile_init (c2m_ctx, ops, getc_func, getc_data);
+
+  int keep_analysis = (ops && ops->no_gen_p && ops->keep_syms_p);
+  size_t keep_mark = 0;
+  if (keep_analysis) {
+    keep_mark = reg_memory_mark (c2m_ctx);
+  }
+
   t_init = stage_time (&prev_time);
   add_stream (c2m_ctx, NULL, source_name, top_level_getc);
   if (!c2m_options->no_prepro_p) add_standard_includes (c2m_ctx);
@@ -22814,7 +22833,15 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
       }
     }
   }
-  compile_finish (c2m_ctx);
+  if (keep_analysis && n_errors == 0) {
+    c2m_ctx->analysis_root = r;
+    c2m_ctx->analysis_reg_mark = keep_mark;
+    c2m_ctx->analysis_kept_p = 1;
+    /* do not call compile_finish -- retain symbol table, node_positions, root for LSP */
+  } else {
+    compile_finish (c2m_ctx);
+    c2m_ctx->analysis_kept_p = 0;
+  }
   if (c2m_options->verbose_p && c2m_options->message_file != NULL) {
     /* One-line per-stage timing summary (skipped stages read 0). */
     FILE *f = c2m_options->message_file;
@@ -22830,6 +22857,179 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
   }
   return n_errors == 0;
 }
+
+/* Retained analysis API (for LSP go-to-definition etc.) */
+#undef symbol_tab
+#undef node_positions
+#undef top_scope
+#undef parse_ctx
+#undef check_ctx
+
+void c2mir_release_analysis (MIR_context_t ctx) {
+  struct c2m_ctx *c2m_ctx = *c2m_ctx_loc (ctx);
+  if (c2m_ctx == NULL || !c2m_ctx->analysis_kept_p) return;
+
+  /* Everything allocated since the mark lives in reg_memory; pop frees it all. */
+  reg_memory_pop (c2m_ctx, c2m_ctx->analysis_reg_mark);
+
+  /* Null pointers into the now-freed region so the next compile will recreate clean structures. */
+  c2m_ctx->symbol_tab = NULL;
+  c2m_ctx->analysis_root = NULL;
+  c2m_ctx->analysis_reg_mark = 0;
+  c2m_ctx->analysis_kept_p = 0;
+  c2m_ctx->node_positions = NULL;
+  c2m_ctx->top_scope = NULL;
+  c2m_ctx->parse_ctx = NULL;
+  c2m_ctx->check_ctx = NULL;
+}
+
+	struct node *c2mir_get_analysis_root (MIR_context_t ctx) {
+	  struct c2m_ctx *c2m_ctx = *c2m_ctx_loc (ctx);
+	  if (c2m_ctx == NULL || !c2m_ctx->analysis_kept_p) return NULL;
+	  return c2m_ctx->analysis_root;
+	}
+
+	/* Visitor for HTAB_FOREACH_ELEM over the whole symbol table (used by definition lookup).
+	   Matches by bare name regardless of scope, so class members are discoverable. */
+	static void find_any_member_visitor (symbol_t sym, void *arg) {
+	  struct {
+	    const char *name;
+	    node_t def;
+	  } *s = arg;
+	  if (s->def != NULL) return;  /* keep the first match */
+	  if (sym.id != NULL && sym.id->code == N_ID && sym.id->u.s.s != NULL
+	      && strcmp (sym.id->u.s.s, s->name) == 0) {
+	    s->def = sym.def_node;
+	  }
+	}
+
+	int c2mir_find_definition (MIR_context_t ctx, const char *ident, c2mir_pos_t *out) {
+	  struct c2m_ctx *c2m_ctx = *c2m_ctx_loc (ctx);
+	  if (c2m_ctx == NULL) {
+	    log_debug("c2mir_find_definition: no c2m_ctx");
+	    return 0;
+	  }
+	  if (!c2m_ctx->analysis_kept_p) {
+	    log_debug("c2mir_find_definition: analysis not kept (keep_syms_p was not used)");
+	    return 0;
+	  }
+	  if (ident == NULL || out == NULL) {
+	    log_debug("c2mir_find_definition: bad args (ident=%p out=%p)", (void*)ident, (void*)out);
+	    return 0;
+	  }
+
+	  log_debug("c2mir_find_definition: looking for '%s' (kept_p=%d top_scope=%p)",
+	            ident, c2m_ctx->analysis_kept_p, (void*)c2m_ctx->top_scope);
+
+	  /* Build a transient N_ID (allocated from the current reg_memory; will be freed on next release). */
+	  node_t id_node = build_id (c2m_ctx, ident, no_pos);
+
+	  /* Try ordinary symbol (functions, globals, vars, class methods registered at class scope). */
+	  node_t def = find_def (c2m_ctx, S_REGULAR, id_node, c2m_ctx->top_scope, NULL);
+
+	  const char *kind = "S_REGULAR";
+	  if (def == NULL) {
+	    def = find_def (c2m_ctx, S_TAG, id_node, c2m_ctx->top_scope, NULL);
+	    kind = "S_TAG";
+	  }
+
+	  if (def == NULL) {
+	    /* Fallback: walk the full symbol table (members live under class scopes) */
+	    struct {
+	      const char *name;
+	      node_t def;
+	    } search = { ident, NULL };
+	    HTAB_FOREACH_ELEM (symbol_t, c2m_ctx->symbol_tab, find_any_member_visitor, &search);
+	    if (search.def) {
+	      def = search.def;
+	      kind = "member";
+	    }
+	  }
+
+	  if (def == NULL) {
+	    log_debug("c2mir_find_definition: '%s' NOT FOUND", ident);
+	    return 0;
+	  }
+
+	  pos_t p = POS (def);
+	  out->fname  = p.fname;
+	  out->lno    = p.lno > 0 ? p.lno : 1;
+	  out->ln_pos = p.ln_pos > 0 ? p.ln_pos : 1;
+
+	  log_debug("c2mir_find_definition: FOUND '%s' (%s) at %s:%d:%d",
+	            ident, kind,
+	            out->fname ? out->fname : "<unknown>",
+	            out->lno, out->ln_pos);
+
+	  return 1;
+	}
+
+	/* Extended lookup for obj.member (or obj->member).
+	   - Resolve receiver (global var or class name) to its declared type/class_node.
+	   - Look up member name inside that class scope.
+	   - Falls back to NULL (caller should try plain c2mir_find_definition on the member name). */
+	int c2mir_find_member_definition (MIR_context_t ctx,
+	                                  const char *receiver,
+	                                  const char *member,
+	                                  c2mir_pos_t *out) {
+	  struct c2m_ctx *c2m_ctx = *c2m_ctx_loc (ctx);
+	  if (c2m_ctx == NULL || !c2m_ctx->analysis_kept_p) return 0;
+	  if (receiver == NULL || member == NULL || out == NULL) return 0;
+
+	  log_debug("c2mir_find_member_definition: receiver='%s' member='%s'", receiver, member);
+
+	  /* 1. locate the receiver identifier at global (top) scope */
+	  node_t rid = build_id (c2m_ctx, receiver, no_pos);
+	  node_t recv_def = find_def (c2m_ctx, S_REGULAR, rid, c2m_ctx->top_scope, NULL);
+	  if (!recv_def)
+	    recv_def = find_def (c2m_ctx, S_TAG, rid, c2m_ctx->top_scope, NULL);
+
+	  if (!recv_def) {
+	    log_debug("c2mir_find_member_definition: receiver '%s' not found at top scope", receiver);
+	    return 0;
+	  }
+
+	  /* 2. derive class_node from the receiver's declared type (or if receiver is the class itself) */
+	  node_t class_node = NULL;
+	  if (recv_def->code == N_CLASS) {
+	    class_node = recv_def;
+	  } else if (recv_def->attr) {
+	    decl_t d = (decl_t) recv_def->attr;
+	    if (d && d->decl_spec.type && d->decl_spec.type->mode == TM_CLASS) {
+	      class_node = d->decl_spec.type->u.tag_type;
+	    }
+	  }
+
+	  if (!class_node) {
+	    log_debug("c2mir_find_member_definition: receiver '%s' does not have a class type", receiver);
+	    return 0;
+	  }
+
+	  /* 3. look up the member name inside the class scope */
+	  node_t mid = build_id (c2m_ctx, member, no_pos);
+	  node_t mdef = find_def (c2m_ctx, S_REGULAR, mid, class_node, NULL);
+	  const char *kind = "member (class scope)";
+	  if (!mdef) {
+	    mdef = find_def (c2m_ctx, S_TAG, mid, class_node, NULL);
+	    kind = "member tag (class scope)";
+	  }
+
+	  if (!mdef) {
+	    log_debug("c2mir_find_member_definition: member '%s' NOT FOUND inside class", member);
+	    return 0;
+	  }
+
+	  pos_t p = POS (mdef);
+	  out->fname  = p.fname;
+	  out->lno    = p.lno > 0 ? p.lno : 1;
+	  out->ln_pos = p.ln_pos > 0 ? p.ln_pos : 1;
+
+	  log_debug("c2mir_find_member_definition: FOUND %s.%s (%s) at %s:%d:%d",
+	            receiver, member, kind,
+	            out->fname ? out->fname : "<unknown>", out->lno, out->ln_pos);
+
+	  return 1;
+	}
 
 /* Local Variables:                */
 /* mode: c                         */
