@@ -20025,10 +20025,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
 	          int i = 0;
 	          for (node_t arg = (args ? NL_HEAD (args->u.ops) : NULL); arg; arg = NL_NEXT (arg)) {
 	        if (sm == SM_COPY) {
-	              vals[i++] = (i == 0
-	                ? val_gen (c2m_ctx, arg)
-	                : promote (c2m_ctx, val_gen (c2m_ctx, arg), MIR_T_I64, FALSE)
-	              ).mir_op;
+				  MIR_op_t vtmp;
+				  vtmp = (i == 0
+                        ? val_gen (c2m_ctx, arg)
+                        : promote (c2m_ctx, val_gen (c2m_ctx, arg), MIR_T_I64, FALSE)
+                      ).mir_op;
+				  vals[i++] = vtmp;
 	            } else if (sm == SM_ATTACH) {
 	              /* attach: single char* arg passed as I64 pointer */
 	              vals[i++] = val_gen (c2m_ctx, arg).mir_op;
