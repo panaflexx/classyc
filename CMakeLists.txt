@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.12)  # 3.12+ for better macOS support; compatible with 10.12 deployment
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
 project("classyc" C)
 
 # Set default build type

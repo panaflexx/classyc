@@ -134,6 +134,29 @@ static void analyze (const char *path, const char *text) {
 
 /* ───────────────────────────────── URIs ─────────────────────────────────── */
 
+/* Encode a filesystem path into a file:// URI (percent-encoded).  Returns a
+   freshly allocated string; caller frees. */
+static char *path_to_uri (const char *path) {
+  if (path == NULL) return NULL;
+  size_t len = strlen(path);
+  char *out = xmalloc(len * 3 + 8);
+  char *o = out;
+  *o++ = 'f', *o++ = 'i', *o++ = 'l', *o++ = 'e', *o++ = ':', *o++ = '/', *o++ = '/';
+  for (const char *p = path; *p; p++) {
+    if ((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z') ||
+        (p[0] >= '0' && p[0] <= '9') || p[0] == '-' || p[0] == '_' ||
+        p[0] == '.' || p[0] == '~' || p[0] == '/') {
+      *o++ = *p;
+    } else {
+      static const char hex[] = "0123456789ABCDEF";
+      unsigned char c = *p;
+      *o++ = '%'; *o++ = hex[c >> 4]; *o++ = hex[c & 0xF];
+    }
+  }
+  *o = '\0';
+  return out;
+}
+
 /* Decode a file:// URI into a filesystem path (percent-decoded).  Returns a
    freshly allocated string; caller frees. */
 static char *uri_to_path (const char *uri) {
@@ -387,6 +410,7 @@ static void handle_initialize (DictValue *id) {
   /* textDocumentSync = 1 (full): the client sends the whole document on change. */
   dict_object_set (caps, "textDocumentSync", dict_create_int64 (1));
   dict_object_set (caps, "definitionProvider", dict_create_bool (1));
+  dict_object_set (caps, "referencesProvider", dict_create_bool (1));
   dict_object_set (info, "name", dict_create_string ("classyc-lsp"));
   dict_object_set (info, "version", dict_create_string ("0.1"));
   dict_object_set (result, "capabilities", caps);
@@ -643,6 +667,96 @@ static void handle_definition (DictValue *id, DictValue *params) {
   send_result (id, loc_obj);
 }
 
+static void handle_references (DictValue *id, DictValue *params) {
+  if (id == NULL) {
+    log_debug("handle_references: no id (ignored)");
+    return;
+  }
+  log_debug("handle_references: entered");
+
+  DictValue *doc = dict_object_get (params, "textDocument");
+  const char *uri = doc != NULL ? obj_str (doc, "uri") : NULL;
+
+  char *doc_text = NULL;
+  for (int i = 0; i < g_num_docs; i++) {
+    if (g_doc_uris[i] && strcmp(g_doc_uris[i], uri) == 0) {
+      doc_text = g_doc_texts[i];
+      break;
+    }
+  }
+
+  if (doc_text == NULL) {
+    log_debug("handle_references: no cached text for uri=%s -> returning null", uri ? uri : "<null>");
+    send_result (id, dict_create_null ());
+    return;
+  }
+
+  DictValue *pos = dict_object_get (params, "position");
+  int line = (int) obj_int (pos, "line");
+  int ch   = (int) obj_int (pos, "character");
+  if (line < 0 || ch < 0) {
+    send_result (id, dict_create_null ());
+    return;
+  }
+
+  char name[256];
+  if (!extract_identifier_at (doc_text, line, ch, name, sizeof name, NULL, NULL)) {
+    log_debug("handle_references: no identifier at line=%d ch=%d", line, ch);
+    send_result (id, dict_create_null ());
+    return;
+  }
+  log_debug("handle_references: identifier '%s'", name);
+
+  /* Ensure compiler has up-to-date kept symbols */
+  {
+    char *path = uri_to_path (uri);
+    analyze (path, doc_text);
+    free (path);
+  }
+
+  c2mir_pos_t *refs = NULL;
+  int count = c2mir_find_references (g_ctx, name, &refs);
+  if (count <= 0 || refs == NULL) {
+    log_debug("handle_references: no references found for '%s'", name);
+    send_result (id, dict_create_null ());
+    return;
+  }
+
+  /* Build an LSP Location array */
+  DictValue *loc_array = dict_create_array ();
+  for (int i = 0; i < count; i++) {
+    DictValue *loc_obj = dict_create_object ();
+    DictValue *range = dict_create_object ();
+    DictValue *start = dict_create_object ();
+    DictValue *end = dict_create_object ();
+    int dline = refs[i].lno > 0 ? refs[i].lno - 1 : 0;
+    int dcol  = refs[i].ln_pos > 0 ? refs[i].ln_pos - 1 : 0;
+    int name_len = (int) strlen (name);
+    if (name_len < 1) name_len = 1;
+
+    dict_object_set (start, "line", dict_create_int64 (dline));
+    dict_object_set (start, "character", dict_create_int64 (dcol));
+    dict_object_set (end, "line", dict_create_int64 (dline));
+    dict_object_set (end, "character", dict_create_int64 (dcol + name_len));
+    dict_object_set (range, "start", start);
+    dict_object_set (range, "end", end);
+
+    char *ref_uri = path_to_uri (refs[i].fname);
+    if (ref_uri != NULL) {
+      dict_object_set (loc_obj, "uri", dict_create_string (ref_uri));
+      free (ref_uri);
+    } else {
+      dict_object_set (loc_obj, "uri", dict_create_string (uri));
+    }
+    dict_object_set (loc_obj, "range", range);
+    dict_array_append (loc_array, loc_obj);
+  }
+
+  c2mir_free_references (refs);
+  send_result (id, loc_array);
+  log_debug("handle_references: sent %d location(s) for '%s'", count, name);
+}
+
 static void handle_message (DictValue *root) {
   const char *method = obj_str (root, "method");
   DictValue *id = dict_object_get (root, "id");
@@ -696,6 +810,9 @@ static void handle_message (DictValue *root) {
   } else if (strcmp (method, "textDocument/definition") == 0) {
     log_debug("handle_message: dispatching textDocument/definition (will call handle_definition)");
     handle_definition (id, params);
+  } else if (strcmp (method, "textDocument/references") == 0) {
+    log_debug("handle_message: dispatching textDocument/references");
+    handle_references (id, params);
   } else {
     if (id != NULL) {
       log_debug("handle_message: unhandled request method=%s", method ? method : "(null)");

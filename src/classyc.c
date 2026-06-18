@@ -23027,11 +23027,61 @@ void c2mir_release_analysis (MIR_context_t ctx) {
 	  out->ln_pos = p.ln_pos > 0 ? p.ln_pos : 1;
 
 	  log_debug("c2mir_find_member_definition: FOUND %s.%s (%s) at %s:%d:%d",
-	            receiver, member, kind,
-	            out->fname ? out->fname : "<unknown>", out->lno, out->ln_pos);
+		        receiver, member, kind,
+		        out->fname ? out->fname : "<unknown>", out->lno, out->ln_pos);
 
 	  return 1;
 	}
+
+/* ─── Reference finder: walk the AST collecting all N_ID nodes matching ident ─── */
+
+static void collect_id_refs (c2m_ctx_t c2m_ctx, node_t n, const char *ident,
+                            c2mir_pos_t **out_arr, size_t *out_count, size_t *out_cap) {
+  if (n == NULL) return;
+
+  /* Check if this node is an N_ID with the target name. */
+  if (n->code == N_ID && n->u.s.s != NULL && strcmp (n->u.s.s, ident) == 0) {
+    size_t cnt = *out_count, cap = *out_cap;
+    if (cnt >= cap) {
+      cap = cap ? cap * 2 : 64;
+      *out_arr = realloc (*out_arr, cap * sizeof (c2mir_pos_t));
+      *out_cap = cap;
+    }
+    pos_t p = POS (n);
+    (*out_arr)[cnt].fname  = p.fname;
+    (*out_arr)[cnt].lno    = p.lno > 0 ? p.lno : 1;
+    (*out_arr)[cnt].ln_pos = p.ln_pos > 0 ? p.ln_pos : 1;
+    (*out_count)++;
+  }
+
+  /* Recurse into children via the ops doubly-linked list. */
+  for (node_t ch = NL_HEAD (n->u.ops); ch != NULL; ch = NL_NEXT (ch))
+    collect_id_refs (c2m_ctx, ch, ident, out_arr, out_count, out_cap);
+}
+
+int c2mir_find_references (MIR_context_t ctx, const char *ident, c2mir_pos_t **out_refs) {
+  struct c2m_ctx *c2m_ctx = *c2m_ctx_loc (ctx);
+  if (c2m_ctx == NULL || !c2m_ctx->analysis_kept_p) {
+    log_debug("c2mir_find_references: analysis not available");
+    return 0;
+  }
+  if (ident == NULL || out_refs == NULL || ident[0] == '\0') {
+    return 0;
+  }
+
+  *out_refs = NULL;
+  size_t count = 0, cap = 0;
+
+  node_t root = c2m_ctx->analysis_root;
+  collect_id_refs (c2m_ctx, root, ident, out_refs, &count, &cap);
+
+  log_debug("c2mir_find_references: found %zu reference(s) for '%s'", count, ident);
+  return (int) count;
+}
+
+void c2mir_free_references (c2mir_pos_t *refs) {
+  free (refs);
+}
 
 /* Local Variables:                */
 /* mode: c                         */

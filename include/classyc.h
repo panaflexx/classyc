@@ -63,8 +63,21 @@ int c2mir_find_definition (MIR_context_t ctx, const char *ident, c2mir_pos_t *ou
  * Returns 1 and fills out (1-based) on success; 0 otherwise.
  */
 int c2mir_find_member_definition (MIR_context_t ctx,
-                                  const char *receiver,
-                                  const char *member,
-                                  c2mir_pos_t *out);
+               const char *receiver,
+               const char *member,
+               c2mir_pos_t *out);
+
+/*
+ * Find all references to an identifier in the current analysis.
+ * Walks the AST and collects positions of N_ID nodes whose name matches `ident`.
+ * Coordinates are 1-based (compiler convention).
+ * Returns the number of references found. On success, *out_refs is set to a
+ * malloc'd array of c2mir_pos_t; caller must free with c2mir_free_references().
+ * Returns 0 if the analysis is not available or `ident` is empty.
+ */
+int c2mir_find_references (MIR_context_t ctx, const char *ident, c2mir_pos_t **out_refs);
+
+/* Free the array returned by c2mir_find_references. Safe with NULL. */
+void c2mir_free_references (c2mir_pos_t *refs);
 
 #endif
