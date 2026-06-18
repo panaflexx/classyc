@@ -58,7 +58,7 @@ run_example classy-strings.cy
 run_example classy-string-copy-test.cy
 run_example string_methods_test.cy
 run_example test_dict_arena.cy
-run_example class-arrays.cy
+run_example classy-arrays.cy
 run_example classy-fstring.cy
 run_example classy-auto.cy
 run_example classy-brace-forin.cy
