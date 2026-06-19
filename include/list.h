@@ -67,23 +67,12 @@ class List<T> {
         this->length   = 1;
     }
 
-    /* Array view: copy ‘count’ elements from a plain C array.
-     * Caller keeps ownership of the source array.  This is also the constructor
-     * that `arr.ToList()` lowers to: the compiler passes the element base
-     * pointer and the array's (statically known) / slice's length as `count`,
-     * since a bare T* pointer carries no length of its own. */
-    List(T* items, int count) {
-        int n = count > 0 ? count : 0;
-        this->length   = 0;
-        this->capacity = n > 0 ? n : 4;
-        this->data     = (T*) malloc(sizeof(T) * this->capacity);
-        for (int i = 0; i < n; i++) {
-            this->data[i] = items[i];
-            this->length++;
-        }
-    }
-
-    /* BONUS items now carries a .count()  */
+    /* Array view: copy the elements of a plain C array (or slice).
+     * Caller keeps ownership of the source.  This is also the constructor that
+     * `arr.ToList()` and `new List<T>(arr)` lower to.  `items` is a bare T*
+     * which carries no length of its own, so the element count is recovered via
+     * `items.count()`: the compiler threads the source array's (statically
+     * known) / slice's length alongside the pointer into a hidden companion. */
     List(T* items) {
         int n = items.count();
         this->length   = 0;

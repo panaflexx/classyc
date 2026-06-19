@@ -4854,6 +4854,16 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
            base_name, tmpl->n_type_params, n_args);
     return build_id (c2m_ctx, base_name, pos);
   }
+  /* The template body never finished parsing (e.g. a syntax error inside the
+     generic class definition left class_node un-backfilled).  Specialising a
+     NULL body would yield a NULL N_CLASS that later gets dereferenced during
+     module injection, so bail out with a diagnostic instead of crashing. */
+  if (tmpl->class_node == NULL) {
+    error (c2m_ctx, pos,
+           "cannot instantiate generic class '%s': its definition failed to parse",
+           base_name);
+    return build_id (c2m_ctx, base_name, pos);
+  }
 
   const char *spec_name = mangle_generic_name (c2m_ctx, base_name, n_args, args);
 
@@ -4867,6 +4877,10 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
   node_t spec_class = specialize_node (c2m_ctx, tmpl->class_node,
                                         base_name, spec_name,
                                         tmpl->n_type_params, tmpl->type_params, args);
+  if (spec_class == NULL) {
+    error (c2m_ctx, pos, "cannot instantiate generic class '%s'", base_name);
+    return build_id (c2m_ctx, base_name, pos);
+  }
 
   /* Register spec_name as a tpname so declarations like `List<String> x` work */
   node_t spec_id_node = build_id (c2m_ctx, spec_name, pos);
@@ -5883,6 +5897,20 @@ D (class_member_declaration) {
   // Try to parse a declarator
   if ((r = TRY(declarator)) != err_node) {
     decl = r;
+
+    // Accept and ignore trailing cv-qualifiers on a method definition:
+    //   RetType name(params) const { ... }
+    // ClassyC does not yet enforce const-correctness, so the qualifier is
+    // consumed purely so the method body parses.  Only commit to swallowing the
+    // qualifier(s) when they are immediately followed by a method body '{';
+    // otherwise rewind so a (malformed) data member is still handled below.
+    if (C(T_CONST) || C(T_VOLATILE)) {
+      size_t cv_mark = record_start(c2m_ctx);
+      while (C(T_CONST) || C(T_VOLATILE)) {
+        if (!M(T_CONST)) M(T_VOLATILE);
+      }
+      record_stop(c2m_ctx, cv_mark, !C('{')); /* commit if a body follows, else rewind */
+    }
 
     // Check if this is a function definition (has a compound statement)
     if (C('{')) {
@@ -7681,8 +7709,10 @@ D (transl_unit) {
     }
     /* Inject any lambdas defined while parsing this top-level item (they must
        precede the item in the module so their MIR functions are generated first). */
-    for (size_t li = 0; li < VARR_LENGTH (node_t, pending_lambdas); li++)
-      op_append (c2m_ctx, list, VARR_GET (node_t, pending_lambdas, li));
+    for (size_t li = 0; li < VARR_LENGTH (node_t, pending_lambdas); li++) {
+      node_t pend = VARR_GET (node_t, pending_lambdas, li);
+      if (pend != NULL) op_append (c2m_ctx, list, pend);
+    }
     VARR_TRUNC (node_t, pending_lambdas, 0);
     op_flat_append (c2m_ctx, list, r);
     continue;
@@ -12594,6 +12624,128 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
       return TRUE;
     }
 
+    /* ── Collection count companion parameters ──────────────────────────────
+       A function/constructor body may recover the element count of a bare `T*`
+       parameter by calling `param.count()` (e.g. List(T* items) {... items.count()
+       ...}).  A plain pointer carries no length of its own, so for each such
+       parameter the compiler appends a hidden companion `int` length parameter
+       right after it and rewrites every `param.count()` to read the companion.
+       Callers fill the companion automatically: array/slice arguments are
+       expanded by try_expand_collection_count_args (so `new List<T>(arr)` just
+       works), and arr.ToList() lowering already passes base+length to the
+       resulting (T*, int) signature.  This lets generic collection APIs written
+       against a bare `T*` recover the source array's / slice's length. */
+
+    /* Node kinds whose union holds a scalar/string payload rather than an op
+       list: do not descend into u.ops for these (it would alias the payload). */
+    static int count_walk_leaf_p (node_code_t c) {
+      switch (c) {
+      case N_I: case N_L: case N_LL: case N_U: case N_UL: case N_ULL:
+      case N_F: case N_D: case N_LD:
+      case N_CH: case N_CH16: case N_CH32:
+      case N_STR: case N_STR16: case N_STR32:
+      case N_ID: case N_STRING: return TRUE;
+      default: return FALSE;
+      }
+    }
+
+    /* TRUE if N is exactly `PNAME.count()` (dot access, zero args).  Restricted
+       to the dot form (N_FIELD): a genuine class-pointer method call uses
+       `p->count()` (N_DEREF_FIELD) and must not be hijacked. */
+    static int param_count_call_p (node_t n, const char *pname) {
+      node_t f, base, m, args;
+      if (n->code != N_CALL) return FALSE;
+      f = CALL_FUNC (n);
+      if (f == NULL || f->code != N_FIELD) return FALSE;
+      base = NL_HEAD (f->u.ops);
+      m = base != NULL ? NL_NEXT (base) : NULL;
+      args = CALL_ARGS (n);
+      if (base == NULL || base->code != N_ID || strcmp (base->u.s.s, pname) != 0) return FALSE;
+      if (m == NULL || m->code != N_ID || strcmp (m->u.s.s, "count") != 0) return FALSE;
+      if (args == NULL || args->code != N_LIST || NL_HEAD (args->u.ops) != NULL) return FALSE;
+      return TRUE;
+    }
+
+    /* Rewrite every `PNAME.count()` in the subtree to an N_ID referencing the
+       companion length parameter CNAME; returns how many were rewritten. */
+    static int rewrite_param_count_calls (c2m_ctx_t c2m_ctx, node_t n, const char *pname,
+                                          str_t cname) {
+      int rewritten = 0;
+      if (n == NULL) return 0;
+      if (param_count_call_p (n, pname)) {
+        /* In-place: N_CALL -> N_ID(cname).  Overwriting u.s aliases the (now
+           abandoned) op list; the sibling op_link lives outside the union, so
+           the caller's traversal stays valid. */
+        n->code = N_ID;
+        n->u.s = cname;
+        n->attr = NULL;
+        return 1;
+      }
+      if (count_walk_leaf_p (n->code)) return 0;
+      for (node_t ch = NL_HEAD (n->u.ops); ch != NULL; ch = NL_NEXT (ch))
+        rewritten += rewrite_param_count_calls (c2m_ctx, ch, pname, cname);
+      return rewritten;
+    }
+
+    /* If P is a plain pointer parameter `T* name` (an N_POINTER declarator with
+       no array/function suffix), return its identifier name, else NULL. */
+    static const char *plain_pointer_param_name (node_t p) {
+      node_t decl, id, list;
+      int has_ptr = FALSE;
+      if (p == NULL || p->code != N_SPEC_DECL) return NULL;
+      decl = SPEC_DECL_DECL (p);
+      if (decl == NULL || decl->code != N_DECL) return NULL;
+      id = DECL_ID (decl);
+      list = DECL_LIST (decl);
+      if (id == NULL || id->code != N_ID || list == NULL) return NULL;
+      for (node_t n = NL_HEAD (list->u.ops); n != NULL; n = NL_NEXT (n)) {
+        if (n->code == N_FUNC || n->code == N_ARR) return NULL;
+        if (n->code == N_POINTER) has_ptr = TRUE;
+      }
+      return has_ptr ? id->u.s.s : NULL;
+    }
+
+    /* Append hidden `int` length companions for any pointer parameter the body
+       queries with `.count()`.  Must run before create_decl so the companions
+       become part of the function's signature (proto, mangling, call sites). */
+    static void expand_count_companion_params (c2m_ctx_t c2m_ctx, node_t func_def) {
+      node_t declarator = FUNC_DEF_DECL (func_def);
+      node_t block = FUNC_DEF_BLOCK (func_def);
+      node_t decl_list, func, param_list, p;
+
+      if (declarator == NULL || declarator->code != N_DECL) return;
+      if (block == NULL || block->code != N_BLOCK) return;
+      decl_list = DECL_LIST (declarator);
+      if (decl_list == NULL) return;
+      func = NL_HEAD (decl_list->u.ops);
+      if (func == NULL || func->code != N_FUNC) return;
+      param_list = NL_HEAD (func->u.ops);
+      if (param_list == NULL || param_list->code != N_LIST) return;
+
+      for (p = NL_HEAD (param_list->u.ops); p != NULL; p = NL_NEXT (p)) {
+        const char *pname = plain_pointer_param_name (p);
+        node_t companion;
+        char cbuf[128];
+        str_t cstr;
+        if (pname == NULL) continue;
+        snprintf (cbuf, sizeof (cbuf), "__seqlen_%s", pname);
+        cstr = uniq_cstr (c2m_ctx, cbuf);
+        if (rewrite_param_count_calls (c2m_ctx, block, pname, cstr) == 0) continue;
+        /* Build `int <cstr>` (mirrors the K&R placeholder construction below). */
+        companion = new_pos_node5 (c2m_ctx, N_SPEC_DECL, POS (p),
+                                   new_node1 (c2m_ctx, N_SHARE,
+                                              new_node1 (c2m_ctx, N_LIST,
+                                                         new_pos_node (c2m_ctx, N_INT, POS (p)))),
+                                   new_pos_node2 (c2m_ctx, N_DECL, POS (p),
+                                                  new_str_node (c2m_ctx, N_ID, cstr, POS (p)),
+                                                  new_node (c2m_ctx, N_LIST)),
+                                   new_node (c2m_ctx, N_IGNORE), new_node (c2m_ctx, N_IGNORE),
+                                   new_node (c2m_ctx, N_IGNORE));
+        DLIST_INSERT_AFTER (node_t, param_list->u.ops, p, companion);
+        p = companion; /* don't reconsider the freshly inserted companion */
+      }
+    }
+
     static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
       check_ctx_t check_ctx = c2m_ctx->check_ctx;
       node_t op1, op2;
@@ -15037,6 +15189,12 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
         decl_scope = class_tag;
       }
     }
+    /* Append hidden length companions for any `T* p` parameter the body queries
+       with `p.count()`, before create_decl bakes the param list into the
+       function's type/signature.  Scoped to class methods/constructors: their
+       call sites (`new`, method calls) auto-supply the companion via
+       count-argument expansion, and arr.ToList() lowering passes it directly. */
+    if (curr_class != NULL) expand_count_companion_params (c2m_ctx, r);
     create_decl(c2m_ctx, decl_scope, r, decl_spec, NULL, FALSE);
 
     /* Lambda return-type inference: lambdas are emitted with 'static auto' specs
