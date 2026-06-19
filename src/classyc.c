@@ -13255,7 +13255,18 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
              Assignment (class[i] = val) is handled in the gen N_ASSIGN path. */
           struct type *cls = t1->mode == TM_PTR ? t1->u.ptr_type : t1;
           node_t get_def = find_class_protocol_method (c2m_ctx, cls->u.tag_type, "Get", 1, POS (r));
-          if (get_def == NULL) {
+          if (get_def == NULL && t1->mode == TM_PTR) {
+            /* A plain pointer to a class type with no Get(int) protocol is just
+               an ordinary C pointer — index it like one.  This is what the
+               `T* data` backing array of a generic collection specialised over
+               a by-value class type (List<Point>, Set<Point>) needs: dense[i]
+               must be raw pointer indexing, not the collection Get() sugar. */
+            *e->type = *t1->u.ptr_type;
+            if (incomplete_type_p (c2m_ctx, t1->u.ptr_type))
+              error (c2m_ctx, POS (r), "pointer to incomplete type in array subscription");
+            if (t2 != NULL && !integer_type_p (t2))
+              error (c2m_ctx, POS (r), "array subscript is not an integer");
+          } else if (get_def == NULL) {
             error (c2m_ctx, POS (r), "class type has no Get(int) method for [] subscript");
           } else {
             decl_t gd = get_def->attr;
@@ -13263,11 +13274,11 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
               struct type *ret = gd->decl_spec.type->u.func_type->ret_type;
               if (ret != NULL) *e->type = *ret;
             }
+            if (t2 != NULL && !integer_type_p (t2)) {
+              error (c2m_ctx, POS (r), "class subscript index must be an integer");
+            }
+            e->def_node = get_def; /* stash for gen to find the method */
           }
-          if (t2 != NULL && !integer_type_p (t2)) {
-            error (c2m_ctx, POS (r), "class subscript index must be an integer");
-          }
-          e->def_node = get_def; /* stash for gen to find the method */
         } else if (t1->mode != TM_PTR && t1->mode != TM_ARR) {
           error (c2m_ctx, POS (r), "subscripted value is neither array nor pointer");
         } else if (t1->mode == TM_PTR) {
@@ -20162,11 +20173,17 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       res = gen_dict_object_get (c2m_ctx, op1.mir_op, op2.mir_op);
       break;
     }
-    if (arr_type->mode == TM_CLASS
-        || (arr_type->mode == TM_PTR && arr_type->u.ptr_type != NULL
-            && arr_type->u.ptr_type->mode == TM_CLASS)) {
+    if ((arr_type->mode == TM_CLASS
+         || (arr_type->mode == TM_PTR && arr_type->u.ptr_type != NULL
+             && arr_type->u.ptr_type->mode == TM_CLASS))
+        && (((struct expr *) r->attr)->def_node != NULL
+            || find_class_protocol_method (c2m_ctx,
+                 (arr_type->mode == TM_PTR ? arr_type->u.ptr_type : arr_type)->u.tag_type,
+                 "Get", 1, POS (r)) != NULL)) {
       /* class[i] — bracket subscript read via Get(int) protocol.
-         The checker already validated the Get method and stashed it in e->def_node. */
+         The checker already validated the Get method and stashed it in e->def_node.
+         A pointer-to-class with no Get protocol falls through to the plain
+         pointer-indexing path below (a by-value class backing array). */
       struct type *cls_type = arr_type->mode == TM_PTR ? arr_type->u.ptr_type : arr_type;
       struct type *this_type
         = arr_type->mode == TM_PTR ? arr_type : create_ptr_type (c2m_ctx, cls_type);

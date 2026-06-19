@@ -263,6 +263,7 @@ Look in the `examples/` directory:
 | `classy-sets.cy`           | Generic `Set<T>` hash set (content-aware `String` hashing) |
 | `classy-sets-myclass.cy`   | Custom `WordBag` class over `Set<T>`: word analytics (sort -u, set-grep, stop-words, Jaccard) |
 | `classy-search-engine.cy`  | MapReduce inverted-index search engine over `List<T>` of custom classes |
+| `classy-collections-class.cy` | `List<Track*>` + `Set<Track*>` over a custom class (Sort/Filter, set algebra by identity) |
 | `classy-dict-arena.c`      | Arena-backed dicts (`new dict(size)`) |
 | `test-any-arena.c`         | `Any<I>` type erasure + arena-managed handles |
 | `test-interface.c`         | `interface` + `impl` structural conformance |
