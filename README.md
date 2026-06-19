@@ -132,6 +132,15 @@ List<Any<View>*> widgets = { any<View>(new Button()), any<View>(new Text()) };
 for (auto v in widgets) v->render();   // heterogeneous via type erasure
 ```
 
+> **Element types & memory** — collections hold scalars, `String`, and pointers
+> (e.g. `List<int>`, `Set<String>`, `List<MyClass*>`) directly. A `class` is a
+> reference type, so put classes in by pointer (`List<Track*>`, `Set<Track*>`)
+> via `new`. For the full picture — value-vs-pointer storage, the
+> `Count()`/`Get(int)`/`Set(int,T)` protocol that powers `for-in` and `coll[i]`,
+> how `Set<T>` hashes `String` by content but objects by identity, and the
+> current limits on by-value class elements — see
+> **[GENERICSMEM.md](GENERICSMEM.md)**.
+
 ### Arrays & Slices → `List<T>` (lengths flow into generics)
 A C array or a filter/map slice converts to a heap `List<T>` with `.ToList()`,
 or straight through the constructor. The compiler threads the source's length
