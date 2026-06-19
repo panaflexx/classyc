@@ -4724,11 +4724,16 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
      specifier list.  We now need to inject N_POINTER nodes into the
      declarator's decoration list so that `T data` becomes `char *data` and
      `T* data` becomes `char **data`.  This applies to N_MEMBER (class
-     fields), N_SPEC_DECL (parameters, locals), and N_FUNC_DEF (return
-     types).  We scan the type-specifier list to see which type param was
-     used (matched by node code against the base-type arg) and check the
-     original arg for pointer depth. */
-  if ((cp->code == N_MEMBER || cp->code == N_SPEC_DECL || cp->code == N_FUNC_DEF)
+     fields), N_SPEC_DECL (named parameters, locals), N_FUNC_DEF (return
+     types), and N_TYPE (abstract declarators: cast/sizeof type-names and the
+     unnamed parameters of function-pointer types such as `int(*cmp)(T,T)`).
+     Without the N_TYPE case, `T` used as a function-pointer parameter, in a
+     `(T*)` cast, or in `sizeof(T)` would lose the pointer level and resolve to
+     a by-value `Doc` instead of `Doc *`.  We scan the type-specifier list to
+     see which type param was used (matched by node code against the base-type
+     arg) and check the original arg for pointer depth. */
+  if ((cp->code == N_MEMBER || cp->code == N_SPEC_DECL || cp->code == N_FUNC_DEF
+       || cp->code == N_TYPE)
       && n_params > 0) {
     /* Determine the spec list and the declarator in both original and copy. */
     node_t orig_specs = NL_HEAD (n->u.ops);      /* original spec list */

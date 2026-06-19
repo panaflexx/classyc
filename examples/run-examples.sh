@@ -71,6 +71,9 @@ run_example test-generic-ptr-args.cy
 run_example test_json_int.cy
 run_example test-ptr-arg-mini.cy
 run_example classy-generics.cy
+run_example classy-sets.cy
+run_example classy-sets-myclass.cy
+run_example classy-search-engine.cy
 run_example classy-overload.cy
 run_example test-interface.cy
 run_example test-any.cy

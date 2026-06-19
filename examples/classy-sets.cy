@@ -15,7 +15,7 @@
 
 #include <stdio.h>
 #include <string.h>
-#include "set.h"
+#include "include/set.h"
 
 int passed = 0;
 int failed = 0;

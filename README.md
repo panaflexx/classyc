@@ -132,6 +132,42 @@ List<Any<View>*> widgets = { any<View>(new Button()), any<View>(new Text()) };
 for (auto v in widgets) v->render();   // heterogeneous via type erasure
 ```
 
+### Arrays & Slices → `List<T>` (lengths flow into generics)
+A C array or a filter/map slice converts to a heap `List<T>` with `.ToList()`,
+or straight through the constructor. The compiler threads the source's length
+(statically known for arrays, from the header for slices) alongside the bare
+`T*`, so a single-argument constructor can recover it via `items.count()`:
+
+```c
+#include "list.h"
+
+String names[] = { "alice", "bob", "carol" };
+
+List<String> *l  = names.ToList();           // compiler supplies base + length
+auto          l2 = names.ToList();           // `auto` deduces List<String>*
+List<String> *l3 = new List<String>(names);  // same, via the constructor
+
+int nums[] = { 1, 2, 3, 4, 5, 6 };
+auto evens = nums.filter((int x) => x % 2 == 0).ToList();   // slice → List<int>
+```
+
+The array-view constructor takes just a `T*` and asks the pointer for its length:
+
+```c
+class List<T> {
+    // ...
+    List(T* items) {            // single-argument array-view constructor
+        int n = items.count();  // length threaded in from the source array/slice
+        // ... copy items[0..n) ...
+    }
+};
+```
+
+This is not special-cased to `List<T>`: any class collection whose constructor
+(or method) takes a bare `T*` may recover the caller's element count with
+`items.count()`, and call sites such as `new Bag<int>(arr)` fill it in
+automatically.
+
 ### Interfaces & `Any<I>` Erasure
 ```c
 interface Drawable { void draw(); }
@@ -223,6 +259,10 @@ Look in the `examples/` directory:
 | `classy-generics.c`        | Generic `List<T>` (30 methods, brace-init `{a,b,c}`) |
 | `classy-lambda.c`          | Typed lambdas for map/filter/sort/etc. |
 | `test-list-stdlib.c`       | Full stdlib List<T> validation |
+| `test-array-to-list.cy`    | Array/slice `.ToList()`, `auto` deduction, `List(T*)` ctor |
+| `classy-sets.cy`           | Generic `Set<T>` hash set (content-aware `String` hashing) |
+| `classy-sets-myclass.cy`   | Custom `WordBag` class over `Set<T>`: word analytics (sort -u, set-grep, stop-words, Jaccard) |
+| `classy-search-engine.cy`  | MapReduce inverted-index search engine over `List<T>` of custom classes |
 | `classy-dict-arena.c`      | Arena-backed dicts (`new dict(size)`) |
 | `test-any-arena.c`         | `Any<I>` type erasure + arena-managed handles |
 | `test-interface.c`         | `interface` + `impl` structural conformance |
@@ -286,7 +326,10 @@ The runtime support for String methods and dict operations lives in small C help
 
 ClassyC is a pragmatic, evolving experiment in "C but pleasant". It already delivers a delightful developer experience for data-heavy systems code (proxies, config-driven services, CLIs, embedded scripting).
 
-Planned / in-progress directions include lambdas (simple delegate style first) and generics (starting with containers like `List<T>`).
+Shipped since the early roadmap: typed lambdas, generics (`List<T>` and
+user-defined collections), `interface`/`Any<I>` erasure, opt-in exceptions, and
+array/slice → `List<T>` conversion with lengths flowing into generics. In-progress
+directions include richer container types and broader standard-library coverage.
 
 Contributions, bug reports, and wild ideas are welcome!
 
