@@ -82,6 +82,9 @@ run_example test-any-arena.cy
 run_example test-any-implicit.cy
 run_example t_raii.cy
 run_example classy-exceptions.cy
+run_example classy-tolist.cy
+run_example test-array-to-list.cy
+run_example test-list-stdlib.cy
 
 # ── summary ────────────────────────────────────────────────────────────
 

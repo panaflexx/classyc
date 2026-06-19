@@ -10,7 +10,7 @@
  */
 
 #include <stdio.h>
-#include "list.h"
+#include "include/list.h"
 
 int main() {
     String names[] = { "alice", "bob", "carol", "dave" };
