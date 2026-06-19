@@ -10747,7 +10747,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
 static struct type *adjust_type (c2m_ctx_t c2m_ctx, struct type *type);
 static struct expr *create_expr (c2m_ctx_t c2m_ctx, node_t r);
 
-enum seq_method { SEQM_NONE = 0, SEQM_FILTER, SEQM_MAP, SEQM_REDUCE, SEQM_COUNT };
+enum seq_method { SEQM_NONE = 0, SEQM_FILTER, SEQM_MAP, SEQM_REDUCE, SEQM_COUNT, SEQM_TOLIST };
 
 static enum seq_method get_seq_method (const char *name, int *nargs) {
   static const struct {
@@ -10759,6 +10759,7 @@ static enum seq_method get_seq_method (const char *name, int *nargs) {
     {"map", SEQM_MAP, 1},
     {"reduce", SEQM_REDUCE, 2},
     {"count", SEQM_COUNT, 0},
+    {"ToList", SEQM_TOLIST, 0},
   };
   for (size_t i = 0; i < sizeof (tab) / sizeof (tab[0]); i++)
     if (strcmp (name, tab[i].name) == 0) {
@@ -11012,13 +11013,305 @@ static node_t instantiate_lambda (c2m_ctx_t c2m_ctx, node_t lam, struct type **p
   return func_def;
 }
 
+/* Build a generic type-argument AST node (exactly as parse_generic_type_arg
+   would have produced for an explicit `List<EL>`) denoting element type EL, so
+   arr.ToList() can instantiate List<EL>.  Returns NULL for element types we
+   cannot express as a type argument. */
+static node_t build_seq_type_arg (c2m_ctx_t c2m_ctx, struct type *el, pos_t pos) {
+  int ptr_depth = 0;
+  node_t base = NULL;
+
+  /* Peel pointer levels, but keep String intact (it is a basic type). */
+  while (el != NULL && el->mode == TM_PTR && el->u.ptr_type != NULL && !string_type_p (el)) {
+    ptr_depth++;
+    el = el->u.ptr_type;
+  }
+  if (el == NULL) return NULL;
+  if (string_type_p (el)) {
+    base = new_pos_node (c2m_ctx, N_STRING, pos);
+  } else if (el->mode == TM_BASIC) {
+    switch (el->u.basic_type) {
+    case TP_BOOL: base = new_pos_node (c2m_ctx, N_BOOL, pos); break;
+    case TP_CHAR:
+    case TP_SCHAR:
+    case TP_UCHAR: base = new_pos_node (c2m_ctx, N_CHAR, pos); break;
+    case TP_SHORT:
+    case TP_USHORT: base = new_pos_node (c2m_ctx, N_SHORT, pos); break;
+    case TP_INT: base = new_pos_node (c2m_ctx, N_INT, pos); break;
+    case TP_UINT: base = new_pos_node (c2m_ctx, N_UNSIGNED, pos); break;
+    case TP_LONG:
+    case TP_ULONG:
+    case TP_LLONG:
+    case TP_ULLONG: base = new_pos_node (c2m_ctx, N_LONG, pos); break;
+    case TP_FLOAT: base = new_pos_node (c2m_ctx, N_FLOAT, pos); break;
+    case TP_DOUBLE:
+    case TP_LDOUBLE: base = new_pos_node (c2m_ctx, N_DOUBLE, pos); break;
+    default: break;
+    }
+  } else if (el->mode == TM_CLASS && el->u.tag_type != NULL) {
+    node_t id = TAG_ID (el->u.tag_type);
+    if (id != NULL && id->code == N_ID) base = build_id (c2m_ctx, id->u.s.s, pos);
+  }
+  if (base == NULL) return NULL;
+  for (int i = 0; i < ptr_depth; i++) base = new_pos_node1 (c2m_ctx, N_POINTER, pos, base);
+  return base;
+}
+
+/* Locate the array-view constructor of a (specialized) List class: the unique
+   constructor overload taking exactly two user parameters, List(T* items,
+   int count).  SPEC_NAME is the mangled class name (e.g. __generic_List_String).
+   Returns the constructor N_FUNC_DEF or NULL. */
+static node_t find_array_view_ctor (c2m_ctx_t c2m_ctx, const char *spec_name, node_t scope,
+                                    pos_t pos) {
+  char ctor_name[320];
+  symbol_t ctor_sym;
+  node_t ctor_id;
+
+  snprintf (ctor_name, sizeof (ctor_name), "__ctor_%s", spec_name);
+  ctor_id = build_id (c2m_ctx, ctor_name, pos);
+  if (!find_overload_sym (c2m_ctx, ctor_id, scope, &ctor_sym)) return NULL;
+  for (size_t ci = 0; ci < VARR_LENGTH (node_t, ctor_sym.defs); ci++) {
+    node_t cand = VARR_GET (node_t, ctor_sym.defs, ci);
+    decl_t cd;
+    struct func_type *cft;
+    node_t cp;
+    int np = 0;
+    if (cand == NULL || cand->code != N_FUNC_DEF) continue;
+    cd = cand->attr;
+    if (cd == NULL || cd->decl_spec.type == NULL || cd->decl_spec.type->mode != TM_FUNC) continue;
+    cft = cd->decl_spec.type->u.func_type;
+    cp = NL_HEAD (cft->param_list->u.ops);
+    if (cp != NULL) cp = NL_NEXT (cp); /* skip implicit 'this' */
+    for (; cp != NULL; cp = NL_NEXT (cp))
+      if (cp->code == N_SPEC_DECL && !void_param_p (cp)) np++;
+    if (np == 2) return cand;
+  }
+  return NULL;
+}
+
+/* ── Generalized collection-argument adaptation ─────────────────────────────
+   A sized collection argument (a C array, a slice, or an array-decayed pointer
+   that still remembers its origin) passed where the callee expects a pointer
+   parameter immediately followed by an integer length parameter may omit the
+   length: the compiler synthesizes it from the collection itself.  This lets
+   any collection-style API written as `f(T* items, int count)` be called as
+   `f(items)`, e.g. `new List<T>(arr)` — not just List, any such signature.
+
+   The length is a compile-time constant for static arrays, otherwise it is the
+   collection's `.count()` (valid for slices, decayed arrays, and any class with
+   a Count() method).  These are check-phase AST rewrites only; gen simply walks
+   the rewritten argument list. */
+
+/* Argument types that carry, or can yield, a length. */
+static int seq_arg_collection_p (struct type *t) {
+  return t != NULL
+         && (t->mode == TM_ARR || t->mode == TM_SLICE
+             || (t->mode == TM_PTR && t->arr_type != NULL));
+}
+
+/* Compile-time element count of a collection arg type, or -1 if it is only
+   known at run time. */
+static mir_llong seq_arg_static_len (struct type *t) {
+  if (t == NULL) return -1;
+  if (t->mode == TM_ARR) return get_arr_type_size (t);
+  if (t->mode == TM_PTR && t->arr_type != NULL) return get_arr_type_size (t->arr_type);
+  return -1;
+}
+
+/* Build the synthesized length argument for collection ARG of type AT: a
+   constant for static arrays, otherwise `argcopy.count()` (only synthesized for
+   side-effect-free simple lvalues — a plain identifier). */
+static node_t build_seq_count_arg (c2m_ctx_t c2m_ctx, node_t arg, struct type *at, pos_t pos) {
+  mir_llong slen = seq_arg_static_len (at);
+  node_t base_copy, field;
+  if (slen >= 0) return new_i_node (c2m_ctx, (long) slen, pos);
+  base_copy = copy_node (c2m_ctx, arg);
+  field = new_pos_node2 (c2m_ctx, N_FIELD, pos, base_copy, build_id (c2m_ctx, "count", pos));
+  return new_pos_node2 (c2m_ctx, N_CALL, pos, field, new_pos_node (c2m_ctx, N_LIST, pos));
+}
+
+/* If ARG_LIST has fewer arguments than FT's user parameters, attempt to make
+   them match by synthesizing length arguments: wherever a pointer parameter
+   that received a collection argument is immediately followed by an integer
+   parameter with no aligned argument, insert the collection's length after the
+   collection argument.  SKIP_THIS drops the implicit leading 'this' parameter
+   (methods/constructors).  Returns TRUE and mutates ARG_LIST only on a complete
+   match; otherwise leaves ARG_LIST untouched. */
+static int try_expand_collection_count_args (c2m_ctx_t c2m_ctx, node_t r, struct func_type *ft,
+                                             node_t arg_list, int skip_this) {
+#define SEQ_EXPAND_MAX 32
+  node_t params[SEQ_EXPAND_MAX], synth_src[SEQ_EXPAND_MAX];
+  int is_synth[SEQ_EXPAND_MAX];
+  node_t p, a, prev_arg = NULL;
+  int np = 0, na, i, ai, n_synth = 0, prev_ptr_collection = FALSE;
+
+  if (ft == NULL || ft->dots_p) return FALSE;
+  na = (int) NL_LENGTH (arg_list->u.ops);
+  p = NL_HEAD (ft->param_list->u.ops);
+  if (skip_this && p != NULL) p = NL_NEXT (p);
+  for (; p != NULL; p = NL_NEXT (p)) {
+    if (p->code != N_SPEC_DECL && p->code != N_TYPE) continue;
+    if (void_param_p (p)) continue;
+    if (np >= SEQ_EXPAND_MAX) return FALSE;
+    params[np++] = p;
+  }
+  if (na >= np) return FALSE; /* only adapt a short call */
+
+  ai = 0;
+  a = NL_HEAD (arg_list->u.ops);
+  for (i = 0; i < np; i++) {
+    struct decl_spec *pds = get_param_decl_spec (params[i]);
+    struct type *pt = pds != NULL ? pds->type : NULL;
+    is_synth[i] = FALSE;
+    synth_src[i] = NULL;
+    if ((na - ai) < (np - i) && prev_ptr_collection && pt != NULL && integer_type_p (pt)) {
+      is_synth[i] = TRUE;
+      synth_src[i] = prev_arg;
+      prev_ptr_collection = FALSE;
+      n_synth++;
+      continue;
+    }
+    if (a == NULL) return FALSE;
+    {
+      struct expr *ae = a->attr;
+      struct type *at = ae != NULL ? ae->type : NULL;
+      int coll = seq_arg_collection_p (at);
+      int synthesizable = coll && (seq_arg_static_len (at) >= 0 || a->code == N_ID);
+      prev_ptr_collection = (pt != NULL && pt->mode == TM_PTR && synthesizable);
+      prev_arg = a;
+    }
+    a = NL_NEXT (a);
+    ai++;
+  }
+  if (a != NULL || ai != na || n_synth == 0) return FALSE;
+
+  for (i = 0; i < np; i++) {
+    node_t coll, cnt;
+    struct expr *ce;
+    if (!is_synth[i]) continue;
+    coll = synth_src[i];
+    ce = coll->attr;
+    cnt = build_seq_count_arg (c2m_ctx, coll, ce != NULL ? ce->type : NULL, POS (coll));
+    DLIST_INSERT_AFTER (node_t, arg_list->u.ops, coll, cnt);
+    check (c2m_ctx, cnt, r);
+  }
+  return TRUE;
+#undef SEQ_EXPAND_MAX
+}
+
+/* Scan the overloads in SYM for a function/method/constructor that ARG_LIST can
+   satisfy via collection count-argument expansion (see above).  On success
+   inserts the synthesized length argument(s) into ARG_LIST and returns the
+   chosen N_FUNC_DEF; otherwise returns NULL and leaves ARG_LIST untouched. */
+static node_t select_overload_with_count_expansion (c2m_ctx_t c2m_ctx, node_t r, symbol_t *sym,
+                                                    int skip_this) {
+  for (size_t ci = 0; ci < VARR_LENGTH (node_t, sym->defs); ci++) {
+    node_t cand = VARR_GET (node_t, sym->defs, ci);
+    decl_t cd;
+    if (cand == NULL || cand->code != N_FUNC_DEF) continue;
+    cd = cand->attr;
+    if (cd == NULL || cd->decl_spec.type == NULL || cd->decl_spec.type->mode != TM_FUNC) continue;
+    if (try_expand_collection_count_args (c2m_ctx, r, cd->decl_spec.type->u.func_type,
+                                          NL_NEXT (NL_HEAD (r->u.ops)) /* arg_list */, skip_this))
+      return cand;
+  }
+  return NULL;
+}
+
+/* Check a generic-class specialization (N_CLASS) that was synthesized in the
+   middle of checking a function body (e.g. by `arr.ToList()`, which needs
+   List<T> instantiated lazily — there is no explicit `List<T>` declaration to
+   trigger it at parse time).  All per-function check state is saved and
+   restored so the enclosing function's check continues undisturbed; the class
+   is checked at top scope, exactly like a parse-time-injected specialization.
+   Mirrors check_lambda_func_def. */
+static void check_injected_class (c2m_ctx_t c2m_ctx, node_t class_node) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
+  node_t saved_scope = curr_scope, saved_func_block_scope = func_block_scope;
+  node_t saved_func_def = curr_func_def, saved_class = curr_class;
+  node_t saved_switch = curr_switch, saved_loop = curr_loop;
+  node_t saved_loop_switch = curr_loop_switch;
+  node_t saved_unnamed = curr_unnamed_anon_struct_union_member;
+  node_t saved_lambda_def = curr_lambda_def;
+  unsigned saved_scope_num = curr_func_scope_num;
+  unsigned char saved_in_params_p = in_params_p, saved_jump_ret_p = jump_ret_p;
+  mir_size_t saved_arg_area = curr_call_arg_area_offset;
+  size_t i, fda_len = VARR_LENGTH (decl_t, func_decls_for_allocation);
+  size_t lu_len = VARR_LENGTH (node_t, label_uses);
+  decl_t *fda_save = NULL;
+  node_t *lu_save = NULL;
+
+  /* The class's method FUNC_DEFs truncate/consume these per-function VARRs;
+     preserve the enclosing function's entries (as check_lambda_func_def does). */
+  if (fda_len != 0) {
+    fda_save = reg_malloc (c2m_ctx, fda_len * sizeof (decl_t));
+    memcpy (fda_save, VARR_ADDR (decl_t, func_decls_for_allocation), fda_len * sizeof (decl_t));
+  }
+  if (lu_len != 0) {
+    lu_save = reg_malloc (c2m_ctx, lu_len * sizeof (node_t));
+    memcpy (lu_save, VARR_ADDR (node_t, label_uses), lu_len * sizeof (node_t));
+  }
+  VARR_TRUNC (node_t, label_uses, 0);
+  curr_scope = top_scope;
+  curr_class = NULL;
+  check (c2m_ctx, class_node, NULL);
+  VARR_TRUNC (decl_t, func_decls_for_allocation, 0);
+  for (i = 0; i < fda_len; i++) VARR_PUSH (decl_t, func_decls_for_allocation, fda_save[i]);
+  VARR_TRUNC (node_t, label_uses, 0);
+  for (i = 0; i < lu_len; i++) VARR_PUSH (node_t, label_uses, lu_save[i]);
+  curr_scope = saved_scope;
+  func_block_scope = saved_func_block_scope;
+  curr_func_def = saved_func_def;
+  curr_class = saved_class;
+  curr_switch = saved_switch;
+  curr_loop = saved_loop;
+  curr_loop_switch = saved_loop_switch;
+  curr_unnamed_anon_struct_union_member = saved_unnamed;
+  curr_lambda_def = saved_lambda_def;
+  curr_func_scope_num = saved_scope_num;
+  in_params_p = saved_in_params_p;
+  jump_ret_p = saved_jump_ret_p;
+  curr_call_arg_area_offset = saved_arg_area;
+}
+
+/* Drain generic-class specializations that get_or_create_specialization pushed
+   onto pending_lambdas after MARK while we were checking a function body, and
+   that aren't otherwise materialized (parse-time specializations are drained
+   into the module before their consuming item; ones created lazily during the
+   check phase — notably by `arr.ToList()` — are not).  Each new specialization
+   is injected into the module item list before the item currently being checked
+   (so gen emits its methods first) and then checked, defining its class symbol
+   for the find_def lookup that follows.  No-op when nothing new was pushed. */
+static void materialize_pending_specs (c2m_ctx_t c2m_ctx, size_t mark) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+
+  if (module_item_list == NULL || curr_module_item == NULL) return;
+  while (VARR_LENGTH (node_t, pending_lambdas) > mark) {
+    /* Snapshot and clear the new tail first: checking an item may itself push
+       further specializations, which the outer loop then picks up in order. */
+    size_t n = VARR_LENGTH (node_t, pending_lambdas) - mark;
+    node_t *items = reg_malloc (c2m_ctx, n * sizeof (node_t));
+    for (size_t i = 0; i < n; i++) items[i] = VARR_GET (node_t, pending_lambdas, mark + i);
+    VARR_TRUNC (node_t, pending_lambdas, mark);
+    for (size_t i = 0; i < n; i++) {
+      DLIST_INSERT_BEFORE (node_t, module_item_list->u.ops, curr_module_item, items[i]);
+      if (items[i]->code == N_CLASS)
+        check_injected_class (c2m_ctx, items[i]);
+      else
+        check_lambda_func_def (c2m_ctx, items[i]);
+    }
+  }
+}
+
 /* Check a sequence lambda-method call  recv.filter/map/reduce/count(...).
    R is the N_CALL node, SR the (already classified) receiver, ARG_LIST the
    call arguments.  Returns the call's result type, or NULL after reporting
    an error. */
 static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm,
                                            struct seq_recv *sr, node_t arg_list) {
-  static const char *const seq_names[] = {"?", "filter", "map", "reduce", "count"};
+  static const char *const seq_names[] = {"?", "filter", "map", "reduce", "count", "ToList"};
+  check_ctx_t check_ctx = c2m_ctx->check_ctx; /* for the curr_scope macro */
   int nargs;
   node_t arg, cb_node, init_node;
   struct type *res, *acc_type = NULL, *el_type = sr->el_type, *cb_ret;
@@ -11031,7 +11324,7 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
     return NULL;
   }
   set_type_layout (c2m_ctx, el_type);
-  if (sm != SEQM_COUNT && (!scalar_type_p (el_type) || el_type->mode == TM_SLICE)) {
+  if (sm != SEQM_COUNT && sm != SEQM_TOLIST && (!scalar_type_p (el_type) || el_type->mode == TM_SLICE)) {
     error (c2m_ctx, POS (r),
            "'%s' requires a scalar element type (integer, floating, pointer, String)",
            seq_names[sm]);
@@ -11048,6 +11341,68 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
 
   if (sm == SEQM_COUNT) {
     res = create_basic_type (c2m_ctx, get_uint_basic_type (sizeof (mir_size_t)));
+    res->pos_node = r;
+    return res;
+  }
+  if (sm == SEQM_TOLIST) {
+    /* arr.ToList() / slice.ToList(): instantiate List<el_type> and lower (in gen)
+       to a heap allocation followed by the array-view constructor
+       List(T* items, int count), supplying the receiver's element base and its
+       (statically known, or slice-header) length as the count.  Class receivers
+       have no contiguous element storage, so are not supported. */
+    node_t type_arg, spec_id, class_def, field, ctor_def;
+    struct type *class_type;
+
+    if (sr->kind != SEQ_RECV_ARR && sr->kind != SEQ_RECV_SLICE) {
+      error (c2m_ctx, POS (r), "'ToList' is only supported for arrays and slices");
+      return NULL;
+    }
+    if ((type_arg = build_seq_type_arg (c2m_ctx, el_type, POS (r))) == NULL) {
+      error (c2m_ctx, POS (r), "'ToList' is not supported for this element type");
+      return NULL;
+    }
+    {
+      /* get_or_create_specialization queues a newly-created List<T> onto
+         pending_lambdas.  At parse time that queue is drained into the module;
+         during the check phase (the `auto lst = arr.ToList();` case, where no
+         explicit `List<T>` declaration created the specialization earlier) it
+         is not, so materialize it here before the lookup below. */
+      parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+      size_t pend_mark = VARR_LENGTH (node_t, pending_lambdas);
+      spec_id = get_or_create_specialization (c2m_ctx, "List", 1, &type_arg, POS (r));
+      materialize_pending_specs (c2m_ctx, pend_mark);
+    }
+    if (spec_id == NULL || spec_id->code != N_ID) {
+      error (c2m_ctx, POS (r), "'ToList' could not instantiate List<T>");
+      return NULL;
+    }
+    class_def = find_def (c2m_ctx, S_REGULAR, spec_id, curr_scope, NULL);
+    if (class_def == NULL || class_def->code != N_CLASS) {
+      error (c2m_ctx, POS (r),
+             "'ToList' requires the generic List<T> class in scope (#include \"list.h\")");
+      return NULL;
+    }
+    class_type = create_class_type (c2m_ctx, class_def);
+    set_class_layout (c2m_ctx, class_def, class_type);
+
+    ctor_def = find_array_view_ctor (c2m_ctx, spec_id->u.s.s, curr_scope, POS (r));
+    if (ctor_def == NULL) {
+      error (c2m_ctx, POS (r),
+             "'ToList' requires List<T>'s array-view constructor List(T*, int)");
+      return NULL;
+    }
+    /* Stash the resolved constructor on the receiver field node's expr: r->attr
+       is overwritten by create_expr at seq_method_done, but the field node's
+       expr survives unchanged through to gen. */
+    field = NL_HEAD (r->u.ops);
+    if (field != NULL && field->attr != NULL)
+      ((struct expr *) field->attr)->def_node = ctor_def;
+
+    res = create_type (c2m_ctx, NULL);
+    init_type (res);
+    res->mode = TM_PTR;
+    res->u.ptr_type = class_type;
+    set_type_layout (c2m_ctx, res);
     res->pos_node = r;
     return res;
   }
@@ -13034,8 +13389,16 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
         /* For positional calls: pick the best-matching constructor overload now
            that all argument types are known.  Named-arg calls already set
            ctor_def during the reordering step above. */
-        if (!has_named && has_ctor_sym)
+        if (!has_named && has_ctor_sym) {
           ctor_def = select_method_overload (c2m_ctx, &ctor_sym, class_def, arg_list);
+          /* Collection convenience: a short call passing a sized collection where
+             a (T* items, int count) constructor is expected fills in the count,
+             e.g. new List<T>(arr) == new List<T>(arr, arr.count()). */
+          {
+            node_t expanded = select_overload_with_count_expansion (c2m_ctx, r, &ctor_sym, TRUE);
+            if (expanded != NULL) ctor_def = expanded;
+          }
+        }
 
         if (ctor_def != NULL && ctor_def->code == N_FUNC_DEF) {
           decl_t cdecl = ctor_def->attr;
@@ -14061,10 +14424,18 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
 	                // share the name, pick the best match for the argument types.
 	                symbol_t msym;
 	                node_t func_def = NULL;
-	                if (find_overload_sym(c2m_ctx, method_id, obj_type->u.tag_type, &msym))
+	                int have_msym = find_overload_sym(c2m_ctx, method_id, obj_type->u.tag_type, &msym);
+	                if (have_msym)
 	                  func_def = select_method_overload(c2m_ctx, &msym, obj_type->u.tag_type, arg_list);
 	                if (!func_def)
 	                  func_def = find_def(c2m_ctx, S_REGULAR, method_id, obj_type->u.tag_type, NULL);
+	                /* Collection convenience: list->AddRange(arr) fills the count of a
+	                   (T* items, int count) method, just like the constructor case. */
+	                if (have_msym) {
+	                  node_t expanded
+	                    = select_overload_with_count_expansion(c2m_ctx, r, &msym, TRUE);
+	                  if (expanded != NULL) func_def = expanded;
+	                }
 	                if (!func_def) {
 	                  error(c2m_ctx, POS(r), "method '%s' not found in class", method_id->u.s.s);
 	                  break;
@@ -18925,6 +19296,75 @@ static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm
   }
 
   if (sm == SEQM_COUNT) return n_save;
+
+  if (sm == SEQM_TOLIST) {
+    /* Lower arr.ToList() to:  obj = malloc(sizeof(List<T>)); memset(obj,0);
+       List::List(obj, base, n_save).  The element base is in `base` and the
+       element count in `n_save` (set above for ARR/SLICE receivers).  The
+       List<T>* result type and the resolved array-view constructor were
+       computed during check (the ctor is stashed on the field node's expr). */
+    struct expr *re = r->attr;
+    struct expr *fe = field->attr;
+    node_t ctor_def = fe != NULL ? fe->def_node : NULL;
+    struct type *list_ptr_t = re != NULL ? re->type : NULL;
+    struct type *class_type
+      = (list_ptr_t != NULL && list_ptr_t->mode == TM_PTR) ? list_ptr_t->u.ptr_type : NULL;
+    decl_t cdecl;
+    struct func_type *ft;
+    MIR_item_t proto;
+    char pname[64];
+    size_t ops_start;
+    node_t param;
+    mir_size_t csize;
+    op_t obj;
+
+    assert (ctor_def != NULL && class_type != NULL);
+    csize = type_size (c2m_ctx, class_type);
+    obj = gen_heap_alloc (c2m_ctx, csize == 0 ? 1 : csize);
+    if (csize > 0) gen_memset (c2m_ctx, 0, obj.mir_op.u.reg, csize);
+
+    cdecl = ctor_def->attr;
+    ft = cdecl->decl_spec.type->u.func_type;
+    collect_args_and_func_types (c2m_ctx, ft);
+    sprintf (pname, "__tolistproto%d", new_proto_count++);
+    proto = MIR_new_proto_arr (ctx, pname,
+                               VARR_LENGTH (MIR_type_t, proto_info.ret_types),
+                               VARR_ADDR (MIR_type_t, proto_info.ret_types),
+                               VARR_LENGTH (MIR_var_t, proto_info.arg_vars),
+                               VARR_ADDR (MIR_var_t, proto_info.arg_vars));
+    move_item_to_module_start (curr_func->module, proto);
+
+    ops_start = VARR_LENGTH (MIR_op_t, call_ops);
+    VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, proto));
+    VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, cdecl->u.item));
+    {
+      target_arg_info_t new_arg_info;
+      struct decl_spec *pds;
+      target_init_arg_vars (c2m_ctx, &new_arg_info);
+      /* 'this' */
+      target_add_call_arg_op (c2m_ctx, list_ptr_t, &new_arg_info, obj);
+      param = NL_HEAD (ft->param_list->u.ops);
+      if (param != NULL) param = NL_NEXT (param); /* skip 'this' */
+      /* items: T* — pass the element base address directly */
+      pds = param != NULL ? get_param_decl_spec (param) : NULL;
+      target_add_call_arg_op (c2m_ctx, pds != NULL ? pds->type : list_ptr_t, &new_arg_info, base);
+      if (param != NULL) param = NL_NEXT (param);
+      /* count: int — promote the I64 length register to the parameter type */
+      pds = param != NULL ? get_param_decl_spec (param) : NULL;
+      {
+        op_t cnt_arg = n_save;
+        if (pds != NULL)
+          cnt_arg = promote (c2m_ctx, n_save,
+                             promote_mir_int_type (get_mir_type (c2m_ctx, pds->type)), FALSE);
+        target_add_call_arg_op (c2m_ctx, pds != NULL ? pds->type : NULL, &new_arg_info, cnt_arg);
+      }
+    }
+    emit_insn (c2m_ctx,
+               MIR_new_insn_arr (ctx, MIR_CALL, VARR_LENGTH (MIR_op_t, call_ops) - ops_start,
+                                 VARR_ADDR (MIR_op_t, call_ops) + ops_start));
+    VARR_TRUNC (MIR_op_t, call_ops, ops_start);
+    return obj;
+  }
 
   struct type *el_type = sr.el_type;
   MIR_type_t el_mir_t = get_mir_type (c2m_ctx, el_type);

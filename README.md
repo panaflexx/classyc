@@ -20,6 +20,9 @@ printf("%s\n", greeting + " from " + name);   // concatenation with auto-promoti
 String s = "  Schöne Grüße  ";
 s = s.trim().upper();                         // many built-in methods
 size_t len = s.length();
+
+String path = "/home/user/docs/report.pdf";
+if (path.find(".pdf")) path = path.replace(".pdf", ".txt");
 ```
 
 ### Heterogeneous `dict` (JSON-like)
@@ -118,9 +121,12 @@ Works over arrays, dicts, and (via methods) strings.
 
 ### Generics, `List<T>` & Lambdas
 ```c
-List<int> nums = {1, 2, 3};          // brace-init
-nums = nums.Filter((int x) => x > 1)
-             .Map((int x) => x * 2);
+List<int> nums = {1, 2, 3};                            // brace-init
+nums = nums.Filter((int x) => x > 1).Map((int x) => x * 2);
+
+List<String> files = {"a.txt", "b.pdf", "c.txt"};   // brace-init + String
+files = files.Filter((String f) => f.find(".txt"))
+               .Map((String f) => f.replace(".txt", ".bak"));
 
 List<Any<View>*> widgets = { any<View>(new Button()), any<View>(new Text()) };
 for (auto v in widgets) v->render();   // heterogeneous via type erasure

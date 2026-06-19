@@ -1,7 +1,7 @@
 /* list.h — Generic dynamic-array collection for ClassyC
  *
  * Provides a production-ready List<T> with 30 methods covering:
- *   · Constructors (default, capacity, singleton)
+ *   · Constructors (default, capacity, singleton, array-view)
  *   · Accessors    (Count, Capacity, IsEmpty, Get, First, Last)
  *   · Capacity     (EnsureCapacity, TrimExcess)
  *   · Mutation     (Set, Add, Insert, Pop, RemoveAt, Remove, Clear)
@@ -14,6 +14,14 @@
  *   List<int>* nums = new List<int>();
  *   nums->Add(42);
  *   defer delete nums;
+ *
+ *   // from a C array, explicit array-view constructor:
+ *   String arr[3] = {"a", "b", "c"};
+ *   List<String>* lst = new List<String>(arr, 3);
+ *
+ *   // ...or let the compiler supply the count via arr.ToList(), which lowers
+ *   // to the same List(T* items, int count) constructor below:
+ *   List<String>* lst2 = arr.ToList();
  *
  * Memory: Caller owns heap-allocated List<T> instances. Use `defer delete` for
  * scope-bound cleanup. Slice() and Copy() return new heap allocations that the
@@ -59,7 +67,35 @@ class List<T> {
         this->length   = 1;
     }
 
-    /* ═══════════════════════════ Destructor ════════════════════════════ */
+    /* Array view: copy ‘count’ elements from a plain C array.
+     * Caller keeps ownership of the source array.  This is also the constructor
+     * that `arr.ToList()` lowers to: the compiler passes the element base
+     * pointer and the array's (statically known) / slice's length as `count`,
+     * since a bare T* pointer carries no length of its own. */
+    List(T* items, int count) {
+        int n = count > 0 ? count : 0;
+        this->length   = 0;
+        this->capacity = n > 0 ? n : 4;
+        this->data     = (T*) malloc(sizeof(T) * this->capacity);
+        for (int i = 0; i < n; i++) {
+            this->data[i] = items[i];
+            this->length++;
+        }
+    }
+
+    /* BONUS items now carries a .count()  */
+    List(T* items) {
+        int n = items.count();
+        this->length   = 0;
+        this->capacity = n > 0 ? n : 4;
+        this->data     = (T*) malloc(sizeof(T) * this->capacity);
+        for (int i = 0; i < n; i++) {
+            this->data[i] = items[i];
+            this->length++;
+        }
+    }
+
+    /* ═══════════════════════════ Destructor ═════════════════════════════════ */
 
     ~List() {
         if (this->data) free((void*) this->data);
