@@ -21,6 +21,49 @@ void risky(int code) {
     printf("    risky(%d): completed normally\n", code);
 }
 
+/* Deep throw helpers: throw originates two call frames below the try. */
+void deepest() {
+    throw(RuntimeException, "deep throw from two levels down");
+}
+
+void middle() {
+    deepest();
+}
+
+void deep_risky() {
+    middle();
+}
+
+/* Three more frames (four total below try). */
+void deeper3() {
+    throw(RuntimeException, "four frames deep");
+}
+
+void level2() {
+    deeper3();
+}
+
+void level1() {
+    level2();
+}
+
+void super_deep() {
+    level1();
+}
+
+/* Three-class deep throw: try in main, throw originates in ctor of C. */
+class C {
+    C() { throw(RuntimeException, "thrown from C ctor (three classes deep)"); }
+};
+
+class B {
+    B() { new C(); }
+};
+
+class A {
+    A() { new B(); }
+};
+
 int main() {
     printf("=== ClassyC exceptions ===\n\n");
 
@@ -67,6 +110,30 @@ int main() {
         printf("    WRONG: handler should not run\n");
     }
 
-    printf("\n=== done ===\n");
+    	/* 5. Deep throw: two frames below the try site. */
+    	printf("\n[5] deep throw (two frames below try)\n");
+    	try {
+    	    deep_risky();
+    	} catch (Exception e) {
+    	    printf("    caught deep throw: id=%u msg=\"%s\"\n", e.id, e.msg);
+    	}
+
+	/* 6. Even deeper: four frames below the try. */
+	printf("\n[6] four-frame-deep throw\n");
+	try {
+	    super_deep();
+	} catch (Exception e) {
+	    printf("    caught four-deep: id=%u msg=\"%s\"\n", e.id, e.msg);
+	}
+
+	/* 7. Three classes deep: throw in ctor of C, caught in main. */
+	printf("\n[7] three-class-deep throw (C ctor)\n");
+	try {
+	    new A();
+	} catch (Exception e) {
+	    printf("    caught from C ctor: id=%u msg=\"%s\"\n", e.id, e.msg);
+	}
+
+	printf("\n=== done ===\n");
     return 0;
 }

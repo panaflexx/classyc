@@ -134,6 +134,21 @@ class Circle impl Drawable { ... }
 Any<Drawable> d = any<Drawable>(new Circle());  // erased handle
 ```
 
+### Exceptions (opt-in)
+```c
+try {
+    risky();
+} catch (NullException e) {
+    printf("null: %s\n", e.msg);
+} catch (Exception e) {
+    printf("other (id=%u): %s\n", e.id, e.msg);
+}
+
+throw(OutOfBoundsException, "bad index");
+```
+
+Enabled with `-fexceptions` (default off; disable explicitly with `-fno-exceptions`). Built-in values: `NullException`, `OutOfBoundsException`, `RuntimeException`, base `Exception`. No `#include` required,
+
 ### Full C11 Base + Useful Extensions
 - All standard C11 features (minus atomics/complex/VLA/TLS)
 - Statement expressions, labels as values, range cases, binary literals, etc.
@@ -206,6 +221,7 @@ Look in the `examples/` directory:
 | `test-any-arena.c`         | `Any<I>` type erasure + arena-managed handles |
 | `test-interface.c`         | `interface` + `impl` structural conformance |
 | `test-any.c`               | Heterogeneous `List<Any<View>*>` (arena + non-arena) |
+| `classy-exceptions.cy`     | `try`/`catch`/`throw` (opt-in via `-fexceptions`) |
 
 Run them all with:
 ```bash
