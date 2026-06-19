@@ -692,7 +692,10 @@ typedef enum {
   N_LAMBDA, /* (params) => body — anonymous function (future: untyped/generic lambdas) */
   N_INTERFACE, /* interface Name { sig; ... } — named structural method-set contract */
   N_ANY,    /* any<I>(expr) — wrap a concrete C* as an erased Any<I>* handle */
-} node_code_t;
+    N_TRY,      /* try block { ... } followed by one or more catch clauses    */
+    N_CATCH,    /* catch(Class? var) { handler } — a single clause of an N_TRY */
+    N_THROW     /* throw(id, message) → cy_exc_throw(longjmp frame)            */
+  } node_code_t;
 
 #undef REP_SEP
 
@@ -6902,6 +6905,76 @@ D (stmt) {
       PT (';');
     }
     r = new_pos_node2 (c2m_ctx, N_RETURN, pos, l, r);
+/* ── Exception: throw(id_expr) / throw(id_expr, msg_expr) ─────── */
+  } else if (C_SOFT("throw")) {
+    size_t mark = record_start(c2m_ctx);
+
+    M_SOFT("throw");
+    pos_t tpos = curr_token->pos;
+    /* Use assign_expr (not expr) so the top-level ',' separates the two
+       arguments rather than being parsed as a comma-operator expression. */
+    PT('('); P(assign_expr); op1 = r;          /* id expr  */
+    if (M(',')) { P(assign_expr); op2 = r; }   /* msg expr */
+    else      op2 = new_node(c2m_ctx, N_IGNORE);
+    PT(')'); PT(';');
+    record_stop(c2m_ctx, mark, FALSE);
+    r = new_pos_node3(c2m_ctx, N_THROW, tpos, l, op1, op2);
+/* ── Exception: try { body } catch(Class? var) { handler } ... ──
+   Layout: N_TRY(labels, body_block, N_LIST:(N_CATCH)+)
+           N_CATCH(class_sel | N_IGNORE, var_id, handler_block)
+   Each handler block gets a synthesized leading `Exception <var>;` decl. */
+  } else if (C_SOFT("try")) {
+    pos_t tpos = curr_token->pos;
+    node_t body_block, catch_list;
+
+    M_SOFT("try");
+    if (!C('{')) { syntax_error(c2m_ctx, "expected '{' after try"); return err_node; }
+    P(compound_stmt);                 /* try-body block (own scope) */
+    body_block = r;
+    catch_list = new_pos_node(c2m_ctx, N_LIST, tpos);
+    if (!C_SOFT("catch")) {
+      syntax_error(c2m_ctx, "expected 'catch' after try block");
+      return err_node;
+    }
+    while (C_SOFT("catch")) {          /* one or more catch clauses */
+      node_t class_sel, var_id, handler_block, specs, declr, sd, blist;
+      const char *vname; pos_t vpos;
+
+      M_SOFT("catch");
+      PT('(');
+      if (curr_token->code != T_ID) {
+        syntax_error(c2m_ctx, "expected identifier in catch(...)");
+        return err_node;
+      }
+      { /* First id is either a class selector or, alone, the variable. */
+        const char *n1 = curr_token->repr; pos_t p1 = curr_token->pos;
+        read_token(c2m_ctx);
+        if (curr_token->code == T_ID) {            /* "Class var" */
+          class_sel = build_id(c2m_ctx, n1, p1);
+          vname = curr_token->repr; vpos = curr_token->pos;
+          read_token(c2m_ctx);
+        } else {                                   /* "var" -> catch-all */
+          class_sel = new_node(c2m_ctx, N_IGNORE);
+          vname = n1; vpos = p1;
+        }
+      }
+      var_id = build_id(c2m_ctx, vname, vpos);
+      PT(')');
+      if (!C('{')) { syntax_error(c2m_ctx, "expected '{' after catch(...)"); return err_node; }
+      P(compound_stmt);               /* handler block (own scope) */
+      handler_block = r;
+      /* Prepend "Exception <var>;" so the handler can read e.id / e.msg. */
+      specs = new_node(c2m_ctx, N_LIST);
+      op_append(c2m_ctx, specs, build_id(c2m_ctx, "Exception", vpos));
+      declr = new_pos_node2(c2m_ctx, N_DECL, vpos, build_id(c2m_ctx, vname, vpos),
+                            new_node(c2m_ctx, N_LIST));
+      sd = build_spec_decl(c2m_ctx, vpos, specs, declr, NULL, NULL, NULL);
+      blist = NL_EL(handler_block->u.ops, 1);    /* N_BLOCK: [labels, items] */
+      op_prepend(c2m_ctx, blist, sd);
+      op_append(c2m_ctx, catch_list,
+                new_pos_node3(c2m_ctx, N_CATCH, tpos, class_sel, var_id, handler_block));
+    }
+    r = new_pos_node3(c2m_ctx, N_TRY, tpos, l, body_block, catch_list);
   } else { /* expression-statement */
     if (C (';')) {
       r = new_node (c2m_ctx, N_IGNORE);
@@ -7708,6 +7781,21 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (iface_t, interfaces, alloc, 4);
 }
 
+/* ClassyC exception prelude — injected into every translation unit so that
+   try/catch/throw type-check without the user including anything.  `Exception`
+   is the value type bound to a `catch` variable; its layout must match
+   cy_exception_t in the runtime (include/cyexc.h).  The named classes are plain
+   integer ids: `throw(NullException, msg)` and `catch(NullException e)` both
+   resolve them as ordinary constants, and users can extend the set with their
+   own `enum { MyException = 100 };`. */
+static const char *const exception_prelude =
+  "typedef struct { unsigned int id; const char *msg; const char *file; int line; } Exception;\n"
+  "enum {\n"
+  "  AnyException = 0, NullException = 1, OutOfBoundsException = 2,\n"
+  "  ArithmeticException = 3, RuntimeException = 4, IOException = 5,\n"
+  "  ValueException = 6, TypeException = 7, KeyException = 8\n"
+  "};\n";
+
 static void add_standard_includes (c2m_ctx_t c2m_ctx) {
   const char *str, *name;
 
@@ -7716,6 +7804,7 @@ static void add_standard_includes (c2m_ctx_t c2m_ctx) {
     str = standard_includes[i].content;
     add_string_stream (c2m_ctx, "<environment>", str);
   }
+  add_string_stream (c2m_ctx, "<exception-prelude>", exception_prelude);
 }
 
 static node_t parse (c2m_ctx_t c2m_ctx) {
@@ -8027,7 +8116,7 @@ static int string_type_p (const struct type *type) {
     if (type->mode == TM_PTR && type->pos_node && type->pos_node->code == N_STR)
         return 1;
     return (type->mode == TM_BASIC || type->mode == TM_PTR)
-        && (type->u.basic_type == TP_STRING || type->u.basic_type == TM_PTR);
+        && (type->u.basic_type == TP_STRING || type->mode == TM_PTR);
 }
 
 /* True only for the built-in String basic type (TP_STRING), not arbitrary
@@ -10140,7 +10229,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
             error (c2m_ctx, POS (assign_node), "%s", msg);
           }
         }
-      } else if (string_type_p (left)) {
+	      } else if (builtin_string_type_p (left)) {
           /* String lvalue: accept String, char*, const char*, and string literals
              (TM_ARR of char), so that `String key = "foo"` and struct field
              initializers like `{.key = "Content-Type"}` work naturally. */
@@ -11905,6 +11994,9 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
         NODE_CASE (FORIN)
         NODE_CASE (DEFER)
         NODE_CASE (DELETE)
+        NODE_CASE (TRY)
+        NODE_CASE (CATCH)
+        NODE_CASE (THROW)
         *stmt_p = TRUE;
         break;
         REP8 (NODE_CASE, IGNORE, CASE, DEFAULT, LABEL, LIST, SHARE, TYPEDEF, EXTERN)
@@ -15237,10 +15329,39 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
       /* Phase 1: structurally verify any `impl I, J` clauses. */
       verify_class_impls (c2m_ctx, r, class_type->u.tag_type);
     }
-    break;
-  }
+        break;
+      }
 
-  default:
+      case N_THROW: {
+        /* ops: [labels, id_expr, msg_expr?] */
+        node_t id_expr  = NL_EL(r->u.ops, 1);
+        node_t msg_expr = NL_EL(r->u.ops, 2);
+        check(c2m_ctx, id_expr, r);                 /* exception id  (int)     */
+        if (msg_expr != NULL && msg_expr->code != N_IGNORE)
+          check(c2m_ctx, msg_expr, r);              /* message       (String)  */
+        break;
+      }
+
+      case N_TRY: {
+        /* ops: [labels, body_block, N_LIST:(N_CATCH)+] */
+        node_t body       = NL_EL(r->u.ops, 1);
+        node_t catch_list = NL_EL(r->u.ops, 2);
+
+        check(c2m_ctx, body, r);                    /* walk try body block     */
+        for (node_t cat = NL_HEAD(catch_list->u.ops); cat != NULL; cat = NL_NEXT(cat)) {
+          node_t class_sel = NL_EL(cat->u.ops, 0);  /* class selector | N_IGNORE */
+          node_t handler   = NL_EL(cat->u.ops, 2);  /* handler block            */
+          /* A named class selector must resolve to a constant integer id (an
+             enum constant from the exception prelude or any user constant).
+             An absent selector or the base type `Exception` => catch-all. */
+          if (class_sel->code == N_ID && strcmp(class_sel->u.s.s, "Exception") != 0)
+            check(c2m_ctx, class_sel, cat);
+          check(c2m_ctx, handler, cat);             /* declares catch var + body */
+        }
+        break;
+      }
+
+      default:
     printf("ERROR: invalid r->code = %d\n", r->code);
       abort ();
   }
@@ -15452,16 +15573,26 @@ struct gen_ctx {
   MIR_item_t obj_detach_proto, obj_detach_item;
   op_t obj_scope_mark;
   int obj_scope_active;
+  /* try/catch/throw exception runtime - lazily imported on first use.
+     setjmp-frame model: cy_exc_push() pushes a frame and returns its jmp_buf,
+     the generator calls setjmp() inline, cy_exc_throw() records the exception
+     and longjmps to the innermost frame, cy_exc_pop() unwinds one frame. */
+  MIR_item_t cy_exc_push_proto, cy_exc_push_item;       /* void *cy_exc_push(void)        */
+  MIR_item_t cy_exc_pop_proto, cy_exc_pop_item;         /* void  cy_exc_pop(void)         */
+  MIR_item_t cy_exc_current_proto, cy_exc_current_item; /* void *cy_exc_current(void)     */
+  MIR_item_t cy_exc_throw_proto, cy_exc_throw_item;     /* void  cy_exc_throw(id,msg,f,l) */
+  MIR_item_t cy_setjmp_proto, cy_setjmp_item;           /* int   setjmp(void *buf)        */
+  int exc_depth;                                        /* try nesting depth (label uids) */
   VARR (MIR_op_t) * call_ops, *ret_ops, *switch_ops;
   VARR (case_t) * switch_cases;
   int curr_mir_proto_num;
   HTAB (MIR_item_t) * proto_tab;
   VARR (node_t) * node_stack;
   /* Debug source location tracking for MIR instructions */
-  uint16_t curr_src_file_id;
-  uint32_t curr_src_line;
-  uint16_t curr_src_col;
-};
+      uint16_t curr_src_file_id;
+      uint32_t curr_src_line;
+      uint16_t curr_src_col;
+  };
 
 #define zero_op gen_ctx->zero_op
 #define one_op gen_ctx->one_op
@@ -15572,6 +15703,17 @@ struct gen_ctx {
 #define obj_detach_item gen_ctx->obj_detach_item
 #define obj_scope_mark gen_ctx->obj_scope_mark
 #define obj_scope_active gen_ctx->obj_scope_active
+#define cy_exc_push_proto gen_ctx->cy_exc_push_proto
+#define cy_exc_push_item gen_ctx->cy_exc_push_item
+#define cy_exc_pop_proto gen_ctx->cy_exc_pop_proto
+#define cy_exc_pop_item gen_ctx->cy_exc_pop_item
+#define cy_exc_current_proto gen_ctx->cy_exc_current_proto
+#define cy_exc_current_item gen_ctx->cy_exc_current_item
+#define cy_exc_throw_proto gen_ctx->cy_exc_throw_proto
+#define cy_exc_throw_item gen_ctx->cy_exc_throw_item
+#define cy_setjmp_proto gen_ctx->cy_setjmp_proto
+#define cy_setjmp_item gen_ctx->cy_setjmp_item
+#define exc_depth gen_ctx->exc_depth
 #define call_ops gen_ctx->call_ops
 #define ret_ops gen_ctx->ret_ops
 #define switch_ops gen_ctx->switch_ops
@@ -17351,6 +17493,77 @@ static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, dict_create_heap_arena_item);
 }
 
+  /* Exception runtime helpers - lazily imported on first try/throw encountered. */
+static void exception_ensure_imports (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+
+  if (cy_exc_throw_item != NULL) return;
+
+  MIR_module_t module = curr_func->module;
+  MIR_type_t ptr_t = MIR_T_I64;
+  MIR_var_t vars[4], one;
+
+  /* void *cy_exc_push(void) - push a frame, return a pointer to its jmp_buf. */
+  cy_exc_push_proto = MIR_new_proto_arr (ctx, "__cy_exc_push_p", 1, &ptr_t, 0, NULL);
+  cy_exc_push_item  = MIR_new_import (ctx, "cy_exc_push");
+  move_item_to_module_start (module, cy_exc_push_proto);
+  move_item_to_module_start (module, cy_exc_push_item);
+
+  /* void cy_exc_pop(void) - unwind one frame. */
+  cy_exc_pop_proto = MIR_new_proto_arr (ctx, "__cy_exc_pop_p", 0, NULL, 0, NULL);
+  cy_exc_pop_item  = MIR_new_import (ctx, "cy_exc_pop");
+  move_item_to_module_start (module, cy_exc_pop_proto);
+  move_item_to_module_start (module, cy_exc_pop_item);
+
+  /* void *cy_exc_current(void) - pointer to the current exception record. */
+  cy_exc_current_proto = MIR_new_proto_arr (ctx, "__cy_exc_current_p", 1, &ptr_t, 0, NULL);
+  cy_exc_current_item  = MIR_new_import (ctx, "cy_exc_current");
+  move_item_to_module_start (module, cy_exc_current_proto);
+  move_item_to_module_start (module, cy_exc_current_item);
+
+  /* void cy_exc_throw(unsigned id, const char *msg, const char *file, int line)
+     records the exception and longjmps to the innermost frame (never returns). */
+  vars[0].name = "id";   vars[0].type = MIR_T_I64;
+  vars[1].name = "msg";  vars[1].type = ptr_t;
+  vars[2].name = "file"; vars[2].type = ptr_t;
+  vars[3].name = "line"; vars[3].type = MIR_T_I64;
+  cy_exc_throw_proto = MIR_new_proto_arr (ctx, "__cy_exc_throw_p", 0, NULL, 4, vars);
+  cy_exc_throw_item  = MIR_new_import (ctx, "cy_exc_throw");
+  move_item_to_module_start (module, cy_exc_throw_proto);
+  move_item_to_module_start (module, cy_exc_throw_item);
+
+  /* int setjmp(void *buf) - libc; emitted inline in the try-containing function
+     so it captures that frame.  Declared to return a 64-bit value (the int
+     result is zero/sign-extended in the return register on supported ABIs). */
+  one.name = "buf"; one.type = ptr_t;
+  cy_setjmp_proto = MIR_new_proto_arr (ctx, "__cy_setjmp_p", 1, &ptr_t, 1, &one);
+  cy_setjmp_item  = MIR_new_import (ctx, "setjmp");
+  move_item_to_module_start (module, cy_setjmp_proto);
+  move_item_to_module_start (module, cy_setjmp_item);
+}
+
+/* Emit cy_exc_throw(id, msg, file, line).  Never returns (it longjmps or
+   aborts); an unreachable label is appended so MIR's CFG stays well formed. */
+static void gen_exception_throw_call (c2m_ctx_t c2m_ctx,
+                                      MIR_op_t id_op,
+                                      MIR_op_t msg_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t ops[4];
+
+  exception_ensure_imports (c2m_ctx);
+  ops[0] = id_op;
+  ops[1] = msg_op;
+  ops[2] = zero_op.mir_op;      /* file: null for now (future: __FILE__) */
+  ops[3] = zero_op.mir_op;      /* line: 0                                */
+  gen_rt_call_void (c2m_ctx, cy_exc_throw_proto, cy_exc_throw_item, 4, ops);
+
+  MIR_label_t unreach = MIR_new_label (ctx);
+  emit_label_insn_opt (c2m_ctx, unreach);
+}
+
+/* Emit: res = dict_create_object() */
 /* ───────── Runtime-helper call emission ─────────
    The String/dict/object runtime helpers are all called the same way: a
    MIR_CALL whose operands are the helper's proto ref, its import ref, an
@@ -21512,6 +21725,162 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     break;
   }
 
+  case N_THROW: {
+    /* throw(id_expr [, msg_expr]) -> cy_exc_throw(id, msg, file, line), which
+       records the exception and longjmps to the innermost active try frame
+       (never returning).  With -fno-exceptions the throw is ignored. */
+    node_t id_node  = NL_EL (r->u.ops, 1);
+    node_t msg_node = NL_EL (r->u.ops, 2);
+
+    assert (false_label == NULL && true_label == NULL);
+    emit_label (c2m_ctx, r);
+    if (!c2m_options->exceptions_p) { res = zero_op; break; }
+
+    op_t id_op = val_gen (c2m_ctx, id_node);
+    id_op = force_reg (c2m_ctx, id_op, MIR_T_I64);    /* exception id -> i64 */
+
+    /* Message operand: if present lower to a char* in a register, else null. */
+    op_t msg_op;
+    if (msg_node != NULL && msg_node->code != N_IGNORE) {
+      msg_op = gen (c2m_ctx, msg_node, NULL, NULL, TRUE, NULL, NULL);
+      msg_op = force_reg_or_mem (c2m_ctx, msg_op, MIR_T_I64);
+    } else {
+      msg_op = zero_op;  /* NULL message */
+    }
+
+    gen_exception_throw_call (c2m_ctx, id_op.mir_op, msg_op.mir_op);
+    res = zero_op;
+    break;
+  }
+
+  case N_TRY: {
+    /* try <body-block> ( catch(Class? var) <handler-block> )+
+
+       setjmp-frame lowering (exceptions enabled):
+         buf = cy_exc_push();
+         if (setjmp(buf) != 0) goto dispatch;     // exception was thrown
+         <body>; cy_exc_pop(); goto after;        // normal completion
+       dispatch:
+         cy_exc_pop();                             // leave this frame
+         tid = cy_exc_current()->id;
+         per clause: if (tid == clause_id) goto handler_k;  (catch-all: goto)
+         <no match>: re-throw to the enclosing frame
+       handler_k:
+         memcpy(clause `Exception var`, *cy_exc_current());
+         <handler-block>; goto after;
+       after:
+
+       With -fno-exceptions: emit the body block only; catch clauses are dead.
+
+       AST: N_TRY(labels, body_block, N_LIST:(N_CATCH)+)
+            N_CATCH(class_sel|N_IGNORE, var_id, handler_block) */
+    node_t body       = NL_EL (r->u.ops, 1);   /* try-body N_BLOCK  */
+    node_t catch_list = NL_EL (r->u.ops, 2);   /* N_LIST of N_CATCH */
+
+    assert (false_label == NULL && true_label == NULL);
+    emit_label (c2m_ctx, r);
+
+    if (!c2m_options->exceptions_p) {
+      gen (c2m_ctx, body, NULL, NULL, FALSE, NULL, NULL);
+      res = zero_op;
+      break;
+    }
+
+    exception_ensure_imports (c2m_ctx);
+
+    {
+#define CY_MAX_CATCH 64
+      MIR_label_t hlabels[CY_MAX_CATCH];
+      MIR_label_t dispatch_label = MIR_new_label (ctx);
+      MIR_label_t after_try      = MIR_new_label (ctx);
+      int n_clauses = 0, k, active, saw_catchall = 0;
+      node_t cat;
+
+      for (cat = NL_HEAD (catch_list->u.ops); cat != NULL; cat = NL_NEXT (cat))
+        if (n_clauses < CY_MAX_CATCH) hlabels[n_clauses++] = MIR_new_label (ctx);
+
+      /* buf = cy_exc_push(); r = setjmp(buf); if (r != 0) goto dispatch */
+      op_t buf = gen_rt_call (c2m_ctx, cy_exc_push_proto, cy_exc_push_item, 0, NULL);
+      buf = force_reg (c2m_ctx, buf, MIR_T_I64);
+      op_t sj = gen_rt_call (c2m_ctx, cy_setjmp_proto, cy_setjmp_item, 1, &buf.mir_op);
+      emit2 (c2m_ctx, MIR_BT, MIR_new_label_op (ctx, dispatch_label), sj.mir_op);
+
+      /* --- normal path: run protected body, unwind frame, done --- */
+      gen (c2m_ctx, body, NULL, NULL, FALSE, NULL, NULL);
+      gen_rt_call_void (c2m_ctx, cy_exc_pop_proto, cy_exc_pop_item, 0, NULL);
+      emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, after_try));
+
+      /* --- exception path: pop our frame, then dispatch on the thrown id --- */
+      emit_label_insn_opt (c2m_ctx, dispatch_label);
+      gen_rt_call_void (c2m_ctx, cy_exc_pop_proto, cy_exc_pop_item, 0, NULL);
+      op_t excp = gen_rt_call (c2m_ctx, cy_exc_current_proto, cy_exc_current_item, 0, NULL);
+      excp = force_reg (c2m_ctx, excp, MIR_T_I64);
+      op_t tid = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, tid.mir_op,
+             MIR_new_mem_op (ctx, MIR_T_U32, 0, excp.mir_op.u.reg, 0, 1));
+
+      active = 0;
+      for (cat = NL_HEAD (catch_list->u.ops), k = 0;
+           cat != NULL && k < CY_MAX_CATCH; cat = NL_NEXT (cat), k++) {
+        node_t class_sel = NL_EL (cat->u.ops, 0);
+        int catchall = (class_sel->code != N_ID || strcmp (class_sel->u.s.s, "Exception") == 0);
+        active = k + 1;
+        if (catchall) {
+          emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, hlabels[k]));
+          saw_catchall = 1;
+          break; /* subsequent clauses are unreachable */
+        } else {
+          struct expr *ce = class_sel->attr;
+          mir_llong cid = (ce != NULL && ce->const_p) ? ce->c.i_val : 0;
+          emit3 (c2m_ctx, MIR_BEQ, MIR_new_label_op (ctx, hlabels[k]),
+                 tid.mir_op, MIR_new_int_op (ctx, cid));
+        }
+      }
+
+      /* No clause matched: re-throw the current exception to the outer frame. */
+      if (!saw_catchall) {
+        op_t e2 = gen_rt_call (c2m_ctx, cy_exc_current_proto, cy_exc_current_item, 0, NULL);
+        e2 = force_reg (c2m_ctx, e2, MIR_T_I64);
+        op_t rid = get_new_temp (c2m_ctx, MIR_T_I64);
+        op_t rmsg = get_new_temp (c2m_ctx, MIR_T_I64);
+        emit2 (c2m_ctx, MIR_MOV, rid.mir_op,
+               MIR_new_mem_op (ctx, MIR_T_U32, 0, e2.mir_op.u.reg, 0, 1));
+        emit2 (c2m_ctx, MIR_MOV, rmsg.mir_op,
+               MIR_new_mem_op (ctx, MIR_T_I64, 8, e2.mir_op.u.reg, 0, 1));
+        gen_exception_throw_call (c2m_ctx, rid.mir_op, rmsg.mir_op);
+      }
+
+      /* --- handler bodies --- */
+      for (cat = NL_HEAD (catch_list->u.ops), k = 0;
+           cat != NULL && k < active; cat = NL_NEXT (cat), k++) {
+        node_t handler = NL_EL (cat->u.ops, 2);   /* N_BLOCK */
+        emit_label_insn_opt (c2m_ctx, hlabels[k]);
+
+        /* Populate this clause's `Exception var` from *cy_exc_current().  The
+           synthesized declaration is the first item of the handler block. */
+        node_t blist = NL_EL (handler->u.ops, 1);
+        node_t decl_node = (blist == NULL) ? NULL : NL_HEAD (blist->u.ops);
+        decl_t evar = (decl_node != NULL && decl_node->code == N_SPEC_DECL)
+                        ? (decl_t) decl_node->attr : NULL;
+        if (evar != NULL && !evar->reg_p) {
+          op_t src = gen_rt_call (c2m_ctx, cy_exc_current_proto, cy_exc_current_item, 0, NULL);
+          src = force_reg (c2m_ctx, src, MIR_T_I64);
+          op_t src_mem = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_I8, 0, src.mir_op.u.reg, 0, 1));
+          gen_memcpy (c2m_ctx, (MIR_disp_t) evar->offset,
+                      MIR_reg (ctx, FP_NAME, curr_func->u.func),
+                      src_mem, type_size (c2m_ctx, evar->decl_spec.type));
+        }
+        gen (c2m_ctx, handler, NULL, NULL, FALSE, NULL, NULL);
+        emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, after_try));
+      }
+
+      emit_label_insn_opt (c2m_ctx, after_try);
+      res = zero_op;
+      break;
+#undef CY_MAX_CATCH
+    }
+  }
+
   default: abort ();
   }
 finish:
@@ -22078,6 +22447,16 @@ static void dbinfo_walk_stmt (c2m_ctx_t c2m_ctx, MIR_module_t mod, MIR_func_t fu
   case N_DEFER: /* labels, stmt */
     dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 1));
     break;
+  case N_TRY: { /* labels, body_block, catch_list */
+    dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 1)); /* try-body block */
+    node_t catch_list = NL_EL (n->u.ops, 2);
+    if (catch_list != NULL)
+      for (node_t cat = NL_HEAD (catch_list->u.ops); cat != NULL; cat = NL_NEXT (cat))
+        dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (cat->u.ops, 2)); /* handler block */
+    break;
+  }
+  case N_THROW:  /* labels, id_expr, msg_expr */
+    break;
   default:
     break;
   }
@@ -22167,6 +22546,7 @@ static const char *get_node_name (node_code_t code) {
     REP8 (C, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF);
     REP7 (C, MODULE, ASM, ATTR, CLASS, STRING, CONCAT, DICT);
     C (IN); C (FORIN); C (NEW); C (DEFER); C (DELETE); C (LAMBDA); C (INTERFACE); C (ANY);
+    C (TRY); C (CATCH); C (THROW);
   default: abort ();
   }
 #undef C
@@ -22453,6 +22833,9 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_RETURN:
   case N_DEFER:
   case N_DELETE:
+  case N_TRY:
+  case N_CATCH:
+  case N_THROW:
   case N_EXPR:
   case N_CASE:
   case N_DEFAULT:

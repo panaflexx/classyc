@@ -23,6 +23,7 @@ struct c2mir_options {
   int no_gen_p;     /* run preprocess+parse+check but skip MIR generation (LSP/analysis) */
   int debug_info_p; /* -g: emit source locations and debug info into MIR/bmir */
   int keep_syms_p;  /* keep symbol table + node positions after no_gen_p analysis (for LSP go-to-def etc.) */
+  int exceptions_p; /* try/catch/throw + JIT safety guards (default on; -fno-exceptions disables) */
   size_t module_num;
   FILE *prepro_output_file; /* non-null for prepro_only_p */
   const char *output_file_name;

@@ -77,6 +77,7 @@ run_example test-any.cy
 run_example test-any-arena.cy
 run_example test-any-implicit.cy
 run_example t_raii.cy
+run_example classy-exceptions.cy
 
 # ── summary ────────────────────────────────────────────────────────────
 

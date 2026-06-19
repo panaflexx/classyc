@@ -1,5 +1,7 @@
 # ClassyC — Modern C with Classes, Strings, Dicts & More
 
+> **Note:** ClassyC now includes an LSP server and the `jitrunner` (hot-reload + DAP debug adapter) for a full development experience.
+
 **ClassyC** is a C11 compiler with a carefully chosen set of modern language extensions that make systems programming feel dramatically more productive, while staying true to C's spirit.  Classy is a heavily-modified c2m compiler from MIR.
 
 It is built on the battle-tested [MIR](https://github.com/vnmakarov/mir) JIT/AOT infrastructure, giving you:
@@ -12,7 +14,7 @@ It is built on the battle-tested [MIR](https://github.com/vnmakarov/mir) JIT/AOT
 ### First-Class `String` (UTF-8)
 ```c
 String greeting = "Hello, 世界 😊";
-String name = "Ada";
+String name = "Ada" + greeting;;
 printf("%s\n", greeting + " from " + name);   // concatenation with auto-promotion
 
 String s = "  Schöne Grüße  ";
@@ -37,7 +39,7 @@ for (auto k in cfg) {
 }
 
 class Fruit {
-    /* UNIFIED declarative definition: one dict, one source of truth.
+    /* Unified declarative definition: one dict, one source of truth.
        Keys are the variant names.
        Each value is a sub-dict containing the int "value" (for switch/case)
        and any other metadata you want (desc, color, season, ...).
@@ -78,11 +80,11 @@ class Point {
     ~Point() { printf("~Point(%d,%d)\n", this.x, this.y); }
 
     Point* withX(int v) { this.x = v; return this; }
-    int sum() { return this.x + this.y; }
+    int sum() { return x + y; }
 };
 
 Point* p = new Point(3, 4).withX(10);         // heap + chaining
-defer delete p;                               // RAII-style cleanup
+defer delete p;                               // RAII-style cleanup for heap memory
 ```
 
 ### `defer`, `delete`, and Scoped Resource Management
@@ -92,9 +94,7 @@ void process() {
     defer fclose(f);
 
     String arena = String.checkpoint();
-    defer String.release_to(arena);
-
-    // ...
+    defer String.release_to(arena); // Arena memory managed strings, no need to free
 }
 ```
 
@@ -103,6 +103,7 @@ void process() {
 String user = "bob";
 int score = 42;
 String msg = f"Hello {user}, your score is {score}";
+printf(f"Score is {score}\n");
 ```
 
 ### Nice `auto` + Disambiguation
@@ -115,6 +116,24 @@ auto arr = {1, 2, 3};           // int[3]
 ### `for (auto x in ...)` Loops
 Works over arrays, dicts, and (via methods) strings.
 
+### Generics, `List<T>` & Lambdas
+```c
+List<int> nums = {1, 2, 3};          // brace-init
+nums = nums.Filter((int x) => x > 1)
+             .Map((int x) => x * 2);
+
+List<Any<View>*> widgets = { any<View>(new Button()), any<View>(new Text()) };
+for (auto v in widgets) v->render();   // heterogeneous via type erasure
+```
+
+### Interfaces & `Any<I>` Erasure
+```c
+interface Drawable { void draw(); }
+class Circle impl Drawable { ... }
+
+Any<Drawable> d = any<Drawable>(new Circle());  // erased handle
+```
+
 ### Full C11 Base + Useful Extensions
 - All standard C11 features (minus atomics/complex/VLA/TLS)
 - Statement expressions, labels as values, range cases, binary literals, etc.
@@ -124,32 +143,47 @@ Works over arrays, dicts, and (via methods) strings.
 
 ```bash
 cd classyc
-git submodule update
-cmake .             # builds in main dir, 
+git submodule sync
+cmake .             # builds in main dir, or into `build` dir
 make                # builds the `classyc` (or `c2m`) compiler
 ```
 
-The build also produces `b2obj` for ahead-of-time ELF object generation.
+The build also produces `b2obj` for ahead-of-time ELF object generation. (b2objmir on MacOS x64)
 
 ## Usage
 
 ### JIT Execution (fast iteration)
 ```bash
-classyc example.c -eg          # generate machine code + run
-classyc example.c -el          # lazy function generation
-classyc example.c -eb          # lazy basic-block generation
+classyc example.c -eg               # generate machine code + run
+classyc example.c -el               # lazy function generation
+classyc example.c -eb               # lazy basic-block generation
+classyc -g -c example.c -o a.bmir   # compile to bmir binary with debug info (link with `b2obj` / run with `jitrunner`)
 ```
 
 ### Ahead-of-Time Compilation
 ```bash
 classyc -c example.c -o example.bmir  # emit MIR binary
 b2obj example.bmir example.o          # produce native ELF .o
+classyc-aot hello.c -o hello          # compile to native ELF binary script
 ```
 
 You can link the resulting `.o` files with any standard C toolchain.
 
 ### As a Library
 `classyc.c` (the single-file compiler) can be embedded exactly like the original c2mir. See the original c2mir documentation for the library interface.
+
+### JIT Runner & Hot-Reload
+The `jitrunner` (src/jitrunner/jitrunner.c) provides:
+
+- Inotify-based hot reload on file change
+- DAP debug adapter protocol for IDE integration
+- Fork/exec isolation for safe recompilation
+
+```bash
+jitrunner --watch src/ --dap
+```
+
+An LSP server is also included for editor support (diagnostics, completion, go-to-definition).
 
 ## Examples
 
@@ -165,11 +199,53 @@ Look in the `examples/` directory:
 | `classy-fstring.c`         | Interpolated f-strings |
 | `classy-strings.c`         | All String methods |
 | `classy-auto.c`            | `auto` + dict/array disambiguation |
+| `classy-generics.c`        | Generic `List<T>` (30 methods, brace-init `{a,b,c}`) |
+| `classy-lambda.c`          | Typed lambdas for map/filter/sort/etc. |
+| `test-list-stdlib.c`       | Full stdlib List<T> validation |
+| `classy-dict-arena.c`      | Arena-backed dicts (`new dict(size)`) |
+| `test-any-arena.c`         | `Any<I>` type erasure + arena-managed handles |
+| `test-interface.c`         | `interface` + `impl` structural conformance |
+| `test-any.c`               | Heterogeneous `List<Any<View>*>` (arena + non-arena) |
 
 Run them all with:
 ```bash
 examples/run-examples.sh
 ```
+
+## Memory Management
+
+ClassyC provides lightweight arena allocators for high-level types:
+
+- **String arena** — `String.checkpoint()` / `String.release_to(arena)` or `defer String.release_to(...)` reclaims all strings allocated since the checkpoint in one shot.
+- **Dict arena** — `new dict(bytes)` creates an arena-backed dict; `delete d` frees the entire arena and its contents.
+- **List<T> and collections** — The generic `List<T>` (and `any<I>` handles) use the same object-arena model: elements registered in a scope-bound arena are automatically reclaimed on scope exit.
+
+Typical pattern:
+
+```c
+String a = String.checkpoint();
+defer String.release_to(a);
+
+dict cfg = new dict(256*1024);
+defer delete cfg; // Heap allocated must be freed manually
+
+List<String> names = List<String>();
+// ... populate and use ...
+// all released automatically at scope exit
+```
+
+## AOT Compilation
+
+`b2obj` now emits basic [DWARF v4](https://dwarfstd.org/) debug information:
+
+```bash
+classyc -c -g foo.cy -o foo.bmir
+b2obj --dwarf4 foo.bmir foo.o
+gcc -g -o foo foo.o
+gdb foo 
+```
+
+Load the resulting object in GDB or any DWARF-aware debugger to step through ClassyC source with line information.
 
 ## Architecture
 

@@ -110,6 +110,7 @@ while [ $# -gt 0 ]; do
     -L*|-l*|-Wl,*)
       ld_flags_v+=("$arg") ;;
     *.c)    sources+=("$arg") ;;
+    *.cy)   sources+=("$arg") ;;
     *.bmir) sources+=("$arg") ;;
     *.o|*.a) link_objects+=("$arg") ;;
     -*)     echo "$prog: warning: unrecognised option '$arg' forwarded to linker" >&2
@@ -180,7 +181,7 @@ for src in "${sources[@]}"; do
   obj="$workdir/$base.o"
 
   case "$src" in
-    *.c)
+    *.c|*.cy)
       bmir="$workdir/$base.bmir"
 
       compile_cmd=("$C2M")

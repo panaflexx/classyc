@@ -18,6 +18,7 @@
 #include "dict.h"
 #include "cstring.h"
 #include "cobjarena.h"
+#include "cyexc.h"
 
 #include "mir.h"
 #include "mir-gen.h"
@@ -142,6 +143,13 @@ static void *import_resolver(const char *name) {
     if (strcmp(name, "c2m_str_from_char")        == 0) return (void *)c2m_str_from_char;
     if (strcmp(name, "c2m_str_from_double")      == 0) return (void *)c2m_str_from_double;
     if (strcmp(name, "c2m_str_copy")             == 0) return (void *)c2m_str_copy;
+    /* try/catch/throw exception runtime (cyexc.h) */
+    if (strcmp(name, "cy_exc_push")              == 0) return (void *)cy_exc_push;
+    if (strcmp(name, "cy_exc_pop")               == 0) return (void *)cy_exc_pop;
+    if (strcmp(name, "cy_exc_current")           == 0) return (void *)cy_exc_current;
+    if (strcmp(name, "cy_exc_throw")             == 0) return (void *)cy_exc_throw;
+    if (strcmp(name, "cy_exc_active")            == 0) return (void *)cy_exc_active;
+    if (strcmp(name, "_safety_trap")             == 0) return (void *)_safety_trap;
 
     fprintf(stderr, "[jitrunner] cannot resolve symbol: %s\n", name);
     return NULL;

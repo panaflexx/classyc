@@ -4,6 +4,8 @@
 #include "cstring.h"
 #define C2M_DICT_API
 #include "dict.h"
+#define C2M_EXC_API
+#include "cyexc.h"
 
 float       mir_aot_ui2f  (uint64_t i)    { return (float) i; }
 double      mir_aot_ui2d  (uint64_t i)    { return (double) i; }

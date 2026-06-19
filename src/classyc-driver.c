@@ -13,6 +13,8 @@
 #include "cstring.h"
 /* Include cobjarena.h for the scope-bound object arena (Any<I> handles) */
 #include "cobjarena.h"
+/* Include cyexc.h for the try/catch/throw exception runtime */
+#include "cyexc.h"
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -291,6 +293,7 @@ static void init_options (int argc, char *argv[]) {
   options.syntax_only_p = options.pedantic_p = FALSE;
   options.no_gen_p = FALSE;
   options.debug_info_p = FALSE;
+  options.exceptions_p = TRUE;   /* try/catch/throw enabled by default */
   gen_debug_level = -1;
   VARR_CREATE (char, temp_string, &default_alloc, 0);
   VARR_CREATE (char_ptr_t, headers, &default_alloc, 0);
@@ -317,6 +320,10 @@ static void init_options (int argc, char *argv[]) {
       options.syntax_only_p = TRUE;
     } else if (strcmp (argv[i], "-fpreprocessed") == 0) {
       options.no_prepro_p = TRUE;
+    } else if (strcmp (argv[i], "-fexceptions") == 0) {
+      options.exceptions_p = TRUE;
+    } else if (strcmp (argv[i], "-fno-exceptions") == 0) {
+      options.exceptions_p = FALSE;
     } else if (strcmp (argv[i], "-pedantic") == 0) {
       options.pedantic_p = TRUE;
     } else if (strcmp (argv[i], "-g") == 0) {
@@ -514,6 +521,13 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "c2m_obj_release_to") == 0) return (void *) c2m_obj_release_to;
     if (strcmp (name, "c2m_obj_detach") == 0) return (void *) c2m_obj_detach;
     if (strcmp (name, "c2m_obj_cleanup") == 0) return (void *) c2m_obj_cleanup;
+    /* try/catch/throw exception runtime (cyexc.h) */
+    if (strcmp (name, "cy_exc_push") == 0) return (void *) cy_exc_push;
+    if (strcmp (name, "cy_exc_pop") == 0) return (void *) cy_exc_pop;
+    if (strcmp (name, "cy_exc_current") == 0) return (void *) cy_exc_current;
+    if (strcmp (name, "cy_exc_throw") == 0) return (void *) cy_exc_throw;
+    if (strcmp (name, "cy_exc_active") == 0) return (void *) cy_exc_active;
+    if (strcmp (name, "_safety_trap") == 0) return (void *) _safety_trap;
     /* String '+' concatenation / basic-type auto-cast helpers */
     if (strcmp (name, "c2m_str_concat") == 0) return (void *) c2m_str_concat;
     if (strcmp (name, "c2m_str_from_int") == 0) return (void *) c2m_str_from_int;
