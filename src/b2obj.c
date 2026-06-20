@@ -680,18 +680,29 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         text_size += funcs[i].code_len;
     }
 
-    /* .data: concatenate all data items (8-byte aligned) */
+    /* .data: concatenate all data items.
+       A MIR data "object" is one *named* item followed by any number of
+       *anonymous* (name == NULL) continuation items, which MIR lays out
+       contiguously with no inter-item padding (see load_bss_data_section in
+       mir.c: it does `addr += len` per item and only rounds the *whole*
+       object up to 8).  A new named item begins a new object, which MIR
+       allocates separately (8-aligned).  So align only at a new named
+       boundary and pack continuations tightly.  Aligning *every* item to 8
+       (the old behaviour) shifted sub-8-byte members (e.g. the i32 fields of
+       a struct), corrupting the layout and the offsets of later pointer
+       members / ref relocations (24-byte stride for a 16-byte struct). */
     size_t data_size = 0;
     for (size_t i = 0; i < n_datas; i++) {
-        if (i > 0) data_size = align8(data_size);
+        if (i > 0 && datas[i].name != NULL) data_size = align8(data_size);
         datas[i].data_offset = data_size;
         data_size += datas[i].size;
     }
 
-    /* .bss: just total size (8-byte aligned per item) */
+    /* .bss: same object model as .data (named item starts a new, 8-aligned
+       object; anonymous items are packed continuations). */
     size_t bss_size = 0;
     for (size_t i = 0; i < n_bsses; i++) {
-        if (i > 0) bss_size = align8(bss_size);
+        if (i > 0 && bsses[i].name != NULL) bss_size = align8(bss_size);
         bsses[i].bss_offset = bss_size;
         bss_size += bsses[i].len;
     }

@@ -543,8 +543,19 @@ static void cstktr_walk_frames(uintptr_t start_fp, uintptr_t start_ip,
         ip = start_ip;
     } else {
         /* Called from GDB or user code — start from here. */
+#if defined(__GNUC__) || defined(__clang__)
         fp = (uintptr_t)__builtin_frame_address(0);
         ip = (uintptr_t)__builtin_return_address(0);
+#else
+        /* Self-hosted build: ClassyC does not implement
+           __builtin_frame_address / __builtin_return_address.  Use the
+           host-compiled runtime helpers (src/mir-aot-runtime.c) instead.
+           They read the frame/return address of *this* caller. */
+        extern void *cstktr_caller_frame_address(void);
+        extern void *cstktr_caller_return_address(void);
+        fp = (uintptr_t)cstktr_caller_frame_address();
+        ip = (uintptr_t)cstktr_caller_return_address();
+#endif
     }
 
     int nframes = 0;

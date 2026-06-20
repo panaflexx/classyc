@@ -24,6 +24,8 @@
 #     --with-mir     also link the MIR core library (mir.o + mir-gen.o) - needed
 #                    when the compiled program calls the MIR API, e.g. when
 #                    bootstrapping the classyc compiler itself
+#     -g             build a debug binary: emit debug info from classyc (which
+#                    b2obj turns into DWARF automatically) and link gcc with -g
 #     -k, --keep     keep intermediate .bmir / .o files (in a temp dir)
 #     -v, --verbose  echo each command before running it
 #     -h, --help     show this help and exit
@@ -56,11 +58,14 @@ find_tool () {
   fi
 }
 
-# OS-specific tool names
+# OS-specific tool names and link flags.  b2obj emits non-PIC objects, so on
+# Linux we link with -no-pie to avoid text relocations in a PIE (DT_TEXTREL).
+pie_flags=()
 if [ "$(uname -s)" = "Darwin" ]; then
     B2OBJ_DEFAULT="b2objmac"
 else
     B2OBJ_DEFAULT="b2obj"
+    pie_flags=(-no-pie)
 fi
 
 C2M=${C2M:-$(find_tool "bin/classyc")}
@@ -70,6 +75,7 @@ CC=${CC:-gcc}
 output="a.out"
 keep=0
 verbose=0
+debug=0            # -g: build a debug (DWARF) binary
 with_mir=0         # link the MIR core (mir.o + mir-gen.o)
 
 # Initialize all arrays properly (critical with `set -u`)
@@ -97,11 +103,13 @@ while [ $# -gt 0 ]; do
 	  with_mir=1 ;;
     -o) shift; [ $# -gt 0 ] || { echo "$prog: -o needs an argument" >&2; exit 1; }; output=$1 ;;
     -o*) output=${arg#-o} ;;
+    # -g: emit debug info through the whole pipeline (classyc -> b2obj -> gcc)
+    -g) debug=1; c2m_flags+=("$arg") ;;
     # c2m front-end flags that take a separate argument
     -I|-D|-U|-include)
       shift; [ $# -gt 0 ] || { echo "$prog: $arg needs an argument" >&2; exit 1; }
       c2m_flags+=("$arg" "$1") ;;
-    -I*|-D*|-U*|-std=*|-O*|-w|-g|-pedantic|-fsigned-char|-fno-*)
+    -I*|-D*|-U*|-std=*|-O*|-w|-pedantic|-fsigned-char|-fno-*)
       c2m_flags+=("$arg") ;;
     # linker flags that take a separate argument
     -L|-l)
@@ -140,8 +148,11 @@ objects=()
 if [ -f "$csrc_dir/mir-aot-runtime.c" ]; then
   echo Compile runtime support $csrc_dir
   rt_obj="$workdir/mir-aot-runtime.o"
-  echo "$CC" -O2 -I include -I ${mir_dir} -c "${csrc_dir}/mir-aot-runtime.c" -o "$rt_obj"
-  "$CC" -O2 -c -I include -I ${mir_dir} "$csrc_dir/mir-aot-runtime.c" -o "$rt_obj"
+  rt_cmd=("$CC" -O2)
+  [ "$debug" -eq 1 ] && rt_cmd+=(-g)
+  rt_cmd+=(-c -I include -I "${mir_dir}" "$csrc_dir/mir-aot-runtime.c" -o "$rt_obj")
+  echo "${rt_cmd[@]}"
+  run "${rt_cmd[@]}"
   link_objects+=("$rt_obj")
 fi
 
@@ -180,6 +191,8 @@ for src in "${sources[@]}"; do
   base=$(unique_base "$base")
   obj="$workdir/$base.o"
 
+  # b2obj takes exactly <input> <output>; it emits DWARF automatically when
+  # the .bmir carries debug info, i.e. when classyc was given -g above.
   case "$src" in
     *.c|*.cy)
       bmir="$workdir/$base.bmir"
@@ -203,12 +216,15 @@ done
 # Build the full command safely for old bash + set -u
 link_cmd=("$CC" -o "$output")
 
+# Keep DWARF in the final binary when building a debug executable.
+[ "$debug" -eq 1 ] && link_cmd+=(-g)
+
 # Append arrays safely (this avoids unbound variable errors on Bash 3.2)
 [ ${#objects[@]} -gt 0 ] && link_cmd+=("${objects[@]}")
 [ ${#link_objects[@]} -gt 0 ] && link_cmd+=("${link_objects[@]}")
 [ ${#ld_flags_v[@]} -gt 0 ] && link_cmd+=("${ld_flags_v[@]}")
+[ ${#pie_flags[@]} -gt 0 ] && link_cmd+=("${pie_flags[@]}")
 [ ${#default_libs[@]} -gt 0 ] && link_cmd+=("${default_libs[@]}")
-#link_cmd+=("-Wl,-no_pie")
 
 # Show the command (safe echo)
 echo "${link_cmd[@]}"

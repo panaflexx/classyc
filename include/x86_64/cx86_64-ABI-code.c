@@ -59,13 +59,22 @@ static int classify_arg (c2m_ctx_t c2m_ctx, struct type *type, MIR_type_t types[
     }
     case TM_CLASS:
     case TM_STRUCT:
-    case TM_UNION:
-      for (node_t el = NL_HEAD (NL_EL (type->u.tag_type->u.ops, 1)->u.ops); el != NULL;
-           el = NL_NEXT (el))
+    case TM_UNION: {
+      /* Be robust against malformed/incomplete aggregates (e.g. va_arg applied
+         to a type whose members were never laid out): treat as "pass in
+         memory" instead of dereferencing a null tag / member-list / member
+         decl.  Fixes the segfault reported in MIR issue #361. */
+      node_t member_list;
+      if (type->u.tag_type == NULL
+          || (member_list = NL_EL (type->u.tag_type->u.ops, 1)) == NULL)
+        return 0;
+      for (node_t el = NL_HEAD (member_list->u.ops); el != NULL; el = NL_NEXT (el))
         if (el->code == N_MEMBER) {
           decl_t decl = el->attr;
-          mir_size_t offset = decl->offset;
+          mir_size_t offset;
           node_t container;
+          if (decl == NULL) return 0;
+          offset = decl->offset;
           if ((container = decl->containing_unnamed_anon_struct_union_member) != NULL) {
             decl_t decl2 = container->attr;
             assert (decl2->decl_spec.type->mode == TM_STRUCT
@@ -92,6 +101,7 @@ static int classify_arg (c2m_ctx_t c2m_ctx, struct type *type, MIR_type_t types[
           }
         }
       break;
+    }
     default: assert (FALSE);
     }
 
