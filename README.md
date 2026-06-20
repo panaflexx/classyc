@@ -200,6 +200,33 @@ throw(OutOfBoundsException, "bad index");
 
 Enabled with `-fexceptions` (default off; disable explicitly with `-fno-exceptions`). Built-in values: `NullException`, `OutOfBoundsException`, `RuntimeException`, base `Exception`. No `#include` required,
 
+### HTTP/HTTPS Fetch (`include/httpclient.h`)
+A header-only client to call a JSON API in one line. Responses come back the
+classy way: `status` as an int, `headers` as a `dict`, `body` as a `String`,
+and `asDict()` to parse JSON. HTTPS works out of the box (OpenSSL is loaded on
+demand — nothing to link), and `List<String>` carries request headers.
+
+```c
+#include "include/httpclient.h"
+
+void show_pokemon(String name) {
+    String url = "https://pokeapi.co/api/v2/pokemon/" + name;
+    auto   resp = Http.get((char *)url);
+    defer delete resp;
+
+    if (!resp->ok()) {
+        printf("  %-12s  -> HTTP %d %s\n", (char *)name, resp->status,
+               resp->error != NULL ? (char *)resp->error : (char *)resp->statusText);
+        return;
+    }
+    dict d = resp->asDict();                  // JSON body -> dict
+    printf("  #%d %s\n", (int)d.id, (char *)d.name);
+}
+```
+
+See `examples/classy-fetch.cy` for the full tour (response headers, custom
+request headers, batch fetch, 404 handling).
+
 ### Full C11 Base + Useful Extensions
 - All standard C11 features (minus atomics/complex/VLA/TLS)
 - Statement expressions, labels as values, range cases, binary literals, etc.
@@ -278,6 +305,7 @@ Look in the `examples/` directory:
 | `test-interface.c`         | `interface` + `impl` structural conformance |
 | `test-any.c`               | Heterogeneous `List<Any<View>*>` (arena + non-arena) |
 | `classy-exceptions.cy`     | `try`/`catch`/`throw` (opt-in via `-fexceptions`) |
+| `classy-fetch.cy`          | HTTP/HTTPS client (`include/httpclient.h`): calls the PokéAPI over TLS, headers as a `dict`, `List<String>` |
 
 Run them all with:
 ```bash
