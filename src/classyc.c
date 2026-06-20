@@ -14900,6 +14900,11 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	                  res_type = *lp;
 	                  break;
 	                }
+	                case SM_JOIN:
+	                  /* join is a List<String> method, not a String method. */
+	                  error(c2m_ctx, POS(r),
+	                        "'join' is a List<String> method; call it on a List<String>");
+	                  break;
 	                default: break;
 	                }
 	                ret_type = &res_type;

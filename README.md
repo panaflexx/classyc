@@ -291,6 +291,7 @@ Look in the `examples/` directory:
 | `classy-dict-arena.c`      | Arena-allocated dicts |
 | `classy-fstring.c`         | Interpolated f-strings |
 | `classy-strings.c`         | All String methods |
+| `classy-string-split-join.cy` | `String.equals`, `String.split` → `List<String>*`, and `List<String>.join` |
 | `classy-auto.c`            | `auto` + dict/array disambiguation |
 | `classy-generics.c`        | Generic `List<T>` (30 methods, brace-init `{a,b,c}`) |
 | `classy-lambda.c`          | Typed lambdas for map/filter/sort/etc. |

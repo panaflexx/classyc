@@ -55,6 +55,7 @@ run_example classy-dict-arena.cy
 run_example classy-file.cy
 run_example classy-file2.cy
 run_example classy-strings.cy
+run_example classy-string-split-join.cy
 run_example classy-string-copy-test.cy
 run_example string_methods_test.cy
 run_example test_dict_arena.cy
