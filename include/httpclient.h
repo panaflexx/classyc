@@ -136,6 +136,7 @@ struct c2m_timeval { long tv_sec; long tv_usec; };
 #  define HTTPCLIENT_DLOPEN_SSL 1
 extern void *dlopen(char *file, int mode);
 extern void *dlsym(void *handle, char *name);
+extern char *dlerror(void);
 #  ifndef C2M_RTLD_NOW
 #    define C2M_RTLD_NOW 2     /* RTLD_NOW (dlfcn.h) */
 #  endif
@@ -189,7 +190,10 @@ static int c2m_tls_available(void) {
     if (c2m_ssl.lib == NULL) c2m_ssl.lib = dlopen("libssl.so.1.1", C2M_RTLD_NOW);
     if (c2m_ssl.lib == NULL) c2m_ssl.lib = dlopen("libssl.so", C2M_RTLD_NOW);
     if (c2m_ssl.lib == NULL) c2m_ssl.lib = dlopen("libssl.dylib", C2M_RTLD_NOW);
-    if (c2m_ssl.lib == NULL) return 0;
+    if (c2m_ssl.lib == NULL) {
+        fprintf(stderr, "Failed to load libssl: %s\n", dlerror());
+        return 0;
+    }
 
     c2m_ssl.TLS_client_method = dlsym(c2m_ssl.lib, "TLS_client_method");
     c2m_ssl.SSL_CTX_new       = dlsym(c2m_ssl.lib, "SSL_CTX_new");
