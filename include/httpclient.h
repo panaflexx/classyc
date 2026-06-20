@@ -678,12 +678,12 @@ class Http {
     }
 
     /* GET. */
-    static HttpResponse* get(char *url) {
+    static HttpResponse* get(String url) {
         return Http.request("GET", url, NULL, NULL);
     }
 
     /* GET with extra request headers. */
-    static HttpResponse* get(char *url, List<String>* headers) {
+    static HttpResponse* get(String url, List<String>* headers) {
         return Http.request("GET", url, headers, NULL);
     }
 

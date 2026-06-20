@@ -74,6 +74,7 @@ run_example test-ptr-arg-mini.cy
 run_example classy-generics.cy
 run_example classy-sets.cy
 run_example classy-sets-myclass.cy
+run_example classy-map.cy
 run_example classy-search-engine.cy
 run_example classy-collections-class.cy
 run_example classy-overload.cy

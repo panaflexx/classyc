@@ -4664,23 +4664,36 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
         return fresh;
       }
     }
-    /* Self-referential generic placeholder: __generic_<orig>_<TypeParam>  e.g.
-       __generic_List_T  inside List<T>'s body gets stored as-is in the template
-       AST.  When the template is specialised (T -> String), substitute the type
-       param part with the concrete mangled name so it becomes __generic_List_String.
-       Only the single-type-param case (n_params == 1) is handled here; multi-param
-       classes can extend this pattern. */
+    /* Self-referential generic placeholder: __generic_<orig>_<P0>[_<P1>...] e.g.
+       __generic_List_T inside List<T>'s body, or __generic_Map_K_V inside
+       Map<K,V>'s body, gets stored as-is in the template AST.  When the template
+       is specialised (T -> String, or K -> String, V -> int), resolve each
+       embedded type-parameter name to its concrete type argument and re-mangle so
+       it becomes the concrete spec name (__generic_List_String /
+       __generic_Map_String_int).  Works for any parameter count; assumes
+       type-parameter names contain no '_' (so the joined names tokenize cleanly). */
     {
       char _pfx[512];
       snprintf (_pfx, sizeof (_pfx), "__generic_%s_", orig_name);
       size_t _plen = strlen (_pfx);
-      if (strncmp (s, _pfx, _plen) == 0) {
-        const char *_rest = s + _plen;
-        for (int _i = 0; _i < n_params; _i++) {
-          if (params[_i] && strcmp (_rest, params[_i]) == 0) {
-            const char *_new = mangle_generic_name (c2m_ctx, orig_name, 1, &args[_i]);
-            return build_id (c2m_ctx, _new, POS (n));
-          }
+      if (n_params > 0 && strncmp (s, _pfx, _plen) == 0) {
+        node_t _resolved[4];
+        int _nr = 0, _ok = 1;
+        const char *_cur = s + _plen;
+        while (*_cur != '\0' && _ok) {
+          const char *_us = strchr (_cur, '_');
+          size_t _len = _us != NULL ? (size_t) (_us - _cur) : strlen (_cur);
+          int _pi = -1;
+          for (int _i = 0; _i < n_params; _i++)
+            if (params[_i] != NULL && strlen (params[_i]) == _len
+                && strncmp (_cur, params[_i], _len) == 0) { _pi = _i; break; }
+          if (_pi < 0 || _nr >= 4) { _ok = 0; break; }
+          _resolved[_nr++] = args[_pi];
+          _cur = _us != NULL ? _us + 1 : _cur + _len;
+        }
+        if (_ok && _nr > 0) {
+          const char *_new = mangle_generic_name (c2m_ctx, orig_name, _nr, _resolved);
+          return build_id (c2m_ctx, _new, POS (n));
         }
       }
     }
@@ -13325,12 +13338,33 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
             error (c2m_ctx, POS (r), "class type has no Get(int) method for [] subscript");
           } else {
             decl_t gd = get_def->attr;
+            struct type *key_pt = NULL;
             if (gd != NULL && gd->decl_spec.type != NULL && gd->decl_spec.type->mode == TM_FUNC) {
-              struct type *ret = gd->decl_spec.type->u.func_type->ret_type;
-              if (ret != NULL) *e->type = *ret;
+              struct func_type *gft = gd->decl_spec.type->u.func_type;
+              node_t gparam = NL_HEAD (gft->param_list->u.ops);
+              struct decl_spec *gpds;
+              if (gparam != NULL) gparam = NL_NEXT (gparam); /* skip implicit 'this' */
+              gpds = get_param_decl_spec (gparam);
+              if (gpds != NULL) key_pt = gpds->type;
+              if (gft->ret_type != NULL) *e->type = *gft->ret_type;
             }
-            if (t2 != NULL && !integer_type_p (t2)) {
-              error (c2m_ctx, POS (r), "class subscript index must be an integer");
+            /* Two flavours of the subscript protocol, distinguished by Get's key
+               parameter type.  Integer-indexed collections (List/Set: Get(int))
+               require an integer index.  Keyed collections (Map<K,V>: Get(K))
+               accept any index assignable to the key type K — so map["name"]
+               works for Map<String,V>. */
+            if (key_pt == NULL || integer_type_p (key_pt)) {
+              if (t2 != NULL && !integer_type_p (t2))
+                error (c2m_ctx, POS (r), "class subscript index must be an integer");
+            } else if (t2 != NULL) {
+              node_t key_node = NL_EL (r->u.ops, 1);
+              int ok = type_eq_p (key_pt, t2)
+                       || compatible_types_p (key_pt, t2, TRUE)
+                       || (builtin_string_type_p (key_pt)
+                           && str_concat_string_operand_p (t2, key_node))
+                       || (arithmetic_type_p (key_pt) && arithmetic_type_p (t2));
+              if (!ok)
+                error (c2m_ctx, POS (r), "class subscript key has incompatible type");
             }
             e->def_node = get_def; /* stash for gen to find the method */
           }
@@ -13774,16 +13808,55 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           /* Class with the Count/Get iteration protocol (duck-typed):
                for (auto x in coll)    — x = coll->Get(i) for i in [0, coll->Count())
                for (auto i, x in coll) — i = index (int), x = element
-             The element type is Get's return type. */
+             The element type is Get's return type.
+
+             A keyed collection (Map<K,V>: Count()/KeyAt(int)/ValAt(int)) takes
+             priority and binds (key, value) instead of (index, element):
+               for (auto k in map)    — k = map->KeyAt(i)
+               for (auto k, v in map) — k = key, v = value
+             so iteration mirrors the built-in dict's `for (auto k, val in d)`. */
           struct type *cls_type = e1->type->mode == TM_PTR ? e1->type->u.ptr_type : e1->type;
           const char *cls_name = class_type_name (cls_type);
           node_t class_tag = cls_type->u.tag_type;
           node_t count_def = find_class_protocol_method (c2m_ctx, class_tag, "Count", 0, POS (r));
+          node_t keyat_def = find_class_protocol_method (c2m_ctx, class_tag, "KeyAt", 1, POS (r));
+          node_t valat_def = find_class_protocol_method (c2m_ctx, class_tag, "ValAt", 1, POS (r));
           node_t get_def = find_class_protocol_method (c2m_ctx, class_tag, "Get", 1, POS (r));
           struct type *el_type = NULL;
 
           if (cls_name == NULL) cls_name = "?";
-          if (count_def == NULL || get_def == NULL) {
+          if (count_def != NULL && keyat_def != NULL && valat_def != NULL) {
+            /* ---- Keyed (map) protocol: KeyAt(i)->K, ValAt(i)->V ---- */
+            decl_t cd = count_def->attr, kd = keyat_def->attr, vd = valat_def->attr;
+            struct type *kt = kd->decl_spec.type->u.func_type->ret_type;
+            struct type *vt = vd->decl_spec.type->u.func_type->ret_type;
+
+            if (!integer_type_p (cd->decl_spec.type->u.func_type->ret_type))
+              error (c2m_ctx, POS (r),
+                     "for-in: 'Count()' of class '%s' must return an integer type", cls_name);
+            if (kt == NULL || !scalar_type_p (kt)) {
+              error (c2m_ctx, POS (r),
+                     "for-in: 'KeyAt(int)' of class '%s' must return a scalar or pointer type",
+                     cls_name);
+              kt = create_basic_type (c2m_ctx, TP_INT);
+            }
+            if (vt == NULL || !scalar_type_p (vt)) {
+              error (c2m_ctx, POS (r),
+                     "for-in: 'ValAt(int)' of class '%s' must return a scalar or pointer type",
+                     cls_name);
+              vt = create_basic_type (c2m_ctx, TP_INT);
+            }
+            {
+              struct type *k_copy = create_type (c2m_ctx, NULL);
+              *k_copy = *kt; k_copy->pos_node = key_id;
+              FORIN_DECL_VAR (key_id, k_copy);
+            }
+            if (val_id->code == N_ID) {
+              struct type *v_copy = create_type (c2m_ctx, NULL);
+              *v_copy = *vt; v_copy->pos_node = val_id;
+              FORIN_DECL_VAR (val_id, v_copy);
+            }
+          } else if (count_def == NULL || get_def == NULL) {
             error (c2m_ctx, POS (r),
                    "class '%s' is not iterable (needs 'Count()' and 'Get(int)' methods)",
                    cls_name);
@@ -20092,9 +20165,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             if (this_op.mir_op.mode == MIR_OP_MEM)
               this_op = mem_to_address (c2m_ctx, this_op, TRUE);
           }
-          /* Evaluate the index */
+          /* Evaluate the index.  Integer indices widen to I64 (List/Set
+             Set(int,T)); a non-integer key (Map<String,V>: Set(String,V)) is
+             passed through for gen_funcptr_call to coerce to the key type. */
           op_t idx_op = val_gen (c2m_ctx, NL_EL (lhs->u.ops, 1));
-          idx_op = cast (c2m_ctx, idx_op, MIR_T_I64, FALSE);
+          if (integer_type_p (((struct expr *) NL_EL (lhs->u.ops, 1)->attr)->type))
+            idx_op = cast (c2m_ctx, idx_op, MIR_T_I64, FALSE);
           /* Evaluate the rhs value */
           op_t val_op = val_gen (c2m_ctx, rhs_node);
           /* Call: this->Set(index, value) */
@@ -20348,9 +20424,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         if (this_op.mir_op.mode == MIR_OP_MEM)
           this_op = mem_to_address (c2m_ctx, this_op, TRUE);
       }
-      /* Evaluate the index and promote to I64 */
+      /* Evaluate the index.  Integer indices are widened to I64 (List/Set
+         Get(int)); a non-integer key (Map<String,V>: Get(String)) is passed
+         through and coerced to the key parameter type by gen_funcptr_call. */
       op_t idx_op = val_gen (c2m_ctx, NL_EL (r->u.ops, 1));
-      idx_op = cast (c2m_ctx, idx_op, MIR_T_I64, FALSE);
+      if (integer_type_p (((struct expr *) NL_EL (r->u.ops, 1)->attr)->type))
+        idx_op = cast (c2m_ctx, idx_op, MIR_T_I64, FALSE);
       /* Call: result = this->Get(index) */
       res = gen_class_method_call (c2m_ctx, get_def, this_type, this_op, &idx_op, 1);
       break;
@@ -22245,8 +22324,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                MIR_new_mem_op (ctx, el_mir_t, 0, addr_reg.mir_op.u.reg, 0, 1));
       }
     } else if (class_forin) {
-      /* ---- Class Count/Get protocol for-in ----
-         n = coll->Count(); for (i = 0; i < n; i++) { x = coll->Get(i); body } */
+      /* ---- Class iteration protocol for-in ----
+         Index protocol (List/Set):  x = coll->Get(i)        (i in [0, Count()))
+         Keyed protocol (Map<K,V>):  k = coll->KeyAt(i), v = coll->ValAt(i) */
       struct type *cls_type = coll_type->mode == TM_PTR ? coll_type->u.ptr_type : coll_type;
       struct type *this_type
         = coll_type->mode == TM_PTR ? coll_type : create_ptr_type (c2m_ctx, cls_type);
@@ -22254,8 +22334,14 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         = find_class_protocol_method (c2m_ctx, cls_type->u.tag_type, "Count", 0, POS (r));
       node_t get_def
         = find_class_protocol_method (c2m_ctx, cls_type->u.tag_type, "Get", 1, POS (r));
+      node_t keyat_def
+        = find_class_protocol_method (c2m_ctx, cls_type->u.tag_type, "KeyAt", 1, POS (r));
+      node_t valat_def
+        = find_class_protocol_method (c2m_ctx, cls_type->u.tag_type, "ValAt", 1, POS (r));
+      int map_proto = (keyat_def != NULL && valat_def != NULL);
 
-      assert (count_def != NULL && get_def != NULL); /* validated during check */
+      /* validated during check */
+      assert (count_def != NULL && (map_proto || get_def != NULL));
       /* Evaluate the receiver pointer once, before the loop. */
       op_t this_reg = get_new_temp (c2m_ctx, MIR_T_I64);
       if (coll_type->mode == TM_PTR) {
@@ -22280,30 +22366,42 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (ctx, break_label), i_reg.mir_op, n_save.mir_op);
       emit_label_insn_opt (c2m_ctx, body_label);
 
-      /* elem = coll->Get(i) */
-      op_t el_res = gen_class_method_call (c2m_ctx, get_def, this_type, this_reg, &i_reg, 1);
-      node_t el_var = val_id->code == N_ID ? val_id : key_id;
-      if (val_id->code == N_ID) {
-        /* Two-var form: key_id = i (index) */
-        MIR_type_t idx_t = promote_mir_int_type (MIR_T_I32);
-        const char *iname = get_reg_var_name (c2m_ctx, idx_t, key_id->u.s.s, fsn);
-        reg_var_t ivar = get_reg_var (c2m_ctx, idx_t, iname, NULL);
-        emit2 (c2m_ctx, tp_mov (idx_t), MIR_new_reg_op (ctx, ivar.reg), i_reg.mir_op);
+      /* Store SRC into the loop variable VAR_NODE using VAR_NODE's *declared*
+         MIR type so the register name matches what N_ID reads in the body (same
+         approach as the dict branch below). */
+      #define STORE_FORIN_VAR(var_node, src_op) do {                                  \
+        symbol_t _vs; MIR_type_t _vt = MIR_T_I64;                                      \
+        if (symbol_find (c2m_ctx, S_REGULAR, (var_node), r, &_vs) && _vs.def_node != NULL \
+            && _vs.def_node->attr != NULL)                                            \
+          _vt = promote_mir_int_type (                                                \
+                  get_mir_type (c2m_ctx, ((decl_t) _vs.def_node->attr)->decl_spec.type)); \
+        const char *_vn = get_reg_var_name (c2m_ctx, _vt, (var_node)->u.s.s, fsn);     \
+        reg_var_t _vv = get_reg_var (c2m_ctx, _vt, _vn, NULL);                         \
+        emit2 (c2m_ctx, tp_mov (_vt), MIR_new_reg_op (ctx, _vv.reg), (src_op).mir_op); \
+      } while (0)
+
+      if (map_proto) {
+        /* Keyed: key_id = coll->KeyAt(i); [val_id = coll->ValAt(i)] */
+        op_t k_res = gen_class_method_call (c2m_ctx, keyat_def, this_type, this_reg, &i_reg, 1);
+        STORE_FORIN_VAR (key_id, k_res);
+        if (val_id->code == N_ID) {
+          op_t v_res = gen_class_method_call (c2m_ctx, valat_def, this_type, this_reg, &i_reg, 1);
+          STORE_FORIN_VAR (val_id, v_res);
+        }
+      } else {
+        /* elem = coll->Get(i) */
+        op_t el_res = gen_class_method_call (c2m_ctx, get_def, this_type, this_reg, &i_reg, 1);
+        node_t el_var = val_id->code == N_ID ? val_id : key_id;
+        if (val_id->code == N_ID) {
+          /* Two-var form: key_id = i (index) */
+          MIR_type_t idx_t = promote_mir_int_type (MIR_T_I32);
+          const char *iname = get_reg_var_name (c2m_ctx, idx_t, key_id->u.s.s, fsn);
+          reg_var_t ivar = get_reg_var (c2m_ctx, idx_t, iname, NULL);
+          emit2 (c2m_ctx, tp_mov (idx_t), MIR_new_reg_op (ctx, ivar.reg), i_reg.mir_op);
+        }
+        STORE_FORIN_VAR (el_var, el_res);
       }
-      {
-        /* Store the element using the loop variable's *declared* MIR type so
-           the register name matches what N_ID reads in the body (same approach
-           as the dict branch below). */
-        symbol_t vsym;
-        MIR_type_t vt = MIR_T_I64;
-        if (symbol_find (c2m_ctx, S_REGULAR, el_var, r, &vsym) && vsym.def_node != NULL
-            && vsym.def_node->attr != NULL)
-          vt = promote_mir_int_type (
-                 get_mir_type (c2m_ctx, ((decl_t) vsym.def_node->attr)->decl_spec.type));
-        const char *vname = get_reg_var_name (c2m_ctx, vt, el_var->u.s.s, fsn);
-        reg_var_t vvar = get_reg_var (c2m_ctx, vt, vname, NULL);
-        emit2 (c2m_ctx, tp_mov (vt), MIR_new_reg_op (ctx, vvar.reg), el_res.mir_op);
-      }
+      #undef STORE_FORIN_VAR
     } else {
       /* ---- Dict for-in ---- */
       op_t coll_val = val_gen (c2m_ctx, coll);

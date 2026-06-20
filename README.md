@@ -74,6 +74,40 @@ for (auto name, data in Fruit.variants) {
 }
 ```
 
+### Typed `Map<K, V>` Hash Maps (`include/map.h`)
+The typed, type-safe sibling of `dict`: a generic open-addressing hash map that
+fixes its key and value types at compile time, stores values inline (no boxing),
+and works with any key type. String keys are hashed by **content**, scalars by
+**value**, and objects (pointers) by **identity** — chosen at compile time via
+`_Generic`, exactly like `Set<T>`.
+
+```c
+#include "map.h"
+
+Map<String, int> *ages = new Map<String, int>();
+ages["Ada"] = 36;                       // subscript write  ->  Set(key, val)
+ages["Ada"] = ages["Ada"] + 1;          // subscript read   ->  Get(key)
+if (ages->Contains("Ada")) { /* ... */ }
+
+for (auto name, age in ages)            // (key, value) iteration, like dict
+    printf("%s is %d\n", name, age);
+
+// string -> object mapping
+Map<String, Track*> *lib = new Map<String, Track*>();
+lib["Kashmir"] = new Track("Kashmir", 508);
+for (auto title, track in lib) track->play();
+
+defer delete ages;
+```
+
+`Map<K, V>` is a two-type-parameter generic that plugs into the same language
+sugar as `List<T>` / `Set<T>`: subscript (`m[k]` / `m[k] = v`) lowers to
+`Get`/`Set`, and `for (auto k in m)` / `for (auto k, v in m)` iterate keys and
+key/value pairs in insertion order (the same `Count()` / `KeyAt(int)` /
+`ValAt(int)` protocol the compiler duck-types over). See
+`examples/classy-map.cy` for the full tour and `examples/classy-map-bench.cy`
+for a 100k-entry throughput benchmark.
+
 ### Classes with Constructors, Destructors & `new`/`delete`
 ```c
 class Point {
@@ -298,6 +332,8 @@ Look in the `examples/` directory:
 | `test-list-stdlib.c`       | Full stdlib List<T> validation |
 | `test-array-to-list.cy`    | Array/slice `.ToList()`, `auto` deduction, `List(T*)` ctor |
 | `classy-sets.cy`           | Generic `Set<T>` hash set (content-aware `String` hashing) |
+| `classy-map.cy`            | Generic `Map<K,V>` hash map (`m[k]`, `for (auto k,v in m)`, string→object) |
+| `classy-map-bench.cy`      | `Map<K,V>` throughput benchmark (100k entries, int & String keys) |
 | `classy-sets-myclass.cy`   | Custom `WordBag` class over `Set<T>`: word analytics (sort -u, set-grep, stop-words, Jaccard) |
 | `classy-search-engine.cy`  | MapReduce inverted-index search engine over `List<T>` of custom classes |
 | `classy-collections-class.cy` | `List<Track*>` + `Set<Track*>` over a custom class (Sort/Filter, set algebra by identity) |

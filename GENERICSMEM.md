@@ -13,23 +13,35 @@ the relevant code lives, what's still missing").
 
 ## TL;DR
 
-| Element type `T`                     | `List<T>` | `Set<T>` | Notes |
-|--------------------------------------|:---------:|:--------:|-------|
-| `int`, `double`, `char`, `bool`, …   | ✅ | ✅ | value stored inline; byte-hash / value-compare |
-| `String`                             | ✅ | ✅ | `Set` hashes/compares **by content** (see below) |
-| `char*` / other pointers             | ✅ | ✅ | hashed/compared **by address** (identity) |
-| `MyClass*` (pointer to a class)      | ✅ | ✅ | **the idiomatic way to put a class in a collection** |
-| `MyClass` (class **by value**)       | ❌ | ⚠️ | blocked — see "By-value class elements" |
+| Element type `T`                     | `List<T>` | `Set<T>` | `Map<K,V>` | Notes |
+|--------------------------------------|:---------:|:--------:|:----------:|-------|
+| `int`, `double`, `char`, `bool`, …   | ✅ | ✅ | ✅ | value stored inline; byte-hash / value-compare |
+| `String`                             | ✅ | ✅ | ✅ | `Set`/`Map` key hashes/compares **by content** (see below) |
+| `char*` / other pointers             | ✅ | ✅ | ✅ | hashed/compared **by address** (identity) |
+| `MyClass*` (pointer to a class)      | ✅ | ✅ | ✅ | **the idiomatic way to put a class in a collection** |
+| `MyClass` (class **by value**)       | ❌ | ⚠️ | ❌ | blocked — see "By-value class elements" |
+
+(`Map<K,V>` columns describe both the key type `K` and the value type `V`; `K`
+is hashed/compared exactly like a `Set<K>` element.)
 
 Rule of thumb: **classes are reference types.** Create them with `new` and store
 the pointer: `List<Track*>`, `Set<Track*>`. Use value element types only for
 scalars, `String`, and plain pointers.
 
 ```c
-auto lib  = new List<Track*>();      // ✅ ordered collection of objects
-auto favs = new Set<Track*>();       // ✅ identity set of objects
+auto lib  = new List<Track*>();          // ✅ ordered collection of objects
+auto favs = new Set<Track*>();           // ✅ identity set of objects
+auto byId = new Map<String, Track*>();   // ✅ keyed collection (string -> object)
 lib->Add(new Track("Kashmir", 508));
+byId->Set("Kashmir", lib->Get(0));
 ```
+
+`Map<K, V>` (see `include/map.h`) is the first **two-type-parameter** generic.
+It stores keys and values inline (no boxing), keys hashed/compared like a
+`Set<K>` (String by content, scalars by value, objects by identity), and plugs
+into the same language sugar as `List`/`Set` plus a *keyed* variant of the
+subscript and for-in protocols (see
+[Multiple type parameters](#multiple-type-parameters-mapk-v) below).
 
 ---
 
@@ -64,13 +76,29 @@ for (auto x in coll)      // x = coll->Get(i)  for i in [0, coll->Count())
 for (auto i, x in coll)   // i = index (int),  x = element
 ```
 
-Lowering: checked in `check()` `case N_FORIN` (≈ L13632), generated in `gen()`
-`case N_FORIN` (≈ L21950, `class_forin` branch ≈ L22052). Requirements:
+Lowering: checked in `check()` `case N_FORIN`, generated in `gen()`
+`case N_FORIN` (`class_forin` branch). Requirements:
 
 * `Count()` must return an integer type.
 * `Get(int)` must take a single integer index and **return a scalar or pointer
-  type** (≈ L13738). A `Get` returning a class *value* is rejected — the for-in
+  type**. A `Get` returning a class *value* is rejected — the for-in
   codegen stores the element into a MIR register, which only holds scalars/pointers.
+
+#### Keyed for-in (the `Map<K,V>` variant)
+
+A class exposing `Count()` **plus** `KeyAt(int)` and `ValAt(int)` is treated as a
+*keyed* collection, and for-in binds **(key, value)** rather than (index, element):
+
+```c
+for (auto k in map)       // k = map->KeyAt(i)            (keys, in insertion order)
+for (auto k, v in map)    // k = map->KeyAt(i), v = map->ValAt(i)
+```
+
+This mirrors the built-in `dict`'s `for (auto k, val in d)`. The keyed protocol
+is detected first in both `check()` and `gen()`; the `KeyAt`/`ValAt` return
+types (which must be scalar/pointer) become the loop-variable types. Classes
+without `KeyAt`/`ValAt` (e.g. `List`/`Set`) fall back to the index `Get`
+protocol unchanged, so there is no behavioural change for existing collections.
 
 ### Subscript `coll[i]`
 
@@ -79,9 +107,19 @@ coll[i]        // read  -> coll->Get(i)
 coll[i] = v    // write -> coll->Set(i, v)
 ```
 
-* Read: `check()` `case N_IND` (≈ L13250); `gen()` `case N_IND` (≈ L20165).
-* Write: intercepted in `gen()` `case N_ASSIGN` (≈ L19913); falls back to a plain
+* Read: `check()` `case N_IND`; `gen()` `case N_IND`.
+* Write: intercepted in `gen()` `case N_ASSIGN`; falls back to a plain
   store when the class has no `Set(int,T)`.
+
+**Keyed subscript (non-integer keys).** The subscript protocol is no longer
+restricted to integer indices. `check()` `case N_IND` now reads `Get`'s key
+*parameter* type: if it is integer, an integer index is required (List/Set,
+unchanged); otherwise any index assignable to the key type is accepted, so
+`Map<String,V>` supports `m["name"]` (read → `Get(String)`) and
+`m["name"] = v` (write → `Set(String, V)`). On the gen side the index is only
+widened to `I64` when it is integer; a non-integer key is passed through and
+coerced to the key parameter type by `gen_funcptr_call`. (Floating-point and
+aggregate keys via subscript are not meaningful here — use `Get`/`Set` directly.)
 
 **Subscript vs. raw pointer indexing (fixed).** `p[i]` where `p` is a
 *pointer to a class* used to *always* try the `Get` sugar and error with
@@ -140,10 +178,74 @@ by-value `MyClass` there, so `List<MyClass*>::Sort/Filter/ForEach` failed with
 the fixup makes `List<MyClass*>` work end-to-end with the higher-order methods.
 
 Other relevant spots:
-* `get_or_create_specialization()` (≈ L4809) — creates/caches a specialization,
+* `get_or_create_specialization()` — creates/caches a specialization,
   with guards against instantiating a template whose body failed to parse
   (returns a diagnostic instead of pushing a NULL class and crashing).
 * `mangle_generic_name()` — `List` + `MyClass*` → `__generic_List_MyClassP`.
+
+---
+
+## Multiple type parameters: `Map<K, V>`
+
+`Map<K, V>` (`include/map.h`) is the first generic with **more than one** type
+parameter. Most of the multi-parameter machinery was already in place — it just
+hadn't been exercised:
+
+* The parser stores up to **4** type parameters per template
+  (`generic_tmpl_t::type_params[4]`) and parses both the declaration
+  (`class Map<K, V> { ... }`) and the instantiation (`Map<String, int>`) as
+  comma-separated lists.
+* `mangle_generic_name()` already loops over every argument, so
+  `Map` + `String` + `int` → `__generic_Map_String_int`, and
+  `Map<String, Track*>` → `__generic_Map_String_TrackP`.
+* `specialize_node()`'s type-parameter substitution and the pointer-arg
+  declarator fixup (`N_MEMBER` / `N_SPEC_DECL` / `N_FUNC_DEF` / `N_TYPE`) both
+  iterate `n_params`, so `K*`/`V*` fields, `sizeof(K)`/`sizeof(V)`, `(K*)` casts,
+  and `int(*)(K,K)` callbacks specialise correctly for two parameters.
+
+### The one gap that needed fixing: multi-param self-reference
+
+Inside a generic body, a reference to the class's **own** type
+(`Map<K, V>* Copy()`, `new Map<K, V>()`) is recorded in the template AST as a
+mangled *placeholder* N_ID built from the parameter names — `__generic_Map_K_V`.
+When the template is specialised, `specialize_node()` must rewrite that
+placeholder to the concrete name (`__generic_Map_String_int`).
+
+The old code only handled the **single**-parameter case: it compared the part
+after `__generic_<Orig>_` against one parameter name (`T` → `__generic_List_T`).
+For `Map<K,V>` the rest was `K_V`, which matched neither `K` nor `V`, so the
+placeholder leaked through unresolved and produced
+`unknown type __generic_Map_K_V`.
+
+The fix generalises the placeholder resolver: it tokenises the suffix on `_`,
+maps each token back to a parameter index, collects the corresponding concrete
+arguments, and re-mangles with all of them. It works for any parameter count
+and reduces to the original behaviour for one parameter. (It assumes parameter
+names contain no `_`, which holds for `T`, `K`, `V`, `Key`, `Value`, ….) This
+is the *only* compiler change required to let a two-parameter generic refer to
+itself, so `Copy()`/`Merge()`/internal `new Map<K,V>()` all work.
+
+### Still unsupported: cross-generic references with an *unresolved* parameter
+
+A generic body that instantiates a **different** generic with one of its own
+(still-abstract) parameters — e.g. `List<K>` inside `Map<K, V>` (think a
+hypothetical `Keys() -> List<K>*`) — does **not** work: `List<K>` tries to
+materialise `__generic_List_K` immediately, with `K` an unresolved identifier,
+yielding `unknown type K`. `map.h` therefore avoids it: instead of returning a
+`List<K>`/`List<V>`, the map exposes its own `Count()` / `KeyAt(int)` /
+`ValAt(int)` traversal (which also powers keyed for-in), plus `ForEach`.
+Closing this gap (deferred specialisation of nested generics) would let keyed
+collections hand back `List<K>` of their keys directly.
+
+### `Map<K, V>` hashing
+
+`map.h` reuses the `set.h` strategy verbatim, on the **key** type `K`:
+`_Generic` selects content hashing/equality for `String` keys and byte-wise
+hashing for everything else (scalars by value, pointers/objects by identity).
+Keys and values live in **parallel dense arrays** (`K* keys; V* vals;`) indexed
+by an open-addressing table of dense indices — the same layout as `Set<T>`, with
+a second value array. Insertion order is preserved, which is what `KeyAt`/
+`ValAt` and keyed for-in iterate.
 
 ---
 
@@ -236,11 +338,14 @@ To make `List<MyClass>` / `Set<MyClass>` real, in rough order:
 
 | Area | Where |
 |------|-------|
-| Generic template registry / instantiation | `get_or_create_specialization` ≈ L4809 |
-| Template deep-copy + pointer-arg fixup     | `specialize_node` ≈ L4646 (N_TYPE fixup ≈ L4731) |
-| Type → MIR type (aggregates → `MIR_T_UNDEF`)| `get_mir_type` ≈ L16392 |
-| Subscript `coll[i]` read (check / gen)      | `check` N_IND ≈ L13250 / `gen` N_IND ≈ L20165 |
-| Subscript `coll[i] = v` write               | `gen` N_ASSIGN ≈ L19913 |
-| `for-in` (check / gen)                       | `check` N_FORIN ≈ L13632 / `gen` N_FORIN ≈ L21950 |
-| Aggregate calling convention helpers        | ≈ L17236–L17351 |
+| Generic template registry / instantiation | `get_or_create_specialization` |
+| Template deep-copy + pointer-arg fixup     | `specialize_node` (N_TYPE fixup) |
+| Multi-param self-reference placeholder      | `specialize_node` (`__generic_<Orig>_<P0>_<P1>...` resolver) |
+| Generic name mangling (all args)            | `mangle_generic_name` |
+| Type → MIR type (aggregates → `MIR_T_UNDEF`)| `get_mir_type` |
+| Subscript `coll[i]` read (check / gen)      | `check` N_IND / `gen` N_IND (keyed key-type check in `check`) |
+| Subscript `coll[i] = v` write               | `gen` N_ASSIGN (keyed `Set(K,V)`) |
+| `for-in` (check / gen)                       | `check` N_FORIN / `gen` N_FORIN (`map_proto` KeyAt/ValAt branch) |
+| Aggregate calling convention helpers        | proto/arg/return `simple_*` / `target_*` helpers |
 | `Set<T>` hash/eq dispatch                    | `include/set.h` (`SET_HASH` / `SET_EQ`) |
+| `Map<K,V>` hash/eq dispatch + keyed protocol | `include/map.h` (`MAP_HASH` / `MAP_EQ`, `KeyAt`/`ValAt`) |

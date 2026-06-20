@@ -23,7 +23,7 @@
 #include <string.h>
 #include "include/httpclient.h"
 
-#define POKE_API "https://pokeapi.co/api/v2/pokemon/"
+String POKE_API="https://pokeapi.co/api/v2/pokemon/";
 
 /* Pretty-print the interesting fields of a parsed Pokémon dict. */
 void print_pokemon(dict d) {
@@ -55,7 +55,7 @@ int main() {
     /* ── 1. One detailed fetch: inspect the response envelope ──────────── */
     printf("-- 1. GET %sditto --\n", POKE_API);
     {
-        auto resp = Http.get(POKE_API "ditto");
+        auto resp = Http.get(POKE_API + "ditto");
         defer delete resp;
 
         printf("  status      : %d %s\n", resp->status, (char *)resp->statusText);
@@ -83,7 +83,7 @@ int main() {
         headers->Add("Accept: application/json");
         headers->Add("X-Powered-By: ClassyC");
 
-        auto resp = Http.get(POKE_API "charizard", headers);
+        auto resp = Http.get( POKE_API + "charizard", headers);
         defer delete resp;
 
         if (resp->ok()) {
@@ -112,7 +112,7 @@ int main() {
     /* ── 4. Graceful handling of a 404 ─────────────────────────────────── */
     printf("\n-- 4. A request that 404s --\n");
     {
-        auto resp = Http.get(POKE_API "definitely-not-a-pokemon");
+        auto resp = Http.get(POKE_API + "definitely-not-a-pokemon");
         defer delete resp;
         printf("  status %d %s -> ok()=%d\n",
                resp->status, (char *)resp->statusText, resp->ok());
