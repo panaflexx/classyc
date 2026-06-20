@@ -8191,6 +8191,9 @@ static int str_concat_string_operand_p (const struct type *type, node_t op) {
 	  SM_ENDS_WITH,   /* s.ends_with(suffix)               -> int (0/1)         */
 	  SM_CONTAINS,    /* s.contains(needle)                -> int (0/1)         */
 	  SM_TRIM,        /* s.trim()                          -> String            */
+	  SM_SPLIT,       /* s.split(delim)                    -> List<String>*     */
+	  SM_JOIN,        /* list.join(delim) (on List<String>)-> String            */
+	  SM_EQUALS,      /* s.equals(other)                   -> int (0/1)         */
 	};
 
 /* Map a method name to its enum, the exact argument count it expects, and the
@@ -8215,6 +8218,9 @@ static enum str_method get_string_method (const char *name, int *nargs,
   else if (strcmp (name, "ends_with") == 0)   { m = SM_ENDS_WITH;   n = 1; rt = "c2m_str_ends_with"; }
   else if (strcmp (name, "contains") == 0)    { m = SM_CONTAINS;    n = 1; rt = "c2m_str_contains"; }
   else if (strcmp (name, "trim") == 0)        { m = SM_TRIM;        n = 0; rt = "c2m_str_trim"; }
+  else if (strcmp (name, "split") == 0)       { m = SM_SPLIT;       n = 1; rt = "c2m_str_split"; }
+  else if (strcmp (name, "join") == 0)        { m = SM_JOIN;        n = 1; rt = "c2m_str_join"; }
+  else if (strcmp (name, "equals") == 0)      { m = SM_EQUALS;      n = 1; rt = "c2m_str_equals"; }
   else                                        { m = SM_NONE;        n = 0; rt = NULL; }
 
   if (nargs != NULL) *nargs = n;
@@ -10078,6 +10084,17 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       return (id != NULL && id->code == N_ID) ? id->u.s.s : NULL;
     }
 
+    /* True when TYPE is the List<String> generic specialization (the receiver
+       type accepted by the built-in `.join(delim)` method).  A pointer to such
+       a class also qualifies (one level is peeled), so both `List<String>` and
+       `List<String>*` receivers match. */
+    static int list_string_type_p (const struct type *type) {
+      const char *name;
+      if (type != NULL && type->mode == TM_PTR) type = type->u.ptr_type;
+      name = class_type_name (type);
+      return name != NULL && strcmp (name, "__generic_List_String") == 0;
+    }
+
     /* Duck-typed protocol lookup: find an instance method NAME belonging to
        class CLASS_TAG (methods are registered by plain name in an enclosing
        scope, so candidates are filtered by their func_type->class_scope; a
@@ -11545,6 +11562,44 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
     return acc_type;
   default: return NULL;
   }
+}
+
+/* Instantiate (or reuse) the generic List<EL> specialization and return a fresh
+   `List<EL>*` type, or NULL (after emitting a diagnostic) when the generic
+   List<T> class is not in scope.  This mirrors the List resolution done for
+   `arr.ToList()` and is what backs `String.split()`'s List<String>* result. */
+static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_t pos) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx; /* for the curr_scope macro */
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx; /* for pending_lambdas macro */
+  node_t type_arg, spec_id, class_def;
+  struct type *class_type, *res;
+  size_t pend_mark;
+
+  if ((type_arg = build_seq_type_arg (c2m_ctx, el, pos)) == NULL) {
+    error (c2m_ctx, pos, "unsupported List element type");
+    return NULL;
+  }
+  pend_mark = VARR_LENGTH (node_t, pending_lambdas);
+  spec_id = get_or_create_specialization (c2m_ctx, "List", 1, &type_arg, pos);
+  materialize_pending_specs (c2m_ctx, pend_mark);
+  if (spec_id == NULL || spec_id->code != N_ID) {
+    error (c2m_ctx, pos, "could not instantiate List<T>");
+    return NULL;
+  }
+  class_def = find_def (c2m_ctx, S_REGULAR, spec_id, curr_scope, NULL);
+  if (class_def == NULL || class_def->code != N_CLASS) {
+    error (c2m_ctx, pos,
+           "this operation requires the generic List<T> class in scope (#include \"list.h\")");
+    return NULL;
+  }
+  class_type = create_class_type (c2m_ctx, class_def);
+  set_class_layout (c2m_ctx, class_def, class_type);
+  res = create_type (c2m_ctx, NULL);
+  init_type (res);
+  res->mode = TM_PTR;
+  res->u.ptr_type = class_type;
+  set_type_layout (c2m_ctx, res);
+  return res;
 }
 
     static void check_dict_init_list (c2m_ctx_t c2m_ctx, node_t initializer, node_t context);
@@ -13936,6 +13991,16 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
             break;
           }
         }
+        /* Built-in List<String>::join(delim) method access: same placeholder
+           treatment as the String/seq methods; N_CALL lowers it to
+           c2m_str_join.  List<String> defines no user `join`. */
+        if (list_string_type_p (t1) && get_string_method (op2->u.s.s, NULL, NULL) == SM_JOIN
+            && find_def (c2m_ctx, S_REGULAR, op2, t1->u.tag_type, NULL) == NULL) {
+          e->type->mode = TM_BASIC;
+          e->type->u.basic_type = TP_VOID;
+          e->u.lvalue_node = NULL;
+          break;
+        }
         if (t1->mode != TM_STRUCT && t1->mode != TM_UNION && t1->mode != TM_CLASS && t1->mode != TM_DICT) {
           error (c2m_ctx, POS (r), "request for member %s in something not a structure, union, class or dict",
                  op2->u.s.s);
@@ -14580,9 +14645,31 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
 
 	              // Only proceed with method call logic if the object is a class (TM_CLASS)
 	              if (obj_type->mode == TM_CLASS) {
-	                node_t method_id = NL_NEXT(obj);  // Method name (N_ID)
+		                node_t method_id = NL_NEXT(obj);  // Method name (N_ID)
 
-	                // Pre-check the user arguments so their types are known for
+		                // Built-in List<String>::join(delim) -> String.  List<String>
+		                // defines no user `join`, so intercept it here (before the
+		                // normal method lookup) and lower to c2m_str_join in gen.
+		                if (list_string_type_p(obj_type)
+		                    && get_string_method(method_id->u.s.s, NULL, NULL) == SM_JOIN
+		                    && find_def(c2m_ctx, S_REGULAR, method_id, obj_type->u.tag_type, NULL)
+		                         == NULL) {
+		                  if (NL_LENGTH(arg_list->u.ops) != 1)
+		                    error(c2m_ctx, POS(r), "String method 'join' expects 1 argument");
+		                  for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg))
+		                    if (!arg->attr) check(c2m_ctx, arg, r);
+		                  init_type(&res_type);
+		                  res_type.mode = TM_BASIC;
+		                  res_type.u.basic_type = TP_STRING;
+		                  res_type.type_qual.const_p = 1;
+		                  res_type.raw_size = 8;
+		                  res_type.align = 8;
+		                  ret_type = &res_type;
+		                  method_call_p = TRUE;
+		                  goto seq_method_done;
+		                }
+
+		                // Pre-check the user arguments so their types are known for
 	                // overload resolution (this runs before the implicit 'this' is
 	                // prepended below).
 	                for (node_t ua = NL_HEAD(arg_list->u.ops); ua != NULL; ua = NL_NEXT(ua))
@@ -14793,6 +14880,26 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
 	                  res_type.raw_size = 8;
 	                  res_type.align = 8;
 	                  break;
+	                case SM_EQUALS:
+	                  /* Returns int (0/1 boolean) */
+	                  res_type.u.basic_type = TP_INT;
+	                  set_type_layout(c2m_ctx, &res_type);
+	                  break;
+	                case SM_SPLIT: {
+	                  /* s.split(delim) -> List<String>*: instantiate List<String>
+	                     (so parts->Count()/delete work) and use it as the result. */
+	                  struct type str_el;
+	                  struct type *lp;
+	                  init_type(&str_el);
+	                  str_el.mode = TM_BASIC;
+	                  str_el.u.basic_type = TP_STRING;
+	                  str_el.type_qual.const_p = 1;
+	                  str_el.raw_size = 8;
+	                  str_el.align = 8;
+	                  if ((lp = make_list_ptr_type(c2m_ctx, &str_el, POS(r))) == NULL) break;
+	                  res_type = *lp;
+	                  break;
+	                }
 	                default: break;
 	                }
 	                ret_type = &res_type;
@@ -16097,6 +16204,9 @@ struct gen_ctx {
   MIR_item_t str_ends_with_proto, str_ends_with_item;
   MIR_item_t str_contains_proto, str_contains_item;
   MIR_item_t str_trim_proto, str_trim_item;
+  MIR_item_t str_split_proto, str_split_item;
+  MIR_item_t str_join_proto, str_join_item;
+  MIR_item_t str_equals_proto, str_equals_item;
   MIR_item_t str_detach_proto, str_detach_item;
   MIR_item_t str_attach_proto, str_attach_item;
   MIR_item_t str_checkpoint_proto, str_checkpoint_item;
@@ -16217,6 +16327,12 @@ struct gen_ctx {
 #define str_contains_item gen_ctx->str_contains_item
 #define str_trim_proto gen_ctx->str_trim_proto
 #define str_trim_item gen_ctx->str_trim_item
+#define str_split_proto gen_ctx->str_split_proto
+#define str_split_item gen_ctx->str_split_item
+#define str_join_proto gen_ctx->str_join_proto
+#define str_join_item gen_ctx->str_join_item
+#define str_equals_proto gen_ctx->str_equals_proto
+#define str_equals_item gen_ctx->str_equals_item
 #define str_detach_proto gen_ctx->str_detach_proto
 #define str_detach_item gen_ctx->str_detach_item
 #define str_attach_proto gen_ctx->str_attach_proto
@@ -18516,6 +18632,30 @@ static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, str_trim_proto);
   move_item_to_module_start (module, str_trim_item);
 
+  /* void *c2m_str_split(const char *s, const char *delim) -> List<String>* */
+  vars[0].name = "s";     vars[0].type = MIR_T_I64;
+  vars[1].name = "delim"; vars[1].type = MIR_T_I64;
+  str_split_proto = MIR_new_proto_arr (ctx, "__c2m_str_split_p", 1, &ptr_t, 2, vars);
+  str_split_item = MIR_new_import (ctx, "c2m_str_split");
+  move_item_to_module_start (module, str_split_proto);
+  move_item_to_module_start (module, str_split_item);
+
+  /* char *c2m_str_join(void *list, const char *delim) -- List<String>* receiver as opaque ptr */
+  vars[0].name = "list";  vars[0].type = MIR_T_I64;
+  vars[1].name = "delim"; vars[1].type = MIR_T_I64;
+  str_join_proto = MIR_new_proto_arr (ctx, "__c2m_str_join_p", 1, &ptr_t, 2, vars);
+  str_join_item = MIR_new_import (ctx, "c2m_str_join");
+  move_item_to_module_start (module, str_join_proto);
+  move_item_to_module_start (module, str_join_item);
+
+  /* int64_t c2m_str_equals(const char *s, const char *other) */
+  vars[0].name = "s";     vars[0].type = MIR_T_I64;
+  vars[1].name = "other"; vars[1].type = MIR_T_I64;
+  str_equals_proto = MIR_new_proto_arr (ctx, "__c2m_str_equals_p", 1, &ptr_t, 2, vars);
+  str_equals_item = MIR_new_import (ctx, "c2m_str_equals");
+  move_item_to_module_start (module, str_equals_proto);
+  move_item_to_module_start (module, str_equals_item);
+
   /* char *c2m_str_detach(const char *s) */
   vars[0].name = "s"; vars[0].type = MIR_T_I64;
   str_detach_proto = MIR_new_proto_arr (ctx, "__c2m_str_detach_p", 1, &ptr_t, 1, vars);
@@ -18666,6 +18806,9 @@ static op_t gen_string_call (c2m_ctx_t c2m_ctx, enum str_method sm, MIR_op_t *va
   case SM_ENDS_WITH:   proto = str_ends_with_proto;   item = str_ends_with_item;   break;
   case SM_CONTAINS:    proto = str_contains_proto;    item = str_contains_item;    break;
   case SM_TRIM:        proto = str_trim_proto;        item = str_trim_item;        break;
+  case SM_SPLIT:       proto = str_split_proto;       item = str_split_item;       break;
+  case SM_JOIN:        proto = str_join_proto;        item = str_join_item;        break;
+  case SM_EQUALS:      proto = str_equals_proto;      item = str_equals_item;       break;
   default:             assert (0);                                                 break;
   }
   return gen_rt_call (c2m_ctx, proto, item, (size_t) n, vals);
@@ -20937,10 +21080,40 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           case SM_TRIM:
             res = gen_string_call (c2m_ctx, SM_TRIM, vals, 1);
             break;
+          case SM_EQUALS:
+            vals[1] = val_gen (c2m_ctx, NL_HEAD (args->u.ops)).mir_op;
+            res = gen_string_call (c2m_ctx, SM_EQUALS, vals, 2);
+            break;
+          case SM_SPLIT:
+            vals[1] = val_gen (c2m_ctx, NL_HEAD (args->u.ops)).mir_op;
+            res = gen_string_call (c2m_ctx, SM_SPLIT, vals, 2);
+            break;
           default: break;
           }
           goto finish;
         }
+      }
+    }
+    /* Built-in List<String>::join(delim) -> String.  The receiver is the
+       List<String> pointer (or a value, whose address we take), passed as the
+       opaque first argument to c2m_str_join. */
+    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
+      node_t mobj = NL_HEAD (func->u.ops);
+      node_t mid = NL_NEXT (mobj);
+      struct expr *obj_e = mobj->attr;
+      if (mid != NULL && mid->code == N_ID
+          && get_string_method (mid->u.s.s, NULL, NULL) == SM_JOIN
+          && obj_e != NULL && list_string_type_p (obj_e->type)) {
+        MIR_op_t vals[2];
+        op_t recv;
+        if (func->code == N_DEREF_FIELD)
+          recv = val_gen (c2m_ctx, mobj); /* receiver already a pointer value */
+        else
+          recv = mem_to_address (c2m_ctx, gen (c2m_ctx, mobj, NULL, NULL, FALSE, NULL, NULL), TRUE);
+        vals[0] = force_reg (c2m_ctx, recv, MIR_T_I64).mir_op;
+        vals[1] = val_gen (c2m_ctx, NL_HEAD (args->u.ops)).mir_op;
+        res = gen_string_call (c2m_ctx, SM_JOIN, vals, 2);
+        goto finish;
       }
     }
     first_arg = NL_HEAD (args->u.ops);
@@ -22618,6 +22791,16 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
          field placeholder.  They have no user-level C prototype either. */
       if (smethod != NULL && smethod->code == N_ID
           && get_seq_method (smethod->u.s.s, NULL) != SEQM_NONE) {
+        struct expr *sfe = func->attr;
+        if (sfe != NULL && sfe->type != NULL && sfe->type->mode == TM_BASIC
+            && sfe->type->u.basic_type == TP_VOID)
+          continue;
+      }
+      /* Built-in List<String>::join(delim) is also lowered to a runtime call
+         (c2m_str_join) in gen, marked by the same void-typed field placeholder
+         and carrying no user-level C prototype. */
+      if (smethod != NULL && smethod->code == N_ID
+          && get_string_method (smethod->u.s.s, NULL, NULL) == SM_JOIN) {
         struct expr *sfe = func->attr;
         if (sfe != NULL && sfe->type != NULL && sfe->type->mode == TM_BASIC
             && sfe->type->u.basic_type == TP_VOID)

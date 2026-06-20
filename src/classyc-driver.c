@@ -509,6 +509,9 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "c2m_str_ends_with") == 0) return (void *) c2m_str_ends_with;
     if (strcmp (name, "c2m_str_contains") == 0) return (void *) c2m_str_contains;
     if (strcmp (name, "c2m_str_trim") == 0) return (void *) c2m_str_trim;
+    if (strcmp (name, "c2m_str_equals") == 0) return (void *) c2m_str_equals;
+    if (strcmp (name, "c2m_str_split") == 0) return (void *) c2m_str_split;
+    if (strcmp (name, "c2m_str_join") == 0) return (void *) c2m_str_join;
     if (strcmp (name, "c2m_str_detach") == 0) return (void *) c2m_str_detach;
     if (strcmp (name, "c2m_str_attach") == 0) return (void *) c2m_str_attach;
     if (strcmp (name, "c2m_str_cleanup") == 0) return (void *) c2m_str_cleanup;

@@ -491,6 +491,140 @@ C2M_STR_API char *c2m_str_trim (const char *s) {
   return r;
 }
 
+/* Content equality: 1 if both Strings hold the same bytes, 0 otherwise.
+   NULL is treated as the empty string, so equals(NULL, "") == 1. */
+C2M_STR_API int64_t c2m_str_equals (const char *s, const char *other) {
+  size_t i;
+  if (s == NULL) s = "";
+  if (other == NULL) other = "";
+  for (i = 0; s[i] != '\0' && other[i] != '\0'; i++)
+    if (s[i] != other[i]) return 0;
+  return s[i] == other[i]; /* both terminated at the same point */
+}
+
+/* ============================================================================
+ * String <-> List<String> bridge (split / join)
+ * ----------------------------------------------------------------------------
+ * `s.split(delim)` returns a heap `List<String>*` and `list.join(delim)`
+ * collapses one back to a String.  The runtime has to materialise / read the
+ * very `List<String>` object that the bundled `include/list.h` generates, so it
+ * relies on that class's stable in-memory layout:
+ *
+ *     class List<T> { T* data; int length; int capacity; };
+ *
+ * For T = String (a char*) this is exactly the struct below.  The object and
+ * its backing `data` array are allocated with malloc so the generated
+ * `~List()` destructor (which does `free(this->data)`) and `delete` (which
+ * frees the object) reclaim them normally.  The element Strings themselves are
+ * tracked allocations, reclaimed by release_to / atexit like every other
+ * String result.  Keep this in sync with include/list.h.
+ * ========================================================================== */
+
+typedef struct c2m__list_str {
+  char **data;
+  int length;
+  int capacity;
+} c2m__list_str;
+
+/* Build an empty List<String> with room for `cap` (>=1) elements. */
+C2M_STR_API c2m__list_str *c2m__list_str_new (int cap) {
+  c2m__list_str *lst = (c2m__list_str *) malloc (sizeof *lst);
+  if (lst == NULL) return NULL;
+  if (cap < 1) cap = 1;
+  lst->data = (char **) malloc (sizeof (char *) * (size_t) cap);
+  lst->length = 0;
+  lst->capacity = cap;
+  if (lst->data == NULL) { free (lst); return NULL; }
+  return lst;
+}
+
+/* Split `s` on every (non-overlapping) occurrence of `delim`, returning a heap
+   List<String>* whose elements are fresh tracked Strings.  An empty or NULL
+   delimiter yields a single-element list containing a copy of the whole input;
+   a NULL input yields an empty list. */
+C2M_STR_API void *c2m_str_split (const char *s, const char *delim) {
+  size_t sl, dl, start, i, count;
+  c2m__list_str *lst;
+
+  if (s == NULL) return c2m__list_str_new (1);
+  sl = c2m__bytelen (s);
+  dl = c2m__bytelen (delim);
+
+  if (dl == 0) {
+    char *whole = (char *) c2m__str_alloc (sl + 1);
+    lst = c2m__list_str_new (1);
+    if (lst == NULL || whole == NULL) return lst;
+    c2m__copy (whole, s, sl);
+    whole[sl] = '\0';
+    lst->data[0] = whole;
+    lst->length = 1;
+    return lst;
+  }
+
+  /* First pass: count the pieces so the backing array is sized exactly once. */
+  count = 1;
+  for (i = 0; i + dl <= sl;) {
+    size_t j = 0;
+    while (j < dl && s[i + j] == delim[j]) j++;
+    if (j == dl) { count++; i += dl; } else i++;
+  }
+
+  lst = c2m__list_str_new ((int) count);
+  if (lst == NULL) return NULL;
+
+  /* Second pass: emit each [start, i) slice as a tracked String. */
+  start = 0;
+  for (i = 0; i + dl <= sl;) {
+    size_t j = 0;
+    while (j < dl && s[i + j] == delim[j]) j++;
+    if (j == dl) {
+      char *piece = (char *) c2m__str_alloc (i - start + 1);
+      if (piece == NULL) return lst;
+      c2m__copy (piece, s + start, i - start);
+      piece[i - start] = '\0';
+      lst->data[lst->length++] = piece;
+      i += dl;
+      start = i;
+    } else {
+      i++;
+    }
+  }
+  {
+    char *piece = (char *) c2m__str_alloc (sl - start + 1);
+    if (piece == NULL) return lst;
+    c2m__copy (piece, s + start, sl - start);
+    piece[sl - start] = '\0';
+    lst->data[lst->length++] = piece;
+  }
+  return lst;
+}
+
+/* Concatenate every element of List<String>* `listv`, separated by `delim`,
+   into a fresh tracked String.  A NULL list / delimiter is tolerated. */
+C2M_STR_API char *c2m_str_join (void *listv, const char *delim) {
+  c2m__list_str *lst = (c2m__list_str *) listv;
+  size_t dl, total, off;
+  int i;
+  char *r;
+
+  if (lst == NULL || lst->length <= 0) return c2m__empty_string ();
+  dl = c2m__bytelen (delim);
+  total = 0;
+  for (i = 0; i < lst->length; i++) total += c2m__bytelen (lst->data[i]);
+  total += dl * (size_t) (lst->length - 1);
+
+  r = (char *) c2m__str_alloc (total + 1);
+  if (r == NULL) return NULL;
+  off = 0;
+  for (i = 0; i < lst->length; i++) {
+    size_t el = c2m__bytelen (lst->data[i]);
+    if (i != 0 && dl != 0) { c2m__copy (r + off, delim, dl); off += dl; }
+    if (el != 0) { c2m__copy (r + off, lst->data[i], el); off += el; }
+  }
+  r[off] = '\0';
+  return r;
+}
+
 /* ============================================================================
  * basic-type -> String auto-cast helpers (String `+` concatenation extension)
  * ----------------------------------------------------------------------------
