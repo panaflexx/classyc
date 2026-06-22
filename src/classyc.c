@@ -1295,7 +1295,9 @@ static void set_string_stream (c2m_ctx_t c2m_ctx, const char *str, pos_t pos,
 }
 
 static void remove_string_stream (c2m_ctx_t c2m_ctx) {
-  assert (cs->f == NULL && cs->f == NULL);
+  assert (cs->f == NULL);
+  if (VARR_LENGTH (stream_t, streams) <= 1)
+    return; /* parent stream was already popped by EOF handling; leave string stream alive */
   free_stream (c2m_ctx, VARR_POP (stream_t, streams));
   cs = VARR_LAST (stream_t, streams);
 }
@@ -8498,7 +8500,8 @@ static int compatible_types_p (struct type *type1, struct type *type2, int ignor
       return FALSE;
     // ??? check parameter types
   } else {
-    assert (type1->mode == TM_STRUCT || type1->mode == TM_UNION || type1->mode == TM_ENUM || type1->mode == TM_CLASS);
+    assert (type1->mode == TM_STRUCT || type1->mode == TM_UNION || type1->mode == TM_ENUM
+            || type1->mode == TM_CLASS || type1->mode == TM_DICT);
     return (type1->u.tag_type == type2->u.tag_type
             && (ignore_quals_p || type_qual_eq_p (&type1->type_qual, &type2->type_qual)));
   }
