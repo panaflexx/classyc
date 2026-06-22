@@ -76,6 +76,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <netdb.h>   /* for gai_strerror */
 #include "list.h"
 
 /* ── POSIX sockets + DNS (declared directly, à la include/tcp.h) ─────────── */
@@ -262,29 +264,94 @@ static void *c2m_http_ctx(void) {
 /* ── Low-level transport (the only "plain C11" plumbing in this header) ───── */
 
 /* Resolve host:port and connect; returns a connected fd or -1. */
+/* Resolve host:port and connect; returns a connected fd or -1. */
 static int c2m_http_dial(char *host, char *port) {
-    struct c2m_addrinfo *res = NULL;
-    struct c2m_addrinfo *ai  = NULL;
+    struct addrinfo hints = {0};
+    struct addrinfo *res = NULL;
+    struct addrinfo *ai = NULL;
     int fd = -1;
+    int gai_err;
+    char addrstr[128];
 
-    if (getaddrinfo(host, port, NULL, (void *)&res) != 0 || res == NULL) return -1;
+#ifdef DEBUG
+    fprintf(stderr, "[c2m] c2m_http_dial: resolving %s:%s\n", host, port);
+#endif
 
-    for (ai = res; ai != NULL; ai = (struct c2m_addrinfo *)ai->ai_next) {
+    /* Only ask for TCP streams (avoids the useless UDP entry you saw) */
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_ADDRCONFIG;   /* optional but recommended */
+
+    gai_err = getaddrinfo(host, port, &hints, &res);
+    if (gai_err != 0 || res == NULL) {
+        fprintf(stderr, "[c2m] c2m_http_dial: getaddrinfo(%s:%s) FAILED: %s (gai_err=%d)\n",
+                host, port, gai_strerror(gai_err), gai_err);
+        return -1;
+    }
+
+    for (ai = res; ai != NULL; ai = ai->ai_next) {
+        /* Convert address to string for logging */
+        addrstr[0] = '\0';
+        if (ai->ai_addr != NULL) {
+            if (ai->ai_family == AF_INET) {
+                inet_ntop(AF_INET,
+                          &((struct sockaddr_in *)ai->ai_addr)->sin_addr,
+                          addrstr, sizeof(addrstr));
+            } else if (ai->ai_family == AF_INET6) {
+                inet_ntop(AF_INET6,
+                          &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr,
+                          addrstr, sizeof(addrstr));
+            } else {
+                snprintf(addrstr, sizeof(addrstr), "family=%d", ai->ai_family);
+            }
+        }
+#if DEBUG
+        fprintf(stderr,
+                "[c2m] c2m_http_dial: trying %s:%s (family=%d socktype=%d proto=%d addr=%s)\n",
+                host, port, ai->ai_family, ai->ai_socktype, ai->ai_protocol,
+                addrstr[0] ? addrstr : "(no addr)");
+#endif
+
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
+        if (fd < 0) {
+            int err = errno;
+            fprintf(stderr, "[c2m] c2m_http_dial: socket() FAILED for %s: %s (errno=%d)\n",
+                    addrstr, strerror(err), err);
+            continue;
+        }
+
+        if (connect(fd, ai->ai_addr, (int)ai->ai_addrlen) == 0) {
+#if DEBUG
+            fprintf(stderr, "[c2m] c2m_http_dial: CONNECTED to %s:%s (%s) fd=%d\n",
+                    host, port, addrstr, fd);
+#endif
+            break;
+        }
+
+#if DEBUG
+        int err = errno;
+        fprintf(stderr, "[c2m] c2m_http_dial: connect() to %s:%s (%s) FAILED: %s (errno=%d)\n",
+                host, port, addrstr, strerror(err), err);
+#endif
+
         close(fd);
         fd = -1;
     }
-    freeaddrinfo((void *)res);
+
+    freeaddrinfo(res);
 
     if (fd >= 0) {
         struct c2m_timeval tv;
-        tv.tv_sec  = 20;
+        tv.tv_sec = 20;
         tv.tv_usec = 0;
         setsockopt(fd, C2M_SOL_SOCKET, C2M_SO_RCVTIMEO, (void *)&tv, sizeof(tv));
         setsockopt(fd, C2M_SOL_SOCKET, C2M_SO_SNDTIMEO, (void *)&tv, sizeof(tv));
+        //fprintf(stderr, "[c2m] c2m_http_dial: set 20s RCV/SND timeouts on fd=%d\n", fd);
+    } else {
+        fprintf(stderr, "[c2m] c2m_http_dial: ALL connection attempts to %s:%s FAILED\n",
+                host, port);
     }
+
     return fd;
 }
 
