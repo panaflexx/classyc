@@ -7,10 +7,12 @@
  *   · a mix of opt-in (`impl`) and purely structural conformance
  *   · heterogeneous Map<String, Any<Shape>*> and List<Any<Shape>*> (for-in)
  *   · NESTED composition: a class that stores an Any<Shape>* and delegates
+ *   · the SAME concrete class erased to TWO different interfaces (SHORTCOMINGS
+ *     E1, now fixed): per-class thunks are emitted once and re-declared after
  *
- * KNOWN BUG (see SHORTCOMINGS.md E1): erasing the SAME class to two different
- * interfaces => "Repeated item declaration __thunk_dtor_<Class>". A disabled
- * repro is kept at the bottom.
+ * Previously a KNOWN BUG (SHORTCOMINGS.md E1): erasing the same class to two
+ * different interfaces aborted with "Repeated item declaration
+ * __thunk_dtor_<Class>". That is now fixed and validated below.
  *
  * Run:  ./bin/classyc -g -I include cy-validate/val-013-any-edge.cy -eg
  */
@@ -30,6 +32,13 @@ interface Shape {
     double area();
     String name();
     void   scale(double f);
+}
+
+/* A second interface that reuses the name() method (shares __thunk_name_<C>)
+   so erasing one class to both interfaces exercises the per-class thunk
+   dedup fixed for SHORTCOMINGS.md E1. */
+interface Named {
+    String name();
 }
 
 class Circle impl Shape {              /* opt-in conformance */
@@ -114,12 +123,17 @@ int main() {
     check(approx(s1->area(), 4.0) && approx(s2->area(), 25.0),
           "two independent handles of the same class don't alias");
 
-    /* ── DISABLED: SHORTCOMINGS.md E1 (compiler bug) ──────────────────────
-       interface Printable { String describe(); }
-       class Tag { String describe(){ return "x"; } ~Tag(){} double area(){return 0;} String name(){return "t";} void scale(double f){} };
-       Any<Shape>*     h1 = any<Shape>(new Tag());
-       Any<Printable>* h2 = any<Printable>(new Tag());   // Repeated item declaration __thunk_dtor_Tag
-       ──────────────────────────────────────────────────────────────────── */
+    /* SHORTCOMINGS.md E1 (FIXED): erase the SAME concrete class to TWO
+       different interfaces. The forwarding/destructor thunks are now emitted
+       once per class (a repeat erasure only re-declares them), so this no
+       longer aborts with "Repeated item declaration __thunk_dtor_<Class>".
+       Note `Named` shares the name() method with `Shape`, exercising the
+       shared-thunk path too. */
+    Any<Shape>* dual_shape = any<Shape>(new Square(2.0));   /* Square -> Shape  */
+    Any<Named>* dual_named = any<Named>(new Square(7.0));   /* Square -> Named  */
+    check(approx(dual_shape->area(), 4.0), "same class erased to interface #1 (Shape)");
+    check(strcmp((char*)dual_named->name(), "square") == 0,
+          "same class erased to interface #2 (Named) — E1 fixed");
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed;

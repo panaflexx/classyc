@@ -1,14 +1,28 @@
 # ClassyC — Shortcomings & Gotchas (validation findings)
 
-Things that **don't work as the README / intuition suggests**, discovered while
-building the `cy-validate/` suite, each with a **workaround**. Living document —
-updated as validation proceeds.
+Actual **language/compiler** shortcomings and gotchas, discovered while building
+the `cy-validate/` suite, each with a **workaround**. Living document.
 
 Compiler/runtime tested via: `./bin/classyc -g -I include <file>.cy -eg`
 
+> **Status:** the top-level `README.md` has been **updated** to match these
+> findings — every code snippet in it now compiles and runs as written
+> (verified end-to-end). The items in section A below were the README
+> mismatches that prompted those edits; they are kept here because they describe
+> the *real language behavior* you still need to know (the README now documents
+> it correctly rather than misleadingly). Sections B–E are genuine language /
+> compiler shortcomings. Several have since been **fixed**: E0 & E1 (the
+> `Any<I>` return-handle UAF and the dual-interface thunk duplication), plus
+> three ergonomics wins — A2 (`replace(needle, repl)` search-and-replace), B1
+> (String methods on a string-literal receiver), and B4 (`List<T>.Map`). Each
+> fix is marked inline and validated in `val-015` (and `val-013` for E1).
+
 ---
 
-## A. README inaccuracies (code that does NOT compile/run as written)
+## A. Language behaviors the README used to get wrong (README now fixed)
+
+These are real, intentional language behaviors. The README previously showed
+code that didn't compile/run; it has been corrected. Kept here as gotchas.
 
 ### A1. `String.checkpoint()` / `String.release_to()` are not real APIs
 README "Memory Management" and the `defer` example show:
@@ -27,27 +41,27 @@ and the `gen` N_BLOCK / N_RETURN paths). There is no user-facing surface.
 **Workaround:** delete these calls; rely on automatic reclamation (validated in
 `val-002-string-arena.cy`). For a leak-free hot loop just allocate normally.
 
-### A2. `String.replace(needle, replacement)` does not exist — `replace` is positional
-README String example:
+### A2. (FIXED) `replace` is now overloaded — `replace(needle, repl)` is search-and-replace
+The README example now works as written:
 ```c
-if (path.find(".pdf")) path = path.replace(".pdf", ".txt");
+if (path.contains(".pdf")) path = path.replace(".pdf", ".txt");
 ```
-**Result:** `String method 'replace' expects 3 arguments`.
+**Reality:** `replace` is overloaded by arity:
+- `replace(pos, len, repl)` (3 args) — the original positional form (code-point
+  position, length, replacement; `SM_REPLACE`).
+- `replace(needle, repl)` (2 args) — search-and-replace of **every** occurrence
+  (`SM_REPLACE_ALL`, backed by the new `c2m_str_replace_all` runtime). A longer
+  or shorter replacement, an empty replacement (deletion), and an absent needle
+  all behave as expected. Validated in `val-015-string-literal-and-replace.cy`.
 
-**Reality:** `replace(pos, len, repl)` — code-point position, length, replacement
-(`SM_REPLACE`, n=3). It is *not* a search-and-replace.
+**Note:** prefer `contains()` over the old `find()` truthiness idiom (see A3).
 
-**Workaround:**
-```c
-size_t i = path.find(".pdf");
-if (i != (size_t)-1) path = path.replace(i, 4, ".txt");
-```
-
-### A3. `if (s.find(x))` is a buggy idiom
+### A3. `if (s.find(x))` is a buggy idiom — use `contains()`
 `find` returns a **code-point index**, or **`(size_t)-1` when not found**.
 So `(size_t)-1` is *truthy* (looks "found") and a match at index 0 is *falsy*.
 
-**Workaround:** always compare explicitly: `if (s.find(x) != (size_t)-1)`.
+**Workaround:** there is a dedicated boolean: `if (s.contains(x))`. If you need
+the index, compare explicitly: `if (s.find(x) != (size_t)-1)`.
 
 ### A4. `printf("%s", dict_value)` is rejected / unsafe
 README's flagship dict example:
@@ -81,11 +95,18 @@ exceptions **and** the JIT safety guards (null-deref / div-by-zero / OOB) are
 
 ## B. Language ergonomics / sharp edges
 
-### B1. String methods need a `String`-typed receiver
-`"abc".equals("abc")` and `"MiXeD".lower()` fail:
+### B1. (FIXED) String methods now work on a string-literal receiver
+`"abc".equals("abc")` and `"MiXeD".lower()` used to fail with
 `request for member ... in something not a structure, union, class or dict`.
 
-**Workaround:** bind to a `String` var first, or cast: `((String)"abc").lower()`.
+**Reality:** a UTF-8 string literal (`N_STR` node) used as a method receiver is
+now dispatched as a `String` instance method, the same as a `String`-typed
+value — no `((String)..)` cast needed. The bare `String` type keyword
+(`N_STRING` node) is still the *static* receiver for `String.copy/attach`.
+Allocating results (`upper`/`lower`/`substr`/`trim`/`replace`) are arena-tracked,
+so tight loops stay bounded. Validated in `val-015-string-literal-and-replace.cy`.
+
+**No workaround needed.**
 
 ### B2. `+` concat needs a `String`-typed left operand
 `"tmp" + i` is C pointer arithmetic (char* + int), not concatenation.
@@ -100,27 +121,26 @@ invocation (no `-I`) you must write `#include "include/list.h"`.
 **Workaround:** run with `-I include` (this suite does) **or** use the
 `include/`-prefixed path.
 
-### B4. README generics example is wrong on multiple counts
+### B4. (PARTIALLY FIXED) `List<T>.Map` now exists; the value-init caveat remains
 README:
 ```c
 List<int> nums = {1, 2, 3};
 nums = nums.Filter((int x) => x > 1).Map((int x) => x * 2);
 ```
-Problems:
-* `List<int> nums = {1,2,3}` (value, non-pointer) warns
-  `assigning integer without cast to pointer` — `List<T>` is a reference type.
-* `.Map(...)` does **not exist** on `List<T>`: `class has no member Map`.
-  `include/list.h` provides `Filter` and `ForEach` but no `Map`.
-* Real examples use pointer + arrow: `new List<int>{...}` and `xs->Filter(...)`.
+* `List<int> nums = {1,2,3}` (value, non-pointer) still warns
+  `assigning integer without cast to pointer` — `List<T>` is a reference type;
+  use the heap idiom `new List<int>{...}` and `->`.
+* `Map` now **exists** on `List<T>` (`include/list.h`), as a same-type transform
+  `List<T>* Map(T(*fn)(T))` that chains with `Filter`/`ForEach`. (A cross-type
+  `T -> U` map would need a second type parameter; for that, use the lowercase
+  seq methods over a C array/slice: `arr.filter(..).map(..).ToList()`.)
 
-**Workaround:** use the heap idiom and the methods that exist:
+**Idiomatic form (validated in `val-015`):**
 ```c
 List<int>* nums = new List<int>{ 1, 2, 3 };
-List<int>* big2 = nums->Filter((int x) => x > 1);   // no Map; transform manually
+List<int>* big2 = nums->Filter((int x) => x > 1)->Map((int x) => x * 2);
 defer delete nums; defer delete big2;
 ```
-For map/filter/reduce pipelines over a **C array/slice**, use the lowercase seq
-methods instead: `arr.filter(..).map(..).ToList()`.
 
 ### B5. Stack class instance with constructor arguments is not supported
 ```c
@@ -194,23 +214,34 @@ responsible for `delete`-ing it (consistent with the `new` ownership model).
 NOTE: returning a *collection* of handles still frees the contained handles
 (see the remaining limitation in E1's neighborhood).
 
-### E1. (BUG) Erasing the SAME class to two different interfaces fails codegen
-Minimal repro:
+### E1. (FIXED) Erasing the SAME class to two different interfaces failed codegen
+Minimal repro (now compiles and runs):
 ```c
 interface Shape     { double area(); }
 interface Printable { String describe(); }
 class Square { ... double area(); String describe(); ~Square(){} };
 
 Any<Shape>*     a = any<Shape>(new Square(2.0));
-Any<Printable>* b = any<Printable>(new Square(3.0));   // <-- here
+Any<Printable>* b = any<Printable>(new Square(3.0));   // <-- used to fail here
 ```
-**Result:** `Repeated item declaration __thunk_dtor_Square` (MIR aborts).
-The destructor thunk is emitted per *(class × interface)* instead of once per
-class, so the second erasure redeclares `__thunk_dtor_Square`.
+**Old result:** `Repeated item declaration __thunk_dtor_Square` (MIR aborts).
+The forwarding/destructor thunks (`__thunk_<m>_<Class>`, `__thunk_dtor_<Class>`)
+are keyed on the concrete **class**, not the interface, but the dedup cache in
+`synthesize_any_thunks` keyed only on the per-*(class, interface)* factory name
+(`__any_make_<I>_<C>`). The second erasure re-emitted the same thunk
+*definitions* → redeclaration.
 
-**Workaround:** erase a given concrete class through **one** interface only. If
-you need several capabilities, declare a single interface that lists all the
-methods and erase to that; or wrap distinct concrete classes per interface.
+**Fix (applied to `src/classyc.c`):** thunk definitions are now deduplicated by
+their own per-class function name via `any_thunk_register_p()`. The first
+erasure of a class emits the definitions; any later erasure (to a different
+interface) emits only a **forward declaration** for each already-defined thunk,
+so the new factory's references still resolve while MIR sees a single
+definition. Shared method names across interfaces (e.g. two interfaces both
+declaring `name()`) collapse onto the one per-class thunk as well. Validated by
+`val-013-any-edge.cy` ("same class erased to interface #1 / #2").
+
+**No workaround needed.** (Historically: erase through one interface, or declare
+a single interface listing all methods.)
 
 ### E2. (works) Conformance checking is sound — both opt-in and structural
 - `class C impl I` missing a method:

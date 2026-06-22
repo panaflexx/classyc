@@ -281,6 +281,16 @@ class List<T> {
             if (pred(this->data[i])) result->Add(this->data[i]);
         return result;
     }
+
+    /* Return new heap list with fn(item) applied to every element.
+     * Same-type transform (T -> T), so it chains with Filter:
+     *   nums->Filter(p)->Map(f).  Caller must `delete` the result. */
+    List<T>* Map(T(*fn)(T)) {
+        List<T>* result = new List<T>(this->length > 0 ? this->length : 1);
+        for (int i = 0; i < this->length; i++)
+            result->Add(fn(this->data[i]));
+        return result;
+    }
 };
 
 #endif /* CLASSYC_LIST_H */

@@ -29,6 +29,9 @@
        Http.del(url)                         -> HttpResponse*
        Http.request(method, url, headers, body) -> HttpResponse*
 
+       Http.download(url, FILE* out)         -> HttpResponse*   // stream body
+       Http.download(method, url, headers, body, FILE* out) -> HttpResponse*
+
        Extra headers are passed as a List<String> of "Name: Value" lines.
 
    ── HttpResponse ───────────────────────────────────────────────────────────
@@ -60,14 +63,22 @@
    * Thread-safety: a shared SSL_CTX is safe to use from multiple threads to
      create connections, but the one-time lazy init is not synchronised — in a
      threaded program, make one request from the main thread first to warm it.
-   * The client sends `Connection: close` and reads the whole response, then
-     parses it.  Both `Content-Length` and `Transfer-Encoding: chunked` bodies
-     are handled.
+   * Keep-alive by default: the client sends `Connection: keep-alive`, frames
+     the response by `Content-Length` or `Transfer-Encoding: chunked`, and
+     caches the live TCP/TLS connection in a small pool keyed by
+     (host, port, https).  The next request to the same origin reuses it,
+     skipping DNS, connect and the TLS handshake.  Before reuse a pooled
+     socket is probed for liveness; if the peer dropped it (or it has gone
+     stale) the connection is discarded and the request transparently
+     redialed.  Servers may opt out with `Connection: close`, which is honored.
+   * `Http.download(url, out)` streams the body straight to a FILE* instead of
+     buffering it, so large transfers need no full-response allocation.  The
+     returned HttpResponse still carries status + headers; `length()` reports
+     the number of bytes written and `body` is empty.
    * Each HttpResponse owns one heap buffer (the raw response); `statusText`
      and `body` are views into it, freed together by `delete` / `defer delete`.
-   * Blocking I/O with a 20s send/recv timeout.  Single-shot request/response;
-     no keep-alive, no redirect following (a 3xx is returned as-is so you can
-     read `resp->header("location")`).
+   * Blocking I/O with a 20s send/recv timeout.  No redirect following (a 3xx
+     is returned as-is so you can read `resp->header("location")`).
    ========================================================================= */
 
 #ifndef CLASSYC_HTTPCLIENT_H
@@ -114,6 +125,37 @@ struct c2m_timeval { long tv_sec; long tv_usec; };
 #endif
 #ifndef C2M_SO_SNDTIMEO
 #  define C2M_SO_SNDTIMEO 21   /* SO_SNDTIMEO  (Linux) */
+#endif
+
+/* poll(2) + fcntl(2): used to probe pooled keep-alive sockets for liveness
+   and to consume TLS post-handshake records without blocking. */
+extern int poll(void *fds, unsigned long nfds, int timeout);
+extern int fcntl(int fd, int cmd, long arg);
+struct c2m_pollfd { int fd; short events; short revents; };
+#ifndef C2M_POLLIN
+#  define C2M_POLLIN      0x001
+#endif
+#ifndef C2M_MSG_PEEK
+#  define C2M_MSG_PEEK    0x02
+#endif
+#ifndef C2M_MSG_DONTWAIT
+#  define C2M_MSG_DONTWAIT 0x40
+#endif
+#ifndef C2M_F_GETFL
+#  define C2M_F_GETFL     3
+#endif
+#ifndef C2M_F_SETFL
+#  define C2M_F_SETFL     4
+#endif
+#ifndef C2M_O_NONBLOCK
+#  define C2M_O_NONBLOCK  0x800   /* O_NONBLOCK (Linux) */
+#endif
+
+/* SIG_IGN for SIGPIPE: a reused keep-alive socket the peer just closed must
+   not kill the process on write; we recover by redialing instead. */
+extern void *signal(int signum, void *handler);
+#ifndef C2M_SIGPIPE
+#  define C2M_SIGPIPE     13
 #endif
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -403,29 +445,6 @@ static void c2m_http_conn_close(struct c2m_http_conn *c) {
     }
 }
 
-/* Read the connection to EOF into one malloc'd, NUL-terminated buffer. */
-static char *c2m_http_read_all(struct c2m_http_conn *c, long *out_len) {
-    long  cap = 16384;
-    long  len = 0;
-    char *buf = (char *)malloc(cap);
-    if (buf == NULL) { *out_len = 0; return NULL; }
-
-    while (1) {
-        if (len + 8192 + 1 > cap) {
-            cap = cap * 2;
-            char *nb = (char *)realloc(buf, cap);
-            if (nb == NULL) { free(buf); *out_len = 0; return NULL; }
-            buf = nb;
-        }
-        long n = c2m_http_conn_read(c, buf + len, 8192);
-        if (n <= 0) break;
-        len = len + n;
-    }
-    buf[len] = 0;
-    *out_len = len;
-    return buf;
-}
-
 /* Case-insensitive substring test (for "Transfer-Encoding: chunked"). */
 static int c2m_http__ci_contains(char *hay, char *needle) {
     if (hay == NULL || needle == NULL) return 0;
@@ -481,6 +500,479 @@ static void c2m_http_dechunk(char *body, long len, long *out_len) {
     }
     *dst = 0;
     *out_len = dst - body;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Framed reads + keep-alive connection pool
+   ══════════════════════════════════════════════════════════════════════════
+   To reuse a socket across requests we can no longer "read to EOF": the
+   connection stays open, so each response must be delimited exactly.  The
+   helpers below parse just enough of the response head to honour
+   Content-Length / Transfer-Encoding: chunked framing, then a small pool keeps
+   idle connections keyed by (host, port, secure).  Reused connections are
+   probed for liveness first and, if the peer dropped them, transparently
+   redialed.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Grow `buf` (capacity *cap) to hold at least `need` bytes; returns the
+   (possibly moved) buffer, or NULL on allocation failure. */
+static char *c2m_http_grow(char *buf, long *cap, long need) {
+    if (need <= *cap) return buf;
+    long c = *cap;
+    while (c < need) c = c * 2;
+    char *nb = (char *)realloc(buf, c);
+    if (nb == NULL) return NULL;
+    *cap = c;
+    return nb;
+}
+
+/* Find header `name` (case-insensitive) within the header block [start,end).
+   Returns a pointer to its value (leading whitespace skipped) and the value
+   length via *out_len, or NULL when the header is absent. */
+static char *c2m_http_hdr(char *start, char *end, char *name, int *out_len) {
+    int nlen = (int)strlen(name);
+    char *p = start;
+    *out_len = 0;
+    while (p < end) {
+        /* NB: written as an explicit `break` rather than
+           `while (eol + 1 < end && !(eol[0]=='\r' && eol[1]=='\n'))` because the
+           MIR JIT (c2mir) miscompiles that `&& !( … && … )` while-condition. */
+        char *eol = p;
+        while (eol + 1 < end) {
+            if (eol[0] == '\r' && eol[1] == '\n') break;
+            eol++;
+        }
+        if (eol + 1 >= end) eol = end;
+        if (eol - p > nlen && p[nlen] == ':') {
+            int match = 1;
+            for (int i = 0; i < nlen; i++) {
+                char a = p[i], b = name[i];
+                if (a >= 'A' && a <= 'Z') a = a + 32;
+                if (b >= 'A' && b <= 'Z') b = b + 32;
+                if (a != b) { match = 0; break; }
+            }
+            if (match) {
+                char *v = p + nlen + 1;
+                while (v < eol && (*v == ' ' || *v == '\t')) v++;
+                *out_len = (int)(eol - v);
+                return v;
+            }
+        }
+        if (eol >= end) break;
+        p = eol + 2;
+    }
+    return NULL;
+}
+
+/* Case-insensitive token search within a length-bounded string. */
+static int c2m_http__ci_has(char *s, int slen, char *needle) {
+    int nlen = (int)strlen(needle);
+    if (nlen == 0 || slen < nlen) return 0;
+    for (int i = 0; i + nlen <= slen; i++) {
+        int j = 0;
+        for (; j < nlen; j++) {
+            char a = s[i + j], b = needle[j];
+            if (a >= 'A' && a <= 'Z') a = a + 32;
+            if (b >= 'A' && b <= 'Z') b = b + 32;
+            if (a != b) break;
+        }
+        if (j == nlen) return 1;
+    }
+    return 0;
+}
+
+/* Has the chunked body in [body,body+n) reached its terminating 0-size chunk?
+   Returns 1 when the full chunked message is present, 0 when more is needed.
+   Trailers are not parsed; any stray bytes left on the socket are caught by
+   the pool's liveness probe and cause the connection to be discarded. */
+static int c2m_http_chunked_complete(char *body, long n) {
+    char *p = body;
+    char *end = body + n;
+    while (p < end) {
+        long sz = 0;
+        int  any = 0;
+        while (p < end) {
+            char ch = *p; int d = -1;
+            if (ch >= '0' && ch <= '9')      d = ch - '0';
+            else if (ch >= 'a' && ch <= 'f') d = ch - 'a' + 10;
+            else if (ch >= 'A' && ch <= 'F') d = ch - 'A' + 10;
+            if (d < 0) break;
+            sz = sz * 16 + d; any = 1; p++;
+        }
+        char *nl = p;
+        while (nl < end && *nl != '\n') nl++;
+        if (nl >= end) return 0;            /* size line not fully read yet */
+        p = nl + 1;
+        if (!any) return 1;                 /* malformed; stop reading */
+        if (sz == 0) return (end - p >= 2); /* terminator reached */
+        if (end - p < sz + 2) return 0;     /* data + CRLF not fully read */
+        p = p + sz;
+        if (p < end && *p == '\r') p++;
+        if (p < end && *p == '\n') p++;
+    }
+    return 0;
+}
+
+/* Inspect the header block (buf .. buf+body_off) and report the body framing:
+   *chunked, *content_len (-1 if absent) and *reusable (1 when the connection
+   may be kept alive afterwards). */
+static void c2m_http_framing(char *buf, long body_off,
+                             int *chunked, long *content_len, int *reusable) {
+    char *hbeg = buf;
+    char *hend = buf + body_off - 4;             /* the "\r\n\r\n" */
+    int   http11 = (strncmp(buf, "HTTP/1.0", 8) != 0);
+
+    int tlen = 0, clen = 0, cnlen = 0;
+    char *te = c2m_http_hdr(hbeg, hend, "transfer-encoding", &tlen);
+    char *cl = c2m_http_hdr(hbeg, hend, "content-length",    &clen);
+    char *cn = c2m_http_hdr(hbeg, hend, "connection",        &cnlen);
+
+    *chunked = (te != NULL && c2m_http__ci_has(te, tlen, "chunked"));
+    *content_len = -1;
+    if (!*chunked && cl != NULL) {
+        long v = 0; int got = 0;
+        for (int i = 0; i < clen; i++) {
+            char ch = cl[i];
+            if (ch >= '0' && ch <= '9') { v = v * 10 + (ch - '0'); got = 1; }
+            else break;
+        }
+        if (got) *content_len = v;
+    }
+    int conn_close = (cn != NULL && c2m_http__ci_has(cn, cnlen, "close"));
+    int conn_keep  = (cn != NULL && c2m_http__ci_has(cn, cnlen, "keep-alive"));
+    *reusable = http11 ? !conn_close : conn_keep;
+}
+
+/* Read one complete response into a NUL-terminated malloc'd buffer, honouring
+   Content-Length / chunked framing so the socket can be reused.  Unframed
+   responses fall back to read-to-EOF (and cannot be kept alive).  *out_keep is
+   set to 1 when the connection may be returned to the pool. */
+static char *c2m_http_read_message(struct c2m_http_conn *c, long *out_len, int *out_keep) {
+    long  cap = 16384, len = 0;
+    char *buf = (char *)malloc(cap);
+    *out_len = 0; *out_keep = 0;
+    if (buf == NULL) return NULL;
+
+    /* phase 1: read until the end of the header block */
+    long body_off = -1;
+    while (1) {
+        buf = c2m_http_grow(buf, &cap, len + 8192 + 1);
+        if (buf == NULL) return NULL;
+        long n = c2m_http_conn_read(c, buf + len, 8192);
+        if (n <= 0) break;
+        len = len + n; buf[len] = 0;
+        char *hb = strstr(buf, "\r\n\r\n");
+        if (hb != NULL) { body_off = (hb - buf) + 4; break; }
+    }
+    if (body_off < 0) { buf[len] = 0; *out_len = len; return buf; }
+
+    int  chunked = 0, reusable = 0;
+    long content_len = -1;
+    c2m_http_framing(buf, body_off, &chunked, &content_len, &reusable);
+
+    /* phase 2: read the body according to its framing */
+    if (chunked) {
+        while (!c2m_http_chunked_complete(buf + body_off, len - body_off)) {
+            buf = c2m_http_grow(buf, &cap, len + 8192 + 1);
+            if (buf == NULL) return NULL;
+            long n = c2m_http_conn_read(c, buf + len, 8192);
+            if (n <= 0) { reusable = 0; break; }
+            len = len + n; buf[len] = 0;
+        }
+        *out_keep = reusable;
+    } else if (content_len >= 0) {
+        long need = body_off + content_len;
+        buf = c2m_http_grow(buf, &cap, need + 1);
+        if (buf == NULL) return NULL;
+        while (len < need) {
+            long n = c2m_http_conn_read(c, buf + len, need - len);
+            if (n <= 0) break;
+            len = len + n;
+        }
+        buf[len] = 0;
+        *out_keep = (len >= need) ? reusable : 0;
+    } else {
+        while (1) {
+            buf = c2m_http_grow(buf, &cap, len + 8192 + 1);
+            if (buf == NULL) return NULL;
+            long n = c2m_http_conn_read(c, buf + len, 8192);
+            if (n <= 0) break;
+            len = len + n; buf[len] = 0;
+        }
+        *out_keep = 0;
+    }
+    *out_len = len;
+    return buf;
+}
+
+/* Like c2m_http_read_message, but the (decoded) body is streamed to `out`
+   instead of being buffered — for large downloads.  Returns a malloc'd buffer
+   holding only the header block (NUL-terminated) for HttpResponse::ingest, and
+   reports the number of body bytes written via *out_body_len. */
+static char *c2m_http_read_message_to(struct c2m_http_conn *c, FILE *out,
+                                      long *out_hdr_len, long *out_body_len,
+                                      int *out_keep) {
+    long  cap = 16384, len = 0;
+    char *buf = (char *)malloc(cap);
+    *out_hdr_len = 0; *out_body_len = 0; *out_keep = 0;
+    if (buf == NULL) return NULL;
+
+    long body_off = -1;
+    while (1) {
+        buf = c2m_http_grow(buf, &cap, len + 8192 + 1);
+        if (buf == NULL) return NULL;
+        long n = c2m_http_conn_read(c, buf + len, 8192);
+        if (n <= 0) break;
+        len = len + n; buf[len] = 0;
+        char *hb = strstr(buf, "\r\n\r\n");
+        if (hb != NULL) { body_off = (hb - buf) + 4; break; }
+    }
+    if (body_off < 0) { buf[len] = 0; *out_hdr_len = len; return buf; }
+
+    int  chunked = 0, reusable = 0;
+    long content_len = -1;
+    c2m_http_framing(buf, body_off, &chunked, &content_len, &reusable);
+
+    long body_have = len - body_off;   /* body bytes already pulled in */
+    long streamed  = 0;
+
+    if (chunked) {
+        /* Chunked responses are buffered to completion, decoded, then flushed
+           (they are usually dynamic and modest in size). */
+        while (!c2m_http_chunked_complete(buf + body_off, len - body_off)) {
+            buf = c2m_http_grow(buf, &cap, len + 8192 + 1);
+            if (buf == NULL) return NULL;
+            long n = c2m_http_conn_read(c, buf + len, 8192);
+            if (n <= 0) { reusable = 0; break; }
+            len = len + n; buf[len] = 0;
+        }
+        long dec = 0;
+        c2m_http_dechunk(buf + body_off, len - body_off, &dec);
+        if (dec > 0 && out != NULL) fwrite(buf + body_off, 1, (size_t)dec, out);
+        streamed = dec;
+        *out_keep = reusable;
+    } else if (content_len >= 0) {
+        if (body_have > content_len) body_have = content_len;
+        if (body_have > 0 && out != NULL) fwrite(buf + body_off, 1, (size_t)body_have, out);
+        streamed = body_have;
+        char io[8192];
+        while (streamed < content_len) {
+            long want = content_len - streamed;
+            if (want > (long)sizeof(io)) want = (long)sizeof(io);
+            long n = c2m_http_conn_read(c, io, want);
+            if (n <= 0) break;
+            if (out != NULL) fwrite(io, 1, (size_t)n, out);
+            streamed = streamed + n;
+        }
+        *out_keep = (streamed >= content_len) ? reusable : 0;
+    } else {
+        if (body_have > 0 && out != NULL) fwrite(buf + body_off, 1, (size_t)body_have, out);
+        streamed = body_have;
+        char io[8192];
+        while (1) {
+            long n = c2m_http_conn_read(c, io, (long)sizeof(io));
+            if (n <= 0) break;
+            if (out != NULL) fwrite(io, 1, (size_t)n, out);
+            streamed = streamed + n;
+        }
+        *out_keep = 0;
+    }
+
+    /* Trim to just the header block (status + headers + CRLFCRLF) for ingest. */
+    buf[body_off] = 0;
+    *out_hdr_len  = body_off;
+    *out_body_len = streamed;
+    return buf;
+}
+
+/* ── keep-alive connection pool ─────────────────────────────────────────── */
+#ifndef C2M_HTTP_POOL_MAX
+#  define C2M_HTTP_POOL_MAX 8
+#endif
+struct c2m_http_pool_entry {
+    int  used;
+    char host[256];
+    int  port;
+    int  secure;
+    struct c2m_http_conn conn;
+};
+static struct c2m_http_pool_entry c2m_http_pool[C2M_HTTP_POOL_MAX];
+
+static int c2m_http_sig_ready = 0;
+static void c2m_http_init_once(void) {
+    if (c2m_http_sig_ready) return;
+    c2m_http_sig_ready = 1;
+    signal(C2M_SIGPIPE, (void *)1);   /* SIG_IGN */
+}
+
+/* Is a pooled connection still usable?  An idle keep-alive socket should have
+   nothing pending; readable bytes mean the peer closed it or left data. */
+static int c2m_http_conn_alive(struct c2m_http_conn *c) {
+    struct c2m_pollfd pfd;
+    pfd.fd = c->fd; pfd.events = C2M_POLLIN; pfd.revents = 0;
+    int r = poll(&pfd, 1, 0);
+    if (r == 0) return 1;            /* idle -> good */
+    if (r <  0) return 0;
+
+    if (c->ssl == NULL) {
+        char b;
+        long n = recv(c->fd, (void *)&b, 1, C2M_MSG_PEEK | C2M_MSG_DONTWAIT);
+        if (n < 0) return 1;         /* spurious wakeup */
+        return 0;                     /* EOF or leftover data -> stale */
+    }
+
+    /* TLS: readable bytes are often just TLS 1.3 session tickets, not a close.
+       Drain them non-blocking; only real app data or a close_notify is fatal. */
+    int fl = fcntl(c->fd, C2M_F_GETFL, 0);
+    if (fl >= 0) fcntl(c->fd, C2M_F_SETFL, (long)(fl | C2M_O_NONBLOCK));
+    char scratch[512];
+    long n = (long)c2m_tls_read(c->ssl, scratch, (int)sizeof(scratch));
+    if (fl >= 0) fcntl(c->fd, C2M_F_SETFL, (long)fl);
+    if (n > 0)  return 0;            /* unexpected application data -> stale */
+    if (n == 0) return 0;            /* close_notify -> stale */
+    return 1;                         /* WANT_READ after consuming records -> ok */
+}
+
+static int c2m_http_pool_take(char *host, int port, int secure, struct c2m_http_conn *out) {
+    for (int i = 0; i < C2M_HTTP_POOL_MAX; i++) {
+        if (!c2m_http_pool[i].used) continue;
+        if (c2m_http_pool[i].port != port || c2m_http_pool[i].secure != secure) continue;
+        if (strcmp(c2m_http_pool[i].host, host) != 0) continue;
+        struct c2m_http_conn c = c2m_http_pool[i].conn;
+        c2m_http_pool[i].used = 0;
+        if (!c2m_http_conn_alive(&c)) { c2m_http_conn_close(&c); continue; }
+        *out = c;
+        return 1;
+    }
+    return 0;
+}
+
+static void c2m_http_pool_put(char *host, int port, int secure, struct c2m_http_conn *c) {
+    if (strlen(host) >= 256) { c2m_http_conn_close(c); return; }
+    for (int i = 0; i < C2M_HTTP_POOL_MAX; i++) {
+        if (c2m_http_pool[i].used) continue;
+        c2m_http_pool[i].used   = 1;
+        strncpy(c2m_http_pool[i].host, host, 255);
+        c2m_http_pool[i].host[255] = 0;
+        c2m_http_pool[i].port   = port;
+        c2m_http_pool[i].secure = secure;
+        c2m_http_pool[i].conn   = *c;
+        return;
+    }
+    c2m_http_conn_close(c);          /* pool full -> just close it */
+}
+
+/* Acquire a connection to host:port, reusing a pooled one when possible.
+   Returns 0 on success (sets *from_pool), -1 on failure (sets *err). */
+static int c2m_http_acquire(char *host, char *portstr, int port, int secure,
+                            struct c2m_http_conn *conn, int *from_pool, char **err) {
+    conn->fd = -1; conn->ssl = NULL;
+    *from_pool = 0;
+
+    if (c2m_http_pool_take(host, port, secure, conn)) { *from_pool = 1; return 0; }
+
+    conn->fd = c2m_http_dial(host, portstr);
+    if (conn->fd < 0) { *err = "could not resolve or connect to host"; return -1; }
+    if (secure) {
+        if (c2m_http_tls_handshake(conn, host) != 0) {
+            c2m_http_conn_close(conn);
+            *err = "TLS handshake failed (OpenSSL/libssl required for https)";
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Send `req` and read the whole response into a malloc'd buffer.  A pooled
+   connection that turns out to be stale (write/first read fails) is silently
+   discarded and the request retried once on a fresh socket.  On success the
+   connection is returned to the pool when the response allows keep-alive. */
+static char *c2m_http_exchange(char *host, int port, int secure,
+                               char *req, long reqlen,
+                               long *out_len, char **out_err) {
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    *out_len = 0; *out_err = NULL;
+    c2m_http_init_once();
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        struct c2m_http_conn conn;
+        int   from_pool = 0;
+        char *err = NULL;
+        if (c2m_http_acquire(host, portstr, port, secure, &conn, &from_pool, &err) != 0) {
+            *out_err = err; return NULL;
+        }
+
+        if (c2m_http_conn_write_all(&conn, req, reqlen) < 0) {
+            c2m_http_conn_close(&conn);
+            if (from_pool) continue;        /* pooled socket went stale: redial */
+            *out_err = "failed to send request"; return NULL;
+        }
+
+        int  keep = 0;
+        long rawlen = 0;
+        char *raw = c2m_http_read_message(&conn, &rawlen, &keep);
+        if (raw == NULL || rawlen == 0) {
+            if (raw != NULL) free(raw);
+            c2m_http_conn_close(&conn);
+            if (from_pool) continue;        /* pooled socket went stale: redial */
+            *out_err = "failed to read response"; return NULL;
+        }
+
+        if (keep) c2m_http_pool_put(host, port, secure, &conn);
+        else      c2m_http_conn_close(&conn);
+
+        *out_len = rawlen;
+        return raw;
+    }
+    *out_err = "failed to read response";
+    return NULL;
+}
+
+/* Streaming variant of c2m_http_exchange: the body is written to `out` and the
+   returned buffer holds only the response head (for ingest). */
+static char *c2m_http_exchange_to(char *host, int port, int secure,
+                                  char *req, long reqlen, FILE *out,
+                                  long *out_hdr_len, long *out_body_len,
+                                  char **out_err) {
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    *out_hdr_len = 0; *out_body_len = 0; *out_err = NULL;
+    c2m_http_init_once();
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        struct c2m_http_conn conn;
+        int   from_pool = 0;
+        char *err = NULL;
+        if (c2m_http_acquire(host, portstr, port, secure, &conn, &from_pool, &err) != 0) {
+            *out_err = err; return NULL;
+        }
+
+        if (c2m_http_conn_write_all(&conn, req, reqlen) < 0) {
+            c2m_http_conn_close(&conn);
+            if (from_pool) continue;
+            *out_err = "failed to send request"; return NULL;
+        }
+
+        int  keep = 0;
+        long hlen = 0, blen = 0;
+        char *hdr = c2m_http_read_message_to(&conn, out, &hlen, &blen, &keep);
+        if (hdr == NULL || hlen == 0) {
+            if (hdr != NULL) free(hdr);
+            c2m_http_conn_close(&conn);
+            if (from_pool) continue;
+            *out_err = "failed to read response"; return NULL;
+        }
+
+        if (keep) c2m_http_pool_put(host, port, secure, &conn);
+        else      c2m_http_conn_close(&conn);
+
+        *out_hdr_len  = hlen;
+        *out_body_len = blen;
+        return hdr;
+    }
+    *out_err = "failed to read response";
+    return NULL;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -550,6 +1042,7 @@ class HttpResponse {
     dict   headers;      /* response headers, names lower-cased              */
     String body;         /* decoded body (view into `raw`)                   */
     char  *raw;          /* owned heap buffer holding the whole response     */
+    long   downloaded;   /* bytes streamed to a FILE* by Http.download (else 0) */
 
     HttpResponse() {
         this->status     = 0;
@@ -558,6 +1051,7 @@ class HttpResponse {
         this->headers    = {};
         this->body       = "";
         this->raw        = NULL;
+        this->downloaded = 0;
     }
 
     ~HttpResponse() {
@@ -660,8 +1154,10 @@ class HttpResponse {
         return json((char *)this->body);
     }
 
-    /* Body length in bytes. */
+    /* Body length in bytes.  For a streamed download (Http.download) the body
+       lives in the destination FILE*, so we report the bytes written there. */
     int length() {
+        if (this->downloaded > 0) return (int)this->downloaded;
         return (int)strlen((char *)this->body);
     }
 
@@ -682,35 +1178,8 @@ class HttpResponse {
    Http — static entry points (use like File.open / File.read_text)
    ══════════════════════════════════════════════════════════════════════════ */
 class Http {
-    /* Full request.  `headers` is an optional List<String> of "Name: Value"
-       lines; `body` is an optional request body.  Always returns a non-NULL
-       HttpResponse* (check ->ok() / ->error). */
-    static HttpResponse* request(char *method, char *url, List<String>* headers, char *body) {
-        Url *u = new Url(url);
-        defer delete u;
-
-        HttpResponse *r = new HttpResponse();
-
-        struct c2m_http_conn conn;
-        conn.fd  = -1;
-        conn.ssl = NULL;
-
-        String portStr = f"{u->port}";
-        conn.fd = c2m_http_dial((char *)u->host, (char *)portStr);
-        if (conn.fd < 0) {
-            r->error = "could not resolve or connect to host";
-            return r;
-        }
-
-        if (u->secure) {
-            if (c2m_http_tls_handshake(&conn, (char *)u->host) != 0) {
-                c2m_http_conn_close(&conn);
-                r->error = "TLS handshake failed (OpenSSL/libssl required for https)";
-                return r;
-            }
-        }
-
-        /* Build the request line + headers with String concatenation. */
+    /* Assemble the wire request (line + headers + optional body) for a URL. */
+    static String buildRequest(char *method, Url *u, List<String>* headers, char *body) {
         String req = method;
         req = req + " " + u->path + " HTTP/1.1\r\n";
         req = req + "Host: " + u->host + "\r\n";
@@ -723,20 +1192,36 @@ class Http {
             int blen = (int)strlen(body);
             req = req + "Content-Length: " + blen + "\r\n";
         }
-        req = req + "Connection: close\r\n\r\n";
+        /* Ask to keep the socket open; the transport pools it for reuse and
+           honours the server's reply (a `Connection: close` is respected). */
+        req = req + "Connection: keep-alive\r\n\r\n";
         if (body != NULL) req = req + body;
+        return req;
+    }
 
-        if (c2m_http_conn_write_all(&conn, (char *)req, (long)strlen((char *)req)) < 0) {
-            c2m_http_conn_close(&conn);
-            r->error = "failed to send request";
-            return r;
-        }
+    /* Full request.  `headers` is an optional List<String> of "Name: Value"
+       lines; `body` is an optional request body.  Always returns a non-NULL
+       HttpResponse* (check ->ok() / ->error).
+
+       The underlying TCP/TLS connection is cached per (host, port, https) and
+       reused on the next request to the same origin, so back-to-back fetches
+       skip DNS, connect and the TLS handshake.  A cached socket the peer has
+       since dropped is detected and transparently redialed. */
+    static HttpResponse* request(char *method, char *url, List<String>* headers, char *body) {
+        Url *u = new Url(url);
+        defer delete u;
+
+        HttpResponse *r = new HttpResponse();
+
+        String req = Http.buildRequest(method, u, headers, body);
 
         long  rawlen = 0;
-        char *raw    = c2m_http_read_all(&conn, &rawlen);
-        c2m_http_conn_close(&conn);
+        char *err    = NULL;
+        char *raw    = c2m_http_exchange((char *)u->host, u->port, u->secure,
+                                         (char *)req, (long)strlen((char *)req),
+                                         &rawlen, &err);
         if (raw == NULL) {
-            r->error = "failed to read response";
+            r->error = (err != NULL) ? err : "request failed";
             return r;
         }
 
@@ -781,6 +1266,41 @@ class Http {
     /* DELETE. */
     static HttpResponse* del(char *url) {
         return Http.request("DELETE", url, NULL, NULL);
+    }
+
+    /* Stream a response body straight to an open FILE* without ever buffering
+       the whole thing in memory — ideal for large downloads.  The returned
+       HttpResponse carries the status and headers; its `body` is empty (the
+       bytes went to `out`) and `length()` reports how many were written.
+       Keep-alive pooling applies just like request(). */
+    static HttpResponse* download(char *method, char *url, List<String>* headers,
+                                  char *body, FILE *out) {
+        Url *u = new Url(url);
+        defer delete u;
+
+        HttpResponse *r = new HttpResponse();
+
+        String req = Http.buildRequest(method, u, headers, body);
+
+        long  hlen = 0;
+        long  blen = 0;
+        char *err  = NULL;
+        char *hdr  = c2m_http_exchange_to((char *)u->host, u->port, u->secure,
+                                          (char *)req, (long)strlen((char *)req),
+                                          out, &hlen, &blen, &err);
+        if (hdr == NULL) {
+            r->error = (err != NULL) ? err : "request failed";
+            return r;
+        }
+
+        r->ingest(hdr, hlen);
+        r->downloaded = blen;
+        return r;
+    }
+
+    /* GET a URL, streaming the body to `out`. */
+    static HttpResponse* download(char *url, FILE *out) {
+        return Http.download("GET", url, NULL, NULL, out);
     }
 };
 

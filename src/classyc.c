@@ -7488,6 +7488,25 @@ static node_t parse_synth_func_def (c2m_ctx_t c2m_ctx) {
   return fd;
 }
 
+/* Per-CLASS thunk dedup.  The forwarding/destructor thunks emitted by
+   synthesize_any_thunks are keyed on the concrete class only (not the
+   interface), so erasing the same class to two interfaces would otherwise
+   re-define them and abort MIR with "Repeated item declaration".  We reuse the
+   generic-spec registry as a name set: return TRUE the first time THUNK_NAME is
+   seen (caller should emit the definition) and record it; return FALSE on any
+   later occurrence (caller should emit a forward declaration only). */
+static int any_thunk_register_p (c2m_ctx_t c2m_ctx, const char *thunk_name) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  for (size_t i = 0; i < VARR_LENGTH (generic_spec_t, generic_specs); i++)
+    if (strcmp (VARR_GET (generic_spec_t, generic_specs, i).spec_name, thunk_name) == 0)
+      return FALSE;
+  generic_spec_t gs;
+  gs.orig_name = "__thunk";
+  gs.spec_name = uniq_cstr (c2m_ctx, thunk_name).s;
+  VARR_PUSH (generic_spec_t, generic_specs, gs);
+  return TRUE;
+}
+
 /* Step 2.4 — monomorphize the per-(C, I) thunks and factory for any<I>(C*).
    Generates, as ClassyC source reparsed through the normal paths:
      static <R> __thunk_<m>_<C>(void* p, ...) { [return] ((C*)p)->m(...); }
@@ -7532,12 +7551,27 @@ static node_t synthesize_any_thunks (c2m_ctx_t c2m_ctx, const char *iface_name,
   SB_PUTS ("void* malloc(unsigned long);\n");
   SB_PUTS ("void* c2m_obj_track(void*, void(*)(void*));\n");
 
+  /* The forwarding thunks and the destructor thunk are keyed on the concrete
+     CLASS only (e.g. __thunk_area_Square, __thunk_dtor_Square), independent of
+     the interface.  Erasing the same class to a second interface must NOT
+     re-emit their definitions (MIR would abort with "Repeated item
+     declaration").  We therefore record each emitted thunk name in the spec
+     registry and, on a repeat, emit a forward declaration only so the factory's
+     references still resolve.  Returns TRUE if a definition still needs emitting
+     (i.e. this is the first time we see THUNK_NAME). */
+#define THUNK_FIRST_TIME(thunk_name)                                          \
+  any_thunk_register_p (c2m_ctx, (thunk_name))
+
   /* One forwarding thunk per interface method. */
   for (node_t m = NL_HEAD (members->u.ops); m != NULL; m = NL_NEXT (m)) {
     node_t spec, mid, plist;
-    int ret_ptr, idx, nparams, is_void;
+    int ret_ptr, idx, nparams, is_void, define_p;
+    char thunk_name[512];
     if (!any_extract_method (m, &spec, &mid, &ret_ptr, &plist)) continue;
     is_void = (ret_ptr == 0 && any_specs_are_void (spec));
+    snprintf (thunk_name, sizeof (thunk_name), "__thunk_%s_%s", mid->u.s.s,
+              concrete_name);
+    define_p = THUNK_FIRST_TIME (thunk_name);
     SB_PUTS ("static ");
     any_append_specs (c2m_ctx, sb, spec);
     VARR_PUSH (char, sb, ' ');
@@ -7555,6 +7589,11 @@ static node_t synthesize_any_thunks (c2m_ctx_t c2m_ctx, const char *iface_name,
         any_append_param (c2m_ctx, sb, pn, idx++, TRUE);
       }
     nparams = idx;
+    if (!define_p) {
+      /* Already defined for this class via another interface: declare only. */
+      SB_PUTS (");\n");
+      continue;
+    }
     SB_PUTS (") { ");
     if (!is_void) SB_PUTS ("return ");
     SB_PUTS ("((");
@@ -7570,12 +7609,23 @@ static node_t synthesize_any_thunks (c2m_ctx_t c2m_ctx, const char *iface_name,
     SB_PUTS ("); }\n");
   }
 
-  /* Destructor thunk: owns and frees the concrete object. */
-  SB_PUTS ("static void __thunk_dtor_");
-  SB_PUTS (concrete_name);
-  SB_PUTS ("(void* __p) { delete (");
-  SB_PUTS (concrete_name);
-  SB_PUTS ("*)__p; }\n");
+  /* Destructor thunk: owns and frees the concrete object (per CLASS). */
+  {
+    char dtor_name[512];
+    snprintf (dtor_name, sizeof (dtor_name), "__thunk_dtor_%s", concrete_name);
+    if (THUNK_FIRST_TIME (dtor_name)) {
+      SB_PUTS ("static void __thunk_dtor_");
+      SB_PUTS (concrete_name);
+      SB_PUTS ("(void* __p) { delete (");
+      SB_PUTS (concrete_name);
+      SB_PUTS ("*)__p; }\n");
+    } else {
+      /* Already defined for this class: forward declaration only. */
+      SB_PUTS ("static void __thunk_dtor_");
+      SB_PUTS (concrete_name);
+      SB_PUTS ("(void* __p);\n");
+    }
+  }
 
   /* Factory: allocate the handle and wire up its slots. */
   SB_PUTS ("static ");
@@ -8197,6 +8247,7 @@ static int str_concat_string_operand_p (const struct type *type, node_t op) {
 	  SM_SUBSTR,  /* s.substr(pos, len)               -> String          */
 	  SM_FIND,    /* s.find(needle)                   -> size_t          */
 	  SM_REPLACE, /* s.replace(pos, len, replacement) -> String (in-place) */
+	  SM_REPLACE_ALL, /* s.replace(needle, replacement) -> String (search-replace) */
 	  SM_UPPER,   /* s.upper()                        -> String          */
 	  SM_LOWER,   /* s.lower()                        -> String          */
 	  SM_COPY,       /* String.copy(p, len)                -> String          */
@@ -14082,24 +14133,34 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	        node_t width, func=NULL, func_op;;
 	        struct expr *width_expr, method;
 
-	        node_t base = NL_HEAD (r->u.ops);
-	        if (base != NULL && base->code == N_STRING) {
-	          node_t mem = NL_NEXT (base);
-	          assert (mem->code == N_ID);
-	          if (get_string_method (mem->u.s.s, NULL, NULL) != SM_NONE) {
-	            /* Special case for built-in String static method: String.copy(p, len) etc.
-	               The base N_STRING here is the type keyword used as receiver for static.
-	               Do NOT process_unop the base (would treat bare "String" as char[] literal). */
-	            e = create_expr (c2m_ctx, r);
-	            e->type->mode = TM_BASIC;
-	            e->type->u.basic_type = TP_VOID;
-	            e->u.lvalue_node = NULL;
-	            break;
-	          } else {
-	            error (c2m_ctx, POS (r), "no static method '%s' on String", mem->u.s.s);
-	            break;
-	          }
-	        }
+	node_t base = NL_HEAD (r->u.ops);
+	/* Two receiver shapes carry a string-ish base node here: the bare `String`
+	   type keyword used as a static receiver (String.copy(...)) is an N_STRING
+	   node, while an actual UTF-8 string literal used as an instance receiver
+	   ("abc".lower()) is an N_STR node. */
+	if (base != NULL && (base->code == N_STRING || base->code == N_STR)) {
+	  node_t mem = NL_NEXT (base);
+	  int literal_recv_p = base->code == N_STR;
+	  assert (mem->code == N_ID);
+	  if (get_string_method (mem->u.s.s, NULL, NULL) != SM_NONE) {
+	    /* For a literal receiver, check the base so it carries a value/type; the
+	       N_CALL handler then dispatches it as a String instance method.  For
+	       the bare `String` keyword, leave the base unchecked (process_unop
+	       would treat bare "String" as a char[] literal). */
+	    if (literal_recv_p) check (c2m_ctx, base, r);
+	    e = create_expr (c2m_ctx, r);
+	    e->type->mode = TM_BASIC;
+	    e->type->u.basic_type = TP_VOID;
+	    e->u.lvalue_node = NULL;
+	    break;
+	  } else {
+	    error (c2m_ctx, POS (r),
+	           literal_recv_p ? "unknown String method '%s'"
+	                          : "no static method '%s' on String",
+	           mem->u.s.s);
+	    break;
+	  }
+	}
 
 	        process_unop (c2m_ctx, r, &op1, &e1, &t1, r);
 	        e = create_expr (c2m_ctx, r);
@@ -14727,6 +14788,8 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	            if (obj->code == N_STRING) {
 	              // Special case for built-in String identifier (static method):
 	              // String.copy(p, len), etc.  No receiver value, static lookup via get_string_method.
+	              // (A literal receiver like "abc".lower() is an N_STR node and is
+	              //  handled as an instance method in the else branch below.)
 	              node_t method_id = NL_NEXT(obj);
 	              int nargs = 0;
 	              enum str_method sm = get_string_method(method_id->u.s.s, &nargs, NULL);
@@ -14755,6 +14818,10 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	              method_call_p = TRUE;
 	            } else {
 	              struct type *obj_type = ((struct expr *)obj->attr)->type;
+	              /* A bare UTF-8 string literal used as a method receiver
+	                 ("abc".lower()) is an N_STR node: dispatch the built-in String
+	                 instance methods on it just like a String-typed value. */
+	              int str_literal_recv_p = (obj->code == N_STR);
 
 	              // For N_DEREF_FIELD, dereference the pointer to get the actual type
 	              if (op1->code == N_DEREF_FIELD) {
@@ -14777,6 +14844,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
                 int seq_call_p = FALSE;
 
                 if (seqm != SEQM_NONE && !builtin_string_type_p (obj_type)
+                    && !str_literal_recv_p
                     && classify_seq_receiver (c2m_ctx, obj_type, POS (r), &seq_sr)
                          != SEQ_RECV_NONE)
                   seq_call_p
@@ -14964,7 +15032,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	                  error(c2m_ctx, POS(r), "too few arguments in method call");
 	                }
 	                method_call_p = TRUE;
-	              } else if (builtin_string_type_p(obj_type)) {
+	              } else if (builtin_string_type_p(obj_type) || str_literal_recv_p) {
 	                // Built-in String method call: s.length(), s.substr(p,n), s.find(x),
 	                // s.replace(p,n,x), s.empty().  Lowered to UTF-8 runtime calls in gen.
 	                node_t method_id = NL_NEXT(obj);
@@ -14973,6 +15041,13 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	                if (sm == SM_NONE) {
 	                  error(c2m_ctx, POS(r), "unknown String method '%s'", method_id->u.s.s);
 	                  break;
+	                }
+	                /* `replace` is overloaded by arity: replace(pos,len,repl) is the
+	                   positional form, while replace(needle, repl) is a search-and-
+	                   replace.  Disambiguate on the actual argument count. */
+	                if (sm == SM_REPLACE && NL_LENGTH(arg_list->u.ops) == 2) {
+	                  sm = SM_REPLACE_ALL;
+	                  nargs = 2;
 	                }
 	                if (NL_LENGTH(arg_list->u.ops) != nargs) {
 	                  error(c2m_ctx, POS(r), "String method '%s' expects %d argument%s",
@@ -14997,6 +15072,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	                case SM_LOWER:
 	                case SM_SUBSTR:
 	                case SM_REPLACE:
+	                case SM_REPLACE_ALL:
 	                  /* String result is a char*; size/align set as in the N_STRING
 	                     path (set_type_layout/basic_type_size reject TP_STRING). */
 	                  res_type.u.basic_type = TP_STRING;
@@ -16371,6 +16447,7 @@ struct gen_ctx {
   MIR_item_t str_substr_proto, str_substr_item;
   MIR_item_t str_find_proto, str_find_item;
   MIR_item_t str_replace_proto, str_replace_item;
+  MIR_item_t str_replace_all_proto, str_replace_all_item;
   MIR_item_t str_upper_proto, str_upper_item;
   MIR_item_t str_lower_proto, str_lower_item;
   MIR_item_t str_starts_with_proto, str_starts_with_item;
@@ -16498,6 +16575,8 @@ struct gen_ctx {
 #define str_find_item gen_ctx->str_find_item
 #define str_replace_proto gen_ctx->str_replace_proto
 #define str_replace_item gen_ctx->str_replace_item
+#define str_replace_all_proto gen_ctx->str_replace_all_proto
+#define str_replace_all_item gen_ctx->str_replace_all_item
 #define str_upper_proto gen_ctx->str_upper_proto
 #define str_upper_item gen_ctx->str_upper_item
 #define str_lower_proto gen_ctx->str_lower_proto
@@ -18996,6 +19075,15 @@ static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, str_replace_proto);
   move_item_to_module_start (module, str_replace_item);
 
+  /* char *c2m_str_replace_all(const char *s, const char *needle, const char *repl) */
+  vars[0].name = "s";      vars[0].type = MIR_T_I64;
+  vars[1].name = "needle"; vars[1].type = MIR_T_I64;
+  vars[2].name = "repl";   vars[2].type = MIR_T_I64;
+  str_replace_all_proto = MIR_new_proto_arr (ctx, "__c2m_str_replace_all_p", 1, &ptr_t, 3, vars);
+  str_replace_all_item = MIR_new_import (ctx, "c2m_str_replace_all");
+  move_item_to_module_start (module, str_replace_all_proto);
+  move_item_to_module_start (module, str_replace_all_item);
+
   /* char *c2m_str_upper(const char *s) */
   vars[0].name = "s"; vars[0].type = MIR_T_I64;
   str_upper_proto = MIR_new_proto_arr (ctx, "__c2m_str_upper_p", 1, &ptr_t, 1, vars);
@@ -19206,6 +19294,7 @@ static op_t gen_string_call (c2m_ctx_t c2m_ctx, enum str_method sm, MIR_op_t *va
   case SM_SUBSTR:      proto = str_substr_proto;      item = str_substr_item;      break;
   case SM_FIND:        proto = str_find_proto;        item = str_find_item;        break;
   case SM_REPLACE:     proto = str_replace_proto;     item = str_replace_item;     break;
+  case SM_REPLACE_ALL: proto = str_replace_all_proto;  item = str_replace_all_item;  break;
   case SM_UPPER:       proto = str_upper_proto;       item = str_upper_item;       break;
   case SM_LOWER:       proto = str_lower_proto;       item = str_lower_item;       break;
   case SM_DETACH:      proto = str_detach_proto;      item = str_detach_item;      break;
@@ -19338,6 +19427,14 @@ static int subtree_allocates_string_p (node_t n) {
 	        /* Both copy (allocates) and attach (registers external ptr) add to
 	           the tracker and need a scope checkpoint for cleanup. */
 	        if (sm == SM_COPY || sm == SM_ATTACH) return TRUE;
+	      }
+	      /* An allocating instance method on a UTF-8 string literal ("abc".upper())
+	         also produces a tracked String and needs a scope checkpoint. */
+	      if (obj != NULL && obj->code == N_STR && m != NULL && m->code == N_ID) {
+	        enum str_method sm = get_string_method (m->u.s.s, NULL, NULL);
+	        if (sm == SM_SUBSTR || sm == SM_REPLACE || sm == SM_UPPER
+	            || sm == SM_LOWER || sm == SM_TRIM)
+	          return TRUE;
 	      }
 	      struct expr *oe = obj == NULL ? NULL : obj->attr;
 	      if (oe != NULL && builtin_string_type_p (oe->type) && m != NULL && m->code == N_ID) {
@@ -21463,7 +21560,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
 	    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
 	      node_t mobj = NL_HEAD (func->u.ops);
 	      if (mobj->code == N_STRING) {
-	        /* Static built-in String method: String.copy(p, len) etc. No receiver. */
+	        /* Static built-in String method: String.copy(p, len) etc. No receiver.
+	           (The bare `String` keyword is an N_STRING node; a string literal
+	           receiver like "abc".lower() is an N_STR node and is lowered as an
+	           instance method below.) */
 	        node_t method_id = NL_NEXT (mobj);
 	        enum str_method sm = get_string_method (method_id->u.s.s, NULL, NULL);
 	        if (sm != SM_NONE) {
@@ -21489,9 +21589,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
 	        }
 	      }
 	      struct expr *obj_e = mobj->attr;
-	      if (obj_e != NULL && builtin_string_type_p (obj_e->type)) {
+	      if ((obj_e != NULL && builtin_string_type_p (obj_e->type))
+	          || mobj->code == N_STR) {
         node_t method_id = NL_NEXT (mobj);
         enum str_method sm = get_string_method (method_id->u.s.s, NULL, NULL);
+        /* replace(needle, repl) (2 args) is search-and-replace; replace(pos,
+           len, repl) (3 args) is the positional form.  Mirror the check-phase
+           disambiguation here. */
+        if (sm == SM_REPLACE && args != NULL && NL_LENGTH (args->u.ops) == 2)
+          sm = SM_REPLACE_ALL;
         if (sm != SM_NONE) {
           MIR_op_t vals[4];
           op_t obj_op = val_gen (c2m_ctx, mobj);
@@ -21525,6 +21631,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                   || (lval.mir_op.mode == MIR_OP_MEM && lval.mir_op.u.mem.index == 0))
                 emit2 (c2m_ctx, MIR_MOV, lval.mir_op, res.mir_op);
             }
+            break;
+          case SM_REPLACE_ALL:
+            /* search-and-replace: replace(needle, repl) -> fresh String.
+               Pure transform (no in-place writeback); caller assigns it. */
+            vals[1] = val_gen (c2m_ctx, NL_HEAD (args->u.ops)).mir_op;
+            vals[2] = val_gen (c2m_ctx, NL_EL (args->u.ops, 1)).mir_op;
+            res = gen_string_call (c2m_ctx, SM_REPLACE_ALL, vals, 3);
             break;
           case SM_UPPER:
             res = gen_string_call (c2m_ctx, SM_UPPER, vals, 1);
@@ -23288,11 +23401,12 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
       node_t sobj = NL_HEAD (func->u.ops);
       struct expr *sobj_e = sobj->attr;
       node_t smethod = NL_NEXT (sobj);
-      /* Skip both static String calls (String.copy where sobj is bare N_STRING keyword
-         with no attr) and instance String method calls (s.length() etc.). */
+      /* Skip static String calls (String.copy where sobj is the bare N_STRING
+         keyword), instance String method calls (s.length() etc.), and methods
+         called directly on a UTF-8 string literal ("abc".lower(), sobj is N_STR). */
       if (smethod != NULL && smethod->code == N_ID
           && get_string_method (smethod->u.s.s, NULL, NULL) != SM_NONE
-          && (sobj->code == N_STRING
+          && (sobj->code == N_STRING || sobj->code == N_STR
               || (sobj_e != NULL && builtin_string_type_p (sobj_e->type))))
         continue;
       /* Sequence lambda methods (arr.filter/map/reduce/count) are lowered to an

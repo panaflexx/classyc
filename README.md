@@ -22,20 +22,23 @@ s = s.trim().upper();                         // many built-in methods
 size_t len = s.length();
 
 String path = "/home/user/docs/report.pdf";
-size_t dot = path.find(".pdf");               // code-point index, or (size_t)-1 if absent
-if (dot != (size_t)-1)
-    path = path.replace(dot, 4, ".txt");      // replace(pos, len, replacement)
+if (path.contains(".pdf"))
+    path = path.replace(".pdf", ".txt");      // search-and-replace (every match)
+
+// Methods work directly on a string literal, too:
+printf("%s\n", (char*)"MiXeD".lower());        // -> mixed
 
 // Split / join round-trips with List<String>
 List<String> *parts = s.split(" ");
 String rejoined = parts->join(", ");
 ```
 
-> `find` returns a code-point **index** (or `(size_t)-1` when not found), and
-> `replace(pos, len, repl)` is **positional** — handy precisely because `find`
-> hands you the position. Other methods: `substr(pos,len)`, `starts_with`,
-> `ends_with`, `contains`, `equals`, `empty`, `lower`. Methods need a
-> `String`-typed receiver, so write `((String)"abc").upper()` for a bare literal.
+> `replace` is overloaded: `replace(needle, repl)` is search-and-replace, while
+> `replace(pos, len, repl)` is positional (handy with `find`, which returns a
+> code-point **index** or `(size_t)-1`). Use `contains` for presence tests.
+> Other methods: `substr(pos,len)`, `starts_with`, `ends_with`, `equals`,
+> `empty`, `upper`/`lower`, `trim`. Methods may be called directly on a string
+> literal (`"abc".upper()`) — no cast needed.
 
 ### Heterogeneous `dict` (JSON-like)
 ```c
@@ -103,9 +106,10 @@ and brace-init with `new List<T>{ ... }`.
 #include "list.h"
 #include "set.h"
 
-List<int> *nums  = new List<int>{ 1, 2, 3, 4, 5, 6 };
-List<int> *evens = nums->Filter((int x) => x % 2 == 0);     // Filter -> new List
-defer delete nums; defer delete evens;
+List<int> *nums    = new List<int>{ 1, 2, 3, 4, 5, 6 };
+List<int> *evens   = nums->Filter((int x) => x % 2 == 0);   // Filter -> new List
+List<int> *doubled = evens->Map((int x) => x * 2);          // Map -> new List (chains)
+defer delete nums; defer delete evens; defer delete doubled;
 
 List<String> *files = new List<String>{ "a.txt", "b.pdf", "c.txt" };
 List<String> *txt   = files->Filter((String f) => f.ends_with(".txt"));
@@ -122,9 +126,10 @@ tags->Add("c"); tags->Add("c"); tags->Add("rust");
 printf("unique tags: %d\n", tags->Count());   // 2
 ```
 
-> `List<T>` provides `Filter` and `ForEach` (no `Map`); for a full
-> map/filter/reduce pipeline over a **C array or slice**, use the lowercase seq
-> methods that return a slice you can `.ToList()` (see the next section).
+> `List<T>` provides `Filter`, `Map`, and `ForEach`. `Map` is a same-type
+> transform (`T -> T`) that chains with `Filter`; for a cross-type (`T -> U`)
+> map/filter/reduce pipeline, use the lowercase seq methods over a **C array or
+> slice** that return a slice you can `.ToList()` (see the next section).
 
 > **Element types & memory** — collections hold scalars, `String`, and pointers
 > (e.g. `List<int>`, `Set<String>`, `List<MyClass*>`) directly. A `class` is a
@@ -477,7 +482,6 @@ Contributions, bug reports, and wild ideas are welcome!
 
 ### What doesn't work / current limitations
 - Single inheritance (`extends` / `super` / `virtual` methods). Use `interface` + `impl` + `Any<I>` (structural typing) instead — this combination covers all observed use-cases in ~8600 lines of examples.
-- Erasing the **same class to two different interfaces** (`any<A>(new C())` *and* `any<B>(new C())`) currently fails codegen (`Repeated item declaration __thunk_dtor_C`). Erase a class through one interface, or declare one interface listing all the methods. (See `cy-validate/SHORTCOMINGS.md` E1.)
 - Class instances stored **by value** inside `List<T>`, `Set<T>`, or `Map<K,V>`. Only scalars, `String`, raw pointers, and `MyClass*` are supported. (See `GENERICSMEM.md` for rationale.)
 - `dict` arrays: JSON parsing builds them and `d.arr[i]` reads elements, but **array-literal assignment** (`d.tags = [..]`) is unimplemented and `for-in` does **not** iterate a dict array value (index by position instead).
 - Stack class instances with constructor arguments (`Wizard w = Wizard(..)`) aren't supported — classes are reference types; use `new`.

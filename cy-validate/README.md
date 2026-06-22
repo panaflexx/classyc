@@ -38,20 +38,25 @@ assertions (0 == all passed). The runner prints a per-file summary.
 | `val-010-exceptions.cy`       | try/catch/throw, multi-catch, user enum exceptions, **default-on** safety guards |
 | `val-011-fstring-auto.cy`     | f-strings (vars + expressions) and `auto` disambiguation (int/array/dict) |
 | `val-012-interfaces-any.cy`   | interface/impl, structural conformance, Any<I> erased dispatch, recursive delete |
-| `val-013-any-edge.cy`         | Any<I> rough edges: non-void/arg methods, pass/return handles, Map/List of Any, composition |
+| `val-013-any-edge.cy`         | Any<I> rough edges: non-void/arg methods, pass/return handles, Map/List of Any, composition, same class erased to two interfaces (E1 fix) |
 | `val-014-any-return-mem.cy`   | **Memory:** regression test for the fixed object-arena return-handle use-after-free |
+| `val-015-string-literal-and-replace.cy` | String methods on a string-literal receiver (B1), 2-arg `replace(needle,repl)` search-and-replace (A2), and `List<T>.Map` (B4) |
 
 ## Headline findings
 
 - `-fexceptions` and the JIT safety guards are **ON by default** (README said
   the opposite). Validated in `val-010`.
-- Several README snippets don't compile/run as written (`String.checkpoint()`,
-  `replace(needle, repl)`, `printf("%s", dict_value)`, `List<T> x={..}.Map(..)`).
-  See SHORTCOMINGS.md A/B.
+- Several README snippets didn't compile/run as written (`String.checkpoint()`,
+  `printf("%s", dict_value)`). See SHORTCOMINGS.md A/B.
+- **Ergonomics fixed:** String methods now work directly on a string literal
+  (`"abc".lower()`, B1), `replace(needle, repl)` is search-and-replace (A2), and
+  `List<T>.Map` exists and chains with `Filter` (B4). See `val-015`.
 - dict JSON arrays work at the value level (`d.arr[i]`); for-in over an array
   value and treating a numeric leaf as a dict do not. See SHORTCOMINGS.md C.
 - **Compiler bug found & fixed:** returning an `Any<I>` handle from a function
   was a use-after-free; now the handle is detached to the caller. See
   SHORTCOMINGS.md E0 and `val-014`.
-- **Remaining bug:** erasing the *same* class to two different interfaces fails
-  codegen (`Repeated item declaration __thunk_dtor_<Class>`). See SHORTCOMINGS.md E1.
+- **Compiler bug found & fixed:** erasing the *same* class to two different
+  interfaces aborted codegen (`Repeated item declaration __thunk_dtor_<Class>`);
+  the per-class forwarding/destructor thunks are now emitted once and
+  re-declared on later erasures. See SHORTCOMINGS.md E1 and `val-013`.

@@ -12,7 +12,8 @@
   *     String sub = s.substr(0, 5);     ->  c2m_str_substr
   *     size_t len = s.length();         ->  c2m_str_length
   *     size_t pos = s.find("this");     ->  c2m_str_find
-  *     s.replace(pos, 4, "that");       ->  c2m_str_replace
+  *     s.replace(pos, 4, "that");       ->  c2m_str_replace      (positional)
+  *     s = s.replace("this", "that");   ->  c2m_str_replace_all  (search-and-replace)
   *     if (s == null || s.empty()) ...  ->  c2m_str_empty / NULL compare
   *     String up  = s.upper();          ->  c2m_str_upper
   *     String low = s.lower();          ->  c2m_str_lower
@@ -328,6 +329,59 @@ C2M_STR_API char *c2m_str_replace (const char *s, int64_t pos, int64_t len, cons
   if (rl != 0) c2m__copy (r + pre, repl, rl);
   c2m__copy (r + pre + rl, region_end, post);
   r[total] = '\0';
+  return r;
+}
+
+/* Return a fresh String equal to s with every non-overlapping occurrence of
+   `needle` replaced by `repl`.  Byte-oriented search (UTF-8 safe for whole-
+   sequence needles).  A NULL/empty needle yields a plain copy of s; a NULL repl
+   acts as deletion.  Never aliases s.  Backs the 2-argument search-and-replace
+   form String.replace(needle, repl). */
+C2M_STR_API char *c2m_str_replace_all (const char *s, const char *needle, const char *repl) {
+  size_t sl, nl, rl, count, i, total;
+  char *r, *out;
+
+  if (s == NULL) s = "";
+  sl = c2m__bytelen (s);
+  nl = c2m__bytelen (needle);
+  rl = c2m__bytelen (repl);
+
+  if (nl == 0 || nl > sl) {
+    r = (char *) c2m__str_alloc (sl + 1);
+    if (r == NULL) return NULL;
+    c2m__copy (r, s, sl);
+    r[sl] = '\0';
+    return r;
+  }
+
+  /* First pass: count non-overlapping matches to size the result exactly. */
+  count = 0;
+  for (i = 0; i + nl <= sl;) {
+    size_t j;
+    for (j = 0; j < nl; j++)
+      if (s[i + j] != needle[j]) break;
+    if (j == nl) { count++; i += nl; } else i++;
+  }
+
+  /* total = sl - count*nl + count*rl, grouped to avoid size_t underflow. */
+  total = (sl - count * nl) + count * rl;
+  out = r = (char *) c2m__str_alloc (total + 1);
+  if (r == NULL) return NULL;
+
+  /* Second pass: emit, substituting repl for each match. */
+  for (i = 0; i + nl <= sl;) {
+    size_t j;
+    for (j = 0; j < nl; j++)
+      if (s[i + j] != needle[j]) break;
+    if (j == nl) {
+      if (rl != 0) { c2m__copy (out, repl, rl); out += rl; }
+      i += nl;
+    } else {
+      *out++ = s[i++];
+    }
+  }
+  while (i < sl) *out++ = s[i++];
+  *out = '\0';
   return r;
 }
 

@@ -504,6 +504,7 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "c2m_str_substr") == 0) return (void *) c2m_str_substr;
     if (strcmp (name, "c2m_str_find") == 0) return (void *) c2m_str_find;
     if (strcmp (name, "c2m_str_replace") == 0) return (void *) c2m_str_replace;
+    if (strcmp (name, "c2m_str_replace_all") == 0) return (void *) c2m_str_replace_all;
     if (strcmp (name, "c2m_str_upper") == 0) return (void *) c2m_str_upper;
     if (strcmp (name, "c2m_str_lower") == 0) return (void *) c2m_str_lower;
     if (strcmp (name, "c2m_str_starts_with") == 0) return (void *) c2m_str_starts_with;

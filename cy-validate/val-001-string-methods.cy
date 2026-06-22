@@ -6,7 +6,8 @@
  *   empty()                  -> int 0/1
  *   substr(pos, len)         -> String   (2 args, code-point indexed)
  *   find(needle)             -> size_t index, or (size_t)-1 if not found
- *   replace(pos, len, repl)  -> String   (3 args, NOT find/replace!)
+ *   replace(pos, len, repl)  -> String   (3 args, positional)
+ *   replace(needle, repl)    -> String   (2 args, search-and-replace; see val-015)
  *   upper() / lower()        -> String
  *   trim()                   -> String
  *   starts_with/ends_with/contains(s) -> int 0/1
