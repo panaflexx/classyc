@@ -22908,10 +22908,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       val = promote (c2m_ctx, val, t, FALSE);
     }
     gen_run_defers (c2m_ctx, 0); /* run all pending defers after computing result */
-    /* Reclaim this scope's Any<I> handles before returning.  NOTE: a handle (or a
-       collection of handles) returned up the stack is freed here — escaping a
-       handle past its constructing scope needs explicit management. */
-    if (obj_scope_active) gen_obj_release_to (c2m_ctx, obj_scope_mark.mir_op);
+    /* Reclaim this scope's Any<I> handles before returning.  A handle returned
+       up the stack (e.g. `return any<I>(new C(...));`) is protected by detaching
+       it from this scope's object arena first, handing ownership to the caller
+       so the release below does not destroy it — mirrors gen_str_release_keeping
+       for Strings.  detach is a safe no-op for pointers that were never tracked.
+       NOTE: returning a *collection* of handles still frees the contained
+       handles; that case needs explicit management. */
+    if (obj_scope_active) {
+      if (!ret_by_addr_p && scalar_p && ret_type->mode == TM_PTR)
+        gen_obj_detach (c2m_ctx, val.mir_op);
+      gen_obj_release_to (c2m_ctx, obj_scope_mark.mir_op);
+    }
     /* Reclaim this scope's Strings before returning; protect a returned String
        so it survives into the caller's scope (no use-after-free). */
     if (str_scope_active) {

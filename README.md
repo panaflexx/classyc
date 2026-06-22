@@ -1,8 +1,8 @@
-# ClassyC — Modern C with Classes, Strings, Dicts & More
+# ClassyC — Modern C with Classes, Strings, Dicts, Lists & Maps
 
 > **Note:** ClassyC now includes an LSP server and the `jitrunner` (hot-reload + DAP debug adapter) for a full development experience.
 
-**ClassyC** is a C11 compiler with a carefully chosen set of modern language extensions that make systems programming feel dramatically more productive, while staying true to C's spirit.  Classy is a heavily-modified c2m compiler from MIR.
+**ClassyC** is a C11 compiler with a carefully chosen set of modern language extensions that make systems programming feel dramatically more productive, while staying true to C's spirit. Classy is a heavily-modified c2m compiler from MIR.
 
 It is built on the battle-tested [MIR](https://github.com/vnmakarov/mir) JIT/AOT infrastructure, giving you:
 - Fast JIT execution (interpreter, lazy codegen, basic-block versioning)
@@ -14,7 +14,7 @@ It is built on the battle-tested [MIR](https://github.com/vnmakarov/mir) JIT/AOT
 ### First-Class `String` (UTF-8)
 ```c
 String greeting = "Hello, 世界 😊";
-String name = "Ada" + greeting;;
+String name = "Ada" + greeting;
 printf("%s\n", greeting + " from " + name);   // concatenation with auto-promotion
 
 String s = "  Schöne Grüße  ";
@@ -22,8 +22,20 @@ s = s.trim().upper();                         // many built-in methods
 size_t len = s.length();
 
 String path = "/home/user/docs/report.pdf";
-if (path.find(".pdf")) path = path.replace(".pdf", ".txt");
+size_t dot = path.find(".pdf");               // code-point index, or (size_t)-1 if absent
+if (dot != (size_t)-1)
+    path = path.replace(dot, 4, ".txt");      // replace(pos, len, replacement)
+
+// Split / join round-trips with List<String>
+List<String> *parts = s.split(" ");
+String rejoined = parts->join(", ");
 ```
+
+> `find` returns a code-point **index** (or `(size_t)-1` when not found), and
+> `replace(pos, len, repl)` is **positional** — handy precisely because `find`
+> hands you the position. Other methods: `substr(pos,len)`, `starts_with`,
+> `ends_with`, `contains`, `equals`, `empty`, `lower`. Methods need a
+> `String`-typed receiver, so write `((String)"abc").upper()` for a bare literal.
 
 ### Heterogeneous `dict` (JSON-like)
 ```c
@@ -33,46 +45,27 @@ dict cfg = {
     "timeout": 30.5
 };
 
-printf("%s\n", cfg.server.host);              // dot access
-printf("%s\n", cfg["timeut"]);                // array access
-cfg.retries = 5;                              // dynamic key creation
+printf("%s\n", (char*)cfg.server.host);       // string leaf -> cast to char*
+int port = (int)cfg.server.port;              // numeric leaf -> read as a scalar
+cfg.retries = 5;                              // dynamic key creation / assignment
 
-for (auto k in cfg) {
-    printf("%s = %s\n", k, json(cfg[k]));
-}
-
-class Fruit {
-    /* Unified declarative definition: one dict, one source of truth.
-       Keys are the variant names.
-       Each value is a sub-dict containing the int "value" (for switch/case)
-       and any other metadata you want (desc, color, season, ...).
-    */
-    dict variants = {
-        "Apple": {
-            "value": 0,
-            "desc": "A crisp, classic apple."
-        },
-        "Banana": {
-            "value": 10,
-            "desc": "Curved yellow banana."
-        },
-        "Kiwi": {
-            "value": 1,
-            "desc": "Furry brown kiwi with bright green inside."
-        },
-        "Mango": {
-            "value": 2,
-            "desc": "Sweet tropical mango."
-        }
-    };
-};
-
-printf("\nAll variants (single for-in over the unified dict):\n");
-for (auto name, data in Fruit.variants) {
-    printf("  %s : value=%d  desc=\"%s\"\n",
-           name, (int)data.value, data.desc);
-}
+for (auto k, v in cfg)
+    printf("%s = %s\n", k, (char*)json(v));   // json() stringifies any value
 ```
+
+> A `dict` value is a tagged box. Print a **string** leaf with a `(char*)` cast,
+> read a **numeric** leaf with `(int)` / `(double)`, and use `json(v)` to
+> stringify *any* value (object, array, number, or string).
+
+JSON arrays come through too — parse, then index by position:
+
+```c
+dict d = json("{\"items\":[{\"name\":\"ada\",\"score\":42}]}");
+printf("%s\n", (char*)d.items[0].name);       // "ada"
+int score = (int)d.items[0].score;            // 42
+```
+
+`dict` also supports arena allocation (`new dict(bytes)`) and is the return type of `HttpResponse::asDict()`.
 
 ### Typed `Map<K, V>` Hash Maps (`include/map.h`)
 The typed, type-safe sibling of `dict`: a generic open-addressing hash map that
@@ -100,71 +93,38 @@ for (auto title, track in lib) track->play();
 defer delete ages;
 ```
 
-`Map<K, V>` is a two-type-parameter generic that plugs into the same language
-sugar as `List<T>` / `Set<T>`: subscript (`m[k]` / `m[k] = v`) lowers to
-`Get`/`Set`, and `for (auto k in m)` / `for (auto k, v in m)` iterate keys and
-key/value pairs in insertion order (the same `Count()` / `KeyAt(int)` /
-`ValAt(int)` protocol the compiler duck-types over). See
-`examples/classy-map.cy` for the full tour and `examples/classy-map-bench.cy`
-for a 100k-entry throughput benchmark.
+`Map<K, V>` plugs into the same language sugar as `List<T>` / `Set<T>`: subscript (`m[k]` / `m[k] = v`) lowers to `Get`/`Set`, and `for (auto k in m)` / `for (auto k, v in m)` iterate keys and key/value pairs in insertion order (the same `Count()` / `KeyAt(int)` / `ValAt(int)` protocol the compiler duck-types over). See `examples/classy-map.cy` for the full tour and `examples/classy-map-bench.cy` for a 100k-entry throughput benchmark.
 
-### Classes with Constructors, Destructors & `new`/`delete`
+### Generics, `List<T>`, `Set<T>` & Lambdas
+Collections are reference types: allocate with `new`, call methods with `->`,
+and brace-init with `new List<T>{ ... }`.
+
 ```c
-class Point {
-    int x, y;
+#include "list.h"
+#include "set.h"
 
-    Point(int x, int y) { this.x = x; this.y = y; }
-    ~Point() { printf("~Point(%d,%d)\n", this.x, this.y); }
+List<int> *nums  = new List<int>{ 1, 2, 3, 4, 5, 6 };
+List<int> *evens = nums->Filter((int x) => x % 2 == 0);     // Filter -> new List
+defer delete nums; defer delete evens;
 
-    Point* withX(int v) { this.x = v; return this; }
-    int sum() { return x + y; }
-};
+List<String> *files = new List<String>{ "a.txt", "b.pdf", "c.txt" };
+List<String> *txt   = files->Filter((String f) => f.ends_with(".txt"));
+defer delete files; defer delete txt;
 
-Point* p = new Point(3, 4).withX(10);         // heap + chaining
-defer delete p;                               // RAII-style cleanup for heap memory
-```
-
-### `defer`, `delete`, and Scoped Resource Management
-```c
-void process() {
-    FILE* f = fopen("data.txt", "r");
-    defer fclose(f);
-
-    String arena = String.checkpoint();
-    defer String.release_to(arena); // Arena memory managed strings, no need to free
-}
-```
-
-### f-Strings (Interpolated Strings)
-```c
-String user = "bob";
-int score = 42;
-String msg = f"Hello {user}, your score is {score}";
-printf(f"Score is {score}\n");
-```
-
-### Nice `auto` + Disambiguation
-```c
-auto x = 42;                    // int
-auto d = {"name": "Ada", "age": 36};   // dict
-auto arr = {1, 2, 3};           // int[3]
-```
-
-### `for (auto x in ...)` Loops
-Works over arrays, dicts, and (via methods) strings.
-
-### Generics, `List<T>` & Lambdas
-```c
-List<int> nums = {1, 2, 3};                            // brace-init
-nums = nums.Filter((int x) => x > 1).Map((int x) => x * 2);
-
-List<String> files = {"a.txt", "b.pdf", "c.txt"};   // brace-init + String
-files = files.Filter((String f) => f.find(".txt"))
-               .Map((String f) => f.replace(".txt", ".bak"));
-
-List<Any<View>*> widgets = { any<View>(new Button()), any<View>(new Text()) };
+List<Any<View>*> *widgets = new List<Any<View>*>();
+widgets->Add(any<View>(new Button()));
+widgets->Add(any<View>(new Text()));
 for (auto v in widgets) v->render();   // heterogeneous via type erasure
+
+// Set<T> — content-aware for String, identity for objects
+Set<String> *tags = new Set<String>();
+tags->Add("c"); tags->Add("c"); tags->Add("rust");
+printf("unique tags: %d\n", tags->Count());   // 2
 ```
+
+> `List<T>` provides `Filter` and `ForEach` (no `Map`); for a full
+> map/filter/reduce pipeline over a **C array or slice**, use the lowercase seq
+> methods that return a slice you can `.ToList()` (see the next section).
 
 > **Element types & memory** — collections hold scalars, `String`, and pointers
 > (e.g. `List<int>`, `Set<String>`, `List<MyClass*>`) directly. A `class` is a
@@ -211,6 +171,61 @@ This is not special-cased to `List<T>`: any class collection whose constructor
 `items.count()`, and call sites such as `new Bag<int>(arr)` fill it in
 automatically.
 
+### Classes with Constructors, Destructors & `new`/`delete`
+```c
+class Point {
+    int x, y;
+
+    Point(int x, int y) { this.x = x; this.y = y; }
+    ~Point() { printf("~Point(%d,%d)\n", this.x, this.y); }
+
+    Point* withX(int v) { this.x = v; return this; }
+    int sum() { return x + y; }
+};
+
+Point* p = new Point(3, 4).withX(10);         // heap + chaining
+defer delete p;                               // RAII-style cleanup for heap memory
+```
+
+### `defer`, `delete`, and Scoped Resource Management
+`defer` runs a statement on scope exit (LIFO, Go-style) — perfect for closing
+files and freeing heap objects right where you acquire them.
+
+```c
+void process() {
+    FILE* f = fopen("data.txt", "r");
+    defer fclose(f);                 // runs last, on the way out
+
+    auto cfg = new dict(64 * 1024);
+    defer delete cfg;                // frees the whole arena on scope exit
+
+    String report = "rows: " + 128;  // heap String, reclaimed automatically
+    // ... no manual String cleanup needed (see Memory Management) ...
+}
+```
+
+> Heap **Strings** are reclaimed for you automatically (see *Memory Management*)
+> — there is no manual `checkpoint`/`release` API to call. Use `defer delete`
+> for things you allocate with `new` (objects, arena dicts, collections).
+
+### f-Strings (Interpolated Strings)
+```c
+String user = "bob";
+int score = 42;
+String msg = f"Hello {user}, your score is {score}";
+printf(f"Score is {score}\n");
+```
+
+### Nice `auto` + Disambiguation
+```c
+auto x = 42;                    // int
+auto d = {"name": "Ada", "age": 36};   // dict
+auto arr = {1, 2, 3};           // int[3]
+```
+
+### `for (auto x in ...)` Loops
+Works over arrays, `dict`, `List<T>`, `Set<T>`, `Map<K,V>`, and (via methods) strings. Keyed variant `for (auto k, v in m)` is supported for `dict` and `Map`.
+
 ### Interfaces & `Any<I>` Erasure
 ```c
 interface Drawable { void draw(); }
@@ -219,7 +234,7 @@ class Circle impl Drawable { ... }
 Any<Drawable> d = any<Drawable>(new Circle());  // erased handle
 ```
 
-### Exceptions (opt-in)
+### Exceptions & Safety Guards (on by default)
 ```c
 try {
     risky();
@@ -232,7 +247,31 @@ try {
 throw(OutOfBoundsException, "bad index");
 ```
 
-Enabled with `-fexceptions` (default off; disable explicitly with `-fno-exceptions`). Built-in values: `NullException`, `OutOfBoundsException`, `RuntimeException`, base `Exception`. No `#include` required,
+**On by default.** Exceptions *and* the JIT safety guards (null-deref,
+divide-by-zero, array/slice out-of-bounds) are active unless you opt out with
+`-fno-exceptions`. A guarded fault becomes a catchable exception:
+
+```c
+int *p = 0;
+try { int v = *p; }                    // null-deref guard fires
+catch (NullException e) { printf("caught: %s\n", e.msg); }
+```
+
+Built-in values: `NullException`, `OutOfBoundsException`, `RuntimeException`,
+base `Exception`. No `#include` required.
+
+**User-defined exceptions** work today without compiler changes:
+```c
+enum { MyKeyError = 100, MyParseError = 101 };   // IDs ≥ 100 conventional for users
+
+try {
+    ...
+} catch (MyKeyError e) {
+    ...
+}
+throw(MyKeyError, "key missing");
+```
+(See `examples/test-customexception.cy` and `examples/classy-exceptions.cy`.)
 
 ### HTTP/HTTPS Fetch (`include/httpclient.h`)
 A header-only client to call a JSON API in one line. Responses come back the
@@ -265,6 +304,7 @@ request headers, batch fetch, 404 handling).
 - All standard C11 features (minus atomics/complex/VLA/TLS)
 - Statement expressions, labels as values, range cases, binary literals, etc.
 - Powerful MIR builtins for JIT specialization (`__builtin_prop_*`, `__builtin_jcall`, overflow helpers)
+- Method overloading (resolved at compile time)
 
 ## How to Build
 
@@ -337,13 +377,15 @@ Look in the `examples/` directory:
 | `classy-sets-myclass.cy`   | Custom `WordBag` class over `Set<T>`: word analytics (sort -u, set-grep, stop-words, Jaccard) |
 | `classy-search-engine.cy`  | MapReduce inverted-index search engine over `List<T>` of custom classes |
 | `classy-collections-class.cy` | `List<Track*>` + `Set<Track*>` over a custom class (Sort/Filter, set algebra by identity) |
-| `classy-dict-arena.c`      | Arena-backed dicts (`new dict(size)`) |
+| `classy-dict-init-class.cy`| Using `dict` inside class methods (with `this` calls) |
+| `classy-overload.cy`       | Compile-time method overloading |
 | `test-any-arena.c`         | `Any<I>` type erasure + arena-managed handles |
 | `test-interface.c`         | `interface` + `impl` structural conformance |
 | `test-any.c`               | Heterogeneous `List<Any<View>*>` (arena + non-arena) |
 | `classy-exceptions.cy`     | `try`/`catch`/`throw` (opt-in via `-fexceptions`) |
 | `classy-safety.cy`         | JIT safety guards: null-ptr, div-by-zero, array/slice OOB (auto-emitted with `-fexceptions`) |
 | `classy-fetch.cy`          | HTTP/HTTPS client (`include/httpclient.h`): calls the PokéAPI over TLS, headers as a `dict`, `List<String>` |
+| `test-customexception.cy`  | User-defined exceptions via `enum { MyErr = 100 }` |
 
 Run them all with:
 ```bash
@@ -352,25 +394,39 @@ examples/run-examples.sh
 
 ## Memory Management
 
-ClassyC provides lightweight arena allocators for high-level types:
+ClassyC manages high-level types with lightweight arenas. The big win: **heap
+`String`s are reclaimed automatically** — there is no manual API to call.
 
-- **String arena** — `String.checkpoint()` / `String.release_to(arena)` or `defer String.release_to(...)` reclaims all strings allocated since the checkpoint in one shot.
-- **Dict arena** — `new dict(bytes)` creates an arena-backed dict; `delete d` frees the entire arena and its contents.
-- **List<T> and collections** — The generic `List<T>` (and `any<I>` handles) use the same object-arena model: elements registered in a scope-bound arena are automatically reclaimed on scope exit.
+- **String arena (automatic)** — every heap `String` (from `+`, `substr`,
+  `replace`, `upper`/`lower`/`trim`, `split` …) is tracked. The compiler emits a
+  checkpoint at the start of each allocating scope and reclaims it on exit; a
+  `String` you `return` is automatically kept alive for the caller. An
+  `atexit` net guarantees a leak-free normal exit. You write no cleanup code.
+- **Object arena (automatic)** — `any<I>(...)` handles use the same scope-bound
+  model and are reclaimed on scope exit; a handle you `return` is handed to the
+  caller, who then owns it (`delete` it, or store it in a collection).
+- **Dict arena (explicit)** — `new dict(bytes)` is arena-backed; `delete d`
+  (or `defer delete d`) frees the whole arena and its contents in one shot.
+- **Collections (explicit)** — `new List<T>` / `Map` / `Set` are heap objects you
+  own; pair them with `defer delete`.
 
 Typical pattern:
 
 ```c
-String a = String.checkpoint();
-defer String.release_to(a);
+void handle() {
+    auto cfg = new dict(256 * 1024);
+    defer delete cfg;                 // explicit: you own `new`
 
-dict cfg = new dict(256*1024);
-defer delete cfg; // Heap allocated must be freed manually
+    auto names = new List<String>();
+    defer delete names;
 
-List<String> names = List<String>();
-// ... populate and use ...
-// all released automatically at scope exit
+    String greeting = "hi " + cfg.user;   // heap String — reclaimed automatically
+    // ... no String cleanup needed ...
+}
 ```
+
+See `cy-validate/` for executable tests of the String arena (a 200k-allocation
+loop stays bounded) and the object/dict arenas.
 
 ## AOT Compilation
 
@@ -403,12 +459,37 @@ The runtime support for String methods and dict operations lives in small C help
 ClassyC is a pragmatic, evolving experiment in "C but pleasant". It already delivers a delightful developer experience for data-heavy systems code (proxies, config-driven services, CLIs, embedded scripting).
 
 Shipped since the early roadmap: typed lambdas, generics (`List<T>` and
-user-defined collections), `interface`/`Any<I>` erasure, opt-in exceptions, and
-array/slice → `List<T>` conversion with lengths flowing into generics. In-progress
-directions include richer container types and broader standard-library coverage.
+user-defined collections), `interface`/`Any<I>` erasure, default-on exceptions +
+safety guards, and array/slice → `List<T>` conversion with lengths flowing into
+generics. In-progress directions include richer container types and broader
+standard-library coverage.
+
+The behavior described in this README is exercised by the executable validation
+suite in **[`cy-validate/`](cy-validate/)** (run `sh cy-validate/run-validate.sh`).
+Known rough edges and their workarounds are catalogued in
+**[`cy-validate/SHORTCOMINGS.md`](cy-validate/SHORTCOMINGS.md)**.
 
 Contributions, bug reports, and wild ideas are welcome!
 
 ---
+
+## Limitations & Future Work
+
+### What doesn't work / current limitations
+- Single inheritance (`extends` / `super` / `virtual` methods). Use `interface` + `impl` + `Any<I>` (structural typing) instead — this combination covers all observed use-cases in ~8600 lines of examples.
+- Erasing the **same class to two different interfaces** (`any<A>(new C())` *and* `any<B>(new C())`) currently fails codegen (`Repeated item declaration __thunk_dtor_C`). Erase a class through one interface, or declare one interface listing all the methods. (See `cy-validate/SHORTCOMINGS.md` E1.)
+- Class instances stored **by value** inside `List<T>`, `Set<T>`, or `Map<K,V>`. Only scalars, `String`, raw pointers, and `MyClass*` are supported. (See `GENERICSMEM.md` for rationale.)
+- `dict` arrays: JSON parsing builds them and `d.arr[i]` reads elements, but **array-literal assignment** (`d.tags = [..]`) is unimplemented and `for-in` does **not** iterate a dict array value (index by position instead).
+- Stack class instances with constructor arguments (`Wizard w = Wizard(..)`) aren't supported — classes are reference types; use `new`.
+- Exception names are resolved only at compile time. Runtime stores integer IDs only; there is no symbolic pretty-printing or `nameof`-style reflection for exceptions.
+- No built-in "key not found" exception type for `dict`/`Map` subscript (users can define their own via `enum { MyKeyError = 100 }` and `throw`/`catch` it manually).
+- `List<T>.sort` / `Set<T>` and a few other methods have minor edge-case limitations documented in the headers.
+
+### Want-to-have features (prioritized)
+- Richer `List<T>` / `Map<K,V>` syntactic sugar and initializer syntax (more Pythonic comprehensions, better literal support, safer typed JSON deserialization into `List<T>` / `Map<K,V>`).
+- Safe / typed JSON parsing helpers that return `Result<T, ParseError>` or throw on failure (beyond the current `asDict()` which can produce a null-ish dict on bad input).
+- Lightweight SQLite wrapper (`include/sqlite.h`) with automatic binding of `dict` rows and `List<dict>` result sets — a natural fit given the existing `dict` infrastructure.
+- Simple gunicorn-style HTTP server library (lower priority than SQLite).
+- Optional pretty-printing / symbolic names for user-defined exceptions at debug time.
 
 *Built with ❤️ on top of MIR. Original c2mir design by Vladimir Makarov.*
