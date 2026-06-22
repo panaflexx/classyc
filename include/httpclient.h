@@ -1043,6 +1043,8 @@ class HttpResponse {
     String body;         /* decoded body (view into `raw`)                   */
     char  *raw;          /* owned heap buffer holding the whole response     */
     long   downloaded;   /* bytes streamed to a FILE* by Http.download (else 0) */
+    dict   jsonCache;    /* lazily-parsed body dict (owned); valid iff jsonParsed */
+    int    jsonParsed;   /* 1 once asDict() has populated jsonCache            */
 
     HttpResponse() {
         this->status     = 0;
@@ -1052,9 +1054,17 @@ class HttpResponse {
         this->body       = "";
         this->raw        = NULL;
         this->downloaded = 0;
+        this->jsonParsed = 0;
     }
 
     ~HttpResponse() {
+        /* Free everything this response owns.  The headers dict and the parsed
+           JSON dict each hold their own strdup'd copies, so destroying them is
+           independent of freeing `raw`.  Without this, every request leaked a
+           headers dict (and asDict() leaked a whole JSON tree) — a steady RAM
+           climb in any fetch loop. */
+        if (this->jsonParsed) delete this->jsonCache;
+        delete this->headers;
         if (this->raw != NULL) free((void *)this->raw);
     }
 
@@ -1149,9 +1159,16 @@ class HttpResponse {
         return names;
     }
 
-    /* Parse the (JSON) body into a dict. */
+    /* Parse the (JSON) body into a dict.  The result is owned by this response
+       and reused on subsequent calls; it is freed by `delete` / `defer delete`
+       along with the response, so callers must not delete it themselves and
+       must not use it after the response is gone. */
     dict asDict() {
-        return json((char *)this->body);
+        if (!this->jsonParsed) {
+            this->jsonCache  = json((char *)this->body);
+            this->jsonParsed = 1;
+        }
+        return this->jsonCache;
     }
 
     /* Body length in bytes.  For a streamed download (Http.download) the body

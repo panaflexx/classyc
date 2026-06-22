@@ -23,6 +23,12 @@
 #include <string.h>
 #include "include/httpclient.h"
 
+/* String-arena lifetime hooks from the String runtime (include/cstring.h):
+ * checkpoint the current high-water mark, then free everything allocated since.
+ * Declared here so the loop below can reclaim each iteration's Strings. */
+size_t c2m_str_checkpoint(void);
+void   c2m_str_release_to(size_t mark);
+
 String POKE_API="https://pokeapi.co/api/v2/pokemon/";
 
 /* Pretty-print the interesting fields of a parsed Pokémon dict. */
@@ -48,76 +54,89 @@ void show_pokemon(String name) {
 }
 
 int main() {
-    printf("════════════════════════════════════════════════\n");
-    printf("  classyc HTTP client — PokéAPI fetcher\n");
-    printf("════════════════════════════════════════════════\n\n");
+	for(int i=0; i<1000; i++) {
+		/* Mark the String arena high-water point.  Every String allocated by
+		   this iteration (concatenated URLs, the request builders, etc.) is
+		   tracked above this mark and freed by c2m_str_release_to() at the end
+		   of the loop body, so RAM stays flat instead of growing each pass.
+		   Safe because every `defer delete` in the iteration has already run by
+		   then, leaving no tracked String still in use. */
+		size_t str_mark = c2m_str_checkpoint();
 
-    /* ── 1. One detailed fetch: inspect the response envelope ──────────── */
-    printf("-- 1. GET %sditto --\n", POKE_API);
-    {
-        auto resp = Http.get(POKE_API + "ditto");
-        defer delete resp;
+		printf("════════════════════════════════════════════════\n");
+		printf("  classyc HTTP client — PokéAPI fetcher\n");
+		printf("════════════════════════════════════════════════\n\n");
 
-        printf("  status      : %d %s\n", resp->status, (char *)resp->statusText);
-        printf("  ok()        : %d\n", resp->ok());
-        printf("  content-type: %s\n", (char *)resp->header("content-type"));
-        printf("  server      : %s\n", (char *)resp->header("server"));
-        printf("  body length : %d bytes\n", resp->length());
+		/* ── 1. One detailed fetch: inspect the response envelope ──────────── */
+		printf("-- 1. GET %sditto --\n", POKE_API);
+		{
+			auto resp = Http.get(POKE_API + "ditto");
+			defer delete resp;
 
-        /* response headers are a dict; their names come back as a List<String> */
-        auto names = resp->headerNames();
-        defer delete names;
-        printf("  headers     : %d returned\n", names->Count());
+			printf("  status      : %d %s\n", resp->status, (char *)resp->statusText);
+			printf("  ok()        : %d\n", resp->ok());
+			printf("  content-type: %s\n", (char *)resp->header("content-type"));
+			printf("  server      : %s\n", (char *)resp->header("server"));
+			printf("  body length : %d bytes\n", resp->length());
 
-        if (resp->ok()) {
-            printf("  parsed JSON :\n  ");
-            print_pokemon(resp->asDict());
-        }
-    }
+			/* response headers are a dict; their names come back as a List<String> */
+			auto names = resp->headerNames();
+			defer delete names;
+			printf("  headers     : %d returned\n", names->Count());
 
-    /* ── 2. Custom request headers via List<String> ────────────────────── */
-    printf("\n-- 2. GET with custom request headers --\n");
-    {
-        List<String> *headers = new List<String>();
-        defer delete headers;
-        headers->Add("Accept: application/json");
-        headers->Add("X-Powered-By: ClassyC");
+			if (resp->ok()) {
+				printf("  parsed JSON :\n  ");
+				print_pokemon(resp->asDict());
+			}
+		}
 
-        auto resp = Http.get( POKE_API + "charizard", headers);
-        defer delete resp;
+		/* ── 2. Custom request headers via List<String> ────────────────────── */
+		printf("\n-- 2. GET with custom request headers --\n");
+		{
+			List<String> *headers = new List<String>();
+			defer delete headers;
+			headers->Add("Accept: application/json");
+			headers->Add("X-Powered-By: ClassyC");
 
-        if (resp->ok()) {
-            dict d = resp->asDict();
-            printf("  sent 2 custom headers; got #%d %s back\n",
-                   (int)d.id, (char *)d.name);
-        } else {
-            printf("  request failed: HTTP %d\n", resp->status);
-        }
-    }
+			auto resp = Http.get( POKE_API + "charizard", headers);
+			defer delete resp;
 
-    /* ── 3. Batch fetch over a List<String> of names ───────────────────── */
-    printf("\n-- 3. Batch fetch (for-in over a List<String>) --\n");
-    {
-        List<String> *roster = new List<String>();
-        defer delete roster;
-        roster->Add("bulbasaur");
-        roster->Add("pikachu");
-        roster->Add("snorlax");
-        roster->Add("mewtwo");
-        roster->Add("eevee");
+			if (resp->ok()) {
+				dict d = resp->asDict();
+				printf("  sent 2 custom headers; got #%d %s back\n",
+					   (int)d.id, (char *)d.name);
+			} else {
+				printf("  request failed: HTTP %d\n", resp->status);
+			}
+		}
 
-        for (auto name in roster) show_pokemon(name);
-    }
+		/* ── 3. Batch fetch over a List<String> of names ───────────────────── */
+		printf("\n-- 3. Batch fetch (for-in over a List<String>) --\n");
+		{
+			List<String> *roster = new List<String>();
+			defer delete roster;
+			roster->Add("bulbasaur");
+			roster->Add("pikachu");
+			roster->Add("snorlax");
+			roster->Add("mewtwo");
+			roster->Add("eevee");
 
-    /* ── 4. Graceful handling of a 404 ─────────────────────────────────── */
-    printf("\n-- 4. A request that 404s --\n");
-    {
-        auto resp = Http.get(POKE_API + "definitely-not-a-pokemon");
-        defer delete resp;
-        printf("  status %d %s -> ok()=%d\n",
-               resp->status, (char *)resp->statusText, resp->ok());
-    }
+			for (auto name in roster) show_pokemon(name);
+		}
 
-    printf("\nDone.\n");
+		/* ── 4. Graceful handling of a 404 ─────────────────────────────────── */
+		printf("\n-- 4. A request that 404s --\n");
+		{
+			auto resp = Http.get(POKE_API + "definitely-not-a-pokemon");
+			defer delete resp;
+			printf("  status %d %s -> ok()=%d\n",
+				   resp->status, (char *)resp->statusText, resp->ok());
+		}
+
+		printf("\n%d Done.\n", i);
+
+		/* Reclaim every String this iteration allocated. */
+		c2m_str_release_to(str_mark);
+	}
     return 0;
 }
