@@ -8726,7 +8726,13 @@ static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
 
   if (type->raw_size != MIR_SIZE_MAX) return; /* defined */
   if (type->mode == TM_BASIC) {
-    overall_size = basic_type_size (type->u.basic_type);
+    /* Guard: after a type error, u.basic_type may be uninitialized (garbage).
+       Any out-of-range value is a sign we are in error-recovery mode. */
+    if (n_errors > 0 && (unsigned) type->u.basic_type > (unsigned) TP_GENERIC) {
+      overall_size = sizeof (int); /* safe fallback during error recovery */
+    } else {
+      overall_size = basic_type_size (type->u.basic_type);
+    }
   } else if (type->mode == TM_PTR) {
     overall_size = sizeof (mir_size_t);
   } else if (type->mode == TM_ENUM) {
@@ -14908,6 +14914,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	                  if (!arg->attr) check(c2m_ctx, arg, r);
 	                init_type(&res_type);
 	                res_type.mode = TM_BASIC;
+	                res_type.u.basic_type = TP_INT; /* safe fallback: overridden by each case below */
 	                switch (sm) {
 	                case SM_LENGTH:
 	                case SM_FIND:
