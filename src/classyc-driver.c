@@ -532,6 +532,9 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "cy_exc_throw") == 0) return (void *) cy_exc_throw;
     if (strcmp (name, "cy_exc_active") == 0) return (void *) cy_exc_active;
     if (strcmp (name, "_safety_trap") == 0) return (void *) _safety_trap;
+    if (strcmp (name, "cy_safe_alloc") == 0) return (void *) cy_safe_alloc;
+    if (strcmp (name, "cy_safe_free") == 0) return (void *) cy_safe_free;
+    if (strcmp (name, "cy_safe_deref") == 0) return (void *) cy_safe_deref;
     /* String '+' concatenation / basic-type auto-cast helpers */
     if (strcmp (name, "c2m_str_concat") == 0) return (void *) c2m_str_concat;
     if (strcmp (name, "c2m_str_from_int") == 0) return (void *) c2m_str_from_int;

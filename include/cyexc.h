@@ -35,8 +35,10 @@
 #endif
 
 #include <setjmp.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,17 +105,19 @@ C2M_EXC_API void cy_exc_throw (unsigned int id, const char *msg, const char *fil
   abort ();
 }
 
-/* Optional JIT safety trap (bounds/null/etc. guards, gated on -fexceptions).
-   Turns a detected fault into a catchable exception when inside a try, else
-   aborts with a diagnostic.  `reason`: 1=OOB, 2=null, 3=uninit, 4=use-after-free. */
+/* JIT safety trap (bounds/null/div-zero guards, gated on -fexceptions).
+   Converts a detected fault into a catchable exception when inside a try block,
+   or aborts with a diagnostic when uncaught.
+   reason: 1=OOB, 2=null-ptr, 3=div-by-zero, 4=use-after-free. */
 C2M_EXC_API void _safety_trap (long reason, long file_id, long line) {
   static const char *const reasons[]
     = {"unknown fault", "out-of-bounds index", "null-pointer dereference",
-       "read of uninitialized value", "use-after-free"};
+       "division by zero", "use-after-free"};
   long n = (long) (sizeof (reasons) / sizeof (reasons[0]));
   const char *what = (reason >= 0 && reason < n) ? reasons[reason] : "unknown fault";
   unsigned int id = reason == 1 ? CY_EXC_OUT_OF_BOUNDS
                     : reason == 2 ? CY_EXC_NULL
+                    : reason == 3 ? CY_EXC_ARITHMETIC
                                   : CY_EXC_RUNTIME;
   (void) file_id;
   if (cy_exc_active ()) cy_exc_throw (id, what, NULL, (int) line);
@@ -124,5 +128,47 @@ C2M_EXC_API void _safety_trap (long reason, long file_id, long line) {
 #ifdef __cplusplus
 }
 #endif
+
+/* ── Safe allocator / free wrapper ────────────────────────────────────────────
+   cy_safe_alloc / cy_safe_free / cy_safe_deref are called by the compiler's
+   gen stage when -fexceptions is active:
+
+     cy_safe_alloc(size) — plain malloc; OOM is caught by the inline
+                           gen_oom_check emitted right after the call.
+
+     cy_safe_free(ptr, line) — throws RuntimeException on delete of null.
+                           The codegen also nulls out the deleted pointer
+                           variable so that same-variable double-free and
+                           use-after-free become null-pointer dereferences
+                           (caught by the null guard).
+
+     cy_safe_deref(ptr, line) — available for manual use in user code;
+                           not auto-emitted because, without intercepting
+                           ALL malloc calls (including runtime-internal
+                           ones like List<String>* from split()), a
+                           per-deref registry check produces false positives
+                           when non-tracked allocations reuse freed addresses.
+
+   Alias double-free/UAF detection requires a full malloc intercept (ASAN
+   or similar); the above covers the common same-variable cases reliably. */
+
+/* Allocate size bytes.  Returns NULL on OOM (caller checks via gen_oom_check). */
+C2M_EXC_API void *cy_safe_alloc (uint64_t size) {
+  return malloc ((size_t) size);
+}
+
+/* Free ptr.  Throws on null (catches same-variable double-free after null-out). */
+C2M_EXC_API void cy_safe_free (void *ptr, long line) {
+  if (ptr == NULL) {
+    cy_exc_throw (CY_EXC_RUNTIME, "delete of null pointer (double-free?)", NULL, (int) line);
+    return;
+  }
+  free (ptr);
+}
+
+/* Manual use-after-free guard (not auto-emitted; see note above). */
+C2M_EXC_API void cy_safe_deref (void *ptr, long line) {
+  (void) ptr; (void) line; /* no-op without a global malloc intercept */
+}
 
 #endif /* C2M_CYEXC_H */

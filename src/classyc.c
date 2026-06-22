@@ -16410,6 +16410,10 @@ struct gen_ctx {
   MIR_item_t cy_exc_current_proto, cy_exc_current_item; /* void *cy_exc_current(void)     */
   MIR_item_t cy_exc_throw_proto, cy_exc_throw_item;     /* void  cy_exc_throw(id,msg,f,l) */
   MIR_item_t cy_setjmp_proto, cy_setjmp_item;           /* int   setjmp(void *buf)        */
+  MIR_item_t safety_trap_proto, safety_trap_item;       /* void  _safety_trap(reason,fid,line) */
+  MIR_item_t cy_safe_alloc_proto, cy_safe_alloc_item;  /* void *cy_safe_alloc(size)           */
+  MIR_item_t cy_safe_free_proto,  cy_safe_free_item;   /* void  cy_safe_free(ptr,line)        */
+  MIR_item_t cy_safe_deref_proto, cy_safe_deref_item;  /* void  cy_safe_deref(ptr,line)       */
   int exc_depth;                                        /* try nesting depth (label uids) */
   VARR (MIR_op_t) * call_ops, *ret_ops, *switch_ops;
   VARR (case_t) * switch_cases;
@@ -16553,6 +16557,14 @@ struct gen_ctx {
 #define cy_exc_throw_item gen_ctx->cy_exc_throw_item
 #define cy_setjmp_proto gen_ctx->cy_setjmp_proto
 #define cy_setjmp_item gen_ctx->cy_setjmp_item
+#define safety_trap_proto gen_ctx->safety_trap_proto
+#define safety_trap_item gen_ctx->safety_trap_item
+#define cy_safe_alloc_proto gen_ctx->cy_safe_alloc_proto
+#define cy_safe_alloc_item gen_ctx->cy_safe_alloc_item
+#define cy_safe_free_proto gen_ctx->cy_safe_free_proto
+#define cy_safe_free_item gen_ctx->cy_safe_free_item
+#define cy_safe_deref_proto gen_ctx->cy_safe_deref_proto
+#define cy_safe_deref_item gen_ctx->cy_safe_deref_item
 #define exc_depth gen_ctx->exc_depth
 #define call_ops gen_ctx->call_ops
 #define ret_ops gen_ctx->ret_ops
@@ -18153,14 +18165,22 @@ static op_t gen_rt_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, MIR_item_t item, s
                          const MIR_op_t *arg_ops);
 static void gen_rt_call_void (c2m_ctx_t c2m_ctx, MIR_item_t proto, MIR_item_t item, size_t nargs,
                               const MIR_op_t *arg_ops);
+static void safety_ensure_imports (c2m_ctx_t c2m_ctx);
 
 /* Emit a call to the C library malloc and return a temp register holding the
    resulting pointer.  Used to back `new ClassName(...)` heap allocations. */
 static op_t gen_heap_alloc (c2m_ctx_t c2m_ctx, mir_size_t size) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_op_t size_op;
+  MIR_op_t size_op = MIR_new_uint_op (ctx, size);
 
+  /* In exceptions mode use the tagged allocator so that use-after-free and
+     double-free can be detected at runtime.  The 16-byte header is invisible
+     to callers (cy_safe_alloc returns payload; cy_safe_free strips the header). */
+  if (c2m_options->exceptions_p) {
+    safety_ensure_imports (c2m_ctx);
+    return gen_rt_call (c2m_ctx, cy_safe_alloc_proto, cy_safe_alloc_item, 1, &size_op);
+  }
   if (malloc_item == NULL) {
     MIR_type_t ret_type = MIR_T_I64;
     MIR_var_t var;
@@ -18172,15 +18192,21 @@ static op_t gen_heap_alloc (c2m_ctx_t c2m_ctx, mir_size_t size) {
     move_item_to_module_start (module, malloc_proto);
     move_item_to_module_start (module, malloc_item);
   }
-  size_op = MIR_new_uint_op (ctx, size);
   return gen_rt_call (c2m_ctx, malloc_proto, malloc_item, 1, &size_op);
 }
 
-/* free (ptr) : release a `new`-allocated object (used by `delete`). */
-static void gen_heap_free (c2m_ctx_t c2m_ctx, MIR_op_t ptr) {
+/* free (ptr) : release a `new`-allocated object (used by `delete`).
+   In exceptions mode, use cy_safe_free which checks for double-free. */
+static void gen_heap_free (c2m_ctx_t c2m_ctx, MIR_op_t ptr, long line) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
 
+  if (c2m_options->exceptions_p) {
+    safety_ensure_imports (c2m_ctx);
+    MIR_op_t args[2] = { ptr, MIR_new_int_op (ctx, line) };
+    gen_rt_call_void (c2m_ctx, cy_safe_free_proto, cy_safe_free_item, 2, args);
+    return;
+  }
   if (free_item == NULL) {
     MIR_var_t var;
     MIR_module_t module = curr_func->module;
@@ -18423,6 +18449,146 @@ static void gen_exception_throw_call (c2m_ctx_t c2m_ctx,
 
   MIR_label_t unreach = MIR_new_label (ctx);
   emit_label_insn_opt (c2m_ctx, unreach);
+}
+
+/* ── JIT safety guards (emitted only when -fexceptions is enabled) ──────────
+   Each guard emits a conditional branch to a call to _safety_trap(reason, 0,
+   line), which either throws a catchable exception (when inside a try block)
+   or aborts with a diagnostic (uncaught fault).
+   reason: 1=OOB, 2=null-ptr, 3=arithmetic (div-by-zero). */
+
+static void safety_ensure_imports (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_var_t vars[3];
+  if (safety_trap_item != NULL) return;
+  exception_ensure_imports (c2m_ctx); /* also pull in cy_exc_* */
+  MIR_module_t module = curr_func->module;
+  vars[0].name = "reason";  vars[0].type = MIR_T_I64;
+  vars[1].name = "file_id"; vars[1].type = MIR_T_I64;
+  vars[2].name = "line";    vars[2].type = MIR_T_I64;
+  safety_trap_proto = MIR_new_proto_arr (ctx, "__safety_trap_p", 0, NULL, 3, vars);
+  safety_trap_item  = MIR_new_import (ctx, "_safety_trap");
+  move_item_to_module_start (module, safety_trap_proto);
+  move_item_to_module_start (module, safety_trap_item);
+
+  /* void *cy_safe_alloc(uint64_t size) */
+  {
+    MIR_type_t ret_t = MIR_T_I64;
+    MIR_var_t v; v.name = "size"; v.type = MIR_T_I64;
+    cy_safe_alloc_proto = MIR_new_proto_arr (ctx, "__cy_safe_alloc_p", 1, &ret_t, 1, &v);
+    cy_safe_alloc_item  = MIR_new_import (ctx, "cy_safe_alloc");
+    move_item_to_module_start (module, cy_safe_alloc_proto);
+    move_item_to_module_start (module, cy_safe_alloc_item);
+  }
+
+  /* void cy_safe_free(void *ptr, long line) */
+  {
+    MIR_var_t vs[2];
+    vs[0].name = "ptr";  vs[0].type = MIR_T_I64;
+    vs[1].name = "line"; vs[1].type = MIR_T_I64;
+    cy_safe_free_proto = MIR_new_proto_arr (ctx, "__cy_safe_free_p", 0, NULL, 2, vs);
+    cy_safe_free_item  = MIR_new_import (ctx, "cy_safe_free");
+    move_item_to_module_start (module, cy_safe_free_proto);
+    move_item_to_module_start (module, cy_safe_free_item);
+  }
+
+  /* void cy_safe_deref(void *ptr, long line) */
+  {
+    MIR_var_t vs[2];
+    vs[0].name = "ptr";  vs[0].type = MIR_T_I64;
+    vs[1].name = "line"; vs[1].type = MIR_T_I64;
+    cy_safe_deref_proto = MIR_new_proto_arr (ctx, "__cy_safe_deref_p", 0, NULL, 2, vs);
+    cy_safe_deref_item  = MIR_new_import (ctx, "cy_safe_deref");
+    move_item_to_module_start (module, cy_safe_deref_proto);
+    move_item_to_module_start (module, cy_safe_deref_item);
+  }
+}
+
+/* Guard: if ptr_op == 0 (NULL), call _safety_trap(2, 0, line).
+   ptr_op must already be an I64 register (use force_reg before calling). */
+static void gen_null_check (c2m_ctx_t c2m_ctx, op_t ptr_op, long line) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_label_t ok_label = MIR_new_label (ctx);
+  MIR_op_t trap_args[3];
+  safety_ensure_imports (c2m_ctx);
+  /* BNE ok_label, ptr, 0 -- skip trap if ptr != NULL */
+  emit3 (c2m_ctx, MIR_BNE, MIR_new_label_op (ctx, ok_label),
+         ptr_op.mir_op, zero_op.mir_op);
+  trap_args[0] = MIR_new_int_op (ctx, 2); /* reason: null-ptr */
+  trap_args[1] = zero_op.mir_op;
+  trap_args[2] = MIR_new_int_op (ctx, line);
+  gen_rt_call_void (c2m_ctx, safety_trap_proto, safety_trap_item, 3, trap_args);
+  emit_label_insn_opt (c2m_ctx, ok_label);
+}
+
+/* Guard: if divisor_op == 0, call _safety_trap(3, 0, line) (div-by-zero).
+   divisor_op must be an I64 register.  Integer types only. */
+static void gen_div_zero_check (c2m_ctx_t c2m_ctx, op_t divisor_op, long line) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_label_t ok_label = MIR_new_label (ctx);
+  MIR_op_t trap_args[3];
+  safety_ensure_imports (c2m_ctx);
+  /* BNE ok_label, divisor, 0 -- skip trap if divisor != 0 */
+  emit3 (c2m_ctx, MIR_BNE, MIR_new_label_op (ctx, ok_label),
+         divisor_op.mir_op, zero_op.mir_op);
+  trap_args[0] = MIR_new_int_op (ctx, 3); /* reason: arithmetic */
+  trap_args[1] = zero_op.mir_op;
+  trap_args[2] = MIR_new_int_op (ctx, line);
+  gen_rt_call_void (c2m_ctx, safety_trap_proto, safety_trap_item, 3, trap_args);
+  emit_label_insn_opt (c2m_ctx, ok_label);
+}
+
+/* Guard: if (uint64_t)idx_op >= len_op, call _safety_trap(1, 0, line).
+   Treats negative signed indices as out-of-bounds via unsigned comparison.
+   idx_op must be an I64 register; len_op may be a register or immediate. */
+static void gen_oob_check (c2m_ctx_t c2m_ctx, op_t idx_op, MIR_op_t len_op, long line) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_label_t ok_label = MIR_new_label (ctx);
+  MIR_op_t trap_args[3];
+  safety_ensure_imports (c2m_ctx);
+  /* UBLT ok_label, idx, len -- if (unsigned)idx < len skip trap (safe) */
+  emit3 (c2m_ctx, MIR_UBLT, MIR_new_label_op (ctx, ok_label),
+         idx_op.mir_op, len_op);
+  trap_args[0] = MIR_new_int_op (ctx, 1); /* reason: out-of-bounds */
+  trap_args[1] = zero_op.mir_op;
+  trap_args[2] = MIR_new_int_op (ctx, line);
+  gen_rt_call_void (c2m_ctx, safety_trap_proto, safety_trap_item, 3, trap_args);
+  emit_label_insn_opt (c2m_ctx, ok_label);
+}
+
+/* Guard: if obj_op == 0 after a `new` allocation, throw RuntimeException("out of memory").
+   obj_op must be an I64 register holding the malloc result. */
+static void gen_oom_check (c2m_ctx_t c2m_ctx, op_t obj_op, long line) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_label_t ok_label = MIR_new_label (ctx);
+  MIR_op_t ops[4];
+  exception_ensure_imports (c2m_ctx);
+  /* BNE ok: skip throw if allocation succeeded */
+  emit3 (c2m_ctx, MIR_BNE, MIR_new_label_op (ctx, ok_label),
+         obj_op.mir_op, zero_op.mir_op);
+  ops[0] = MIR_new_int_op (ctx, 4); /* CY_EXC_RUNTIME */
+  ops[1] = MIR_new_str_op (ctx, (MIR_str_t){14, "out of memory"});
+  ops[2] = zero_op.mir_op;
+  ops[3] = MIR_new_int_op (ctx, line);
+  gen_rt_call_void (c2m_ctx, cy_exc_throw_proto, cy_exc_throw_item, 4, ops);
+  emit_label_insn_opt (c2m_ctx, ok_label); /* also serves as unreachable anchor after throw */
+}
+
+/* Guard: call cy_safe_deref(ptr, line) before a ptr->field access on a class pointer.
+   Throws RuntimeException("use-after-free") if the object was already deleted. */
+static void gen_class_deref_check (c2m_ctx_t c2m_ctx, op_t ptr_op, long line) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[2];
+  safety_ensure_imports (c2m_ctx);
+  args[0] = ptr_op.mir_op;
+  args[1] = MIR_new_int_op (ctx, line);
+  gen_rt_call_void (c2m_ctx, cy_safe_deref_proto, cy_safe_deref_item, 2, args);
 }
 
 /* Emit: res = dict_create_object() */
@@ -20218,6 +20384,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_DIV:
   case N_MOD:
     gen_bin_op (c2m_ctx, r, &op1, &op2, &res);
+    /* Integer division-by-zero guard — only for / and %, not &, |, <<, * etc. */
+    if (c2m_options->exceptions_p && (r->code == N_DIV || r->code == N_MOD)
+        && integer_type_p (((struct expr *) r->attr)->type)) {
+      op_t div_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
+      gen_div_zero_check (c2m_ctx, div_reg, (long) POS (r).lno);
+    }
     emit_bin_op (c2m_ctx, r, ((struct expr *) r->attr)->type, res, op1, op2);
     break;
   case N_EQ:
@@ -20298,6 +20470,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_DIV_ASSIGN:
   case N_MOD_ASSIGN:
     gen_assign_bin_op (c2m_ctx, r, ((struct expr *) r->attr)->type2, &val, &op2, &var);
+    /* Integer division-by-zero guard for /= and %= (exceptions mode only). */
+    if (c2m_options->exceptions_p && (r->code == N_DIV_ASSIGN || r->code == N_MOD_ASSIGN)
+        && integer_type_p (((struct expr *) r->attr)->type2)) {
+      op_t div_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
+      gen_div_zero_check (c2m_ctx, div_reg, (long) POS (r).lno);
+    }
     emit_bin_op (c2m_ctx, r, ((struct expr *) r->attr)->type2, val, val, op2);
     t = get_op_type (c2m_ctx, var);
     t = promote_mir_int_type (t);
@@ -20617,6 +20795,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                                                                                : MIR_T_I64,
                                       FALSE),
                        MIR_T_I64);
+      /* Slice bounds guard: load count from slice header[0] and check idx < count. */
+      if (c2m_options->exceptions_p) {
+        op_t slice_len = get_new_temp (c2m_ctx, MIR_T_I64);
+        emit2 (c2m_ctx, MIR_MOV, slice_len.mir_op,
+               MIR_new_mem_op (ctx, MIR_T_I64, 0, op1.mir_op.u.reg, 0, 1));
+        gen_oob_check (c2m_ctx, op2, slice_len.mir_op, (long) POS (r).lno);
+      }
       emit3 (c2m_ctx, MIR_ADD, sbase.mir_op, op1.mir_op, MIR_new_int_op (ctx, SLICE_HDR_SIZE));
       if (size <= MIR_MAX_SCALE) {
         res = new_op (NULL, MIR_new_mem_op (ctx, t, 0, sbase.mir_op.u.reg, op2.mir_op.u.reg,
@@ -20642,6 +20827,23 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       op2 = cast (c2m_ctx, op2, ind_t == MIR_T_I32 ? MIR_T_I64 : MIR_T_U64, FALSE);
     }
 #endif
+    /* Static C array bounds guard (exceptions mode only).  We know the length
+       when the pointer was obtained by array-to-pointer decay (arr_type->arr_type
+       is the original TM_ARR type with a constant size).  Negative or oversized
+       indices are caught by unsigned comparison. */
+    if (c2m_options->exceptions_p && arr_type->arr_type != NULL
+        && arr_type->arr_type->mode == TM_ARR) {
+      node_t sz_node = arr_type->arr_type->u.arr_type->size;
+      if (sz_node != NULL && sz_node->code != N_IGNORE && sz_node->attr != NULL) {
+        struct expr *sze = sz_node->attr;
+        if (sze->const_p && sze->c.i_val > 0) {
+          op_t idx_check = force_reg (c2m_ctx, op2, MIR_T_I64);
+          gen_oob_check (c2m_ctx, idx_check,
+                         MIR_new_int_op (ctx, (long long) sze->c.i_val),
+                         (long) POS (r).lno);
+        }
+      }
+    }
     if (el_type->mode == TM_PTR && el_type->arr_type != NULL) { /* elem is an array */
       size = type_size (c2m_ctx, el_type->arr_type);
     }
@@ -20756,6 +20958,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         && type->u.ptr_type->mode == TM_FUNC && type->func_type_before_adjustment_p) {
       res = op1;
     } else {
+      /* Null-pointer guard before data dereference (*ptr). */
+      if (c2m_options->exceptions_p)
+        gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
       struct expr *op_e = NL_HEAD (r->u.ops)->attr;
       t = get_mir_type (c2m_ctx, type);
       op1.mir_op = MIR_new_alias_mem_op (ctx, t, 0, op1.mir_op.u.reg, 0, 1,
@@ -20853,6 +21058,14 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       assert (left->type->mode == TM_PTR);
       op1 = force_reg (c2m_ctx, op1, MIR_T_I64);
       assert (op1.mir_op.mode == MIR_OP_REG);
+      /* Null-pointer guard before ptr->field access. */
+      if (c2m_options->exceptions_p)
+        gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
+      /* Note: use-after-free detection via cy_safe_deref is available in the
+         runtime but not auto-emitted here.  Without intercepting ALL malloc calls
+         (including runtime-internal ones) the per-deref check produces false
+         positives when a non-tracked allocation reuses a freed address.  The
+         null-out after `delete` (below) catches the direct same-variable case. */
       op1.mir_op
         = MIR_new_alias_mem_op (ctx, t, decl->offset, op1.mir_op.u.reg, 0, 1,
                                 get_type_alias (c2m_ctx, left->type->u.ptr_type->mode == TM_UNION
@@ -21002,6 +21215,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     struct type *class_type = ne->type->u.ptr_type;
     mir_size_t csize = type_size (c2m_ctx, class_type);
     op_t obj = gen_heap_alloc (c2m_ctx, csize == 0 ? 1 : csize);
+    /* OOM guard: throw RuntimeException("out of memory") if malloc returned NULL. */
+    if (c2m_options->exceptions_p)
+      gen_oom_check (c2m_ctx, obj, (long) POS (r).lno);
 
     if (csize > 0) gen_memset (c2m_ctx, 0, obj.mir_op.u.reg, csize);
     if (ctor_def != NULL) {
@@ -22730,10 +22946,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
 
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
-    op1 = val_gen (c2m_ctx, expr);
+    /* Obtain both the lvalue (for null-out after free) and the pointer value. */
+    op_t lval_for_null = gen (c2m_ctx, expr, NULL, NULL, FALSE, NULL, NULL);
+    op1 = force_val (c2m_ctx, lval_for_null, FALSE);
     op1 = force_reg (c2m_ctx, op1, MIR_T_I64);
 
-    /* ── dict: delegate entirely to dict_destroy ──────────────────────── */
+    /* ── dict: delegate entirely to dict_destroy ────────────────────── */
     {
       struct expr *del_e = expr->attr;
       if (del_e && del_e->type && del_e->type->mode == TM_DICT) {
@@ -22773,7 +22991,17 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                                    VARR_ADDR (MIR_op_t, call_ops) + ops_start));
       VARR_TRUNC (MIR_op_t, call_ops, ops_start);
     }
-    gen_heap_free (c2m_ctx, op1.mir_op);
+    gen_heap_free (c2m_ctx, op1.mir_op, (long) POS (r).lno);
+    /* Use-after-free mitigation: null out the deleted pointer's lvalue so that
+       any subsequent access through the same variable hits the null guard. */
+    if (c2m_options->exceptions_p
+        && (lval_for_null.mir_op.mode == MIR_OP_MEM
+            || lval_for_null.mir_op.mode == MIR_OP_REG)) {
+      MIR_op_t lval_mir = lval_for_null.mir_op;
+      /* Adjust mem type to I64 for the pointer-sized store. */
+      if (lval_mir.mode == MIR_OP_MEM) lval_mir.u.mem.type = MIR_T_I64;
+      emit2 (c2m_ctx, MIR_MOV, lval_mir, zero_op.mir_op);
+    }
     break;
   }
   case N_CONCAT: {

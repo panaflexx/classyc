@@ -342,6 +342,7 @@ Look in the `examples/` directory:
 | `test-interface.c`         | `interface` + `impl` structural conformance |
 | `test-any.c`               | Heterogeneous `List<Any<View>*>` (arena + non-arena) |
 | `classy-exceptions.cy`     | `try`/`catch`/`throw` (opt-in via `-fexceptions`) |
+| `classy-safety.cy`         | JIT safety guards: null-ptr, div-by-zero, array/slice OOB (auto-emitted with `-fexceptions`) |
 | `classy-fetch.cy`          | HTTP/HTTPS client (`include/httpclient.h`): calls the PokéAPI over TLS, headers as a `dict`, `List<String>` |
 
 Run them all with:
