@@ -42,11 +42,10 @@ run_test() {
 
 # ── tests ───────────────────────────────────────────────────────────
 
-# Generate and run all 100 test cases
-# Generate and run all 100 test cases
-for i in $(seq -f "%03g" 0 99); do
+# Generate and run all test cases (0-134)
+for i in $(seq -f "%03g" 0 134); do
     file="cy-$i.cy"
-    
+
     if [ -f "$DIR/$file" ]; then
         run_test "$file"
     else

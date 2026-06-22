@@ -14957,7 +14957,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	                  res_type.align = 8;
 	                  break;
 	                case SM_EQUALS:
-	                  /* Returns int (0/1 boolean) */
+	                  
 	                  res_type.u.basic_type = TP_INT;
 	                  set_type_layout(c2m_ctx, &res_type);
 	                  break;
@@ -16269,6 +16269,9 @@ struct gen_ctx {
   MIR_item_t dict_object_count_proto, dict_object_count_item;
   MIR_item_t dict_object_key_at_proto, dict_object_key_at_item;
   MIR_item_t dict_object_value_at_proto, dict_object_value_at_item;
+  MIR_item_t dict_value_at_proto, dict_value_at_item;
+  MIR_item_t dict_create_array_proto, dict_create_array_item;
+  MIR_item_t dict_array_append_proto, dict_array_append_item;
   MIR_item_t dict_serialize_json_proto, dict_serialize_json_item;
   MIR_item_t dict_deserialize_json_proto, dict_deserialize_json_item;
   MIR_item_t dict_destroy_proto, dict_destroy_item;              /* delete d  */
@@ -16378,6 +16381,12 @@ struct gen_ctx {
 #define dict_object_key_at_item gen_ctx->dict_object_key_at_item
 #define dict_object_value_at_proto gen_ctx->dict_object_value_at_proto
 #define dict_object_value_at_item gen_ctx->dict_object_value_at_item
+#define dict_value_at_proto gen_ctx->dict_value_at_proto
+#define dict_value_at_item gen_ctx->dict_value_at_item
+#define dict_create_array_proto gen_ctx->dict_create_array_proto
+#define dict_create_array_item gen_ctx->dict_create_array_item
+#define dict_array_append_proto gen_ctx->dict_array_append_proto
+#define dict_array_append_item gen_ctx->dict_array_append_item
 #define dict_serialize_json_proto gen_ctx->dict_serialize_json_proto
 #define dict_serialize_json_item gen_ctx->dict_serialize_json_item
 #define dict_deserialize_json_proto gen_ctx->dict_deserialize_json_proto
@@ -18202,6 +18211,28 @@ static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, dict_object_value_at_proto);
   move_item_to_module_start (module, dict_object_value_at_item);
 
+  /* dict_value_at(const DictValue *obj, size_t index) -> DictValue* */
+  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
+  vars[1].name = "idx"; vars[1].type = MIR_T_I64;
+  dict_value_at_proto = MIR_new_proto_arr (ctx, "__dict_value_at_p", 1, &ptr_t, 2, vars);
+  dict_value_at_item = MIR_new_import (ctx, "dict_value_at");
+  move_item_to_module_start (module, dict_value_at_proto);
+  move_item_to_module_start (module, dict_value_at_item);
+
+  /* dict_create_array() -> DictValue* */
+  dict_create_array_proto = MIR_new_proto_arr (ctx, "__dict_create_array_p", 1, &ptr_t, 0, NULL);
+  dict_create_array_item = MIR_new_import (ctx, "dict_create_array");
+  move_item_to_module_start (module, dict_create_array_proto);
+  move_item_to_module_start (module, dict_create_array_item);
+
+  /* dict_array_append(DictValue *arr, DictValue *val) -> void */
+  vars[0].name = "arr"; vars[0].type = MIR_T_I64;
+  vars[1].name = "val"; vars[1].type = MIR_T_I64;
+  dict_array_append_proto = MIR_new_proto_arr (ctx, "__dict_array_append_p", 0, NULL, 2, vars);
+  dict_array_append_item = MIR_new_import (ctx, "dict_array_append");
+  move_item_to_module_start (module, dict_array_append_proto);
+  move_item_to_module_start (module, dict_array_append_item);
+
   /* dict_deserialize_json(const char *json) -> DictValue* */
   vars[0].name = "json"; vars[0].type = MIR_T_I64;
   dict_deserialize_json_proto = MIR_new_proto_arr (ctx, "__dict_deserialize_json_p", 1, &ptr_t, 1, vars);
@@ -18447,6 +18478,14 @@ static op_t gen_dict_object_value_at (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op
   return gen_rt_call (c2m_ctx, dict_object_value_at_proto, dict_object_value_at_item, 2, a);
 }
 
+/* Emit: res = dict_value_at(obj_op, idx_op) — unified array/object index lookup */
+static op_t gen_dict_value_at (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op_t idx_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_op_t a[2] = {obj_op, idx_op};
+  dict_ensure_imports (c2m_ctx);
+  return gen_rt_call (c2m_ctx, dict_value_at_proto, dict_value_at_item, 2, a);
+}
+
 /* Create a named (uniquely-named) string-data item holding a dict key, returning
    a ref operand to it.  The data item is given a real name and moved to the
    module start so that it survives binary (.bmir) serialization: an anonymous
@@ -18462,6 +18501,9 @@ static MIR_op_t gen_dict_key_op (c2m_ctx_t c2m_ctx, const char *key_str, size_t 
   move_item_to_module_start (module, str_item);
   return MIR_new_ref_op (ctx, str_item);
 }
+
+/* Forward declaration */
+static op_t gen_dict_value_for_init (c2m_ctx_t c2m_ctx, node_t value);
 
 /* Recursively generate dict initializer code.
    obj_op is the MIR register holding the parent dict object pointer.
@@ -18483,41 +18525,72 @@ static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initi
     MIR_op_t key_op = gen_dict_key_op (c2m_ctx, key_str, strlen (key_str) + 1);
 
     if (value->code == N_LIST) {
-      /* nested object: { "key": { ... } } */
-      op_t child = gen_dict_create_object (c2m_ctx);
-      gen_dict_init_list (c2m_ctx, child.mir_op, value);
-      gen_dict_object_set (c2m_ctx, obj_op, key_op, child.mir_op);
+      node_t inner_init = NL_HEAD (value->u.ops);
+      node_t inner_des_list = inner_init != NULL ? NL_HEAD (inner_init->u.ops) : NULL;
+      node_t inner_des = inner_des_list != NULL ? NL_HEAD (inner_des_list->u.ops) : NULL;
+      if (inner_des == NULL || inner_des->code != N_FIELD_ID) {
+        /* array-like list: [ { ... }, { ... } ]  ->  DICT_ARRAY */
+        op_t arr = gen_rt_call (c2m_ctx, dict_create_array_proto, dict_create_array_item, 0, NULL);
+        for (node_t elem_init = NL_HEAD (value->u.ops); elem_init != NULL; elem_init = NL_NEXT (elem_init)) {
+          if (elem_init->code != N_INIT) continue;
+          node_t elem_des_list = NL_HEAD (elem_init->u.ops);
+          node_t elem_value = NL_NEXT (elem_des_list);
+          op_t elem_op;
+          if (elem_value->code == N_LIST) {
+            op_t nested = gen_dict_create_object (c2m_ctx);
+            gen_dict_init_list (c2m_ctx, nested.mir_op, elem_value);
+            elem_op = nested;
+          } else {
+            elem_op = gen_dict_value_for_init (c2m_ctx, elem_value);
+          }
+          MIR_op_t append_args[2] = {arr.mir_op, elem_op.mir_op};
+          gen_rt_call_void (c2m_ctx, dict_array_append_proto, dict_array_append_item, 2, append_args);
+        }
+        gen_dict_object_set (c2m_ctx, obj_op, key_op, arr.mir_op);
+      } else {
+        /* nested object: { "key": { ... } } */
+        op_t child = gen_dict_create_object (c2m_ctx);
+        gen_dict_init_list (c2m_ctx, child.mir_op, value);
+        gen_dict_object_set (c2m_ctx, obj_op, key_op, child.mir_op);
+      }
     } else {
       /* scalar value */
-      struct expr *ve = value->attr;
-      op_t wrapped;
-      if (ve != NULL && ve->const_p && ve->type->mode == TM_BASIC
-          && ve->type->u.basic_type == TP_BOOL) {
-        wrapped = gen_dict_create_bool (c2m_ctx, MIR_new_int_op (ctx, ve->c.i_val));
-      } else if (ve != NULL && ve->const_p && integer_type_p (ve->type)) {
-        wrapped = gen_dict_create_int64 (c2m_ctx, MIR_new_int_op (ctx, ve->c.i_val));
-      } else if (ve != NULL && ve->const_p && floating_type_p (ve->type)) {
-        wrapped = gen_dict_create_number (c2m_ctx, MIR_new_double_op (ctx, ve->c.d_val));
-      } else if (value->code == N_STR) {
-        MIR_op_t si_op = gen_dict_key_op (c2m_ctx, value->u.s.s, value->u.s.len);
-        wrapped = gen_dict_create_string (c2m_ctx, si_op);
-      } else if (ve != NULL && ve->type->mode == TM_DICT) {
-        /* dict-valued expression: store an owned deep copy, not a borrowed
-           pointer (avoids aliasing / double-free with the source dict). */
-        op_t v = val_gen (c2m_ctx, value);
-        wrapped = gen_dict_value_copy (c2m_ctx, v.mir_op);
-      } else if (ve != NULL && ve->type->mode == TM_BASIC
-                 && ve->type->u.basic_type == TP_BOOL) {
-        /* runtime _Bool expression: wrap as JSON boolean */
-        op_t v = val_gen (c2m_ctx, value);
-        wrapped = gen_dict_create_bool (c2m_ctx, v.mir_op);
-      } else {
-        /* runtime expression: evaluate then wrap as int64 */
-        op_t v = val_gen (c2m_ctx, value);
-        wrapped = gen_dict_create_int64 (c2m_ctx, v.mir_op);
-      }
+      op_t wrapped = gen_dict_value_for_init (c2m_ctx, value);
       gen_dict_object_set (c2m_ctx, obj_op, key_op, wrapped.mir_op);
     }
+  }
+}
+
+/* Wrap a single initializer value as a DictValue*.  Used by gen_dict_init_list
+   for both object key values and array elements. */
+static op_t gen_dict_value_for_init (c2m_ctx_t c2m_ctx, node_t value) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  struct expr *ve = value->attr;
+  if (ve != NULL && ve->const_p && ve->type->mode == TM_BASIC
+      && ve->type->u.basic_type == TP_BOOL) {
+    return gen_dict_create_bool (c2m_ctx, MIR_new_int_op (ctx, ve->c.i_val));
+  } else if (ve != NULL && ve->const_p && integer_type_p (ve->type)) {
+    return gen_dict_create_int64 (c2m_ctx, MIR_new_int_op (ctx, ve->c.i_val));
+  } else if (ve != NULL && ve->const_p && floating_type_p (ve->type)) {
+    return gen_dict_create_number (c2m_ctx, MIR_new_double_op (ctx, ve->c.d_val));
+  } else if (value->code == N_STR) {
+    MIR_op_t si_op = gen_dict_key_op (c2m_ctx, value->u.s.s, value->u.s.len);
+    return gen_dict_create_string (c2m_ctx, si_op);
+  } else if (ve != NULL && ve->type->mode == TM_DICT) {
+    /* dict-valued expression: store an owned deep copy, not a borrowed
+       pointer (avoids aliasing / double-free with the source dict). */
+    op_t v = val_gen (c2m_ctx, value);
+    return gen_dict_value_copy (c2m_ctx, v.mir_op);
+  } else if (ve != NULL && ve->type->mode == TM_BASIC
+             && ve->type->u.basic_type == TP_BOOL) {
+    /* runtime _Bool expression: wrap as JSON boolean */
+    op_t v = val_gen (c2m_ctx, value);
+    return gen_dict_create_bool (c2m_ctx, v.mir_op);
+  } else {
+    /* runtime expression: evaluate then wrap as int64 */
+    op_t v = val_gen (c2m_ctx, value);
+    return gen_dict_create_int64 (c2m_ctx, v.mir_op);
   }
 }
 
@@ -20397,7 +20470,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       /* d["key"] or d[var] — dict bracket subscript read */
       op1 = val_gen (c2m_ctx, arr);
       op2 = val_gen (c2m_ctx, NL_EL (r->u.ops, 1));
-      res = gen_dict_object_get (c2m_ctx, op1.mir_op, op2.mir_op);
+      if (integer_type_p (((struct expr *) NL_EL (r->u.ops, 1)->attr)->type)) {
+        /* integer index: dispatch to unified array/object lookup */
+        res = gen_dict_value_at (c2m_ctx, op1.mir_op, op2.mir_op);
+      } else {
+        res = gen_dict_object_get (c2m_ctx, op1.mir_op, op2.mir_op);
+      }
       break;
     }
     if ((arr_type->mode == TM_CLASS

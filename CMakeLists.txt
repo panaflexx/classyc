@@ -13,6 +13,10 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
+#Set debug c flags
+set(CMAKE_C_FLAGS_DEBUG "-g3 -O0 -fno-omit-frame-pointer" CACHE STRING "")
+set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-g" CACHE STRING "")
+
 # ------------------ MIR Subdirectory -----------------------
 # Add MIR as a subdirectory (assumes ${MIRDIR}/CMakeLists.txt exists)
 set(MIRDIR ext/mir)

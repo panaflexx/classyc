@@ -575,6 +575,23 @@ C2M_DICT_API DictValue *dict_object_value_at(const DictValue *obj, size_t index)
     return obj->object_value.pairs[index].value;
 }
 
+/* Unified subscript/index helper used by the ClassyC JIT for dict[n].
+ * For DICT_ARRAY it returns the n-th array element.
+ * For DICT_OBJECT it returns the n-th insertion-ordered pair value.
+ * Returns NULL for out-of-bounds or unsupported types. */
+C2M_DICT_API DictValue *dict_value_at(const DictValue *obj, size_t index) {
+    if (!obj) return NULL;
+    if (obj->type == DICT_ARRAY) {
+        if (index >= obj->array_value.length) return NULL;
+        return obj->array_value.items[index];
+    }
+    if (obj->type == DICT_OBJECT) {
+        if (index >= obj->object_value.count) return NULL;
+        return obj->object_value.pairs[index].value;
+    }
+    return NULL;
+}
+
 C2M_DICT_API void dict_destroy(DictValue *val) {
     if (!val) return;
     DictArena *arena = val->owned_arena;
