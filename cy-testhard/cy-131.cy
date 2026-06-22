@@ -20,7 +20,7 @@ class Node<T> {
 
     void inorder() {
         if (this.left) this.left->inorder();
-        printf("%s ", this.value);
+        printf(f"{this.value} ");
         if (this.right) this.right->inorder();
     }
 

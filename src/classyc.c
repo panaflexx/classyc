@@ -12828,6 +12828,74 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       }
     }
 
+    /* ---- printf-family format-string argument type checker --------------------
+       Called after all CALL arguments are type-checked.  Scans the format string
+       literal for %s/%S specifiers and verifies that the matching variadic argument
+       is a string or pointer type.  Passing a bare integer for %s causes strlen()
+       to dereference the integer value as a pointer, producing a JIT SIGSEGV.
+       fmt_idx is the 0-based position of the format string in arg_list->u.ops
+       (0 for printf, 1 for fprintf/sprintf/snprintf).                           */
+    static void check_printf_format (c2m_ctx_t c2m_ctx, node_t arg_list, int fmt_idx) {
+      node_t fmt_node = NL_EL (arg_list->u.ops, fmt_idx);
+      if (fmt_node == NULL || fmt_node->code != N_STR) return;
+      const char *fmt = fmt_node->u.s.s;
+      if (fmt == NULL) return;
+
+      int vararg_slot = 0; /* 0-based index of the current variadic arg after format */
+      for (const char *p = fmt; *p != '\0'; p++) {
+        if (*p != '%') continue;
+        p++;
+        if (*p == '\0') break;
+        if (*p == '%') continue;              /* %% literal */
+        while (*p && strchr ("-+ #0'", *p)) p++; /* flags */
+        if (*p == '*') { p++; vararg_slot++; } /* width from arg */
+        else while (*p >= '0' && *p <= '9') p++;
+        if (*p == '.') {                       /* precision */
+          p++;
+          if (*p == '*') { p++; vararg_slot++; }
+          else while (*p >= '0' && *p <= '9') p++;
+        }
+        /* length modifiers */
+        if      (*p == 'h') { p++; if (*p == 'h') p++; }
+        else if (*p == 'l') { p++; if (*p == 'l') p++; }
+        else if (*p && strchr ("LztjqZ", *p)) p++;
+        if (*p == '\0') break;
+
+        char spec = *p;
+        {
+          node_t varg = NL_EL (arg_list->u.ops, fmt_idx + 1 + vararg_slot);
+          if (varg != NULL && varg->attr != NULL) {
+            struct expr *ae = (struct expr *) varg->attr;
+            struct type *at = ae->type;
+            if (at != NULL) {
+              /* %s / %S — argument must be a pointer or string type */
+              if ((spec == 's' || spec == 'S')
+                  && at->mode != TM_PTR && at->mode != TM_ARR
+                  && !string_type_p (at) && !builtin_string_type_p (at)) {
+                error (c2m_ctx, POS (varg),
+                       "format '%%%c' expects a string or pointer argument "
+                       "but the corresponding argument has %s type "
+                       "(passing a non-pointer for %%s crashes at runtime)",
+                       spec, integer_type_p (at) ? "integer" : "non-pointer");
+              }
+              /* %d / %i / %u / %o / %x / %X — argument must not be a pointer or string */
+              else if ((spec == 'd' || spec == 'i' || spec == 'u'
+                        || spec == 'o' || spec == 'x' || spec == 'X')
+                       && (at->mode == TM_PTR || at->mode == TM_ARR
+                           || string_type_p (at) || builtin_string_type_p (at))) {
+                error (c2m_ctx, POS (varg),
+                       "format '%%%c' expects an integer argument "
+                       "but the corresponding argument has pointer/string type "
+                       "(printing a pointer with %%%c gives a raw address, not the value)",
+                       spec, spec);
+              }
+            }
+          }
+        }
+        vararg_slot++;
+      }
+    }
+
     static void check (c2m_ctx_t c2m_ctx, node_t r, node_t context) {
       check_ctx_t check_ctx = c2m_ctx->check_ctx;
       node_t op1, op2;
@@ -15061,6 +15129,20 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         }
         curr_call_arg_area_offset = saved_call_arg_area_offset_before_args;
         if (param != NULL) error(c2m_ctx, POS(r), "too few arguments");
+        /* ---- printf-family format-string type checking ---- */
+        if (func_type->dots_p && op1->code == N_ID) {
+          const char *fn = op1->u.s.s;
+          int fmt_pos = -1;
+          if (strcmp (fn, "printf") == 0 || strcmp (fn, "vprintf") == 0)
+            fmt_pos = 0;
+          else if (strcmp (fn, "fprintf") == 0 || strcmp (fn, "sprintf") == 0
+                   || strcmp (fn, "snprintf") == 0 || strcmp (fn, "dprintf") == 0
+                   || strcmp (fn, "vfprintf") == 0 || strcmp (fn, "vsprintf") == 0
+                   || strcmp (fn, "vsnprintf") == 0)
+            fmt_pos = 1;
+          if (fmt_pos >= 0)
+            check_printf_format (c2m_ctx, arg_list, fmt_pos);
+        }
         break;
       }
       case N_GENERIC: {
