@@ -89,6 +89,7 @@
 #include <string.h>
 #include <errno.h>
 #include <netdb.h>   /* for gai_strerror */
+#include <arpa/inet.h>
 #include "list.h"
 
 /* ── POSIX sockets + DNS (declared directly, à la include/tcp.h) ─────────── */
