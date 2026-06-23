@@ -5406,10 +5406,27 @@ D (unary_expr) {
   }
 
   if ((r = TRY (par_type_name)) != err_node) {
+    /* Lenient dict-to-class bind cast: `(T)? expr` is the optional `?` marker
+       sitting between the closing paren and the cast operand.  We place it
+       outside the parens (rather than `(T?)`) because the latter spelling
+       collides with lambda_expr / param_type_list's lookahead during the
+       primary_expr TRY chain and corrupts the parse for declarations that
+       follow a class cast.  Semantics are identical: the checker still sees
+       `(T)` as a cast targeting a class, with the lenient bit threaded
+       through expr->lenient_p. */
+    int cast_lenient_p = M ('?');
     t = r;
     if (!MP ('{', pos)) {
       P (unary_expr);
       r = new_node2 (c2m_ctx, N_CAST, t, r);
+      if (cast_lenient_p) {
+        /* Stash a marker that survives until the checker by hanging the
+           lenient bit on the N_CAST node itself via a one-shot attr.  We
+           reuse the unused `attr` slot here; the checker overwrites it with
+           the proper expr struct (and copies lenient_p into expr->lenient_p
+           first).  Using a sentinel pointer keeps memory ownership clear. */
+        r->attr = (void *) (intptr_t) 1;
+      }
     } else {
       P (initializer_list);
       if (!M ('}')) return err_node;
@@ -8537,6 +8554,10 @@ static struct type arithmetic_conversion (const struct type *type1, const struct
 
 struct expr {
   unsigned int const_p : 1, const_addr_p : 1, builtin_call_p : 1;
+  /* Dict-to-class bind cast flags (set on N_CAST nodes):
+     bind_p     : 1 iff this is the (T)dict / (T?)dict synthesized binder.
+     lenient_p  : 1 iff the `?` form (no throw on missing/mismatched fields). */
+  unsigned int bind_p : 1, lenient_p : 1;
   union {
     node_t lvalue_node;       /* for id, str, field, deref field, ind, deref, compound literal */
     node_t label_addr_target; /* for label address */
@@ -12427,6 +12448,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       e->type->pos_node = r;
       e->u.lvalue_node = NULL;
       e->const_p = e->const_addr_p = e->builtin_call_p = FALSE;
+      e->bind_p = e->lenient_p = FALSE;
       return e;
     }
 
@@ -14809,6 +14831,11 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       case N_CAST: {
         struct decl_spec *decl_spec;
         int void_p;
+        /* Snapshot the lenient-bind sentinel stashed by the parser BEFORE
+           create_expr overwrites r->attr.  The sentinel is the literal
+           pointer (void*)1 (see primary_expr cast block); ordinary casts
+           have r->attr == NULL going into the checker. */
+        int cast_lenient_p = (r->attr == (void *) (intptr_t) 1);
 
         process_type_bin_ops (c2m_ctx, r, &op1, &op2, &e2, &t2, r);
         e = create_expr (c2m_ctx, r);
@@ -14816,6 +14843,32 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         decl_spec = op1->attr;
         *e->type = *decl_spec->type;
         void_p = void_type_p (decl_spec->type);
+
+        /* Dict-to-aggregate bind cast: (T)d or (T)?d where T is a by-value
+           class OR a plain struct.  Bypasses the standard "non-scalar
+           conversion" rejection.  The gen side walks T's member list and
+           builds T from the dict subtree; lenient_p == 1 (the `?` form)
+           tolerates missing/mismatched fields, while the strict form throws
+           KeyException on a missing required field.
+
+           Unions are deliberately excluded: there is no well-defined mapping
+           from one JSON object to multiple overlapping union members.  Use a
+           tagged class with an explicit discriminator field instead. */
+        if (t2->mode == TM_DICT
+            && (decl_spec->type->mode == TM_CLASS
+                || decl_spec->type->mode == TM_STRUCT)) {
+          e->bind_p = TRUE;
+          e->lenient_p = cast_lenient_p ? TRUE : FALSE;
+          break;
+        }
+        /* A `?` cast that did NOT target a class/struct is malformed — the
+           marker is only meaningful for dict-to-aggregate binds.  Surface as
+           an error so users do not silently get a no-op `?`. */
+        if (cast_lenient_p) {
+          error (c2m_ctx, POS (r),
+                 "the `?` (lenient) cast form is only valid when casting a dict to a class or struct");
+        }
+
         if (!void_p && !scalar_type_p (decl_spec->type)) {
           error (c2m_ctx, POS (r), "conversion to non-scalar type requested");
         } else if (!void_p && !scalar_type_p (t2) && !void_type_p (t2)) {
@@ -19437,6 +19490,171 @@ static op_t gen_dict_iter_count (c2m_ctx_t c2m_ctx, MIR_op_t obj_op) {
   return gen_rt_call (c2m_ctx, dict_iter_count_proto, dict_iter_count_item, 1, &obj_op);
 }
 
+/* ---------------------------------------------------------------------------
+   Dict -> by-value class bind cast: lower `(T)d` and `(T?)d` to a per-field
+   walk over T's members (see JSONBINDING.md Phase 1).  The strict form throws
+   KeyException on a missing field; the lenient `?` form leaves the field at
+   its zero-initialized default.
+
+     gen_dict_bind_emit_string_literal   - intern a C string as MIR data
+     gen_dict_bind_throw_key_exception   - emit cy_exc_throw(KeyException, msg)
+     gen_dict_bind_into                  - walk fields, recurse on classes
+   --------------------------------------------------------------------------- */
+
+/* Forward decls — the two helpers below sit *before* gen_dict_key_op and
+   gen_dict_unwrap in this file (which they call into).  Declaring them up
+   front lets us keep the bind code grouped with the other dict gen helpers. */
+static MIR_op_t gen_dict_key_op (c2m_ctx_t c2m_ctx, const char *key_str, size_t len);
+static op_t gen_dict_unwrap (c2m_ctx_t c2m_ctx, op_t dop);
+
+/* Intern STR as an anonymous string data item in the current module and return
+   a ref op pointing to it.  Mirrors gen_dict_key_op's strategy so the string
+   survives binary (.bmir) round-tripping. */
+static MIR_op_t gen_dict_bind_emit_string_literal (c2m_ctx_t c2m_ctx, const char *str) {
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_module_t module = DLIST_TAIL (MIR_module_t, *MIR_get_module_list (ctx));
+  char buff[50];
+  size_t len = strlen (str) + 1;
+
+  _MIR_get_temp_item_name (ctx, module, buff, sizeof (buff));
+  MIR_item_t str_item = MIR_new_string_data (ctx, buff, (MIR_str_t){len, str});
+  move_item_to_module_start (module, str_item);
+  return MIR_new_ref_op (ctx, str_item);
+}
+
+/* Emit a `throw(KeyException, msg)` call with msg = "missing field 'F' in T".
+   KeyException's enum value (8) is fixed by the exception prelude in
+   add_standard_includes — see the `KeyException = 8` line. */
+static void gen_dict_bind_throw_key_exception (c2m_ctx_t c2m_ctx,
+                                               const char *class_name,
+                                               const char *field_name) {
+  /* Build the message string at compile time so it lives in static data. */
+  size_t cn = strlen (class_name), fn = strlen (field_name);
+  size_t need = cn + fn + 32; /* "missing field '' in " + nul */
+  char *msg = reg_malloc (c2m_ctx, need);
+  snprintf (msg, need, "missing field '%s' in %s", field_name, class_name);
+
+  MIR_op_t msg_op = gen_dict_bind_emit_string_literal (c2m_ctx, msg);
+  /* KeyException id == 8 (see exception_prelude). */
+  MIR_op_t id_op = MIR_new_int_op (c2m_ctx->ctx, 8);
+  gen_exception_throw_call (c2m_ctx, id_op, msg_op);
+}
+
+/* Walk CLS_TYPE's by-value members, reading each one from the source dict
+   pointer SRC_DV_OP (a DictValue* in an I64 register) and writing it into the
+   destination object whose base address is DST_ADDR_OP (also an I64 register).
+
+   For each member m of class T:
+     val_dv = dict_object_get(src, "m");
+     if (val_dv == NULL) {
+       lenient: continue;       // leave at zero-initialized default
+       strict : throw KeyException("missing field 'm' in T");
+     }
+     dispatch on the *declared* member type:
+       - scalar / string / pointer  ->  unwrap union payload, store into slot
+       - nested class               ->  recurse with the same lenient flag
+       - everything else            ->  compile error (Phase 1 unsupported)
+
+   POS is used only for the error message on unsupported field types. */
+static void gen_dict_bind_into (c2m_ctx_t c2m_ctx, struct type *cls_type,
+                                op_t src_dv_op, op_t dst_addr_op,
+                                int lenient, pos_t pos) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+
+  /* Both TM_CLASS and TM_STRUCT share the same `tag_type` shape and per-field
+     N_MEMBER layout, so the walk is identical for both.  TM_UNION is rejected
+     in the checker (no sensible mapping from a dict object). */
+  assert (cls_type != NULL
+          && (cls_type->mode == TM_CLASS || cls_type->mode == TM_STRUCT));
+  const char *cls_name = (cls_type->mode == TM_CLASS)
+                           ? class_type_name (cls_type) : NULL;
+  if (cls_name == NULL) {
+    /* Plain struct: the tag_type's first child is the N_ID for the tag name. */
+    node_t tag_id = cls_type->u.tag_type ? NL_HEAD (cls_type->u.tag_type->u.ops) : NULL;
+    cls_name = (tag_id != NULL && tag_id->code == N_ID) ? tag_id->u.s.s
+             : (cls_type->mode == TM_STRUCT) ? "<struct>" : "<class>";
+  }
+
+  node_t class_node = cls_type->u.tag_type;
+  node_t members = (class_node != NULL && class_node->u.ops.head != NULL)
+                     ? NL_EL (class_node->u.ops, 1) : NULL;
+  if (members == NULL || members->code != N_LIST) return;
+
+  /* Force the source DictValue* into a fresh register once — dict_object_get
+     takes it as the first arg every iteration. */
+  src_dv_op = force_reg (c2m_ctx, src_dv_op, MIR_T_I64);
+  dst_addr_op = force_reg (c2m_ctx, dst_addr_op, MIR_T_I64);
+
+  for (node_t m = NL_HEAD (members->u.ops); m != NULL; m = NL_NEXT (m)) {
+    if (m->code != N_MEMBER) continue;
+    decl_t mdecl = m->attr;
+    if (mdecl == NULL) continue;
+    struct type *mtype = mdecl->decl_spec.type;
+    if (mtype == NULL) continue;
+    /* Skip method members (function-typed) — they are part of the class but
+       are not data slots a dict could provide. */
+    if (mtype->mode == TM_FUNC) continue;
+    /* Static class members live outside the instance and aren't bind targets. */
+    if (mdecl->decl_spec.static_p) continue;
+
+    /* Extract the member name from the declarator: N_DECL(N_ID, ...) */
+    node_t declarator = NL_EL (m->u.ops, 1);
+    node_t mid = declarator ? NL_HEAD (declarator->u.ops) : NULL;
+    if (mid == NULL || mid->code != N_ID) continue;
+    const char *mname = mid->u.s.s;
+    mir_size_t moff = mdecl->offset;
+
+    /* field_addr = dst_addr + moff */
+    op_t field_addr = get_new_temp (c2m_ctx, MIR_T_I64);
+    emit3 (c2m_ctx, MIR_ADD, field_addr.mir_op, dst_addr_op.mir_op,
+           MIR_new_int_op (ctx, (long) moff));
+
+    /* val_dv = dict_object_get(src_dv, "mname") */
+    MIR_op_t key_op = gen_dict_key_op (c2m_ctx, mname, strlen (mname) + 1);
+    op_t val_dv = gen_dict_object_get (c2m_ctx, src_dv_op.mir_op, key_op);
+    val_dv = force_reg (c2m_ctx, val_dv, MIR_T_I64);
+
+    /* Branch on val_dv == NULL */
+    MIR_label_t after_field = MIR_new_label (ctx);
+    MIR_label_t present_label = MIR_new_label (ctx);
+    emit3 (c2m_ctx, MIR_BNE, MIR_new_label_op (ctx, present_label),
+           val_dv.mir_op, MIR_new_int_op (ctx, 0));
+    /* --- missing-key path --- */
+    if (lenient) {
+      /* leave the slot at its zero-init default and move on */
+      emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, after_field));
+    } else {
+      gen_dict_bind_throw_key_exception (c2m_ctx, cls_name, mname);
+      /* unreachable: throw does not return.  Fall through is fine. */
+      emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, after_field));
+    }
+    /* --- present-key path --- */
+    emit_label_insn_opt (c2m_ctx, present_label);
+
+    if (mtype->mode == TM_CLASS || mtype->mode == TM_STRUCT) {
+      /* Nested class or struct: recurse with field_addr as the new
+         destination base.  Identical layout walk regardless of kind. */
+      gen_dict_bind_into (c2m_ctx, mtype, val_dv, field_addr, lenient, pos);
+    } else if (scalar_type_p (mtype) || string_type_p (mtype)) {
+      /* Unwrap the union payload (offset 8 of DictValue) and store into the
+         class slot.  Same path as `(T)d.x` would take for a scalar leaf. */
+      op_t unwrapped = gen_dict_unwrap (c2m_ctx, val_dv);
+      MIR_type_t mir_t = get_mir_type (c2m_ctx, mtype);
+      MIR_alias_t alias = get_type_alias (c2m_ctx, mtype);
+      emit2 (c2m_ctx, tp_mov (mir_t),
+             MIR_new_alias_mem_op (ctx, mir_t, 0, field_addr.mir_op.u.reg, 0, 1, alias, 0),
+             unwrapped.mir_op);
+    } else {
+      error (c2m_ctx, pos,
+             "dict->aggregate bind: unsupported field type for '%s.%s' "
+             "(Phase 1 supports scalars, String, and nested class/struct only)",
+             cls_name, mname);
+    }
+    emit_label_insn_opt (c2m_ctx, after_field);
+  }
+}
+
 /* Create a named (uniquely-named) string-data item holding a dict key, returning
    a ref operand to it.  The data item is given a real name and moved to the
    module start so that it survives binary (.bmir) serialization: an anonymous
@@ -22025,9 +22243,44 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_ALIGNOF:
   case N_SIZEOF:
   case N_EXPR_SIZEOF: assert (FALSE); break;
-  case N_CAST:
-    assert (!((struct expr *) r->attr)->const_p);
-    type = ((struct expr *) r->attr)->type;
+  case N_CAST: {
+    struct expr *cast_e = (struct expr *) r->attr;
+    assert (!cast_e->const_p);
+    type = cast_e->type;
+    /* Dict-to-class bind cast: (T)d / (T?)d — lowered to a per-field walk
+       over T's members.  Strict (no `?`) throws KeyException on a missing
+       field; lenient (`?`) leaves the field at zero.  Source-level checking
+       (target is TM_CLASS, source is TM_DICT) happens in the N_CAST checker;
+       here we just need to produce a class-shaped result. */
+    if (cast_e->bind_p) {
+      node_t src_node = NL_EL (r->u.ops, 1);
+      op_t src_op = val_gen (c2m_ctx, src_node);
+      op_t src_reg = force_reg (c2m_ctx, src_op, MIR_T_I64);
+
+      mir_size_t cls_size = type_size (c2m_ctx, type);
+      /* alloca a fresh buffer for the result.  A future optimization could
+         honor `desirable_dest` to skip the buffer when the consumer is an
+         aggregate assignment, but the straightforward alloca path is correct
+         in every context (initializer, function argument, return). */
+      op_t dst_addr = get_new_temp (c2m_ctx, MIR_T_I64);
+      MIR_append_insn (ctx, curr_func,
+                       MIR_new_insn (ctx, MIR_ALLOCA, dst_addr.mir_op,
+                                     MIR_new_int_op (ctx, (long) cls_size)));
+      /* Zero-fill so any field we skip (lenient missing, or a member declared
+         but not populated) reads as 0 / NULL rather than uninitialized junk. */
+      gen_memset (c2m_ctx, 0, dst_addr.mir_op.u.reg, cls_size);
+
+      gen_dict_bind_into (c2m_ctx, type, src_reg, dst_addr,
+                          cast_e->lenient_p, POS (r));
+
+      /* Result: the class value stored at dst_addr.  An aggregate MEM op with
+         MIR_T_UNDEF and a zero displacement is what every other class-by-value
+         producer (call return, compound literal) hands back; the consumer
+         (assignment / init / argument passing) handles the block move. */
+      res = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0,
+                                          dst_addr.mir_op.u.reg, 0, 1));
+      break;
+    }
     op1 = gen (c2m_ctx, NL_EL (r->u.ops, 1), NULL, NULL, !void_type_p (type), NULL, NULL);
     if (void_type_p (type)) {
       res = op1;
@@ -22049,6 +22302,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       res = cast (c2m_ctx, op1, t, TRUE);
     }
     break;
+  }
   case N_COMPOUND_LITERAL: {
     const char *global_name = NULL;
     char buff[50];

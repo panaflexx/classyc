@@ -60,15 +60,62 @@ for (auto k, v in cfg)
 > read a **numeric** leaf with `(int)` / `(double)`, and use `json(v)` to
 > stringify *any* value (object, array, number, or string).
 
-JSON arrays come through too — parse, then index by position:
+JSON arrays come through too — parse, then index by position **or** iterate:
 
 ```c
-dict d = json("{\"items\":[{\"name\":\"ada\",\"score\":42}]}");
+dict d = json("{\"items\":[{\"name\":\"ada\",\"score\":42},"
+              "            {\"name\":\"cy\", \"score\":99}]}");
+
+// Indexed access
 printf("%s\n", (char*)d.items[0].name);       // "ada"
 int score = (int)d.items[0].score;            // 42
+
+// Length: works for both array and object dicts
+int n = (int)d.items.length();                // 2  (alias: .count())
+
+// for-in dispatches on the runtime tag: object -> (key, value),
+// array -> (index, element).  Single-var form counts iterations.
+for (auto i, item in d.items)
+    printf("%d: %s = %d\n", i, (char*)item.name, (int)item.score);
 ```
 
+Every dict access is a **tagged box** — `d.items[0].score` returns a `DictValue*`,
+not a raw int. That means deep navigation, `json(leaf)` re-serialization, and the
+typed JSON binding below are all lossless: a numeric leaf survives a round-trip
+through `dict v = d.items[0].score; json(v)` (prints `"42"`).
+
 `dict` also supports arena allocation (`new dict(bytes)`) and is the return type of `HttpResponse::asDict()`.
+
+### Typed JSON Binding: `(T) d` and `(T)? d`
+
+C#-style "JSON-to-struct deserialization" — cast a `dict` directly to a `class`
+or plain `struct` and the compiler walks the target's member list, filling each
+field from the matching dict key:
+
+```c
+class Address { String city; int zip; };
+class User    { String name; int age; Address addr; };
+
+dict d = json(req.body);
+
+User u = (User) d;              // strict: throws KeyException on missing field
+User u = (User)? d;             // lenient: missing fields default to 0 / NULL
+```
+
+* **Strict** (`(T) d`): a missing field throws a catchable `KeyException` with
+  `e.msg == "missing field 'F' in T"`.
+* **Lenient** (`(T)? d`): missing fields stay at zero/NULL; lenience propagates
+  recursively into nested class and struct members.
+* Works on **plain C structs** too — `struct Point { int x, y; }; Point p = (struct Point) d;`
+  — and freely mixes class and struct nesting (`class Sprite { struct Pixel pixel; }`).
+* Scalars, `String`, and nested by-value classes / structs are supported today.
+  `List<T>*` / `Set<T>*` / `Map<K,V>*` and pointer-to-class fields are
+  Phase 2 (planned).
+* No annotations needed — the binder works off the class's declared members.
+  Field names must match the dict keys verbatim (no case conversion).
+
+See `cy-validate/val-020-json-binding.cy` for the full coverage matrix and
+`JSONBINDING.md` for the design rationale and phasing.
 
 ### Typed `Map<K, V>` Hash Maps (`include/map.h`)
 The typed, type-safe sibling of `dict`: a generic open-addressing hash map that
@@ -332,7 +379,7 @@ auto arr = {1, 2, 3};           // int[3]
 ```
 
 ### `for (auto x in ...)` Loops
-Works over arrays, `dict`, `List<T>`, `Set<T>`, `Map<K,V>`, and (via methods) strings. Keyed variant `for (auto k, v in m)` is supported for `dict` and `Map`.
+Works over arrays, `dict`, `List<T>`, `Set<T>`, `Map<K,V>`, and (via methods) strings. Keyed variant `for (auto k, v in m)` is supported for `dict` and `Map`. For a `dict` carrying a JSON **array**, the two-var form binds `(index, element)` (runtime-tag dispatched) so the same loop walks both objects and arrays without a type switch.
 
 ### Interfaces & `Any<I>` Erasure
 ```c
@@ -707,9 +754,11 @@ ClassyC is a pragmatic, evolving experiment in "C but pleasant". It already deli
 
 Shipped since the early roadmap: typed lambdas, generics (`List<T>` and
 user-defined collections), `interface`/`Any<I>` erasure, default-on exceptions +
-safety guards, and array/slice → `List<T>` conversion with lengths flowing into
-generics. In-progress directions include richer container types and broader
-standard-library coverage.
+safety guards, array/slice → `List<T>` conversion with lengths flowing into
+generics, and **typed JSON binding** (`(T) d` / `(T)? d` for class or struct,
+with `KeyException` on missing required fields). In-progress directions include
+richer container types, broader standard-library coverage, and Phase 2 of the
+JSON binder (collection-valued fields, see `JSONBINDING.md`).
 
 The behavior described in this README is exercised by the executable validation
 suite in **[`cy-validate/`](cy-validate/)** (run `sh cy-validate/run-validate.sh`).
@@ -725,16 +774,28 @@ Contributions, bug reports, and wild ideas are welcome!
 ### What doesn't work / current limitations
 - Single inheritance (`extends` / `super` / `virtual` methods). Use `interface` + `impl` + `Any<I>` (structural typing) instead — this combination covers all observed use-cases in ~8600 lines of examples.
 - Class instances stored **by value** inside `List<T>`, `Set<T>`, and `Map<K,V>` are supported: elements (and `Map` keys/values) live inline and the collection runs each element's destructor on `delete`. Scalars, `String`, raw pointers, and `MyClass*` work as before. For **pointer** elements the collection is non-owning by default, but `.owns()` (`.ownsValues()`/`.ownsKeys()` on `Map`) makes `delete` also free the pointed-to objects. (See `GENERICSMEM.md` and the *Element ownership* section above.)
-- `dict` arrays: JSON parsing builds them and `d.arr[i]` reads elements, but **array-literal assignment** (`d.tags = [..]`) is unimplemented and `for-in` does **not** iterate a dict array value (index by position instead).
+- `dict` arrays: JSON parsing builds them, `d.arr[i]` reads elements, `for-in`
+  iterates both objects and arrays (runtime-tag dispatched), and `d.arr.length()` /
+  `.count()` expose the size. The remaining gap is **array-literal assignment**
+  (`d.tags = ["fast", "safe"];`) — unimplemented; use JSON or the runtime
+  `dict_create_array`/`dict_array_append` helpers.
+- Typed JSON binding `(T) d` / `(T)? d` covers scalars, `String`, and nested
+  class/struct members. Field types that map to a `List<T>*`, `Set<T>*`,
+  `Map<K,V>*`, or pointer-to-class are **Phase 2** — the compiler currently
+  reports a clear error directing you to write that field by hand.
 - Stack value-construction works for plain classes: `Point p = Point(1, 2);` runs the constructor in place and `~Point()` at scope exit. It is the **generic collections** (`List<T>` / `Set<T>` / `Map<K,V>`) that are reference types only — instantiate them with `new` (a bare `Map<K,V> m = ...` value expression does not parse).
-- Exception names are resolved only at compile time. Runtime stores integer IDs only; there is no symbolic pretty-printing or `nameof`-style reflection for exceptions.
-- No built-in "key not found" exception type for `dict`/`Map` subscript (users can define their own via `enum { MyKeyError = 100 }` and `throw`/`catch` it manually).
+- Exception names are resolved only at compile time. Runtime stores integer IDs only; there is no symbolic pretty-printing or `nameof`-style reflection for exceptions. The prelude ships `KeyException = 8` and `TypeException = 7` (used by the typed JSON binder); user code can extend the set with `enum { MyErr = 100 }`.
 - `List<T>.sort` / `Set<T>` and a few other methods have minor edge-case limitations documented in the headers.
 
 ### Want-to-have features (prioritized)
 - ~~Automatic `defer delete` for `new`-bound locals, with `unowned` as the opt-out~~ **(landed)** — the static ownership analyzer in `src/ownership.c` tracks `malloc`-family and `new`-bound locals through a 5-state lattice, and `-fauto-release` synthesizes `defer free(p);` for definite leaks (see *Memory Management*). `unowned` is the opt-out at the declaration site.
 - A working `attach <expr>;` paired with a lightweight dataflow / borrow-check pass: today `attach` parses and type-checks but emits no runtime call. Once the analysis is in, `attach` will adopt an externally-owned value into the current arena and the compiler will be able to prove every owning binding is matched by exactly one of `{scope-end defer, detach, attach-into-another-scope}`.
-- Richer `List<T>` / `Map<K,V>` syntactic sugar and initializer syntax (more Pythonic comprehensions, better literal support, safer typed JSON deserialization into `List<T>` / `Map<K,V>`).
+- **Typed JSON binding — Phase 2**: extend `(T) d` / `(T)? d` to populate
+  `List<T>*` from array dicts, then `Set<T>*` and `Map<String, V>*`. Phase 3 then
+  adds an opt-in `Bindable` marker for per-field `required` / `optional(=default)`
+  / `renamed("x")` annotations (C# `[JsonRequired]` / `[JsonPropertyName]` parity).
+  See `JSONBINDING.md` for the design.
+- Richer `List<T>` / `Map<K,V>` syntactic sugar and initializer syntax (more Pythonic comprehensions, better literal support).
 - Safe / typed JSON parsing helpers that return `Result<T, ParseError>` or throw on failure (beyond the current `asDict()` which can produce a null-ish dict on bad input).
 - Lightweight SQLite wrapper (`include/sqlite.h`) with automatic binding of `dict` rows and `List<dict>` result sets — a natural fit given the existing `dict` infrastructure.
 - Simple gunicorn-style HTTP server library (lower priority than SQLite).
