@@ -8612,6 +8612,11 @@ struct decl {
      gen emits the ctor at the declaration and registers the dtor at scope exit
      (via the defer machinery) — no free, since the storage is automatic. */
   node_t ctor_call, dtor_call;
+  /* Auto-synthesized `free(p)` (or release-fn) N_CALL deferred at scope exit.
+     Populated by src/ownership.c when -fauto-release proves the binding leaks
+     on every reachable function exit. NULL otherwise.  Registered alongside
+     dtor_call in the gen pass so it runs through the existing defer machinery. */
+  node_t auto_release_call;
   union {
     const char *asm_str; /* register name for global reg used and defined only if asm_p */
     MIR_item_t item;     /* MIR_item for some declarations */
@@ -12062,6 +12067,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       decl->bit_offset = -1;
       decl->param_args_start = decl->param_args_num = 0;
       decl->ctor_call = decl->dtor_call = NULL;
+      decl->auto_release_call = NULL;
       decl->auto_defer_p = FALSE;
       decl->scope = curr_scope;
       decl->containing_unnamed_anon_struct_union_member = curr_unnamed_anon_struct_union_member;
@@ -22784,6 +22790,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             gen (c2m_ctx, decl->ctor_call, NULL, NULL, FALSE, NULL, NULL);
           if (decl->dtor_call != NULL)
             VARR_PUSH (node_t, defer_stmts, decl->dtor_call);
+          /* -fauto-release: ownership pass proved this binding leaks; run the
+             synthesized free()/release at scope exit through the same defer
+             stack so returns/breaks/continues all unwind through it. */
+          if (decl->auto_release_call != NULL)
+            VARR_PUSH (node_t, defer_stmts, decl->auto_release_call);
           /* Null-initialize uninitialized local String variables, so that
              `String x;` is a well-defined null String (x == null is true and
              x.empty() is safe). */

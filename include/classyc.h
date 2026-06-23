@@ -24,6 +24,9 @@ struct c2mir_options {
   int debug_info_p; /* -g: emit source locations and debug info into MIR/bmir */
   int keep_syms_p;  /* keep symbol table + node positions after no_gen_p analysis (for LSP go-to-def etc.) */
   int exceptions_p; /* try/catch/throw + JIT safety guards (default on; -fno-exceptions disables) */
+  int auto_release_p; /* -fauto-release: synthesize defer free(p) for owned heap locals that would leak */
+  int ownership_report_p; /* -fownership-report: dump per-function alloc/release map after analysis */
+  int check_whole_allocs_p; /* -fcheck-whole-allocs: link-time-style whole-program ownership analysis */
   size_t module_num;
   FILE *prepro_output_file; /* non-null for prepro_only_p */
   const char *output_file_name;

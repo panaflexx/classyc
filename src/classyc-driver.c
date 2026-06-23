@@ -294,6 +294,9 @@ static void init_options (int argc, char *argv[]) {
   options.no_gen_p = FALSE;
   options.debug_info_p = FALSE;
   options.exceptions_p = TRUE;   /* try/catch/throw enabled by default */
+  options.auto_release_p = FALSE; /* -fauto-release: synthesize free for definite leaks */
+  options.ownership_report_p = FALSE; /* -fownership-report: dump alloc/release map */
+  options.check_whole_allocs_p = FALSE; /* -fcheck-whole-allocs: whole-program ownership analysis */
   gen_debug_level = -1;
   VARR_CREATE (char, temp_string, &default_alloc, 0);
   VARR_CREATE (char_ptr_t, headers, &default_alloc, 0);
@@ -324,6 +327,18 @@ static void init_options (int argc, char *argv[]) {
       options.exceptions_p = TRUE;
     } else if (strcmp (argv[i], "-fno-exceptions") == 0) {
       options.exceptions_p = FALSE;
+    } else if (strcmp (argv[i], "-fauto-release") == 0) {
+      options.auto_release_p = TRUE;
+    } else if (strcmp (argv[i], "-fno-auto-release") == 0) {
+      options.auto_release_p = FALSE;
+    } else if (strcmp (argv[i], "-fownership-report") == 0) {
+      options.ownership_report_p = TRUE;
+    } else if (strcmp (argv[i], "-fno-ownership-report") == 0) {
+      options.ownership_report_p = FALSE;
+    } else if (strcmp (argv[i], "-fcheck-whole-allocs") == 0) {
+      options.check_whole_allocs_p = TRUE;
+    } else if (strcmp (argv[i], "-fno-check-whole-allocs") == 0) {
+      options.check_whole_allocs_p = FALSE;
     } else if (strcmp (argv[i], "-pedantic") == 0) {
       options.pedantic_p = TRUE;
     } else if (strcmp (argv[i], "-g") == 0) {
@@ -788,6 +803,57 @@ static void sort_modules (MIR_context_t ctx) {
 }
 #endif
 
+/* -fcheck-whole-allocs: assemble every source file in source_file_names into
+   one virtual TU buffer separated by `#line` directives so the preprocessor,
+   parser, check, and ownership passes all see a single combined module.
+
+   Returns 1 on success (combined buffer placed in `out`, populated by
+   VARR_PUSH), 0 otherwise (mixed inputs / stdin / .bmir present).  Caller
+   keeps ownership of `out` and is responsible for VARR_DESTROY.
+
+   Each file is preceded by `#line 1 "<name>"` so diagnostics report the
+   original filename and line number even though the parser is reading a
+   stitched buffer. */
+static int build_whole_program_buffer (VARR (uint8_t) *out, const char **virt_name) {
+  size_t nfiles = VARR_LENGTH (char_ptr_t, source_file_names);
+  if (nfiles < 2) return 0;
+  for (size_t k = 0; k < nfiles; k++) {
+    const char *nm = VARR_GET (char_ptr_t, source_file_names, k);
+    size_t ln = strlen (nm);
+    if (strcmp (nm, STDIN_SOURCE_NAME) == 0) return 0;
+    if ((ln >= 5 && strcmp (nm + ln - 5, ".bmir") == 0)
+        || (ln >= 4 && strcmp (nm + ln - 4, ".mir") == 0))
+      return 0;
+  }
+  for (size_t k = 0; k < nfiles; k++) {
+    const char *nm = VARR_GET (char_ptr_t, source_file_names, k);
+    char header[2048];
+    /* IMPORTANT: no leading newline before the #line directive.  The c2mir
+       preprocessor counts a leading `\n` against the *previous* file's
+       line tally instead of resetting cleanly, which causes the file
+       content to be reported at the previous file's exit line + offset.
+       Putting `#line` at column 0 of its own buffer line avoids it. */
+    int hn = snprintf (header, sizeof (header), "#line 1 \"%s\"\n", nm);
+    if (hn < 0) return 0;
+    /* Ensure the #line directive starts on its own line (the first file
+       prepends nothing because the buffer is empty; subsequent files need
+       a separating newline to start a fresh source line). */
+    if (VARR_LENGTH (uint8_t, out) > 0) VARR_PUSH (uint8_t, out, (uint8_t) '\n');
+    for (int j = 0; j < hn; j++) VARR_PUSH (uint8_t, out, (uint8_t) header[j]);
+    FILE *f = fopen (nm, "rb");
+    if (f == NULL) {
+      fprintf (stderr, "can not open %s -- goodbye\n", nm);
+      exit (1);
+    }
+    int c;
+    while ((c = getc (f)) != EOF) VARR_PUSH (uint8_t, out, (uint8_t) c);
+    fclose (f);
+  }
+  VARR_PUSH (uint8_t, out, 0); /* NUL terminator like the per-file path does */
+  *virt_name = VARR_GET (char_ptr_t, source_file_names, 0); /* attribute diagnostics to first file by default; #line overrides */
+  return 1;
+}
+
 int main (int argc, char *argv[], char *env[]) {
   int i, bin_p;
   size_t len;
@@ -804,53 +870,73 @@ int main (int argc, char *argv[], char *env[]) {
   options.prepro_output_file = NULL;
 	  init_options (argc, argv);
 
-	  /* On macOS, always predefine the GNUC family + Apple platform macros
-	     that the SDK headers expect.  This prevents cdefs.h from
-	     emitting "#warning Unsupported compiler detected".  These
-	     are injected as if the user had written -D on the command line.  */
-#if defined(__APPLE__)
-	  {
-	    struct c2mir_macro_command mc = {TRUE, NULL, NULL};
-	    char *n;
+	  /* (Removed: a previous version of this code predefined `__GNUC__`,
+	     `__APPLE__`, etc. on macOS so SDK headers wouldn't emit the
+	     "unsupported compiler" warning.  That block had two latent bugs:
+	     it never reached the preprocessor because `init_options()` had
+	     already snapshotted `options.macro_commands_num` /
+	     `options.macro_commands` before this code ran, AND — had the
+	     snapshot bug been fixed — declaring `__GNUC__` would have unmasked
+	     `__attribute__((__nothrow__))` etc. annotations on glibc / macOS
+	     SDK function declarations in positions classyc's parser doesn't
+	     yet accept, producing a cascade of syntax errors when including
+	     `<stdio.h>` and friends.
 
-	    n = reg_malloc (sizeof "__GNUC__");
-	    strcpy (n, "__GNUC__");
-	    mc.name = n;
-	    mc.def = "4";
-	    VARR_PUSH (macro_command_t, macro_commands, mc);
-
-	    n = reg_malloc (sizeof "__GNUC_MINOR__");
-	    strcpy (n, "__GNUC_MINOR__");
-	    mc.name = n;
-	    mc.def = "2";
-	    VARR_PUSH (macro_command_t, macro_commands, mc);
-
-	    n = reg_malloc (sizeof "__GNUC_PATCHLEVEL__");
-	    strcpy (n, "__GNUC_PATCHLEVEL__");
-	    mc.name = n;
-	    mc.def = "1";
-	    VARR_PUSH (macro_command_t, macro_commands, mc);
-
-	    n = reg_malloc (sizeof "__APPLE__");
-	    strcpy (n, "__APPLE__");
-	    mc.name = n;
-	    mc.def = "1";
-	    VARR_PUSH (macro_command_t, macro_commands, mc);
-
-	    n = reg_malloc (sizeof "__MACH__");
-	    strcpy (n, "__MACH__");
-	    mc.name = n;
-	    mc.def = "1";
-	    VARR_PUSH (macro_command_t, macro_commands, mc);
-	  }
-#endif
+	     The block has been removed entirely.  Step H attribute support
+	     (`((borrows))`, `((releases))`, `((cleanup(fn)))`) is parsed and
+	     wired into the ownership pass, but currently only takes effect in
+	     code that DOES NOT include problematic system headers in the same
+	     translation unit.  Restoring the predefines is contingent on first
+	     teaching the parser to accept trailing attribute-specs on function
+	     declarations.) */
 
 	  main_ctx = MIR_init ();
-  if (!C2MIR_PARALLEL || threads_num <= 0) c2mir_init (main_ctx);
-  init_compilers ();
-  result_code = 0;
+	  if (!C2MIR_PARALLEL || threads_num <= 0) c2mir_init (main_ctx);
+	  init_compilers ();
+	  result_code = 0;
+
+	  /* -fcheck-whole-allocs (whole-program ownership analysis).  Stitch every
+	     source file in source_file_names into one combined buffer separated by
+	     `#line` directives, then drop it into curr_input.code so the existing
+	     main loop runs it as a single virtual TU.  Threading is forced off so
+	     all of check + ownership + gen happens in one context; the MIR module
+	     comes out as one unit and `-o foo.bmir` writes a unified output.  */
+	  static VARR (uint8_t) *whole_buf;  /* outlives main loop */
+	  if (options.check_whole_allocs_p && curr_input.code == NULL
+	      && VARR_LENGTH (char_ptr_t, source_file_names) >= 2) {
+	    const char *vname = NULL;
+	    VARR_CREATE (uint8_t, whole_buf, &default_alloc, 16384);
+	    if (build_whole_program_buffer (whole_buf, &vname)) {
+	      curr_input.code     = VARR_ADDR (uint8_t, whole_buf);
+	      curr_input.code_len = VARR_LENGTH (uint8_t, whole_buf) - 1; /* exclude NUL */
+	      /* Synthetic input name: not COMMAND_LINE_SOURCE_NAME, so c2mir_compile
+	         writes the bmir to the -o file rather than diverting to stderr. */
+	      curr_input.input_name = vname != NULL ? vname : "<whole-program>";
+	      /* Empty the source_file_names list so the per-file loop does not
+	         then try to re-open each file; downstream code checks code != NULL
+	         and routes through the command-line-script path with input_name
+	         = our synthetic name + #line directives restoring real names. */
+	      VARR_TRUNC (char_ptr_t, source_file_names, 0);
+	      if (options.verbose_p)
+	        fprintf (stderr,
+	                 "[whole-allocs] stitched %zu source files into a single TU\n",
+	                 (size_t) (VARR_LENGTH (uint8_t, whole_buf) - 1));
+	      (void) vname;
+	    } else {
+	      VARR_DESTROY (uint8_t, whole_buf);
+	      whole_buf = NULL;
+	      fprintf (stderr,
+	               "-fcheck-whole-allocs: needs >=2 source files, all .cy/.c "
+	               "(no .bmir/.mir, no stdin) -- ignoring flag\n");
+	    }
+	  }
+  /* The main loop normally resets curr_input.input_name at the top of each
+     iteration, but the whole-allocs path needs to preserve the synthetic
+     name across the first iteration.  Save it now and re-stamp it before
+     the reset below. */
+  const char *preserved_input_name = curr_input.input_name;
   for (i = 0, options.module_num = 0;; i++, options.module_num++) {
-    curr_input.input_name = NULL;
+    curr_input.input_name = (i == 0 ? preserved_input_name : NULL);
     if (i == 0) { /* check and modify options */
       if (curr_input.code == NULL && VARR_LENGTH (char_ptr_t, source_file_names) == 0) {
         fprintf (stderr, "No source file is given -- good bye.\n");
@@ -901,9 +987,14 @@ int main (int argc, char *argv[], char *env[]) {
     }
     curr_input.curr_char = 0;
     curr_input.code_container = NULL;
-    if (curr_input.code != NULL) { /* command line script: */
+    if (curr_input.code != NULL) { /* command line script or whole-program stitched TU */
       if (i > 0) break;
-      curr_input.input_name = COMMAND_LINE_SOURCE_NAME;
+      /* If the whole-allocs path stashed a virtual input name on curr_input,
+         keep it so c2mir_compile writes its bmir to the requested -o file
+         instead of dumping textual MIR (the COMMAND_LINE_SOURCE_NAME branch
+         inside c2mir_compile diverts output to message_file). */
+      if (curr_input.input_name == NULL)
+        curr_input.input_name = COMMAND_LINE_SOURCE_NAME;
     } else { /* stdin input or files given on the command line: */
       int c;
       FILE *f;

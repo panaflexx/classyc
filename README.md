@@ -251,6 +251,66 @@ void process() {
 > — there is no manual `checkpoint`/`release` API to call. Use `defer delete`
 > for things you allocate with `new` (objects, arena dicts, collections).
 
+### Arena Ownership: `unowned`, `detach`, `attach`
+
+Three keywords act as explicit, readable operations on the per-scope cleanup
+ledger that `defer` already implies. They're inverses of each other on the
+same data structure:
+
+| Keyword | When it runs | What it does |
+|---|---|---|
+| `defer` | end of scope | add a cleanup entry |
+| `detach` | now, inline | remove an entry (escape) |
+| `attach` | now, inline | add an entry (adopt) — *stub today* |
+| `unowned` | at declaration | opt the binding out of future auto-cleanup |
+
+```c
+String build_label(int i) {
+    return detach (String)"x#" + i;     // escape the arena: caller owns the value
+}
+
+Box* spawn(int v) {
+    return detach new Box(v);            // ownership transfers to caller
+}
+
+class Request {
+    String method;
+    Request(String m) { this.method = detach m.trim().upper(); }   // store past scope
+}
+
+void handle() {
+    unowned auto held = Http.get(url);   // I'll manage this one myself
+    defer delete held;
+
+    attach external_ptr;                 // (stub: parses + checks; no runtime call yet)
+}
+```
+
+- **`detach <expr>`** is an expression. It evaluates the inner expression,
+  removes the resulting value from the current scope's arena tracking set
+  (`String` registry or object-handle registry), and yields the same value —
+  now owned by whoever receives it. Works for `String` and pointer-to-class
+  values; on a non-arena-tracked value (an integer, a `new`-allocated pointer
+  the arena never tracked) it warns and falls through unchanged.
+- **`unowned <decl>`** is a declaration prefix. Today it parses and is
+  recorded in the AST as a no-op marker; it will become the opt-out for the
+  upcoming auto-`defer delete` pass. Adding it now future-proofs your code.
+- **`attach <expr>;`** is a statement. Today it's a stub (parses and
+  type-checks; emits no runtime call). Reserved for the future
+  ownership-flow / borrow-check pass that will use it to adopt
+  externally-owned values into the current scope's arena.
+- **Legacy `.detach()` method on `String`** still works for existing code
+  (`examples/classy-controller-like.cy` uses it); the new keyword is the
+  preferred form going forward and covers pointer-to-class values too.
+
+Note: because `detach` is an expression-level keyword, it shadows any
+ordinary identifier named `detach` in expression position (same rule
+`new` follows). `attach` and `unowned` remain usable as identifiers in
+expressions — they're only special at statement-start and
+declaration-start respectively.
+
+See `examples/test-ownership-keywords.cy` for a runnable demo.
+
 ### f-Strings (Interpolated Strings)
 ```c
 String user = "bob";
@@ -465,6 +525,106 @@ ClassyC manages high-level types with lightweight arenas. The big win: **heap
   own; pair them with `defer delete`. For collections of pointers, add `.owns()`
   (`.ownsValues()` / `.ownsKeys()` on `Map`) and `delete` will also free the
   pointed-to objects — see *Element ownership* below.
+- **Manual escape (`detach`)** — when you need a value to outlive the current
+  scope (return it, store it in a long-lived class field, hand it to an outer
+  collection), `detach <expr>` removes it from the local arena's tracking set
+  while returning the same value. Pairs with `defer` as its inverse on the
+  cleanup ledger. See *Arena Ownership* in the feature list above for the
+  `unowned` / `detach` / `attach` keywords.
+- **Static leak / UAF / double-free analyzer** — between check and gen the
+  compiler runs a CFG-based forward dataflow over every function. Bindings
+  initialized by recognized acquire calls (`malloc` / `calloc` / `realloc` /
+  `strdup` / `strndup`) AND ClassyC `new T(...)` are tracked through a
+  5-state ownership lattice (Unowned / Owned / Detached / Released /
+  MaybeOwned) with null-check path narrowing on `if (p == NULL)` / `!p` /
+  `p`.  `delete p;` releases the candidate (matching the language-level
+  `new` → `delete` pair), `free(p)` releases malloc-family candidates,
+  and `defer delete p;` / `defer free(p);` are recognized as scope-exit
+  cleanup without invalidating subsequent reads.  The pass emits:
+  - `warning: leak: ... is still owned at the end of this function`
+  - `warning: potential leak: ... may be owned on some path` (MaybeOwned)
+  - `error: use-after-free: ... was released earlier on this path`
+  - `error: double-free` (and `warning: double-free risk` on loop back-edges)
+  Per-arg hints via standard attributes on function parameters are
+  understood: `__attribute__((borrows))` (read-only, do not retain),
+  `__attribute__((releases))` (call takes ownership and frees), and the
+  GCC `__attribute__((cleanup(fn)))` on a local variable suppresses the
+  leak diagnostic (you've wired up RAII cleanup yourself).
+- **`-fauto-release` — silently fix definite leaks.** When the analyzer is
+  certain a binding leaks (Owned at every reachable function exit AND
+  never observed escaping via return / store / detaching call), this flag
+  has the compiler synthesize a `defer release_fn(p);` immediately after
+  the declaration. The fix is invisible at the source level but runs
+  through the existing defer machinery, so it unwinds at scope exit *and*
+  on every `return` / `break` / `continue` path. MaybeOwned candidates,
+  candidates that escape on any path, and bindings already marked
+  `__attribute__((cleanup(fn)))` are skipped — synthesizing for them
+  could double-free. Use `-v` to see each synthesized binding.
+  ```bash
+  classyc -fauto-release my-prog.cy   # turns five clean leaks into five free()s
+  ```
+- **`-fownership-report` — show what the analyzer verified.** Emits a
+  structured per-function (and per-class, for methods) dump of every
+  tracked allocation and *where* its ownership was disposed of — freed,
+  returned to caller, stored into a non-tracked location, deleted,
+  detached, auto-released, or leaked. Great for code review and for
+  building trust in what the static checker proved:
+  ```
+  [ownership report]
+  class Buffer
+    fn Buffer::load  (foo.cy:18)
+      tmp = malloc(...)  at foo.cy:19
+        → freed by release fn  at foo.cy:21
+    fn Buffer::grow  (foo.cy:25)
+      fresh = malloc(...)  at foo.cy:26
+        → stored into non-tracked location  at foo.cy:27
+    fn Buffer::scratch  (foo.cy:31)
+      junk = malloc(...)  at foo.cy:32
+        → auto-released (-fauto-release)  at foo.cy:32
+  fn make_name  (foo.cy:38)
+    s = malloc(...)  at foo.cy:39
+      → returned to caller  at foo.cy:41
+  ```
+  Combine with `-fauto-release` to see exactly which leaks the compiler
+  is silently fixing for you.
+- **Interprocedural summary inference** — the analyzer iterates over the
+  whole TU until function summaries reach a fixpoint (capped at 4 silent
+  passes; a final pass emits diagnostics).  For each function it infers:
+  - per-parameter `((releases))` / `((borrows))` from how the body uses
+    the parameter (releases on every reachable path → ((releases));
+    untouched on every path → ((borrows));
+  - whether the function returns an owned pointer + which release form
+    callers should use (`returns_owned_p` + `returns_release_fn`).
+  Call sites consult the inferred summary when no explicit annotation
+  exists, so user-written wrappers like `void take(char *p) { free(p); }`
+  are recognized as free-equivalents automatically.  A caller binding like
+  `char *x = make_buf(...);` is auto-tracked when `make_buf` has the
+  `returns_owned_p` summary, so leaks downstream of user wrappers are
+  caught (and `-fauto-release` will silently insert a matching `defer`).
+  Class-method calls treat the implicit `this` receiver as `((borrows))`
+  by default — method calls don't escape the receiver.
+  `-fownership-report` shows each inferred summary alongside the function
+  header.
+- **`-fcheck-whole-allocs` — link-time-style whole-program ownership.**
+  Mirrors the spirit of `gcc -flto`: when you pass multiple `.cy` source
+  files in one command, the driver stitches them into a single virtual TU
+  (separated by `#line` directives so diagnostics keep their original
+  filenames) and runs check + ownership + gen *once* over the combined
+  AST.  The analyzer then sees every function definition from every file
+  simultaneously and `-fownership-report` produces one unified dump.
+  Pairs naturally with a single `-o foo.bmir` for a unified module.
+  ```bash
+  classyc -fcheck-whole-allocs -fownership-report \
+          examples/test-whole-allocs.cy examples/test-whole-allocs-2.cy
+  classyc -fcheck-whole-allocs -c -o app.bmir a.cy b.cy c.cy
+  ```
+  Caveat: a known c2mir preprocessor quirk under-counts newlines inside
+  multi-line `/* ... */` block comments after a `#line` directive, so
+  reports for files whose leading docstring is a multi-line block comment
+  may have line numbers shifted by the comment's height.  Code and the
+  ownership analysis itself are unaffected; only the *reported* line for
+  diagnostics in that file shifts.  Workaround: use `//` line comments
+  for top-of-file headers, or accept the shift.
 
 Typical pattern:
 
@@ -567,6 +727,8 @@ Contributions, bug reports, and wild ideas are welcome!
 - `List<T>.sort` / `Set<T>` and a few other methods have minor edge-case limitations documented in the headers.
 
 ### Want-to-have features (prioritized)
+- ~~Automatic `defer delete` for `new`-bound locals, with `unowned` as the opt-out~~ **(landed)** — the static ownership analyzer in `src/ownership.c` tracks `malloc`-family and `new`-bound locals through a 5-state lattice, and `-fauto-release` synthesizes `defer free(p);` for definite leaks (see *Memory Management*). `unowned` is the opt-out at the declaration site.
+- A working `attach <expr>;` paired with a lightweight dataflow / borrow-check pass: today `attach` parses and type-checks but emits no runtime call. Once the analysis is in, `attach` will adopt an externally-owned value into the current arena and the compiler will be able to prove every owning binding is matched by exactly one of `{scope-end defer, detach, attach-into-another-scope}`.
 - Richer `List<T>` / `Map<K,V>` syntactic sugar and initializer syntax (more Pythonic comprehensions, better literal support, safer typed JSON deserialization into `List<T>` / `Map<K,V>`).
 - Safe / typed JSON parsing helpers that return `Result<T, ParseError>` or throw on failure (beyond the current `asDict()` which can produce a null-ish dict on bad input).
 - Lightweight SQLite wrapper (`include/sqlite.h`) with automatic binding of `dict` rows and `List<dict>` result sets — a natural fit given the existing `dict` infrastructure.
