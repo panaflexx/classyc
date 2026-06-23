@@ -17,6 +17,32 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_C_FLAGS_DEBUG "-g3 -O0 -fno-omit-frame-pointer" CACHE STRING "")
 set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-g" CACHE STRING "")
 
+# ------------------ Profile-Guided Optimization (PGO) support ----------------
+# Usage:
+#   1) cmake -B build -S . -DCLASSYC_PGO_GENERATE=ON && cmake --build build
+#   2) Run representative workloads (e.g. examples via ./bin/classyc -eg).
+#      Profile data (*.gcda) is emitted next to the objects or under CMAKE_BINARY_DIR.
+#   3) cmake -B build -S . -DCLASSYC_PGO_USE=ON && cmake --build build
+#      The second build consumes the profile and emits an optimized binary.
+option(CLASSYC_PGO_GENERATE "Instrument for PGO (generate phase)" OFF)
+option(CLASSYC_PGO_USE     "Use collected profile for PGO optimization" OFF)
+
+if(CLASSYC_PGO_GENERATE AND CLASSYC_PGO_USE)
+  message(FATAL_ERROR "CLASSYC_PGO_GENERATE and CLASSYC_PGO_USE are mutually exclusive")
+endif()
+
+if(CLASSYC_PGO_GENERATE)
+  message(STATUS "PGO generate phase enabled (-fprofile-generate)")
+  # For GCC: -fprofile-generate writes .gcda next to objects (or use -fprofile-dir=...)
+  # We also enable -O2 so the generated profile is meaningful.
+  add_compile_options(-fprofile-generate -O2)
+  add_link_options(-fprofile-generate)
+elseif(CLASSYC_PGO_USE)
+  message(STATUS "PGO use phase enabled (-fprofile-use)")
+  add_compile_options(-fprofile-use -fprofile-correction -O3)
+  add_link_options(-fprofile-use)
+endif()
+
 # ------------------ MIR Subdirectory -----------------------
 # Add MIR as a subdirectory (assumes ${MIRDIR}/CMakeLists.txt exists)
 set(MIRDIR ext/mir)
