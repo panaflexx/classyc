@@ -11988,51 +11988,84 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
          the ctor at the declaration point and registers the dtor with the defer
          machinery so it runs at every scope exit, in reverse declaration order.
          Only plain class objects qualify (not pointers, params, members,
-         statics, or `new`-initialized declarations). */
+         statics, or `new`-initialized declarations).
+
+         Stack-constructor syntax `C c = C(args);` is handled here too: the
+         initializer is a call whose callee is the class name.  We lower it to
+         the same in-place `c.__ctor_C(args)` method call (constructing directly
+         into the variable's storage -- no temporary, no by-value return) and
+         then neutralize the initializer so gen takes the RAII ctor path. */
       if (decl_node->code == N_SPEC_DECL && declarator->code == N_DECL && id != NULL
           && id->code == N_ID && scope != NULL && scope->code == N_BLOCK && !param_p
           && !decl->decl_spec.typedef_p && !decl->decl_spec.static_p
           && !decl->decl_spec.extern_p && !decl->decl_spec.thread_local_p
-          && decl->decl_spec.type->mode == TM_CLASS && decl->decl_spec.type->u.tag_type != NULL
-          && (initializer == NULL || initializer->code == N_IGNORE)) {
+          && decl->decl_spec.type->mode == TM_CLASS && decl->decl_spec.type->u.tag_type != NULL) {
         node_t tag = decl->decl_spec.type->u.tag_type;
         node_t cid = NL_HEAD (tag->u.ops);
-        if (cid != NULL && cid->code == N_ID) {
+        /* A constructor-call initializer:  `C c = C(args);`  (callee is the
+           class name -- matching this variable's class tag). */
+        node_t ctor_init_callee
+          = (initializer != NULL && initializer->code == N_CALL)
+              ? NL_HEAD (initializer->u.ops) : NULL;
+        int ctor_init_p = (ctor_init_callee != NULL && ctor_init_callee->code == N_ID
+                           && cid != NULL && cid->code == N_ID
+                           && strcmp (ctor_init_callee->u.s.s, cid->u.s.s) == 0);
+        if ((initializer == NULL || initializer->code == N_IGNORE || ctor_init_p)
+            && cid != NULL && cid->code == N_ID) {
           char nm[320];
           unsigned saved_errs;
           node_t cdtor_id, call;
           symbol_t ctor_sym;
-          int has_default_ctor = FALSE;
-          /* Constructor: auto-invoke only when a zero-argument (default) ctor
-             exists, so a class with only parametrized ctors is not flagged with
-             a spurious "too few arguments" error for a plain `C c;`. */
           snprintf (nm, sizeof (nm), "__ctor_%s", cid->u.s.s);
-          cdtor_id = build_id (c2m_ctx, nm, POS (id));
-          if (find_overload_sym (c2m_ctx, cdtor_id, scope, &ctor_sym)) {
-            for (size_t ci = 0; ci < VARR_LENGTH (node_t, ctor_sym.defs); ci++) {
-              node_t cand = VARR_GET (node_t, ctor_sym.defs, ci);
-              decl_t cd;
-              struct func_type *cft;
-              node_t cp;
-              if (cand == NULL || cand->code != N_FUNC_DEF) continue;
-              cd = cand->attr;
-              if (cd == NULL || cd->decl_spec.type == NULL
-                  || cd->decl_spec.type->mode != TM_FUNC) continue;
-              cft = cd->decl_spec.type->u.func_type;
-              cp = NL_HEAD (cft->param_list->u.ops);
-              if (cp != NULL) cp = NL_NEXT (cp); /* skip implicit 'this' */
-              if (cp == NULL) { has_default_ctor = TRUE; break; } /* no user params */
-            }
-          }
-          if (has_default_ctor) {
+          if (ctor_init_p) {
+            /* Reuse the supplied argument list for the in-place ctor call, and
+               neutralize the initializer so the rest of create_decl/gen treat
+               this declaration as uninitialized (the ctor does the init). */
+            node_t args = NL_NEXT (ctor_init_callee);
+            if (args != NULL) NL_REMOVE (initializer->u.ops, args);
+            else args = new_node (c2m_ctx, N_LIST);
             call = new_pos_node2 (c2m_ctx, N_CALL, POS (id),
                                   new_pos_node2 (c2m_ctx, N_FIELD, POS (id),
                                                  copy_node (c2m_ctx, id),
                                                  build_id (c2m_ctx, nm, POS (id))),
-                                  new_node (c2m_ctx, N_LIST));
+                                  args);
             saved_errs = n_errors;
             check (c2m_ctx, call, decl_node);
             if (n_errors == saved_errs) decl->ctor_call = call;
+            /* Turn the original initializer into a no-op. */
+            initializer->code = N_IGNORE;
+          } else {
+            int has_default_ctor = FALSE;
+            /* Constructor: auto-invoke only when a zero-argument (default) ctor
+               exists, so a class with only parametrized ctors is not flagged
+               with a spurious "too few arguments" error for a plain `C c;`. */
+            cdtor_id = build_id (c2m_ctx, nm, POS (id));
+            if (find_overload_sym (c2m_ctx, cdtor_id, scope, &ctor_sym)) {
+              for (size_t ci = 0; ci < VARR_LENGTH (node_t, ctor_sym.defs); ci++) {
+                node_t cand = VARR_GET (node_t, ctor_sym.defs, ci);
+                decl_t cd;
+                struct func_type *cft;
+                node_t cp;
+                if (cand == NULL || cand->code != N_FUNC_DEF) continue;
+                cd = cand->attr;
+                if (cd == NULL || cd->decl_spec.type == NULL
+                    || cd->decl_spec.type->mode != TM_FUNC) continue;
+                cft = cd->decl_spec.type->u.func_type;
+                cp = NL_HEAD (cft->param_list->u.ops);
+                if (cp != NULL) cp = NL_NEXT (cp); /* skip implicit 'this' */
+                if (cp == NULL) { has_default_ctor = TRUE; break; } /* no user params */
+              }
+            }
+            if (has_default_ctor) {
+              call = new_pos_node2 (c2m_ctx, N_CALL, POS (id),
+                                    new_pos_node2 (c2m_ctx, N_FIELD, POS (id),
+                                                   copy_node (c2m_ctx, id),
+                                                   build_id (c2m_ctx, nm, POS (id))),
+                                    new_node (c2m_ctx, N_LIST));
+              saved_errs = n_errors;
+              check (c2m_ctx, call, decl_node);
+              if (n_errors == saved_errs) decl->ctor_call = call;
+            }
           }
           /* Destructor. */
           snprintf (nm, sizeof (nm), "__dtor_%s", cid->u.s.s);
@@ -13224,6 +13257,16 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           /* String == char* (e.g. comparing with a literal that decayed to ptr). */
         } else if (t1->mode == TM_PTR && builtin_string_type_p (t2)) {
           /* char* == String */
+        } else if ((r->code == N_EQ || r->code == N_NE)
+                   && (t1->mode == TM_CLASS || t1->mode == TM_STRUCT || t1->mode == TM_UNION)
+                   && (t2->mode == TM_CLASS || t2->mode == TM_STRUCT || t2->mode == TM_UNION)
+                   && compatible_types_p (t1, t2, TRUE)) {
+          /* By-value class/struct == / != : lowered to a byte-wise memcmp in gen
+             (see N_EQ/N_NE codegen).  This is shallow (raw bytes) equality, which
+             is what generic collections like List<T> need to type-check and run
+             for value element types.  NOTE: padding bytes participate, so it is
+             only well-defined for classes whose storage is fully initialized
+             (constructors should not leave padding holes that vary). */
         } else {
           error (c2m_ctx, POS (r), "invalid types of comparison operands");
         }
@@ -13911,6 +13954,10 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           set_type_layout(c2m_ctx, _d->decl_spec.type); \
           _d->reg_p = scalar_type_p(_d->decl_spec.type); \
           _sd->attr = _d; \
+          /* Aggregate (class/struct/union) loop variables need a stack slot, \
+             not a register; register them for frame allocation. */ \
+          if (!_d->reg_p && curr_scope != top_scope) \
+            VARR_PUSH (decl_t, func_decls_for_allocation, _d); \
           symbol_insert(c2m_ctx, S_REGULAR, _copy, curr_scope, _sd, NULL); \
         } while(0)
 
@@ -14002,10 +14049,13 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
             if (gpds == NULL || !integer_type_p (gpds->type)) {
               error (c2m_ctx, POS (r),
                      "for-in: 'Get' of class '%s' must take a single integer index", cls_name);
-            } else if (!scalar_type_p (gft->ret_type)) {
+            } else if (!scalar_type_p (gft->ret_type)
+                       && gft->ret_type->mode != TM_CLASS
+                       && gft->ret_type->mode != TM_STRUCT
+                       && gft->ret_type->mode != TM_UNION) {
               error (c2m_ctx, POS (r),
-                     "for-in: 'Get' of class '%s' must return a scalar or pointer type",
-                     cls_name);
+                     "for-in: 'Get' of class '%s' must return a scalar, pointer, or by-value "
+                     "class/struct type", cls_name);
             } else {
               el_type = gft->ret_type;
             }
@@ -14602,6 +14652,46 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         int json_p = FALSE;
 
         op1 = NL_HEAD(r->u.ops);
+        /* __destroy(x): compiler intrinsic used by generic collection templates to
+           run an element's destructor before the backing buffer is freed.  It is
+           rewritten here, in place, into either:
+             - `(&x)->__dtor_T()`  when x is a by-value class type whose class has
+               a user destructor (so `delete list` destroys each live element); or
+             - a no-op  for every other element type (int, String, pointers, or a
+               class without a destructor) — preserving existing semantics for
+               List<int>, List<String>, List<char*>, etc.
+           Keeping this knowledge in the template (which knows its buffer/length
+           fields) avoids hard-coding collection internals into the compiler. */
+        if (op1->code == N_ID && strcmp (op1->u.s.s, "__destroy") == 0
+            && NL_NEXT (op1) != NULL && NL_HEAD (NL_NEXT (op1)->u.ops) != NULL
+            && NL_NEXT (NL_HEAD (NL_NEXT (op1)->u.ops)) == NULL) {
+          node_t darg = NL_HEAD (NL_NEXT (op1)->u.ops);
+          check (c2m_ctx, darg, r);
+          struct expr *de = darg->attr;
+          struct type *dt = de != NULL ? de->type : NULL;
+          node_t dtor_def = NULL;
+          if (dt != NULL && dt->mode == TM_CLASS && dt->u.tag_type != NULL) {
+            node_t cid = NL_HEAD (dt->u.tag_type->u.ops);
+            if (cid != NULL && cid->code == N_ID) {
+              char dtor_name[320];
+              node_t dtor_id;
+              snprintf (dtor_name, sizeof (dtor_name), "__dtor_%s", cid->u.s.s);
+              dtor_id = build_id (c2m_ctx, dtor_name, POS (r));
+              dtor_def = find_def (c2m_ctx, S_REGULAR, dtor_id, curr_scope, NULL);
+              if (dtor_def != NULL && dtor_def->code != N_FUNC_DEF) dtor_def = NULL;
+            }
+          }
+          /* Mark this as a builtin (so it is not pushed to call_nodes or routed
+             through normal call resolution) and record the resolved destructor on
+             the node's expr.  gen emits the on-the-fly dtor call (modeled on
+             N_DELETE) or nothing when def_node is NULL. */
+          e = create_expr (c2m_ctx, r);
+          e->type->mode = TM_BASIC;
+          e->type->u.basic_type = TP_VOID;
+          e->builtin_call_p = TRUE;
+          e->def_node = dtor_def;
+          break;
+        }
         if (op1->code == N_ID) {
           alloca_p = str_eq_p(op1->u.s.s, ALLOCA);
           add_overflow_p = strcmp(op1->u.s.s, ADD_OVERFLOW) == 0;
@@ -15165,7 +15255,8 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
             && incomplete_type_p(c2m_ctx, ret_type)) {
           error(c2m_ctx, POS(r), "function return type is incomplete");
         }
-        if (ret_type->mode == TM_STRUCT || ret_type->mode == TM_UNION) {
+        if (ret_type->mode == TM_STRUCT || ret_type->mode == TM_UNION
+            || ret_type->mode == TM_CLASS) {
           set_type_layout(c2m_ctx, ret_type);
           if (!builtin_call_p && curr_scope != top_scope)
             update_call_arg_area_offset(c2m_ctx, ret_type, TRUE);
@@ -16412,6 +16503,7 @@ struct gen_ctx {
   VARR (init_el_t) * init_els;
   MIR_item_t memset_proto, memset_item;
   MIR_item_t memcpy_proto, memcpy_item;
+  MIR_item_t memcmp_proto, memcmp_item;
   /* heap allocation for `new ClassName(...)` */
   MIR_item_t malloc_proto, malloc_item;
   MIR_item_t free_proto, free_item; /* heap release for `delete obj` */
@@ -16519,6 +16611,8 @@ struct gen_ctx {
 #define memset_item gen_ctx->memset_item
 #define memcpy_proto gen_ctx->memcpy_proto
 #define memcpy_item gen_ctx->memcpy_item
+#define memcmp_proto gen_ctx->memcmp_proto
+#define memcmp_item gen_ctx->memcmp_item
 #define malloc_proto gen_ctx->malloc_proto
 #define malloc_item gen_ctx->malloc_item
 #define free_proto gen_ctx->free_proto
@@ -18237,6 +18331,42 @@ static void gen_memcpy (c2m_ctx_t c2m_ctx, MIR_disp_t disp, MIR_reg_t base, op_t
   args[4] = mem_to_address (c2m_ctx, val, FALSE).mir_op;
   args[5] = MIR_new_uint_op (ctx, len);
   emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 6 /* args + proto + func + res */, args));
+}
+
+/* Emit `memcmp(&a, &b, len)` for two aggregate (class/struct/union) operands and
+   return a temp register holding the int result (0 == equal).  Used to lower
+   `==` / `!=` on by-value class/struct values (see N_EQ/N_NE in gen). */
+static op_t gen_memcmp (c2m_ctx_t c2m_ctx, op_t a, op_t b, mir_size_t len) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_type_t ret_type;
+  MIR_var_t vars[3];
+  MIR_op_t args[6];
+  op_t res;
+
+  if (memcmp_item == NULL) {
+    MIR_module_t module = curr_func->module;
+    ret_type = get_int_mir_type (sizeof (mir_int));
+    vars[0].name = "s1";
+    vars[0].type = get_int_mir_type (sizeof (mir_size_t));
+    vars[1].name = "s2";
+    vars[1].type = get_int_mir_type (sizeof (mir_size_t));
+    vars[2].name = "n";
+    vars[2].type = get_int_mir_type (sizeof (mir_size_t));
+    memcmp_proto = MIR_new_proto_arr (ctx, "memcmp_p", 1, &ret_type, 3, vars);
+    memcmp_item = MIR_new_import (ctx, "memcmp");
+    move_item_to_module_start (module, memcmp_proto);
+    move_item_to_module_start (module, memcmp_item);
+  }
+  res = get_new_temp (c2m_ctx, get_int_mir_type (sizeof (mir_int)));
+  args[0] = MIR_new_ref_op (ctx, memcmp_proto);
+  args[1] = MIR_new_ref_op (ctx, memcmp_item);
+  args[2] = res.mir_op;
+  args[3] = mem_to_address (c2m_ctx, a, FALSE).mir_op;
+  args[4] = mem_to_address (c2m_ctx, b, FALSE).mir_op;
+  args[5] = MIR_new_uint_op (ctx, len);
+  emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 6 /* args + proto + func + res */, args));
+  return res;
 }
 
 /* Runtime-helper call emission (defined with the dict helpers below). */
@@ -19993,7 +20123,7 @@ static MIR_item_t gen_func_proto_item (c2m_ctx_t c2m_ctx, struct func_type *ft) 
    args must already be memory ops.  Returns the call result (a meaningless op
    for void functions). */
 static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_type *ft,
-                              MIR_op_t func_op, op_t *args, int n_args) {
+                              MIR_op_t func_op, op_t *args, int n_args, op_t *agg_dest) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
   size_t ops_start = VARR_LENGTH (MIR_op_t, call_ops);
@@ -20002,13 +20132,31 @@ static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_t
   op_t res = zero_op;
   int i, n;
 
+  int agg_ret_p = (agg_dest != NULL
+                   && (ft->ret_type->mode == TM_STRUCT || ft->ret_type->mode == TM_UNION
+                       || ft->ret_type->mode == TM_CLASS));
+  int agg_by_addr_p = 0;
   VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, proto));
   VARR_PUSH (MIR_op_t, call_ops, func_op);
   target_init_arg_vars (c2m_ctx, &arg_info);
-  n = target_add_call_res_op (c2m_ctx, ft->ret_type, &arg_info, 0);
-  if (n > 0) {
-    assert (n == 1);
-    res = new_op (NULL, VARR_LAST (MIR_op_t, call_ops));
+  if (agg_ret_p && target_return_by_addr_p (c2m_ctx, ft->ret_type)) {
+    /* Aggregate returned via a hidden pointer: instead of routing through the
+       call arg area (which the synthetic for-in/protocol call sites never sized
+       during check), construct the result directly in the caller-supplied
+       destination slot.  Push an RBLK operand pointing at &agg_dest. */
+    op_t addr = mem_to_address (c2m_ctx, *agg_dest, TRUE);
+    MIR_op_t rblk = MIR_new_mem_op (ctx, MIR_T_RBLK, type_size (c2m_ctx, ft->ret_type),
+                                    addr.mir_op.u.reg, 0, 1);
+    VARR_PUSH (MIR_op_t, call_ops, rblk);
+    res = *agg_dest;
+    n = 0;
+    agg_by_addr_p = 1;
+  } else {
+    n = target_add_call_res_op (c2m_ctx, ft->ret_type, &arg_info, 0);
+    if (n > 0 && !agg_ret_p) {
+      assert (n == 1);
+      res = new_op (NULL, VARR_LAST (MIR_op_t, call_ops));
+    }
   }
   param = NL_HEAD (ft->param_list->u.ops);
   for (i = 0; i < n_args; i++) {
@@ -20026,9 +20174,18 @@ static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_t
     target_add_call_arg_op (c2m_ctx, pt, &arg_info, av);
     param = NL_NEXT (param);
   }
-  emit_insn (c2m_ctx,
-             MIR_new_insn_arr (ctx, MIR_CALL, VARR_LENGTH (MIR_op_t, call_ops) - ops_start,
-                               VARR_ADDR (MIR_op_t, call_ops) + ops_start));
+  {
+    MIR_insn_t ci = MIR_new_insn_arr (ctx, MIR_CALL,
+                                      VARR_LENGTH (MIR_op_t, call_ops) - ops_start,
+                                      VARR_ADDR (MIR_op_t, call_ops) + ops_start);
+    emit_insn (c2m_ctx, ci);
+    if (agg_ret_p && !agg_by_addr_p) {
+      /* Small aggregate returned in registers: scatter the result registers into
+         the destination slot, then expose the slot as the result. */
+      target_gen_post_call_res_code (c2m_ctx, ft->ret_type, *agg_dest, ci, ops_start);
+      res = *agg_dest;
+    }
+  }
   VARR_TRUNC (MIR_op_t, call_ops, ops_start);
   return res;
 }
@@ -20040,8 +20197,9 @@ static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_t
    receiver pointer type, ARGS holds N_ARGS already-evaluated user argument
    values.  Aggregate return types are rejected during check. */
 #define GEN_METHOD_MAX_ARGS 8
-static op_t gen_class_method_call (c2m_ctx_t c2m_ctx, node_t func_def, struct type *this_type MIR_UNUSED,
-                                   op_t this_op, op_t *args, int n_args) {
+static op_t gen_class_method_call_dest (c2m_ctx_t c2m_ctx, node_t func_def,
+                                        struct type *this_type MIR_UNUSED, op_t this_op,
+                                        op_t *args, int n_args, op_t *agg_dest) {
   MIR_context_t ctx = c2m_ctx->ctx;
   decl_t mdecl = func_def->attr;
   struct func_type *ft = mdecl->decl_spec.type->u.func_type;
@@ -20052,7 +20210,12 @@ static op_t gen_class_method_call (c2m_ctx_t c2m_ctx, node_t func_def, struct ty
   all_args[0] = this_op; /* 'this' is the first parameter of the method */
   for (int i = 0; i < n_args; i++) all_args[i + 1] = args[i];
   return gen_funcptr_call (c2m_ctx, proto, ft, MIR_new_ref_op (ctx, mdecl->u.item), all_args,
-                           n_args + 1);
+                           n_args + 1, agg_dest);
+}
+
+static op_t gen_class_method_call (c2m_ctx_t c2m_ctx, node_t func_def, struct type *this_type,
+                                   op_t this_op, op_t *args, int n_args) {
+  return gen_class_method_call_dest (c2m_ctx, func_def, this_type, this_op, args, n_args, NULL);
 }
 
 /* ---- Sequence lambda methods: MIR lowering ----
@@ -20258,7 +20421,7 @@ static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm
 
   switch (sm) {
   case SEQM_FILTER: {
-    op_t keep = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, &el_op, 1);
+    op_t keep = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, &el_op, 1, NULL);
     MIR_label_t skip_label = MIR_new_label (ctx);
     op_t daddr = get_new_temp (c2m_ctx, MIR_T_I64);
 
@@ -20274,7 +20437,7 @@ static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm
     break;
   }
   case SEQM_MAP: {
-    op_t v = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, &el_op, 1);
+    op_t v = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, &el_op, 1, NULL);
     op_t daddr = get_new_temp (c2m_ctx, MIR_T_I64);
 
     emit3 (c2m_ctx, MIR_MUL, daddr.mir_op, i_reg.mir_op, MIR_new_int_op (ctx, (long) out_size));
@@ -20288,7 +20451,7 @@ static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm
 
     cb_args[0] = acc;
     cb_args[1] = el_op;
-    v = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, cb_args, 2);
+    v = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, cb_args, 2, NULL);
     emit2 (c2m_ctx, tp_mov (acc_mir_t), acc.mir_op,
            promote (c2m_ctx, v, acc_mir_t, FALSE).mir_op);
     break;
@@ -20498,6 +20661,28 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     struct type *type1 = ((struct expr *) NL_HEAD (r->u.ops)->attr)->type;
     struct type *type2 = ((struct expr *) NL_EL (r->u.ops, 1)->attr)->type;
     struct type type_s, ptr_type_s = get_ptr_int_type (FALSE);
+    /* By-value aggregate equality (`a == b` / `a != b` where a, b are
+       class/struct/union values): lower to memcmp(&a, &b, sizeof) and compare
+       the int result against 0.  Shallow, byte-wise equality. */
+    if ((r->code == N_EQ || r->code == N_NE)
+        && (type1->mode == TM_CLASS || type1->mode == TM_STRUCT || type1->mode == TM_UNION)
+        && (type2->mode == TM_CLASS || type2->mode == TM_STRUCT || type2->mode == TM_UNION)) {
+      op_t a = gen (c2m_ctx, NL_HEAD (r->u.ops), NULL, NULL, FALSE, NULL, NULL);
+      op_t b = gen (c2m_ctx, NL_EL (r->u.ops, 1), NULL, NULL, FALSE, NULL, NULL);
+      op_t cmp = gen_memcmp (c2m_ctx, a, b, type_size (c2m_ctx, type1));
+      MIR_insn_code_t cc = (r->code == N_EQ ? MIR_EQS : MIR_NES);
+      if (true_label == NULL) {
+        res = get_new_temp (c2m_ctx, MIR_T_I64);
+        emit3 (c2m_ctx, cc, res.mir_op, cmp.mir_op, MIR_new_int_op (ctx, 0));
+      } else {
+        cc = (r->code == N_EQ ? MIR_BEQS : MIR_BNES);
+        emit3 (c2m_ctx, cc, MIR_new_label_op (ctx, true_label), cmp.mir_op,
+               MIR_new_int_op (ctx, 0));
+        emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, false_label));
+        true_label = false_label = NULL;
+      }
+      break;
+    }
     /* dict, slice and managed String are all pointer-sized identity values;
        compare them as integers/pointers (arithmetic_conversion only accepts
        arithmetic operands). */
@@ -21420,6 +21605,41 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     target_arg_info_t arg_info;
     int n, struct_p;
     type = call_expr->type;
+    /* __destroy(x) intrinsic (resolved in check): run x's destructor in place if
+       its class has one, else emit nothing.  Modeled on the N_DELETE dtor call,
+       minus the heap free (the buffer free is the template's responsibility). */
+    if (func->code == N_ID && strcmp (func->u.s.s, "__destroy") == 0
+        && call_expr->builtin_call_p) {
+      node_t dtor_def = call_expr->def_node;
+      if (dtor_def != NULL && dtor_def->code == N_FUNC_DEF) {
+        node_t darg = NL_HEAD (args->u.ops);
+        op_t lv = gen (c2m_ctx, darg, NULL, NULL, FALSE, NULL, NULL);
+        op_t addr = mem_to_address (c2m_ctx, lv, TRUE);
+        decl_t cdecl = dtor_def->attr;
+        struct func_type *dft = cdecl->decl_spec.type->u.func_type;
+        MIR_item_t dproto;
+        char dpname[64];
+        size_t dops_start;
+        collect_args_and_func_types (c2m_ctx, dft);
+        sprintf (dpname, "__dtorproto%d", new_proto_count++);
+        dproto = MIR_new_proto_arr (ctx, dpname,
+                                    VARR_LENGTH (MIR_type_t, proto_info.ret_types),
+                                    VARR_ADDR (MIR_type_t, proto_info.ret_types),
+                                    VARR_LENGTH (MIR_var_t, proto_info.arg_vars),
+                                    VARR_ADDR (MIR_var_t, proto_info.arg_vars));
+        move_item_to_module_start (curr_func->module, dproto);
+        dops_start = VARR_LENGTH (MIR_op_t, call_ops);
+        VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, dproto));
+        VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, cdecl->u.item));
+        VARR_PUSH (MIR_op_t, call_ops, addr.mir_op); /* implicit 'this' */
+        emit_insn (c2m_ctx,
+                   MIR_new_insn_arr (ctx, MIR_CALL,
+                                     VARR_LENGTH (MIR_op_t, call_ops) - dops_start,
+                                     VARR_ADDR (MIR_op_t, call_ops) + dops_start));
+        VARR_TRUNC (MIR_op_t, call_ops, dops_start);
+      }
+      break;
+    }
     if (add_overflow_p || sub_overflow_p || mul_overflow_p) {
       op1 = val_gen (c2m_ctx, NL_HEAD (args->u.ops));
       op2 = val_gen (c2m_ctx, NL_EL (args->u.ops, 1));
@@ -21734,7 +21954,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       assert (res.mir_op.mode == MIR_OP_MEM && res.mir_op.u.mem.type == MIR_T_RBLK);
       res.mir_op = MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, res.mir_op.u.mem.base, 0, 1);
       t = MIR_T_I64;
-    } else if (type->mode == TM_STRUCT || type->mode == TM_UNION) { /* passed in regs */
+    } else if (type->mode == TM_STRUCT || type->mode == TM_UNION
+               || type->mode == TM_CLASS) { /* passed in regs */
       if (!va_arg_p) {
         res = get_new_temp (c2m_ctx, MIR_T_I64);
         emit3 (c2m_ctx, MIR_ADD, res.mir_op,
@@ -21759,7 +21980,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
 #endif
           op2 = mem_to_address (c2m_ctx, op2, FALSE);
       }
-      if (type->mode == TM_STRUCT || type->mode == TM_UNION) {
+      if (type->mode == TM_STRUCT || type->mode == TM_UNION || type->mode == TM_CLASS) {
         if (desirable_dest == NULL) {
           res = get_new_temp (c2m_ctx, MIR_T_I64);
           MIR_append_insn (ctx, curr_func,
@@ -22879,6 +23100,26 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         emit2 (c2m_ctx, tp_mov (_vt), MIR_new_reg_op (ctx, _vv.reg), (src_op).mir_op); \
       } while (0)
 
+      /* Compute the stack-slot MEM op for an aggregate (class/struct/union) loop
+         variable, or set has_agg=0 for scalar/pointer element types.  The loop
+         var N_ID is never checked, so we build its MEM op straight from the
+         decl's frame offset. */
+      #define FORIN_AGG_DEST(var_node, dst_out, vty_out, has_agg_out) do {             \
+        symbol_t _vs; (vty_out) = NULL; (has_agg_out) = 0;                            \
+        if (symbol_find (c2m_ctx, S_REGULAR, (var_node), r, &_vs) && _vs.def_node != NULL \
+            && _vs.def_node->attr != NULL) {                                          \
+          decl_t _vd = (decl_t) _vs.def_node->attr;                                   \
+          (vty_out) = _vd->decl_spec.type;                                            \
+          if ((vty_out)->mode == TM_CLASS || (vty_out)->mode == TM_STRUCT             \
+              || (vty_out)->mode == TM_UNION) {                                       \
+            (has_agg_out) = 1;                                                        \
+            (dst_out) = new_op (_vd, MIR_new_alias_mem_op (ctx, MIR_T_UNDEF,          \
+                                _vd->offset, MIR_reg (ctx, FP_NAME, curr_func->u.func), \
+                                0, 1, get_type_alias (c2m_ctx, (vty_out)), 0));        \
+          }                                                                           \
+        }                                                                             \
+      } while (0)
+
       if (map_proto) {
         /* Keyed: key_id = coll->KeyAt(i); [val_id = coll->ValAt(i)] */
         op_t k_res = gen_class_method_call (c2m_ctx, keyat_def, this_type, this_reg, &i_reg, 1);
@@ -22888,9 +23129,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           STORE_FORIN_VAR (val_id, v_res);
         }
       } else {
-        /* elem = coll->Get(i) */
-        op_t el_res = gen_class_method_call (c2m_ctx, get_def, this_type, this_reg, &i_reg, 1);
+        /* elem = coll->Get(i).  For an aggregate element type, construct the
+           result directly into the loop variable's stack slot; otherwise store
+           the scalar/pointer result into its register. */
         node_t el_var = val_id->code == N_ID ? val_id : key_id;
+        op_t agg_dst; struct type *el_vty; int el_agg;
+        FORIN_AGG_DEST (el_var, agg_dst, el_vty, el_agg);
+        op_t el_res = el_agg
+          ? gen_class_method_call_dest (c2m_ctx, get_def, this_type, this_reg, &i_reg, 1, &agg_dst)
+          : gen_class_method_call (c2m_ctx, get_def, this_type, this_reg, &i_reg, 1);
         if (val_id->code == N_ID) {
           /* Two-var form: key_id = i (index) */
           MIR_type_t idx_t = promote_mir_int_type (MIR_T_I32);
@@ -22898,9 +23145,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           reg_var_t ivar = get_reg_var (c2m_ctx, idx_t, iname, NULL);
           emit2 (c2m_ctx, tp_mov (idx_t), MIR_new_reg_op (ctx, ivar.reg), i_reg.mir_op);
         }
-        STORE_FORIN_VAR (el_var, el_res);
+        /* Aggregate elements were already materialized into the slot by
+           gen_class_method_call_dest; only scalars need the register store. */
+        if (!el_agg) STORE_FORIN_VAR (el_var, el_res);
       }
       #undef STORE_FORIN_VAR
+      #undef FORIN_AGG_DEST
     } else {
       /* ---- Dict for-in ---- */
       op_t coll_val = val_gen (c2m_ctx, coll);
@@ -23940,6 +24190,7 @@ static void gen_mir (c2m_ctx_t c2m_ctx, node_t r) {
   VARR_CREATE (node_t, node_stack, alloc, 8);
   VARR_CREATE (node_t, defer_stmts, alloc, 16);
   memset_proto = memset_item = memcpy_proto = memcpy_item = NULL;
+  memcmp_proto = memcmp_item = NULL;
   top_gen (c2m_ctx, r, NULL, NULL, NULL);
   gen_finish (c2m_ctx);
 }

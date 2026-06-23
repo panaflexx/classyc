@@ -86,7 +86,15 @@ class List<T> {
 
     /* ═══════════════════════════ Destructor ═════════════════════════════════ */
 
+    /* Destroy each live element, then release the backing buffer.
+     *
+     * __destroy(x) is a compiler intrinsic: for a by-value class element type
+     * with a destructor it runs that destructor on x; for scalars, String, and
+     * pointer element types it expands to nothing.  This is what makes
+     * `delete list` (or a List on a `defer delete`) reclaim its by-value class
+     * elements — owned storage dies with the owner. */
     ~List() {
+        for (int i = 0; i < this->length; i++) __destroy(this->data[i]);
         if (this->data) free((void*) this->data);
     }
 

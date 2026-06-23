@@ -54,7 +54,7 @@ void show_pokemon(String name) {
 }
 
 int main() {
-	for(int i=0; i<1000; i++) {
+	for(int i=0; i<5; i++) {
 		/* Mark the String arena high-water point.  Every String allocated by
 		   this iteration (concatenated URLs, the request builders, etc.) is
 		   tracked above this mark and freed by c2m_str_release_to() at the end

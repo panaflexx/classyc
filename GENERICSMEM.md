@@ -18,8 +18,8 @@ the relevant code lives, what's still missing").
 | `int`, `double`, `char`, `bool`, …   | ✅ | ✅ | ✅ | value stored inline; byte-hash / value-compare |
 | `String`                             | ✅ | ✅ | ✅ | `Set`/`Map` key hashes/compares **by content** (see below) |
 | `char*` / other pointers             | ✅ | ✅ | ✅ | hashed/compared **by address** (identity) |
-| `MyClass*` (pointer to a class)      | ✅ | ✅ | ✅ | **the idiomatic way to put a class in a collection** |
-| `MyClass` (class **by value**)       | ❌ | ⚠️ | ❌ | blocked — see "By-value class elements" |
+| `MyClass*` (pointer to a class)      | ✅ | ✅ | ✅ | a class in a collection by reference |
+| `MyClass` (class **by value**)       | ✅ | ⚠️ | ⚠️ | stored inline; `List<MyClass>` destroys its elements on `delete` (see "By-value class elements") |
 
 (`Map<K,V>` columns describe both the key type `K` and the value type `V`; `K`
 is hashed/compared exactly like a `Set<K>` element.)
@@ -249,88 +249,92 @@ a second value array. Insertion order is preserved, which is what `KeyAt`/
 
 ---
 
-## By-value class elements: why `List<MyClass>` / `Set<MyClass>` don't work yet
+## By-value class elements: `List<MyClass>` now works
 
-Storing a `class` **by value** in a generic collection is blocked by three
-*independent* gaps. All three must be closed for `List<MyClass>` to work; today
-none should be relied upon.
+Storing a `class` **by value** in a `List<T>` is supported: elements live inline
+in the backing buffer (cache-friendly, no per-element heap allocation), and the
+collection **owns** them — `delete list` (or a `defer delete`) runs each live
+element's destructor before freeing the buffer. Four pieces had to come
+together; each is now in place.
 
-### 1. Codegen: classes can't be passed/returned by value (`undeclared reg`)
+### 1. ABI: classes pass / return by value like structs
 
-A plain function that takes/returns a class **by value** miscompiles, while the
-identical `struct` is fine:
+A function that takes/returns a class by value now compiles and runs:
 
 ```c
-class  P { int x, y; };
-P  padd(P a, P b)  { P r; r.x=a.x+b.x; r.y=a.y+b.y; return r; }   // ❌ "undeclared reg of func main"
-
-struct P2 { int x, y; };
-struct P2 padd2(struct P2 a, struct P2 b) { ... }                 // ✅ works
+class P { int x, y; };
+P padd(P a, P b) { P r; r.x=a.x+b.x; r.y=a.y+b.y; return r; }   // ✅ works
 ```
 
-So this is **not** a generics problem — it's the class aggregate calling
-convention in `gen`. The proto/arg/return *helpers* already treat `TM_CLASS` as
-an aggregate (`get_param_name` ≈ L17236, `simple_return_by_addr_p` ≈ L17247,
-`simple_add_arg_proto` ≈ L17323, `simple_add_call_arg_op` ≈ L17336, and
-`get_mir_type` returns `MIR_T_UNDEF` for `TM_CLASS`/`TM_STRUCT`/`TM_UNION`
-≈ L16392). The defect is that generating the *operand* for a class-typed
-argument (or the aggregate return result) yields a bad/garbage register instead
-of the expected `MIR_OP_MEM`. Root cause not yet isolated; lives in the `gen()`
-`case N_CALL` argument loop (≈ L21054) and the post-call result path
-(`target_gen_post_call_res_code`, ≈ L21101).
+The fix was in `gen()` `case N_CALL`: the result paths that special-cased
+`TM_STRUCT || TM_UNION` (the by-reg aggregate result, the va_arg block, and the
+check-side call-arg-area sizing) now include `TM_CLASS`, so a class result yields
+the expected `MIR_OP_MEM`/block-move instead of a garbage register. The ABI
+*helpers* (`simple_return_by_addr_p`, `simple_add_arg_proto`,
+`simple_add_call_arg_op`, `target_*` in `cx86_64-ABI-code.c`) already handled
+`TM_CLASS`. See `examples/test-byval-abi.cy`.
 
-### 2. `list.h` compares elements with `==`
+### 2. `==` / `!=` on class/struct values (byte-wise)
 
 `IndexOf` / `LastIndexOf` / `Contains` / `Remove` / `Equals` do `data[i] == item`.
-Struct/class values cannot be compared with `==` ("invalid types of comparison
-operands"), so a by-value class specialization of `list.h` fails to type-check
-even if you never call those methods (the whole template is checked). `Set<T>`
-avoids this (it uses `SET_EQ`, not `==`), which is why `Set<MyClass>` is closer
-to working than `List<MyClass>`.
+For a by-value class/struct, `a == b` / `a != b` is now lowered to
+`memcmp(&a, &b, sizeof) (== / != 0)` (shallow, byte-wise equality). Checked in
+`check` N_EQ/N_NE; emitted in `gen` via `gen_memcmp`. Caveat: padding bytes
+participate, so it is only well-defined for fully-initialized values.
 
-### 3. `for-in` requires a scalar/pointer `Get`
+### 3. `for-in` over aggregate elements
 
-`Get` returning a class value is rejected by the for-in checker (reason in the
-protocol section). `list.h::Concat` uses `for (auto x in other)` internally, so
-even ignoring (2), the by-value specialization still won't compile. The for-in
-*codegen* is register-based and would need aggregate (stack block-copy) handling
-to support struct/class elements — the same gap affects `for (auto s in arr)`
-over a C array of structs.
+`Get` returning a class value is accepted by the for-in checker, and the for-in
+*codegen* now block-copies the aggregate element into the loop variable's stack
+slot (the loop var is registered for frame allocation; small aggregates returned
+in registers are scattered into the slot, larger ones constructed directly into
+it via the hidden-pointer return). This makes `list.h::Concat`'s
+`for (auto x in other)` specialize for a by-value `T`.
 
-### Also: value-construction syntax
+### 4. Element destruction: `__destroy(x)` intrinsic
 
-`auto x = List<int>();` / `Point(1,2)` (constructor as a value expression) are
-**not parsed** — generic/class instances are constructed with `new`:
+So that the collection can destroy what it owns, `~List()` calls a compiler
+intrinsic in a loop:
 
 ```c
-auto x = new List<int>();     // ✅
-Point* p = new Point(1, 2);   // ✅
+~List() {
+    for (int i = 0; i < this->length; i++) __destroy(this->data[i]);
+    if (this->data) free((void*) this->data);
+}
 ```
+
+`__destroy(x)` expands to `x`'s destructor call when `x` is a by-value class with
+a user `~T()`, and to **nothing** for scalars, `String`, and pointer element
+types — so `List<int>` / `List<String>` / `List<char*>` are unchanged. Keeping
+the loop in the template (which knows its `data`/`length` fields) avoids
+hard-coding collection internals into the compiler. See
+`examples/test-list-byval.cy`.
+
+### Value-construction syntax
+
+Stack construction is parsed and lowered to in-place construction (no temporary,
+no by-value return) reusing the existing RAII ctor/dtor machinery:
+
+```c
+Point p = Point(1, 2);        // ✅ ctor runs in place; ~Point() at scope exit
+Point* h = new Point(1, 2);   // ✅ heap (unchanged)
+```
+
+`auto x = List<int>();` (a generic instance as a *value* expression) is still
+constructed with `new`.
 
 ---
 
-## What to do today
+## Still open
 
-* **Put classes in collections by pointer:** `List<MyClass*>`, `Set<MyClass*>`,
-  created with `new`; free the objects yourself (the container frees only its
-  own storage). See `examples/classy-collections-class.cy`.
-* **Use value element types** for scalars, `String`, and plain pointers:
-  `List<int>`, `List<String>`, `Set<String>`, `List<char*>`.
-* For content-identity of objects in a `Set`, key on a stable scalar/`String`
-  field rather than the object pointer.
-
-## A future "by-value class elements" project
-
-To make `List<MyClass>` / `Set<MyClass>` real, in rough order:
-
-1. **Fix the class aggregate calling convention** so `class P` passes/returns by
-   value like `struct P` (the `undeclared reg` bug). This alone unlocks
-   `Set<MyClass>` (it needs neither `==` nor for-in).
-2. **Add byte-wise `==` / `!=` for class/struct values** (with the usual padding
-   caveat) so `list.h`'s search/equality methods specialize.
-3. **Allow aggregate element types in `for-in`** (block-copy the element into the
-   loop variable's stack slot) — also fixes for-in over arrays of structs.
-4. *(optional)* Parse value-construction (`List<int>()`, `Point(1,2)`).
+* **`Set<MyClass>` / `Map<K, MyClass>` by value:** the ABI, `==`, and for-in
+  fixes apply, but `set.h` / `map.h` were not updated to call `__destroy` on
+  their elements, so a by-value class `Set`/`Map` would leak element-owned
+  resources on delete. Add the same `__destroy` loop to their destructors to
+  finish this.
+* **`==` padding caveat:** consider a member-wise compare (or requiring an
+  `equals` protocol method) for classes with padding or pointer members where
+  byte equality is not the intended semantics.
 
 ---
 
@@ -340,12 +344,10 @@ To make `List<MyClass>` / `Set<MyClass>` real, in rough order:
 |------|-------|
 | Generic template registry / instantiation | `get_or_create_specialization` |
 | Template deep-copy + pointer-arg fixup     | `specialize_node` (N_TYPE fixup) |
-| Multi-param self-reference placeholder      | `specialize_node` (`__generic_<Orig>_<P0>_<P1>...` resolver) |
-| Generic name mangling (all args)            | `mangle_generic_name` |
-| Type → MIR type (aggregates → `MIR_T_UNDEF`)| `get_mir_type` |
-| Subscript `coll[i]` read (check / gen)      | `check` N_IND / `gen` N_IND (keyed key-type check in `check`) |
-| Subscript `coll[i] = v` write               | `gen` N_ASSIGN (keyed `Set(K,V)`) |
-| `for-in` (check / gen)                       | `check` N_FORIN / `gen` N_FORIN (`map_proto` KeyAt/ValAt branch) |
-| Aggregate calling convention helpers        | proto/arg/return `simple_*` / `target_*` helpers |
+| Multi-param self-reference placeholder      ≈ L4646 (N_TYPE fixup ≈ L4731) |
+| Type → MIR type (aggregates → `MIR_T_UNDEF`)| `get_mir_type` ≈ L16392 |
+| Subscript `coll[i]` read (check / gen)      | `check` N_IND ≈ L13250 / `gen` N_IND ≈ L20165 |
+| Subscript `coll[i] = v` write               | `gen` N_ASSIGN ≈ L19913 |
+| `for-in` (check / gen)                       | `check` N_FORIN ≈ L13632 / `gen` N_FORIN ≈ L21950 |
+| Aggregate calling convention helpers        | ≈ L17236–L17351 |
 | `Set<T>` hash/eq dispatch                    | `include/set.h` (`SET_HASH` / `SET_EQ`) |
-| `Map<K,V>` hash/eq dispatch + keyed protocol | `include/map.h` (`MAP_HASH` / `MAP_EQ`, `KeyAt`/`ValAt`) |
