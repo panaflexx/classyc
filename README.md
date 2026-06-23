@@ -540,6 +540,7 @@ Look in the `examples/` directory:
 | `classy-exceptions.cy`     | `try`/`catch`/`throw` (opt-in via `-fexceptions`) |
 | `classy-safety.cy`         | JIT safety guards: null-ptr, div-by-zero, array/slice OOB (auto-emitted with `-fexceptions`) |
 | `classy-fetch.cy`          | HTTP/HTTPS client (`include/httpclient.h`): calls the PokéAPI over TLS, headers as a `dict`, `List<String>` |
+| `classy-customers.cy`      | End-to-end typed JSON ingest: `(Customer)? rec` binds each record from `customers.json` into a `Map<int, Customer*>`, then runs 6 database-style queries (lookup, filter, group-by, aggregate, top-K) |
 | `test-customexception.cy`  | User-defined exceptions via `enum { MyErr = 100 }` |
 
 Run them all with:
