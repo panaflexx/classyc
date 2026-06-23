@@ -200,7 +200,18 @@ class Map<K, V> {
         this->init_storage(initialCapacity);
     }
 
+    /* Destroy each live key and value, then release the backing buffers.
+     *
+     * __destroy(x) is a compiler intrinsic: for a by-value class element type
+     * with a destructor it runs that destructor on x; for scalars, String, and
+     * pointer element types it expands to nothing.  This is what makes
+     * `delete map` (or a Map on a `defer delete`) reclaim its by-value class
+     * keys/values — owned storage dies with the owner. */
     ~Map() {
+        for (int i = 0; i < this->count; i++) {
+            __destroy(this->keys[i]);
+            __destroy(this->vals[i]);
+        }
         if (this->keys)  free((void*)this->keys);
         if (this->vals)  free((void*)this->vals);
         if (this->table) free((void*)this->table);

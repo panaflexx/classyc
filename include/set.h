@@ -164,7 +164,15 @@ class Set<T> {
         this->init_storage(initialCapacity);
     }
 
+    /* Destroy each live element, then release the backing buffers.
+     *
+     * __destroy(x) is a compiler intrinsic: for a by-value class element type
+     * with a destructor it runs that destructor on x; for scalars, String, and
+     * pointer element types it expands to nothing.  This is what makes
+     * `delete set` (or a Set on a `defer delete`) reclaim its by-value class
+     * elements — owned storage dies with the owner. */
     ~Set() {
+        for (int i = 0; i < this->count; i++) __destroy(this->dense[i]);
         if (this->dense) free((void*)this->dense);
         if (this->table) free((void*)this->table);
     }

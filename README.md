@@ -482,9 +482,9 @@ Contributions, bug reports, and wild ideas are welcome!
 
 ### What doesn't work / current limitations
 - Single inheritance (`extends` / `super` / `virtual` methods). Use `interface` + `impl` + `Any<I>` (structural typing) instead — this combination covers all observed use-cases in ~8600 lines of examples.
-- Class instances stored **by value** inside `List<T>`, `Set<T>`, or `Map<K,V>`. Only scalars, `String`, raw pointers, and `MyClass*` are supported. (See `GENERICSMEM.md` for rationale.)
+- Class instances stored **by value** inside `List<T>`, `Set<T>`, and `Map<K,V>` are supported: elements (and `Map` keys/values) live inline and the collection runs each element's destructor on `delete`. Scalars, `String`, raw pointers, and `MyClass*` work as before — for pointer elements the collection owns only the pointers, not the pointed-to objects. (See `GENERICSMEM.md` for details.)
 - `dict` arrays: JSON parsing builds them and `d.arr[i]` reads elements, but **array-literal assignment** (`d.tags = [..]`) is unimplemented and `for-in` does **not** iterate a dict array value (index by position instead).
-- Stack class instances with constructor arguments (`Wizard w = Wizard(..)`) aren't supported — classes are reference types; use `new`.
+- Stack value-construction works for plain classes: `Point p = Point(1, 2);` runs the constructor in place and `~Point()` at scope exit. It is the **generic collections** (`List<T>` / `Set<T>` / `Map<K,V>`) that are reference types only — instantiate them with `new` (a bare `Map<K,V> m = ...` value expression does not parse).
 - Exception names are resolved only at compile time. Runtime stores integer IDs only; there is no symbolic pretty-printing or `nameof`-style reflection for exceptions.
 - No built-in "key not found" exception type for `dict`/`Map` subscript (users can define their own via `enum { MyKeyError = 100 }` and `throw`/`catch` it manually).
 - `List<T>.sort` / `Set<T>` and a few other methods have minor edge-case limitations documented in the headers.
