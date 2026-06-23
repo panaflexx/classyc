@@ -323,15 +323,42 @@ Point* h = new Point(1, 2);   // ✅ heap (unchanged)
 `auto x = List<int>();` (a generic instance as a *value* expression) is still
 constructed with `new`.
 
+### Element destruction in `Set<T>` and `Map<K, V>` (done)
+
+The `__destroy` loop now lives in **all three** standard collections, so
+by-value class elements are reclaimed when the owning collection is deleted:
+
+```c
+~Set() {
+    for (int i = 0; i < this->count; i++) __destroy(this->dense[i]);
+    /* ... free buffers ... */
+}
+
+~Map() {
+    for (int i = 0; i < this->count; i++) {
+        __destroy(this->keys[i]);   // by-value class keys
+        __destroy(this->vals[i]);   // by-value class values
+    }
+    /* ... free buffers ... */
+}
+```
+
+`Map` destroys **both** keys and values (each `__destroy` is a no-op for
+scalar / `String` / pointer types, so `Map<String, int>` etc. are unchanged).
+For pointer elements the collection still owns only the pointers, not the
+pointed-to objects. Covered by `cy-validate/val-015-collection-byval-dtor.cy`
+(`Set<Tag>`, `Map<int, Item>` values, and `Map<Key, int>` keys).
+
+Note there is no *stack* form of a generic collection to clean up at scope exit:
+`List`/`Set`/`Map` are reference types instantiated only with `new` (a bare
+`Map<K, V> m = ...` value expression does not parse), so ownership cleanup always
+runs through the heap `delete` path. (Plain non-generic classes *do* support
+stack value-construction with `~T()` at scope exit — see above.)
+
 ---
 
 ## Still open
 
-* **`Set<MyClass>` / `Map<K, MyClass>` by value:** the ABI, `==`, and for-in
-  fixes apply, but `set.h` / `map.h` were not updated to call `__destroy` on
-  their elements, so a by-value class `Set`/`Map` would leak element-owned
-  resources on delete. Add the same `__destroy` loop to their destructors to
-  finish this.
 * **`==` padding caveat:** consider a member-wise compare (or requiring an
   `equals` protocol method) for classes with padding or pointer members where
   byte equality is not the intended semantics.
@@ -351,3 +378,4 @@ constructed with `new`.
 | `for-in` (check / gen)                       | `check` N_FORIN ≈ L13632 / `gen` N_FORIN ≈ L21950 |
 | Aggregate calling convention helpers        | ≈ L17236–L17351 |
 | `Set<T>` hash/eq dispatch                    | `include/set.h` (`SET_HASH` / `SET_EQ`) |
+| By-value element destruction (`__destroy`)   | `~List` / `~Set` / `~Map` in `include/{list,set,map}.h` |
