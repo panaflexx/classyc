@@ -689,6 +689,19 @@ typedef enum {
   N_NEW,    /* new ClassName(args) — heap allocation + constructor call */
   N_DEFER,  /* defer <stmt> — run statement at enclosing scope exit (LIFO) */
   N_DELETE, /* delete <ptr> — run destructor (if any) then free the heap object */
+  N_DETACH, /* detach <expr>  — remove the value from the current scope's arena
+               tracking set (String or object handle); returns the same value,
+               now caller-owned.  Pairs with `defer` as its inverse on the
+               scope's cleanup ledger.  Falls through unchanged for values that
+               aren't tracked (literals, raw pointers, integers, etc.). */
+  N_ATTACH, /* attach <expr>;  — adopt an externally-owned value into the
+               current scope's arena.  STUB for now: parses and type-checks but
+               emits no runtime call (reserved for the future dataflow /
+               ownership-check pass).  Mirrors `detach` as the opposite ledger op. */
+  N_UNOWNED, /* unowned <decl>  — wrap a declaration to opt out of any future
+                automatic scope-bound cleanup.  Parses and is recorded in the
+                AST so users can start writing it now; no semantic effect until
+                auto-`defer delete` lands.  Wraps the inner declaration list. */
   N_LAMBDA, /* (params) => body — anonymous function (future: untyped/generic lambdas) */
   N_INTERFACE, /* interface Name { sig; ... } — named structural method-set contract */
   N_ANY,    /* any<I>(expr) — wrap a concrete C* as an erased Any<I>* handle */
@@ -5519,6 +5532,35 @@ D (assign_expr) {
   pos_t pos;
   node_code_t code;
 
+  /* detach <expr>  — arena escape.  Soft keyword: only treated specially when
+     followed by a parseable assign_expr.  Binds at assign_expr level so the
+     keyword wraps the whole RHS:
+         return detach (String)"x#" + i;
+     parses as `return detach((String)"x#" + i);`, not
+     `return (detach (String)"x#") + i;`.  `detach` itself stays usable as an
+     ordinary identifier elsewhere via the C_SOFT / rollback mechanism. */
+  if (C_SOFT ("detach")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t dpos = curr_token->pos;
+    node_t inner;
+    M_SOFT ("detach");
+    /* Guard against ordinary-identifier uses: `detach;`, `detach,`, `detach=`,
+       `detach.x`, `detach[i]`, `detach)`.  We DO accept `detach (expr)` and
+       `detach (Type)expr` because `(` here starts a parenthesised expression
+       or a cast — both are legitimate operands for the keyword (e.g.
+       `return detach (String)"x#" + i;`).  A user who declared `detach` as an
+       identifier and writes `detach(arg)` will have that re-interpreted as
+       `detach(arg)` the keyword form — acceptable, since `detach` is now a
+       reserved soft keyword for arena escape. */
+    if (!C (';') && !C (',') && !C (')') && !C (']') && !C ('}')
+        && !C ('=') && !C (T_ASSIGN) && !C ('.') && !C ('[')
+        && (inner = TRY (assign_expr)) != err_node) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit */
+      return new_pos_node1 (c2m_ctx, N_DETACH, dpos, inner);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* rewind: `detach` is an ordinary id */
+  }
+
   P (cond_expr);
   if (MC (T_ASSIGN, pos, code) || MC ('=', pos, code)) {
     n = new_pos_node1 (c2m_ctx, code, pos, r);
@@ -5608,6 +5650,39 @@ D (declaration) {
   int typedef_p;
   node_t op, list, decl, spec, r, attrs, asm_part = NULL;
   pos_t pos, last_pos;
+  int unowned_p = FALSE;
+  pos_t unowned_pos = no_pos;
+
+  /* unowned <decl>  — declaration opts out of any future automatic scope-bound
+     cleanup.  Today this is a no-op (manual cleanup is still the default), but
+     we capture it in the AST as N_UNOWNED so the future auto-defer-delete pass
+     can read it.  Soft keyword: rewind if the rest doesn't look like a real
+     declaration, so `int unowned = 5;` and similar uses remain legal. */
+  if (C_SOFT ("unowned")) {
+    size_t mark = record_start (c2m_ctx);
+    unowned_pos = curr_token->pos;
+    M_SOFT ("unowned");
+    /* Heuristic: a declaration after `unowned` must start with something that
+       can begin a type — a type keyword, a class/typedef identifier, or one of
+       the recognized type-builder soft tokens.  Rewind otherwise. */
+    if (curr_token->code == T_INT  || curr_token->code == T_CHAR
+        || curr_token->code == T_DOUBLE || curr_token->code == T_FLOAT
+        || curr_token->code == T_VOID   || curr_token->code == T_STRING
+        || curr_token->code == T_LONG   || curr_token->code == T_SHORT
+        || curr_token->code == T_UNSIGNED || curr_token->code == T_SIGNED
+        || curr_token->code == T_STRUCT || curr_token->code == T_CLASS
+        || curr_token->code == T_UNION  || curr_token->code == T_ENUM
+        || curr_token->code == T_CONST  || curr_token->code == T_VOLATILE
+        || curr_token->code == T_DICT   || curr_token->code == T_BOOL
+        || curr_token->code == T_AUTO
+        /* allow `unowned ClassName x = ...` and `unowned List<T>* x = ...` */
+        || curr_token->code == T_ID) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit */
+      unowned_p = TRUE;
+    } else {
+      record_stop (c2m_ctx, mark, TRUE);  /* rewind: ordinary identifier use */
+    }
+  }
 
   if (C (T_STATIC_ASSERT)) {
     P (st_assert);
@@ -5725,6 +5800,10 @@ D (declaration) {
     r = list;
     PT (';');
   }
+  /* Wrap a committed `unowned` declaration so future passes (auto-defer-delete,
+     ownership-flow analysis) can see the opt-out marker.  Today: pass-through. */
+  if (unowned_p && r != NULL && r != err_node)
+    r = new_pos_node1 (c2m_ctx, N_UNOWNED, unowned_pos, r);
   return r;
 }
 
@@ -6862,6 +6941,23 @@ D (stmt) {
       return new_pos_node2 (c2m_ctx, N_DELETE, dpos, l, op1);
     }
     record_stop (c2m_ctx, mark, TRUE); /* not a delete statement: rewind */
+  }
+  /* attach <expr> ; : adopt the value into the current scope's arena.  STUB
+     for now — the AST node is recorded and the inner expression is evaluated
+     for side effects, but no runtime registration is performed.  Reserved for
+     the future dataflow / ownership-check pass; pairs with `detach` as the
+     inverse op on the cleanup ledger.  Soft keyword (same rollback discipline
+     as `defer`/`delete`). */
+  if (C_SOFT ("attach")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t apos = curr_token->pos;
+    M_SOFT ("attach");
+    if (!C ('=') && !C (';') && (op1 = TRY (assign_expr)) != err_node && C (';')) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit: this is an attach statement */
+      PT (';');
+      return new_pos_node2 (c2m_ctx, N_ATTACH, apos, l, op1);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not an attach statement: rewind */
   }
   if (C ('{')) {
     P (compound_stmt);
@@ -8044,6 +8140,10 @@ struct check_ctx {
   node_t curr_func_def, curr_loop, curr_loop_switch;
   mir_size_t curr_call_arg_area_offset;
   VARR (node_t) * context_stack;
+  /* Set while inside an `unowned <decl>` wrapper so the auto-defer-candidate
+     detection on `N_SPEC_DECL` knows to skip this binding.  Save/restore at
+     N_UNOWNED entry/exit so nested declarations behave correctly. */
+  int in_unowned_p;
   /* Sequence lambda methods (filter/map/reduce): module-level injection points
      for lambda FUNC_DEFs synthesized while checking a call site. */
   node_t module_item_list; /* the module's top-level N_LIST */
@@ -8072,6 +8172,7 @@ struct check_ctx {
 #define module_item_list check_ctx->module_item_list
 #define curr_module_item check_ctx->curr_module_item
 #define curr_lambda_def check_ctx->curr_lambda_def
+#define in_unowned_p check_ctx->in_unowned_p
 
 
 static int supported_alignment_p (mir_llong align MIR_UNUSED) { return TRUE; }  // ???
@@ -8481,6 +8582,15 @@ struct node_scope {
 struct decl {
   /* true if address is taken, reg can be used or is used: */
   unsigned addr_p : 1, reg_p : 1, asm_p : 1, used_p : 1;
+  /* Marked by the check pass when this is a local declaration whose
+     initializer matches a recognized resource-acquire pattern
+     (`new T(...)` today; `malloc`/`fopen`/`strdup`/... when the upcoming
+     ownership pass lands).  The auto-defer-delete *synthesis* is intentionally
+     deferred to that pass — today we only set the bit so the future analyzer
+     has a starting set of candidates without retracing the AST.
+     Cleared whenever the declaration is wrapped in `unowned`.
+     See `src/ownership.c` for the planned state machine. */
+  unsigned auto_defer_p : 1;
   int bit_offset, width; /* for bitfields, -1 bit_offset for non bitfields. */
   mir_size_t offset;     /* var offset in frame or bss */
   /* Extra stack bytes for a class/struct local whose trailing flexible array
@@ -10471,8 +10581,8 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           }
         }
       } else if (left->mode == TM_PTR) {
-        if (null_const_p (expr, right)) {
-        } else if (builtin_string_type_p (right)
+          if (null_const_p (expr, right)) {
+          } else if (builtin_string_type_p (right)
                    && (void_ptr_p (left)
                        || (left->u.ptr_type->mode == TM_BASIC
                            && char_type_p (left->u.ptr_type)))) {
@@ -11952,10 +12062,69 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       decl->bit_offset = -1;
       decl->param_args_start = decl->param_args_num = 0;
       decl->ctor_call = decl->dtor_call = NULL;
+      decl->auto_defer_p = FALSE;
       decl->scope = curr_scope;
       decl->containing_unnamed_anon_struct_union_member = curr_unnamed_anon_struct_union_member;
       decl->u.item = NULL;
       decl->c2m_ctx = c2m_ctx;
+    }
+
+    /* ============================================================
+       Resource-acquire / auto-defer foundation.
+
+       Recognises initializer patterns that hand the binding ownership of a
+       heap resource.  Today only `new T(...)` / `new T{...}` / `new dict(...)`
+       (the language-level acquire forms) are recognised.  The framework is
+       designed to be extended without touching this file: the upcoming
+       ownership pass (see `src/ownership.c`) will register a table of known
+       C-runtime acquire/release pairs — `malloc`/`free`, `strdup`/`free`,
+       `fopen`/`fclose`, `mmap`/`munmap`, etc. — and this predicate will then
+       also return TRUE for `N_CALL` nodes whose callee is in that table.
+       That generalisation is what makes RAII work for plain C11 code, not
+       just code using `new`/`delete`.
+
+       Used at one site: detection of auto-defer-delete candidates in
+       N_SPEC_DECL.  The check pass only *marks* candidates (decl->auto_defer_p);
+       it intentionally does NOT synthesize the `defer delete` itself.  The
+       ownership pass owns the synthesis decision, because the right rule
+       ("defer only if the binding is not later detached, returned, or stored
+       into a longer-lived owner") needs flow analysis the check pass doesn't
+       have. */
+    static int is_resource_acquire (node_t init) {
+      if (init == NULL) return FALSE;
+      /* Peel off a leading C cast — `(char *)malloc(n)` is the universal
+         idiom for typed pointer allocations.  N_CAST is (type, expr), so the
+         expression is operand 1.  Recurse so chained casts also unwrap. */
+      while (init != NULL && init->code == N_CAST)
+        init = NL_EL (init->u.ops, 1);
+      if (init == NULL) return FALSE;
+      /* Language-level acquire: every `new` form (class, brace-init, dict).
+         We deliberately key on the syntactic form, not the type, so that any
+         future generic specialisation of `new T(...)` is recognised the same
+         way as a primitive one. */
+      if (init->code == N_NEW) return TRUE;
+      /* C-runtime acquire: a direct call to one of the known malloc-family
+         functions (or any other acquire registered in the table below).
+         Method-chained results (`new T(...).withX(10)`, or in C terms
+         `wrap(malloc(n))`) are intentionally NOT matched here — a chain may
+         return any pointer, so until the ownership pass propagates return
+         attributes, we stick to a single-call shape. */
+      if (init->code == N_CALL) {
+        node_t callee = NL_HEAD (init->u.ops);
+        if (callee != NULL && callee->code == N_ID && callee->u.s.s != NULL) {
+          const char *fn = callee->u.s.s;
+          /* Keep this table in lockstep with `release_fn_for_acquire` in
+             src/ownership.c — they will be unified into one shared resource
+             table when the seed list grows beyond malloc-family.  See the
+             header comments in src/ownership.c for the planned design. */
+          if (strcmp (fn, "malloc")  == 0) return TRUE;
+          if (strcmp (fn, "calloc")  == 0) return TRUE;
+          if (strcmp (fn, "realloc") == 0) return TRUE;
+          if (strcmp (fn, "strdup")  == 0) return TRUE;
+          if (strcmp (fn, "strndup") == 0) return TRUE;
+        }
+      }
+      return FALSE;
     }
 
     static void create_decl (c2m_ctx_t c2m_ctx, node_t scope, node_t decl_node,
@@ -12588,6 +12757,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         NODE_CASE (ANY)
         NODE_CASE (LAMBDA)
         NODE_CASE (CONCAT)
+        NODE_CASE (DETACH) /* expression: same type as inner operand */
         *expr_attr_p = TRUE;
         break;
         REP8 (NODE_CASE, IF, SWITCH, WHILE, DO, FOR, GOTO, INDIRECT_GOTO, CONTINUE)
@@ -12595,6 +12765,9 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         NODE_CASE (FORIN)
         NODE_CASE (DEFER)
         NODE_CASE (DELETE)
+        NODE_CASE (ATTACH)  /* statement (stub today): like DEFER/DELETE */
+        NODE_CASE (UNOWNED) /* declaration wrapper; treated as a statement-like
+                               container so the inner SPEC_DECL list runs */
         NODE_CASE (TRY)
         NODE_CASE (CATCH)
         NODE_CASE (THROW)
@@ -15576,6 +15749,35 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
                      || decl->decl_spec.type->mode == TM_UNION)) {
         VARR_PUSH (node_t, possible_incomplete_decls, r);
       }
+
+      /* --- Auto-defer candidate detection ---------------------------------
+         Mark a local declaration as a candidate for automatic scope-bound
+         cleanup when its initializer matches a resource-acquire pattern and
+         the user has not opted out via `unowned`.  This sets only a flag on
+         the decl; the actual `defer delete` synthesis is deferred to the
+         upcoming ownership pass (see `src/ownership.c`).
+
+         Eligibility (intentionally conservative; the ownership pass will
+         refine each criterion as it gains flow information):
+           - not under `unowned <decl>`
+           - local scope (not top-level / global)
+           - not typedef / extern / static / thread-local
+           - simple identifier declarator (N_DECL with an N_ID)
+           - initializer matches `is_resource_acquire` (today: `N_NEW`)
+           - resulting type is a deletable category (TM_PTR or TM_DICT) */
+      if (!in_unowned_p
+          && initializer != NULL && initializer->code != N_IGNORE
+          && declarator->code == N_DECL
+          && decl->scope != top_scope
+          && !decl->decl_spec.typedef_p && !decl->decl_spec.extern_p
+          && !decl->decl_spec.static_p && !decl->decl_spec.thread_local_p
+          && (decl->decl_spec.type->mode == TM_PTR
+              || decl->decl_spec.type->mode == TM_DICT)
+          && is_resource_acquire (initializer)) {
+        node_t spec_id = NL_HEAD (declarator->u.ops);
+        if (spec_id != NULL && spec_id->code == N_ID)
+          decl->auto_defer_p = TRUE;
+      }
     } else if (decl_spec.type->mode == TM_STRUCT || decl_spec.type->mode == TM_UNION ||
            decl_spec.type->mode == TM_CLASS) {
       if (NL_HEAD (decl_spec.type->u.tag_type->u.ops)->code != N_ID)
@@ -16371,6 +16573,93 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         }
       }
     }
+    break;
+  }
+  case N_DETACH: {
+    /* detach <expr>: the value is removed from the current scope's arena
+       tracking set (String registry or object registry).  Result type is the
+       inner expression's type — detach is a pass-through at the value level;
+       only its side effect (the runtime un-track call) matters.
+
+       N_DETACH classifies as an expression (see classify_node), so the check
+       function's tail relies on the outer-scope `e` being non-NULL to skip
+       the "error recovery: default to TP_INT" path.  Assign to the function-
+       level `e` here (NOT a shadowing local) so that path is correctly
+       suppressed when our type setup succeeds.
+
+       We also store a runtime selector on r->attr's `def_node` slot via a
+       sentinel pointer cast: but since `attr` is shared with the struct expr,
+       we keep the runtime selector in `e->def_node` instead, which is
+       otherwise unused for non-identifier expressions:
+           e->def_node == (node_t)1 — string detach   (c2m_str_detach)
+           e->def_node == (node_t)2 — object detach   (c2m_obj_detach)
+           e->def_node == NULL    — no runtime call (untracked / scalar) */
+    node_t inner = NL_HEAD (r->u.ops);
+    struct expr *ie;
+    struct type *it;
+
+    check (c2m_ctx, inner, r);
+    ie = inner->attr;
+    if (ie == NULL || ie->type == NULL) {
+      /* Inner expression failed to type-check; degrade gracefully and let
+         the trailing fallback path stamp an int-typed error expr. */
+      break;
+    }
+    it = ie->type;
+    /* IMPORTANT: assign to the OUTER `e` declared at the top of check(),
+       not a new local.  The trailing tail-block at the bottom of check()
+       checks `if (e != NULL)` to decide whether to run adjust_type /
+       set_type_layout / const-folding; if we shadowed with a local, it
+       would treat the N_DETACH as an error-recovery case and replace our
+       expr struct with a default TP_INT one (silent type corruption). */
+    e = create_expr (c2m_ctx, r);
+    /* Share the inner's type pointer so every type subfield — ptr_type,
+       func_type, tag_type, type_qual, basic_type — is preserved verbatim. */
+    e->type = it;
+    /* Classify which detach runtime applies, if any. */
+    if (builtin_string_type_p (it)
+        || (it->mode == TM_ARR && it->pos_node != NULL && it->pos_node->code == N_STR)) {
+      e->def_node = (node_t) (intptr_t) 1; /* string detach */
+    } else if (it->mode == TM_PTR) {
+      e->def_node = (node_t) (intptr_t) 2; /* object detach */
+    } else if (it->mode == TM_BASIC || it->mode == TM_STRUCT
+               || it->mode == TM_UNION || it->mode == TM_CLASS) {
+      /* Detaching a non-tracked value is allowed (no-op) but worth flagging
+         so users catch silly mistakes like `return detach 42;`.  Demoted to
+         a soft warning so generic-template code that may instantiate detach
+         on a scalar T still compiles. */
+      warning (c2m_ctx, POS (r),
+               "`detach` on a non-arena-tracked value is a no-op (only "
+               "`String` and pointer-to-class values are arena-managed)");
+      e->def_node = NULL;
+    } else {
+      e->def_node = NULL;
+    }
+    break;
+  }
+  case N_ATTACH: {
+    /* attach <expr>;  — stub statement.  We check the inner expression so any
+       errors surface (e.g. unknown identifier) but emit no runtime call at gen
+       time.  Reserved for the future ownership / dataflow pass. */
+    node_t labels = NL_HEAD (r->u.ops);
+    node_t expr = NL_NEXT (labels);
+
+    check_labels (c2m_ctx, labels, r);
+    check (c2m_ctx, expr, r);
+    /* No semantic effect today; keep the AST node so future passes can use it. */
+    break;
+  }
+  case N_UNOWNED: {
+    /* unowned <decl> — pure wrapper.  Recurse into the inner declaration so it
+       gets type-checked normally; while recursing, raise `in_unowned_p` so the
+       auto-defer-candidate detection in N_SPEC_DECL knows to *skip* these
+       bindings (the user is taking manual responsibility).  The opt-out marker
+       is preserved in the AST for the upcoming ownership pass to consult. */
+    node_t inner = NL_HEAD (r->u.ops);
+    int saved_unowned = in_unowned_p;
+    in_unowned_p = TRUE;
+    if (inner != NULL) check (c2m_ctx, inner, r);
+    in_unowned_p = saved_unowned;
     break;
   }
   case N_INTERFACE:
@@ -23728,6 +24017,55 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     }
     break;
   }
+  case N_DETACH: {
+    /* detach <expr>: evaluate the inner expression, remove the resulting
+       pointer/String from the current scope's arena tracking set, and yield
+       the same value.  The check pass stored a runtime selector on the expr
+       struct's def_node slot:
+           (node_t)1 — string detach   (c2m_str_detach)
+           (node_t)2 — object detach   (c2m_obj_detach)
+           NULL     — no runtime call (untracked or scalar value)
+       For all three cases the result value equals the inner value (both
+       runtime functions return their argument; the untracked case is a pure
+       pass-through). */
+    node_t inner = NL_HEAD (r->u.ops);
+    struct expr *de = (struct expr *) r->attr;
+    intptr_t kind = de != NULL ? (intptr_t) de->def_node : 0;
+    MIR_op_t arg;
+
+    op1 = gen (c2m_ctx, inner, NULL, NULL, TRUE, NULL, NULL);
+    op1 = force_val (c2m_ctx, op1, FALSE);
+    op1 = force_reg (c2m_ctx, op1, MIR_T_I64);
+    arg = op1.mir_op;
+    if (kind == 1) {
+      /* c2m_str_detach(s) — returns the same pointer, now untracked. */
+      res = gen_string_call (c2m_ctx, SM_DETACH, &arg, 1);
+    } else if (kind == 2) {
+      /* c2m_obj_detach(p) — result equals the argument; we ignore the call's
+         return value and reuse op1 directly so callers see the same MIR op. */
+      gen_obj_detach (c2m_ctx, arg);
+      res = op1;
+    } else {
+      /* No-op: not arena-tracked.  Just yield the inner value. */
+      res = op1;
+    }
+    break;
+  }
+  case N_ATTACH:
+    /* attach <expr>;  — stub.  Generate the inner expression for side effects
+       only (e.g. to surface evaluation errors at runtime), then drop the
+       result.  No runtime tracking call is emitted yet; this is reserved for
+       a future ownership-flow pass. */
+    assert (false_label == NULL && true_label == NULL);
+    emit_label (c2m_ctx, r);
+    top_gen (c2m_ctx, NL_EL (r->u.ops, 1), NULL, NULL, NULL);
+    break;
+  case N_UNOWNED:
+    /* unowned <decl>  — pure wrapper.  Recurse into the inner declaration list
+       (an N_LIST of N_SPEC_DECL nodes); the opt-out marker is preserved in the
+       AST for future passes but has no codegen effect today. */
+    (void) gen (c2m_ctx, NL_HEAD (r->u.ops), true_label, false_label, FALSE, NULL, NULL);
+    break;
   case N_CONCAT: {
     /* String `+` concatenation.  Each operand is lowered to a char* (string
        operands directly, basic arithmetic operands auto-cast via the
@@ -24476,6 +24814,12 @@ static void dbinfo_walk_stmt (c2m_ctx_t c2m_ctx, MIR_module_t mod, MIR_func_t fu
   case N_DEFER: /* labels, stmt */
     dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 1));
     break;
+  case N_ATTACH: /* labels, expr — stub statement, walk inner for line info */
+    dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 1));
+    break;
+  case N_UNOWNED: /* wrapper around an inner declaration list */
+    dbinfo_walk_stmt (c2m_ctx, mod, func, NL_HEAD (n->u.ops));
+    break;
   case N_TRY: { /* labels, body_block, catch_list */
     dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 1)); /* try-body block */
     node_t catch_list = NL_EL (n->u.ops, 2);
@@ -24577,6 +24921,8 @@ static const char *get_node_name (node_code_t code) {
     REP7 (C, MODULE, ASM, ATTR, CLASS, STRING, CONCAT, DICT);
     C (IN); C (FORIN); C (NEW); C (DEFER); C (DELETE); C (LAMBDA); C (INTERFACE); C (ANY);
     C (TRY); C (CATCH); C (THROW);
+    /* Arena-ownership keywords (see Memory Management in README). */
+    C (DETACH); C (ATTACH); C (UNOWNED);
   default: abort ();
   }
 #undef C
@@ -24863,6 +25209,9 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_RETURN:
   case N_DEFER:
   case N_DELETE:
+  case N_DETACH:
+  case N_ATTACH:
+  case N_UNOWNED:
   case N_TRY:
   case N_CATCH:
   case N_THROW:
@@ -25172,12 +25521,19 @@ static const char *get_module_name (c2m_ctx_t c2m_ctx) {
 
 static int top_level_getc (c2m_ctx_t c2m_ctx) { return c_getc (c_getc_data); }
 
+/* Ownership / lifetime pass.  Single-TU build model: this file's body is
+   pulled in here so it has visibility into all of classyc.c's internal
+   types (c2m_ctx_t, node_t, decl_t, the N_* enum, traversal macros, etc.).
+   Must come AFTER the definitions it depends on (struct decl, struct
+   c2mir_options) and BEFORE c2mir_compile, which calls ownership_run. */
+#include "ownership.c"
+
 int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func) (void *),
                    void *getc_data, const char *source_name, FILE *output_file) {
   struct c2m_ctx *c2m_ctx = *c2m_ctx_loc (ctx);
   double start_time = real_usec_time ();
   double prev_time = start_time; /* advanced per stage by stage_time() */
-  double t_init = 0, t_pre = 0, t_parse = 0, t_check = 0, t_gen = 0;
+  double t_init = 0, t_pre = 0, t_parse = 0, t_check = 0, t_ownership = 0, t_gen = 0;
   node_t r;
   unsigned n_error_before;
   MIR_module_t m;
@@ -25229,6 +25585,20 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
         if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_file, r, 0, TRUE);
       } else {
         if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_file, r, 0, TRUE);
+        /* Ownership pass: runs between check and gen.  Today: observation
+           only — walks the AST, counts auto-defer candidates, and (under
+           -v) prints them.  Future: synthesizes `defer delete` for owned
+           bindings and emits leak / UAF / double-free diagnostics.  See
+           src/ownership.c for the planned state machine. */
+        n_error_before = n_errors;
+        ownership_run (c2m_ctx, r);
+        t_ownership = stage_time (&prev_time);
+        if (n_errors > n_error_before) {
+          if (c2m_options->verbose_p && c2m_options->message_file != NULL)
+            fprintf (c2m_options->message_file, "ownership - FAIL\n");
+          /* Fall through to gen_mir anyway today; once the pass emits real
+             errors we'll guard gen the same way `check` is guarded above. */
+        }
         m = MIR_new_module (ctx, get_module_name (c2m_ctx));
         gen_mir (c2m_ctx, r);
         if ((c2m_options->asm_p || c2m_options->object_p) && n_errors == 0) {
@@ -25261,11 +25631,11 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
     /* One-line per-stage timing summary (skipped stages read 0). */
     FILE *f = c2m_options->message_file;
     int color = log_color_enabled (f);
-    const char *names[] = {"init", "preprocess", "parse", "check", "generate", "total"};
-    double vals[] = {t_init, t_pre, t_parse, t_check, t_gen, real_usec_time () - start_time};
+    const char *names[] = {"init", "preprocess", "parse", "check", "ownership", "generate", "total"};
+    double vals[] = {t_init, t_pre, t_parse, t_check, t_ownership, t_gen, real_usec_time () - start_time};
 
     fprintf (f, "  %stimings (usec):%s", log_c (color, LOG_BOLD), log_c (color, LOG_RESET));
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 7; i++)
       fprintf (f, " %s%s%s=%s%.0f%s", log_c (color, LOG_CYAN), names[i], log_c (color, LOG_RESET),
                log_c (color, LOG_BOLD), vals[i], log_c (color, LOG_RESET));
     fprintf (f, "\n");
