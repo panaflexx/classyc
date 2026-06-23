@@ -122,6 +122,8 @@ class Map<K, V> {
     int* table;
     int  table_cap;   /* always a power of two */
     int  used;        /* live + tombstones */
+    int  _owns_keys;  /* 1 = delete pointer keys on dtor */
+    int  _owns_vals;  /* 1 = delete pointer values on dtor */
 
     /* ───────────────────── Internal helpers ───────────────────── */
 
@@ -182,6 +184,8 @@ class Map<K, V> {
         this->capacity = cap > 4 ? cap : 4;
         this->keys     = (K*)malloc(sizeof(K) * this->capacity);
         this->vals     = (V*)malloc(sizeof(V) * this->capacity);
+        this->_owns_keys = 0;
+        this->_owns_vals = 0;
 
         this->table_cap = 16;
         while (this->table_cap < this->capacity * 2) this->table_cap *= 2;
@@ -206,11 +210,17 @@ class Map<K, V> {
      * with a destructor it runs that destructor on x; for scalars, String, and
      * pointer element types it expands to nothing.  This is what makes
      * `delete map` (or a Map on a `defer delete`) reclaim its by-value class
-     * keys/values — owned storage dies with the owner. */
+     * keys/values — owned storage dies with the owner.
+     *
+     * is_pointer<K>() / is_pointer<V>() are compiler intrinsics returning 1 for
+     * pointer types. Combined with the _owns_keys / _owns_vals flags (set via
+     * ownsValues() / ownsKeys()), this deletes owned pointer keys/values too. */
     ~Map() {
         for (int i = 0; i < this->count; i++) {
-            __destroy(this->keys[i]);
-            __destroy(this->vals[i]);
+            if (this->_owns_keys && is_pointer<K>()) delete this->keys[i];
+            else                                     __destroy(this->keys[i]);
+            if (this->_owns_vals && is_pointer<V>()) delete this->vals[i];
+            else                                     __destroy(this->vals[i]);
         }
         if (this->keys)  free((void*)this->keys);
         if (this->vals)  free((void*)this->vals);
@@ -222,6 +232,28 @@ class Map<K, V> {
     int Count()    const { return this->count; }
     int Capacity() const { return this->capacity; }
     int IsEmpty()  const { return this->count == 0; }
+
+    /* ownsValues(): mark this map as owner of its pointer values.
+     * Usage: Map<String, Track*>* m = new Map<String, Track*>().ownsValues();
+     * When the map is deleted, it also deletes each V* value. Returns this. */
+    Map<K, V>* ownsValues() {
+        this->_owns_vals = 1;
+        return this;
+    }
+
+    /* ownsKeys(): mark this map as owner of its pointer keys (rare; keys are
+     * usually String/int). When deleted, it also deletes each K* key. Returns this. */
+    Map<K, V>* ownsKeys() {
+        this->_owns_keys = 1;
+        return this;
+    }
+
+    /* owns(): own both keys and values. Returns this. */
+    Map<K, V>* owns() {
+        this->_owns_keys = 1;
+        this->_owns_vals = 1;
+        return this;
+    }
 
     int Contains(K key) const { return this->find_index(key) >= 0 ? 1 : 0; }
 
@@ -325,6 +357,7 @@ class Map<K, V> {
         for (int i = 0; i < this->count; i++)
             action(this->keys[i], this->vals[i]);
     }
+
 };
 
 #endif /* CLASSYC_MAP_H */

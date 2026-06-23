@@ -4718,6 +4718,31 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
     return build_id (c2m_ctx, s, POS (n));
   }
 
+  /* is_pointer<T>() intrinsic: substitute the type parameter PRESERVING pointer
+     wrapping (unlike the declarator path above, which unwraps N_POINTER and
+     re-adds the level elsewhere).  is_pointer needs the full type to decide
+     whether T resolved to a pointer, so we copy the matching arg verbatim. */
+  if (n->code == N_CALL) {
+    node_t callee = NL_HEAD (n->u.ops);
+    if (callee != NULL && callee->code == N_ID && callee->u.s.s != NULL
+        && strcmp (callee->u.s.s, "is_pointer") == 0) {
+      node_t tlist = NL_NEXT (callee);
+      node_t targ = (tlist != NULL) ? NL_HEAD (tlist->u.ops) : NULL;
+      if (targ != NULL && targ->code == N_ID) {
+        for (int i = 0; i < n_params; i++) {
+          if (params[i] != NULL && strcmp (targ->u.s.s, params[i]) == 0) {
+            /* Deep-copy the full type arg (keeps N_POINTER wrapping intact). */
+            node_t arg_copy = copy_node (c2m_ctx, args[i]);
+            node_t new_tlist = new_node1 (c2m_ctx, N_LIST, arg_copy);
+            node_t new_alist = new_node (c2m_ctx, N_LIST);
+            node_t new_id = build_id (c2m_ctx, "is_pointer", POS (callee));
+            return new_pos_node3 (c2m_ctx, N_CALL, POS (n), new_id, new_tlist, new_alist);
+          }
+        }
+      }
+    }
+  }
+
   /* Allocate a new node of the same kind */
   node_t cp = new_node (c2m_ctx, n->code);
   set_node_pos (c2m_ctx, cp, POS (n));
@@ -5086,6 +5111,31 @@ D (primary_expr) {
     node_t lr = TRY (lambda_expr);
     if (lr != err_node) return lr;
     /* Not a lambda — token stream rewound, fall through to normal handling */
+  }
+
+  /* is_pointer<T>(): compiler intrinsic. Parse the type argument list specially
+     so the '<' '>' are not treated as comparison operators. Builds an N_CALL with
+     children [is_pointer_id, N_LIST(type_arg), N_LIST(empty)] which check() rewrites
+     to an integer literal based on whether T resolves to a pointer type. */
+  if (C (T_ID) && curr_token->repr != NULL && strcmp (curr_token->repr, "is_pointer") == 0) {
+    size_t ip_mark = record_start (c2m_ctx);
+    node_t ip_id;
+    pos_t ip_pos = curr_token->pos;
+    MN (T_ID, ip_id);
+    if (C (T_CMP) && curr_token->node_code == N_LT) {
+      M (T_CMP); /* consume '<' */
+      node_t targ = parse_generic_type_arg (c2m_ctx);
+      if (targ != NULL && C (T_CMP) && curr_token->node_code == N_GT) {
+        M (T_CMP); /* consume '>' */
+        if (M ('(') && M (')')) {
+          record_stop (c2m_ctx, ip_mark, FALSE); /* commit */
+          node_t tlist = new_node1 (c2m_ctx, N_LIST, targ);
+          node_t alist = new_node (c2m_ctx, N_LIST);
+          return new_pos_node3 (c2m_ctx, N_CALL, ip_pos, ip_id, tlist, alist);
+        }
+      }
+    }
+    record_stop (c2m_ctx, ip_mark, TRUE); /* not is_pointer<T>(): rewind */
   }
 
   /* Shorthand untyped lambda:  x => body  (single parameter, no parens).
@@ -14652,6 +14702,47 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         int json_p = FALSE;
 
         op1 = NL_HEAD(r->u.ops);
+        /* is_pointer<T>: compiler intrinsic that returns 1 if T is a pointer type,
+           0 otherwise. Used by generic collection destructors to conditionally
+           delete pointer elements when the collection owns them.
+           Syntax: is_pointer<TypeArg>()
+           Rewritten during check phase to an integer literal (1 or 0) based on the
+           resolved type parameter. */
+        if (op1->code == N_ID && strcmp (op1->u.s.s, "is_pointer") == 0) {
+          node_t type_args = NL_NEXT (op1);
+          if (type_args != NULL && type_args->code == N_LIST) {
+            node_t type_arg = NL_HEAD (type_args->u.ops);
+            node_t call_args = NL_NEXT (type_args);
+            if (type_arg != NULL && NL_NEXT (type_arg) == NULL
+                && call_args != NULL && NL_HEAD (call_args->u.ops) == NULL) {
+              /* Check if type_arg represents a pointer type.
+                 For type arguments, if it's a N_POINTER node or ends with *, it's a pointer.
+                 For template parameters that have been resolved, check the resolved type. */
+              int is_ptr = 0;
+              if (type_arg->code == N_POINTER) {
+                /* Direct pointer type like int* */
+                is_ptr = 1;
+              } else if (type_arg->code == N_ID) {
+                /* Could be a template parameter T that resolved to a pointer type.
+                   Look up the symbol and check its type. */
+                node_t def = find_def (c2m_ctx, S_REGULAR, type_arg, curr_scope, NULL);
+                if (def != NULL && def->attr != NULL) {
+                  struct expr *e_attr = (struct expr *) def->attr;
+                  if (e_attr->type != NULL && e_attr->type->mode == TM_PTR) {
+                    is_ptr = 1;
+                  }
+                }
+              }
+              /* Replace the entire call expression with an integer literal */
+              node_t lit = new_i_node (c2m_ctx, (long) is_ptr, POS (r));
+              check (c2m_ctx, lit, NULL);
+              *r = *lit;
+              e = r->attr;
+              break;
+            }
+          }
+          /* Malformed is_pointer<...>(...); fall through to error */
+        }
         /* __destroy(x): compiler intrinsic used by generic collection templates to
            run an element's destructor before the backing buffer is freed.  It is
            rewritten here, in place, into either:
@@ -16256,7 +16347,15 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
        freed by dict_destroy() which handles both arena-backed and plain dicts. */
     if (t1->mode == TM_DICT) break;
     if (t1->mode != TM_PTR) {
-      error (c2m_ctx, POS (r), "delete requires a pointer operand (or a dict)");
+      /* Non-pointer delete: in a generic template a statement like
+         `delete this->data[i]` may be instantiated with T = a non-pointer
+         (int, double, by-value class, ...).  Such a delete is only ever reached
+         when guarded by `is_pointer<T>()` (which folds to 0 for non-pointers),
+         so the statement is dead code.  Rather than reject the whole template,
+         mark this N_DELETE as a no-op for gen.  This keeps `delete` polymorphic
+         in generic ownership code while still being a real free for pointers. */
+      r->attr = (void *) (intptr_t) -1; /* sentinel: gen emits nothing */
+      break;
     } else {
       struct type *pt = t1->u.ptr_type;
       if (pt != NULL && pt->mode == TM_CLASS && pt->u.tag_type != NULL) {
@@ -23314,6 +23413,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
        plain dicts uniformly (frees arena in one shot or recurses). */
     node_t expr = NL_EL (r->u.ops, 1);
     node_t dtor_def = (node_t) r->attr; /* resolved in check, NULL if none */
+
+    /* Non-pointer delete (dead code in a generic ownership branch): emit nothing.
+       See the N_DELETE check phase for why this sentinel exists. */
+    if (r->attr == (void *) (intptr_t) -1) break;
 
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);

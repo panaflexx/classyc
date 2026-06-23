@@ -24,50 +24,60 @@
  *   List<String>* lst2 = arr.ToList();
  *
  * Memory: Caller owns heap-allocated List<T> instances. Use `defer delete` for
- * scope-bound cleanup. Slice() and Copy() return new heap allocations that the
- * caller must also free. Filter() similarly returns a new heap list.
- *
- * Thread safety: None. External synchronization required for shared access.
+* scope-bound cleanup. Slice() and Copy() return new heap allocations that the
+* caller must also free. Filter() similarly returns a new heap list.
+*
+* Pointer ownership:
+*   - List<T> (by-value): __destroy auto-runs ~T() on each element
+*   - List<T*>(): non-owning, you must delete each T* manually
+*   - List<T*>::MakeOwning(): owning, auto-deletes each T* on list delete
+*
+* Thread safety: None. External synchronization required for shared access.
  */
 
 #ifndef CLASSYC_LIST_H
 #define CLASSYC_LIST_H
 
 #include <stdlib.h>
+#include <stdbool.h>
 
 class List<T> {
     T*  data;
     int length;
     int capacity;
+    int _owns_ptrs;  /* ownership flag: 1 = delete pointer elements on dtor */
 
     /* ═══════════════════════════ Constructors ═══════════════════════════ */
 
-    /* Default: empty list with initial capacity of 4. */
+    /* Default: empty list with initial capacity of 4. Non-owning. */
     List() {
         this->length   = 0;
         this->capacity = 4;
         this->data     = (T*) malloc(sizeof(T) * this->capacity);
+        this->_owns_ptrs = 0;
     }
 
-    /* Pre-sized: empty list with the given initial capacity.
+    /* Pre-sized: empty list with the given initial capacity. Non-owning.
      * Clamps non-positive values to the default capacity of 4. */
     List(int initialCapacity) {
         this->length   = 0;
         this->capacity = initialCapacity > 0 ? initialCapacity : 4;
         this->data     = (T*) malloc(sizeof(T) * this->capacity);
+        this->_owns_ptrs = 0;
     }
 
-    /* Singleton: list pre-loaded with one element.
+    /* Singleton: list pre-loaded with one element. Non-owning.
      * For T=int, the capacity constructor wins tie-breaking on integer literals. */
     List(T firstItem) {
         this->length   = 0;
         this->capacity = 4;
         this->data     = (T*) malloc(sizeof(T) * this->capacity);
+        this->_owns_ptrs = 0;
         this->data[0]  = firstItem;
         this->length   = 1;
     }
 
-    /* Array view: copy the elements of a plain C array (or slice).
+    /* Array view: copy the elements of a plain C array (or slice). Non-owning.
      * Caller keeps ownership of the source.  This is also the constructor that
      * `arr.ToList()` and `new List<T>(arr)` lower to.  `items` is a bare T*
      * which carries no length of its own, so the element count is recovered via
@@ -78,11 +88,14 @@ class List<T> {
         this->length   = 0;
         this->capacity = n > 0 ? n : 4;
         this->data     = (T*) malloc(sizeof(T) * this->capacity);
+        this->_owns_ptrs = 0;
         for (int i = 0; i < n; i++) {
             this->data[i] = items[i];
             this->length++;
         }
     }
+
+
 
     /* ═══════════════════════════ Destructor ═════════════════════════════════ */
 
@@ -92,9 +105,19 @@ class List<T> {
      * with a destructor it runs that destructor on x; for scalars, String, and
      * pointer element types it expands to nothing.  This is what makes
      * `delete list` (or a List on a `defer delete`) reclaim its by-value class
-     * elements — owned storage dies with the owner. */
+     * elements — owned storage dies with the owner.
+     *
+     * is_pointer<T>() is a compiler intrinsic that returns 1 if T is a pointer
+     * type, 0 otherwise. Combined with the _owns_ptrs flag, this enables automatic
+     * deletion of owned pointer elements. */
     ~List() {
-        for (int i = 0; i < this->length; i++) __destroy(this->data[i]);
+        for (int i = 0; i < this->length; i++) {
+            if (this->_owns_ptrs && is_pointer<T>()) {
+                delete this->data[i];  /* delete owned pointer elements */
+            } else {
+                __destroy(this->data[i]);  /* by-value or non-owned */
+            }
+        }
         if (this->data) free((void*) this->data);
     }
 
@@ -104,6 +127,17 @@ class List<T> {
     int Capacity() { return this->capacity; }
     int IsEmpty()  { return this->length == 0; }
 
+    /* owns(): mark this list as the owner of its pointer elements.
+     * Usage: List<Track*>* lib = new List<Track*>().owns();
+     * When the list is deleted, it will also delete each T* element
+     * (runs the element's destructor, if any, then frees it).
+     * No-op for by-value element lists (List<int>, List<Track>) where
+     * __destroy already handles cleanup. Returns this for chaining. */
+    List<T>* owns() {
+        this->_owns_ptrs = 1;
+        return this;
+    }
+
     /* Indexed access. Caller must ensure 0 <= index < Count(). */
     T Get(int index) { return this->data[index]; }
 
@@ -112,6 +146,8 @@ class List<T> {
     T Last()  { return this->data[this->length - 1]; }
 
     /* ═════════════════════════ Capacity management ══════════════════════ */
+
+    void owns(bool owns) { this->_owns_ptrs = owns; }
 
     /* Ensure capacity >= min. Doubles until satisfied; preserves elements. */
     void EnsureCapacity(int min) {
@@ -299,6 +335,8 @@ class List<T> {
             result->Add(fn(this->data[i]));
         return result;
     }
+
+
 };
 
 #endif /* CLASSYC_LIST_H */

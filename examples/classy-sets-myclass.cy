@@ -96,14 +96,16 @@ class WordBag {
         return this->total == 0 ? 0 : (this->words->Count() * 100) / this->total;
     }
 
-    /* Jaccard similarity vs another bag, as a percentage. */
+    /* Jaccard similarity vs another bag, as a percentage.
+     * `defer delete` co-locates cleanup with allocation, so the temporary sets
+     * are freed on every exit path (including any future early return/throw). */
     int SimilarityPct(WordBag* other) {
         Set<String>* inter = this->words->Intersect(other->Words());
+        defer delete inter;
         Set<String>* uni   = this->words->Union(other->Words());
+        defer delete uni;
         int i = inter->Count();
         int u = uni->Count();
-        delete inter;
-        delete uni;
         return u == 0 ? 0 : (i * 100) / u;
     }
 };

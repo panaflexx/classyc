@@ -97,7 +97,8 @@ List<Term*>* reduce_postings(List<Posting*>* postings) {
         return c != 0 ? c : a->docId - b->docId;
     });
 
-    List<Term*>* index = new List<Term*>();
+    /* This list OWNS the Terms it creates — deleting it runs ~Term() on each. */
+    List<Term*>* index = new List<Term*>().owns();
     Term* cur = NULL;
     for (auto post in postings) {
         if (cur == NULL || strcmp(cur->word, post->term) != 0) {
@@ -150,7 +151,8 @@ List<Hit*>* search(List<Term*>* index, int nDocs, String query) {
         }
     }
 
-    List<Hit*>* hits = new List<Hit*>();
+    /* This list OWNS its Hits — `delete hits` will reclaim them all. */
+    List<Hit*>* hits = new List<Hit*>().owns();
     for (int d = 0; d < nDocs; d++)
         if (tf[d] > 0) hits->Add(new Hit(d, matched[d] * 1000 + tf[d]));
     free(tf);
@@ -176,8 +178,7 @@ void run_query(List<Doc*>* corpus, List<Term*>* index, String query) {
     }
     if (hits->Count() == 0) printf("   (no documents matched)\n");
 
-    for (auto h in hits) delete h;
-    delete hits;
+    delete hits;   /* owning list: frees every Hit, no manual loop */
 }
 
 /* ───────────────────────────────── main ───────────────────────────────── */
@@ -186,7 +187,8 @@ int main() {
     printf("=== ClassyC MapReduce search engine ===\n");
 
     /* ── Corpus ─────────────────────────────────────────────────────────── */
-    List<Doc*>* corpus = new List<Doc*>();
+    /* corpus OWNS its Docs — `delete corpus` runs ~Doc() on each. */
+    List<Doc*>* corpus = new List<Doc*>().owns();
     corpus->Add(new Doc(0, "Rust",
         "Rust is a fast systems programming language focused on memory "
         "safety without a garbage collector."));
@@ -206,7 +208,8 @@ int main() {
     printf("Indexed %d documents.\n", corpus->Count());
 
     /* ── MAP ────────────────────────────────────────────────────────────── */
-    List<Posting*>* postings = new List<Posting*>();
+    /* postings OWNS its Postings — `delete postings` reclaims them all. */
+    List<Posting*>* postings = new List<Posting*>().owns();
     for (auto d in corpus) map_doc(d, postings);
     printf("MAP    emitted %d (term, doc) postings.\n", postings->Count());
 
@@ -227,7 +230,8 @@ int main() {
     printf("\nTerms appearing in >= 4 documents: ");
     for (auto t in common) printf("%s ", t->word);
     printf("\n");
-    delete common;
+    delete common;   /* non-owning view: frees only the container, not the Terms
+                      * (those are owned by `index`) */
 
     /* ── QUERY ──────────────────────────────────────────────────────────── */
     run_query(corpus, index, "fast systems language");
@@ -236,11 +240,11 @@ int main() {
     run_query(corpus, index, "javascript monad");   /* nothing matches */
 
     /* ── Cleanup ────────────────────────────────────────────────────────── */
-    for (auto t in index)  delete t;
+    /* Each owning list reclaims its elements on delete — no manual loops.
+     * (index owns Terms, and each Term's ~Term() deletes its inner docIds
+     *  list; postings owns Postings; corpus owns Docs.) */
     delete index;
-    for (auto p in postings) delete p;
     delete postings;
-    for (auto d in corpus) delete d;
     delete corpus;
 
     printf("\nDone.\n");

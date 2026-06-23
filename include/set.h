@@ -94,6 +94,7 @@ class Set<T> {
     int* table;
     int  table_cap;   /* always a power of two */
     int  used;        /* live + tombstones */
+    int  _owns_ptrs;  /* ownership flag: 1 = delete pointer elements on dtor */
 
     /* ───────────────────── Internal helpers ───────────────────── */
 
@@ -146,6 +147,7 @@ class Set<T> {
         this->count    = 0;
         this->capacity = cap > 4 ? cap : 4;
         this->dense    = (T*)malloc(sizeof(T) * this->capacity);
+        this->_owns_ptrs = 0;
 
         this->table_cap = 16;
         while (this->table_cap < this->capacity * 2) this->table_cap *= 2;
@@ -170,9 +172,19 @@ class Set<T> {
      * with a destructor it runs that destructor on x; for scalars, String, and
      * pointer element types it expands to nothing.  This is what makes
      * `delete set` (or a Set on a `defer delete`) reclaim its by-value class
-     * elements — owned storage dies with the owner. */
+     * elements — owned storage dies with the owner.
+     *
+     * is_pointer<T>() is a compiler intrinsic that returns 1 if T is a pointer
+     * type. Combined with the _owns_ptrs flag (set via owns()), this deletes
+     * owned pointer elements automatically. */
     ~Set() {
-        for (int i = 0; i < this->count; i++) __destroy(this->dense[i]);
+        for (int i = 0; i < this->count; i++) {
+            if (this->_owns_ptrs && is_pointer<T>()) {
+                delete this->dense[i];  /* delete owned pointer elements */
+            } else {
+                __destroy(this->dense[i]);  /* by-value or non-owned */
+            }
+        }
         if (this->dense) free((void*)this->dense);
         if (this->table) free((void*)this->table);
     }
@@ -182,6 +194,14 @@ class Set<T> {
     int  Count()    const { return this->count; }
     int  Capacity() const { return this->capacity; }
     int  IsEmpty()  const { return this->count == 0; }
+
+    /* owns(): mark this set as the owner of its pointer elements.
+     * Usage: Set<Track*>* s = new Set<Track*>().owns();
+     * When the set is deleted, it also deletes each T* element. Returns this. */
+    Set<T>* owns() {
+        this->_owns_ptrs = 1;
+        return this;
+    }
 
     int Contains(T item) const {
         if (this->table_cap == 0) return 0;
@@ -302,6 +322,7 @@ class Set<T> {
             if (pred(this->dense[i])) r->Add(this->dense[i]);
         return r;
     }
+
 };
 
 #endif /* CLASSYC_SET_H */

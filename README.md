@@ -140,6 +140,44 @@ printf("unique tags: %d\n", tags->Count());   // 2
 > current limits on by-value class elements — see
 > **[GENERICSMEM.md](GENERICSMEM.md)**.
 
+#### Ownership: `.owns()` auto-frees pointer elements
+
+A collection of pointers (`List<Track*>`, `Set<Track*>`, `Map<String, Track*>`)
+stores the pointers but, by default, does **not** own the pointed-to objects —
+`delete list` frees the container only. Add `.owns()` to make the collection the
+owner: deleting it then runs each element's destructor and frees it. No manual
+cleanup loop, no leaks.
+
+```c
+// OWNING: the list owns the Tracks; delete frees them all
+auto library = new List<Track*>().owns();
+library->Add(new Track("Kashmir", 508));
+library->Add(new Track("Africa", 295));
+defer delete library;                  // frees the list AND every Track ✅
+
+// NON-OWNING (default): a view that shares another collection's objects
+auto epics = library->Filter((Track* t) => t->seconds > 360);
+defer delete epics;                    // frees the view's container only
+
+// Set and Map have the same protocol:
+auto favs = new Set<Track*>().owns();              // owns its elements
+auto byId = new Map<int, Track*>().ownsValues();   // owns its values
+//        Map also has .ownsKeys() and .owns() (both keys and values)
+```
+
+Rules of thumb:
+- **Exactly one owner per object.** Make the collection that should free the
+  objects `.owns()`; leave every sharing view at the default (non-owning).
+- **Transform results are non-owning.** `Filter`, `Slice`, `Copy`, `Map`,
+  `Union`, `Intersect`, `Difference` return views that share the source's
+  elements — deleting them never double-frees.
+- **By-value elements need nothing.** `List<Track>` (value, not pointer) already
+  destroys its elements automatically via the `__destroy` intrinsic.
+
+This works for any custom collection that follows the same `~Dtor` + element
+loop pattern (it is powered by the `is_pointer<T>` compiler intrinsic and a
+per-collection ownership flag); see `include/list.h`, `set.h`, and `map.h`.
+
 ### Arrays & Slices → `List<T>` (lengths flow into generics)
 A C array or a filter/map slice converts to a heap `List<T>` with `.ToList()`,
 or straight through the constructor. The compiler threads the source's length
@@ -413,7 +451,9 @@ ClassyC manages high-level types with lightweight arenas. The big win: **heap
 - **Dict arena (explicit)** — `new dict(bytes)` is arena-backed; `delete d`
   (or `defer delete d`) frees the whole arena and its contents in one shot.
 - **Collections (explicit)** — `new List<T>` / `Map` / `Set` are heap objects you
-  own; pair them with `defer delete`.
+  own; pair them with `defer delete`. For collections of pointers, add `.owns()`
+  (`.ownsValues()` / `.ownsKeys()` on `Map`) and `delete` will also free the
+  pointed-to objects — see *Element ownership* below.
 
 Typical pattern:
 
@@ -430,8 +470,34 @@ void handle() {
 }
 ```
 
+### Element ownership (`.owns()`)
+
+A pointer collection stores the pointers but, by default, does not own the
+objects they point to — `delete list` frees only the container. Mark it `.owns()`
+to transfer ownership: deleting the collection then runs each element's
+destructor and frees it, with no manual cleanup loop.
+
+```c
+auto library = new List<Track*>().owns();   // owns the Tracks
+library->Add(new Track("Kashmir", 508));
+defer delete library;                       // frees the list AND every Track ✅
+```
+
+- **One owner per object.** Make the owning collection `.owns()`; leave sharing
+  views (and the results of `Filter`/`Slice`/`Copy`/`Union`/… ) at the default
+  non-owning state. Transform results are always non-owning, so they never
+  double-free a shared element.
+- **`Map`** distinguishes value vs. key ownership: `.ownsValues()`,
+  `.ownsKeys()`, or `.owns()` for both.
+- **By-value elements** (`List<Track>`, not `List<Track*>`) are destroyed
+  automatically via the `__destroy` intrinsic — no `.owns()` needed.
+- **Custom collections** get this for free by following the same destructor
+  pattern; it is powered by the `is_pointer<T>` compiler intrinsic plus a
+  per-collection ownership flag (see `include/list.h`, `set.h`, `map.h`).
+
 See `cy-validate/` for executable tests of the String arena (a 200k-allocation
-loop stays bounded) and the object/dict arenas.
+loop stays bounded), the object/dict arenas, and the `.owns()` protocol
+(`val-017-collections-owns.cy`, `val-018-owns-transforms.cy`).
 
 ## AOT Compilation
 
@@ -482,7 +548,7 @@ Contributions, bug reports, and wild ideas are welcome!
 
 ### What doesn't work / current limitations
 - Single inheritance (`extends` / `super` / `virtual` methods). Use `interface` + `impl` + `Any<I>` (structural typing) instead — this combination covers all observed use-cases in ~8600 lines of examples.
-- Class instances stored **by value** inside `List<T>`, `Set<T>`, and `Map<K,V>` are supported: elements (and `Map` keys/values) live inline and the collection runs each element's destructor on `delete`. Scalars, `String`, raw pointers, and `MyClass*` work as before — for pointer elements the collection owns only the pointers, not the pointed-to objects. (See `GENERICSMEM.md` for details.)
+- Class instances stored **by value** inside `List<T>`, `Set<T>`, and `Map<K,V>` are supported: elements (and `Map` keys/values) live inline and the collection runs each element's destructor on `delete`. Scalars, `String`, raw pointers, and `MyClass*` work as before. For **pointer** elements the collection is non-owning by default, but `.owns()` (`.ownsValues()`/`.ownsKeys()` on `Map`) makes `delete` also free the pointed-to objects. (See `GENERICSMEM.md` and the *Element ownership* section above.)
 - `dict` arrays: JSON parsing builds them and `d.arr[i]` reads elements, but **array-literal assignment** (`d.tags = [..]`) is unimplemented and `for-in` does **not** iterate a dict array value (index by position instead).
 - Stack value-construction works for plain classes: `Point p = Point(1, 2);` runs the constructor in place and `~Point()` at scope exit. It is the **generic collections** (`List<T>` / `Set<T>` / `Map<K,V>`) that are reference types only — instantiate them with `new` (a bare `Map<K,V> m = ...` value expression does not parse).
 - Exception names are resolved only at compile time. Runtime stores integer IDs only; there is no symbolic pretty-printing or `nameof`-style reflection for exceptions.

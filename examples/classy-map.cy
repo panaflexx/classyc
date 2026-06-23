@@ -145,7 +145,9 @@ int main() {
     /* ── 9. String -> object (Track*) ───────────────────────────────── */
     printf("\n-- 9. Map<String,Track*> (string -> object) --\n");
 
-    Map<String, Track*>* library = new Map<String, Track*>();
+    /* ownsValues(): the map owns the Track* values, so `delete library` (here via
+     * defer) runs ~Track() on each and frees them — no manual loop. */
+    Map<String, Track*>* library = new Map<String, Track*>().ownsValues();
     defer delete library;
     library["Kashmir"] = new Track("Kashmir", 508);
     library["Africa"]  = new Track("Africa",  295);
@@ -163,8 +165,8 @@ int main() {
     for (auto title, trk in library)
         printf("    %-10s %d:%02d\n", (char*)title, trk->seconds / 60, trk->seconds % 60);
 
-    /* the map owns only the pointers; free the Tracks ourselves */
-    for (auto title, trk in library) delete trk;
+    /* No manual Track cleanup needed: the deferred `delete library` reclaims
+     * each owned Track* value automatically (see .ownsValues() above). */
 
     /* ── 10. Growth / rehashing ─────────────────────────────────────── */
     printf("\n-- 10. Growth --\n");
