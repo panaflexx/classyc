@@ -802,4 +802,23 @@ Contributions, bug reports, and wild ideas are welcome!
 - Simple gunicorn-style HTTP server library (lower priority than SQLite).
 - Optional pretty-printing / symbolic names for user-defined exceptions at debug time.
 
+## Linking Shared Libraries (`-l` / `-L`)
+
+The driver's `-l` / `-L` flags work just like `cc`/`ld`:
+
+- `-l <name>` takes a **library name**, not a path. The driver builds `lib<name>.so` (or platform suffix) and searches the library directories.
+- `-L <dir>` adds `<dir>` to the library search path.
+
+On x86_64 Linux, `/lib64` and `/lib/x86_64-linux-gnu` are already on the built-in search path, so most system libraries just work with `-l` alone:
+
+```bash
+# Good: -l takes a name
+./bin/classyc -I sketch -I include -l sqlite3 sketch/test-sqlite-classyc.cy -eg
+
+# If the library lives in a non-standard location, add -L:
+./bin/classyc -L /opt/mylib/lib -l mylib example.cy -eg
+```
+
+Passing a full path to `-l` (e.g. `-l /usr/lib/x86_64-linux-gnu/libsqlite3.so`) will fail with `cannot find library lib/usr/lib/...` because the driver prepends `lib` and appends the platform suffix to whatever you give it.
+
 *Built with ❤️ on top of MIR. Original c2mir design by Vladimir Makarov.*

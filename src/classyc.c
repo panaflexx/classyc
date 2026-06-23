@@ -4360,13 +4360,29 @@ static void syntax_error (c2m_ctx_t c2m_ctx, const char *expected_name) {
   FILE *f = c2m_options->message_file;
   pos_t pos = curr_token->pos;
   const char *tok = get_token_name (c2m_ctx, curr_token->code);
+  /* When the offending token is a bare identifier, surface its spelling and
+     a hint that it isn't a known type.  This catches the very common case of
+     a method returning/parameter-taking a class/typedef that hasn't been
+     declared yet (or is misspelled / missing an #include): the previous
+     message only said "syntax error on class (expected ...)" at a position
+     far from the real culprit. */
+  const char *id_name = NULL;
+  if (curr_token->code == T_ID && curr_token->node != NULL
+      && curr_token->node->code == N_ID) {
+    id_name = curr_token->node->u.s.s;
+  }
 
   n_errors++;
   if (log_diag_active ()) {
     char buf[512];
     log_diag_t d;
 
-    snprintf (buf, sizeof buf, "syntax error on %s (expected '%s')", tok, expected_name);
+    if (id_name != NULL)
+      snprintf (buf, sizeof buf,
+                "syntax error on identifier '%s' (expected '%s'); '%s' is not a declared type",
+                id_name, expected_name, id_name);
+    else
+      snprintf (buf, sizeof buf, "syntax error on %s (expected '%s')", tok, expected_name);
     d.file = pos.fname;
     d.line = pos.lno;
     d.col = pos.ln_pos;
@@ -4378,10 +4394,22 @@ static void syntax_error (c2m_ctx_t c2m_ctx, const char *expected_name) {
     int color = log_color_enabled (f);
     fputs (log_c (color, LOG_BOLD), f);
     if (pos.lno >= 0) fprintf (f, "%s:%d:%d: ", pos.fname, pos.lno, pos.ln_pos);
-    fprintf (f, "%ssyntax error%s on %s%s%s", log_c (color, LOG_BRED), log_c (color, LOG_RESET),
-             log_c (color, LOG_BOLD), tok, log_c (color, LOG_RESET));
-    fprintf (f, " (expected '%s%s%s'):\n", log_c (color, LOG_BGREEN), expected_name,
-             log_c (color, LOG_RESET));
+    if (id_name != NULL) {
+      fprintf (f, "%ssyntax error%s on identifier %s'%s'%s",
+               log_c (color, LOG_BRED), log_c (color, LOG_RESET),
+               log_c (color, LOG_BOLD), id_name, log_c (color, LOG_RESET));
+      fprintf (f, " (expected '%s%s%s')\n", log_c (color, LOG_BGREEN), expected_name,
+               log_c (color, LOG_RESET));
+      fprintf (f, "%s  note:%s '%s' is not a declared type, class, or typedef"
+                  " \u2014 forward declaration order matters for typedefs/structs"
+                  " (classes are pre-registered file-wide).\n",
+               log_c (color, LOG_BOLD), log_c (color, LOG_RESET), id_name);
+    } else {
+      fprintf (f, "%ssyntax error%s on %s%s%s", log_c (color, LOG_BRED), log_c (color, LOG_RESET),
+               log_c (color, LOG_BOLD), tok, log_c (color, LOG_RESET));
+      fprintf (f, " (expected '%s%s%s'):\n", log_c (color, LOG_BGREEN), expected_name,
+               log_c (color, LOG_RESET));
+    }
   }
 }
 
@@ -8070,10 +8098,57 @@ static void add_standard_includes (c2m_ctx_t c2m_ctx) {
   add_string_stream (c2m_ctx, "<exception-prelude>", exception_prelude);
 }
 
+/* Pre-scan the post-preprocessor token stream and register every `class NAME`
+   that appears at file scope (brace_depth == 0) as a tpname *before* any class
+   body is parsed.
+
+   Rationale: ClassyC's parser already registers a class's own name before it
+   descends into the body so that self-referential return types like
+   `ClassName*` work (see the tpname_add at the `class { ... }` site).  But a
+   *sibling* class declared later in the file is still unknown at that point,
+   so members like `Statement* prepare(...)` inside `class Sqlite { ... }`
+   fail to parse if `class Statement` appears below.
+
+   By collecting every file-scope `class NAME` token pair up front and inserting
+   each NAME into tpname_tab at the (NULL) file scope, methods of one class can
+   freely mention any other class regardless of source order.  C11 semantics for
+   plain functions, typedefs and structs are untouched: ordinary C identifiers
+   still need a real preceding declaration before use.
+
+   Nested `class` declarations (brace_depth > 0) are intentionally ignored;
+   they continue to self-register during normal parsing.
+
+   Implementation note: tpname_add() is idempotent (early-returns if the
+   {id-string, scope} pair is already present), so it is safe to call it here
+   even though the parser may add the same name again when it reaches the
+   class header.  We pass the very same N_ID node the parser will see, which
+   guarantees pointer-equal `id->u.s.s` for the htab hash/eq predicates. */
+static void pre_register_class_tpnames (c2m_ctx_t c2m_ctx) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  size_t n = VARR_LENGTH (token_t, recorded_tokens);
+  int brace_depth = 0;
+
+  if (n < 2) return;
+  for (size_t i = 0; i + 1 < n; i++) {
+    token_t t = VARR_GET (token_t, recorded_tokens, i);
+    int c = t->code;
+    if (c == '{') { brace_depth++; continue; }
+    if (c == '}') { if (brace_depth > 0) brace_depth--; continue; }
+    if (brace_depth != 0) continue;        /* only file-scope class decls */
+    if (c != T_CLASS) continue;
+    token_t id_tok = VARR_GET (token_t, recorded_tokens, i + 1);
+    if (id_tok->code != T_ID || id_tok->node == NULL) continue;
+    /* curr_scope is NULL at parse start (set by parse_init) — that is the
+       file scope used by the rest of the parser for top-level classes. */
+    tpname_add (c2m_ctx, id_tok->node, curr_scope, TRUE);
+  }
+}
+
 static node_t parse (c2m_ctx_t c2m_ctx) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
 
   next_token_index = 0;
+  pre_register_class_tpnames (c2m_ctx);
   return transl_unit (c2m_ctx, FALSE);
 }
 
@@ -8139,6 +8214,31 @@ DEF_VARR (decl_t);
 typedef struct case_attr *case_t;
 DEF_HTAB (case_t);
 
+/* Deferred class-method body record.  When `defer_method_bodies_p` is set
+   (true throughout the module's first check pass), every N_FUNC_DEF whose
+   enclosing context is a class skips its body check and instead pushes one of
+   these onto `pending_method_bodies`.  After every top-level item has had its
+   signature processed (so every class's members, constructors, and method
+   prototypes are visible in the symbol table), the module driver drains the
+   queue and runs each body in the right scope/class context.  This is what
+   makes `new B(args)` and `b->method()` work inside class A regardless of
+   whether B is declared above or below A in the same translation unit. */
+struct pending_body {
+  node_t func_def;     /* the N_FUNC_DEF node still awaiting body check */
+  node_t block;        /* the function's N_BLOCK whose node_scope is live */
+  node_t class_node;   /* enclosing class tag (curr_class at deferral time) */
+  /* Snapshot of `func_decls_for_allocation` taken at deferral time.  Holds
+     the decls that the signature pass already registered for this method
+     (the FUNC_DEF's own decl + the synthetic `this` parameter for instance
+     methods).  Subsequent class members would otherwise overwrite the global
+     accumulator before the drain runs.  Restored verbatim into the global
+     VARR at drain time so process_func_decls_for_allocation can lay them
+     out together with any locals declared inside the body. */
+  VARR (decl_t) * saved_fda;
+};
+typedef struct pending_body pending_body_t;
+DEF_VARR (pending_body_t);
+
 #undef curr_scope
 
 struct check_ctx {
@@ -8166,6 +8266,12 @@ struct check_ctx {
   node_t module_item_list; /* the module's top-level N_LIST */
   node_t curr_module_item; /* module item currently being checked */
   node_t curr_lambda_def;  /* innermost synthetic lambda FUNC_DEF being checked */
+  /* When non-zero (set across the module's first check pass), method bodies
+     of class members are queued in `pending_method_bodies` instead of being
+     checked immediately.  Restoring 0 around the drain prevents recursive
+     deferral of bodies that are checked from within the drain itself. */
+  int defer_method_bodies_p;
+  VARR (pending_body_t) * pending_method_bodies;
 };
 
 #define curr_scope check_ctx->curr_scope
@@ -8190,6 +8296,8 @@ struct check_ctx {
 #define curr_module_item check_ctx->curr_module_item
 #define curr_lambda_def check_ctx->curr_lambda_def
 #define in_unowned_p check_ctx->in_unowned_p
+#define defer_method_bodies_p check_ctx->defer_method_bodies_p
+#define pending_method_bodies check_ctx->pending_method_bodies
 
 
 static int supported_alignment_p (mir_llong align MIR_UNUSED) { return TRUE; }  // ???
@@ -16240,6 +16348,33 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 
     // Add function definition and check block
     add__func__def(c2m_ctx, block, id->u.s);
+    /* Defer the body check for class methods/constructors/destructors when
+       the module driver is in its "signatures first" phase.  We finish the
+       function block scope so the outer class member walk continues with
+       curr_scope back at the class scope, and we hold on to `block` so the
+       drain pass can re-enter the function scope (its node_scope chain is
+       still intact: scope state is just a node pointer chain on attrs).
+       The drain at the end of N_MODULE then runs the body in proper context,
+       by which time every sibling class's symbols are visible. */
+    if (defer_method_bodies_p && curr_class != NULL) {
+      MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+      pending_body_t pend;
+      size_t fda_len = VARR_LENGTH (decl_t, func_decls_for_allocation);
+      pend.func_def = r;
+      pend.block = block;
+      pend.class_node = curr_class;
+      VARR_CREATE (decl_t, pend.saved_fda, alloc, fda_len);
+      for (size_t fi = 0; fi < fda_len; fi++)
+        VARR_PUSH (decl_t, pend.saved_fda, VARR_GET (decl_t, func_decls_for_allocation, fi));
+      /* Don't leak this method's allocation entries into subsequent class
+         members; we will restore them per-body in the drain. */
+      VARR_TRUNC (decl_t, func_decls_for_allocation, 0);
+      VARR_PUSH (pending_body_t, pending_method_bodies, pend);
+      finish_scope (c2m_ctx);                 /* pop back to class scope */
+      func_block_scope = saved_scope_before_func;
+      assert (curr_scope == saved_scope_before_func);
+      break;
+    }
     check(c2m_ctx, block, r);
 
     /* Auto/lambda return type fixup: if the return type is still TP_UNDEF after
@@ -16338,7 +16473,137 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
   case N_MODULE:
     create_node_scope (c2m_ctx, r);
     top_scope = curr_scope;
+    /* Pre-register every top-level class so that members of one class can
+       reference any other class regardless of source order.  This is the
+       check-phase complement to pre_register_class_tpnames() (which only
+       teaches the parser that the names are types).  Without this pass the
+       N_ID resolution in check_decl_spec() would emit "unknown type X" when
+       a class body mentions a sibling class declared further down in the
+       same translation unit.  Plain C semantics for typedefs / structs /
+       functions are unaffected: only N_CLASS nodes are pre-registered. */
+    {
+      node_t items = NL_HEAD (r->u.ops);
+      if (items != NULL && items->code == N_LIST) {
+        for (node_t it = NL_HEAD (items->u.ops); it != NULL; it = NL_NEXT (it)) {
+          if (it->code != N_SPEC_DECL) continue;
+          node_t specs = NL_HEAD (it->u.ops);
+          if (specs == NULL) continue;
+          if (specs->code == N_SHARE) specs = NL_HEAD (specs->u.ops);
+          if (specs == NULL || specs->code != N_LIST) continue;
+          for (node_t s = NL_HEAD (specs->u.ops); s != NULL; s = NL_NEXT (s)) {
+            if (s->code != N_CLASS) continue;
+            /* Skip generic class templates (only their specializations are
+               real types).  Sentinel attr matches type_spec at L6302. */
+            if (s->attr == (void *)((intptr_t)-1)) continue;
+            node_t cid = NL_HEAD (s->u.ops);
+            if (cid == NULL || cid->code != N_ID) continue;
+            /* Idempotent: if find_def can already see it, skip.  Otherwise
+               install the N_CLASS node as the forward symbol so later
+               name-lookups inside earlier class bodies resolve to it.  The
+               canonical insert in check_decl_spec()'s N_CLASS arm will run
+               in due course; symbol_insert is HTAB_INSERT-with-replace so
+               doing it here first does not double-bind. */
+            if (find_def (c2m_ctx, S_REGULAR, cid, curr_scope, NULL) == NULL) {
+              symbol_insert (c2m_ctx, S_REGULAR, cid, curr_scope, s, NULL);
+              tpname_add (c2m_ctx, cid, curr_scope, TRUE);
+            }
+          }
+        }
+      }
+    }
+    /* First pass: queue every class method body for deferred checking so
+       that cross-class references (constructor lookups, sibling-class method
+       calls, etc.) can resolve regardless of source order. */
+    defer_method_bodies_p = TRUE;
     check (c2m_ctx, NL_HEAD (r->u.ops), r);
+    defer_method_bodies_p = FALSE;
+
+    /* Drain: each pending body is checked in a fresh function context with
+       curr_scope re-entered at its preserved function block.  We snapshot
+       a few per-method context fields, run the body (case N_BLOCK pops the
+       scope on the way out, leaving curr_scope at the class scope), then
+       restore curr_scope to the module scope and reset class context.
+
+       We use index-based iteration because checking a body can synthesise
+       new pending entries (lambdas declared inline, etc.) and we want to
+       process those too without invalidating the iterator. */
+    {
+      node_t module_scope = curr_scope;
+      size_t i = 0;
+      while (i < VARR_LENGTH (pending_body_t, pending_method_bodies)) {
+        pending_body_t pend = VARR_GET (pending_body_t, pending_method_bodies, i);
+        i++;
+        node_t fdef = pend.func_def;
+        node_t block = pend.block;
+        node_t saved_class = curr_class;
+        struct node_scope *ns;
+
+        /* Re-enter function block scope (its parent chain is still set). */
+        curr_class = pend.class_node;
+        curr_scope = block;
+        func_block_scope = block;
+        curr_func_def = fdef;
+        jump_ret_p = FALSE;
+        curr_switch = curr_loop = curr_loop_switch = NULL;
+        curr_call_arg_area_offset = 0;
+        VARR_TRUNC (decl_t, func_decls_for_allocation, 0);
+        /* Re-seed the allocation accumulator with what the signature pass
+           captured for this method (its own FUNC_DEF decl and the synthetic
+           `this` parameter for instance methods).  Body locals will be
+           pushed on top during the check below, and the whole set is laid
+           out together by process_func_decls_for_allocation. */
+        for (size_t fi = 0; fi < VARR_LENGTH (decl_t, pend.saved_fda); fi++)
+          VARR_PUSH (decl_t, func_decls_for_allocation,
+                     VARR_GET (decl_t, pend.saved_fda, fi));
+        VARR_DESTROY (decl_t, pend.saved_fda);
+
+        check (c2m_ctx, block, fdef);          /* N_BLOCK finish_scope pops to class scope */
+
+        /* Auto/lambda return-type fixup (mirrors the inline path). */
+        {
+          decl_t fdecl = fdef->attr;
+          if (fdecl != NULL && fdecl->decl_spec.auto_p) {
+            struct type *ftype = fdecl->decl_spec.type;
+            if (ftype != NULL && ftype->mode == TM_FUNC
+                && ftype->u.func_type->ret_type != NULL
+                && ftype->u.func_type->ret_type->mode == TM_BASIC
+                && ftype->u.func_type->ret_type->u.basic_type == TP_UNDEF) {
+              ftype->u.func_type->ret_type->u.basic_type = TP_VOID;
+              set_type_layout (c2m_ctx, ftype->u.func_type->ret_type);
+            }
+          }
+        }
+
+        /* Resolve labels used in the body, same as the inline path. */
+        for (size_t li = 0; li < VARR_LENGTH (node_t, label_uses); li++) {
+          node_t n = VARR_GET (node_t, label_uses, li);
+          symbol_t sym;
+          node_t id = n->code == N_LABEL_ADDR ? NL_HEAD (n->u.ops)
+                                              : NL_NEXT (NL_HEAD (n->u.ops));
+          if (!symbol_find (c2m_ctx, S_LABEL, id, func_block_scope, &sym)) {
+            error (c2m_ctx, POS (id), "undefined label %s", id->u.s.s);
+          } else if (n->code == N_LABEL_ADDR) {
+            ((struct expr *) n->attr)->u.label_addr_target = sym.def_node;
+          } else {
+            n->attr = sym.def_node;
+          }
+        }
+        VARR_TRUNC (node_t, label_uses, 0);
+
+        process_func_decls_for_allocation (c2m_ctx);
+        ns = block->attr;
+        ns->size = round_size (ns->size, MAX_ALIGNMENT);
+        ns->size += ns->call_arg_area_size;
+
+        /* Restore outer state.  curr_scope is now at the class scope (block's
+           parent) thanks to N_BLOCK's finish_scope; pop directly to module. */
+        curr_class = saved_class;
+        curr_scope = module_scope;
+        func_block_scope = module_scope;
+      }
+      VARR_TRUNC (pending_body_t, pending_method_bodies, 0);
+    }
+
     finish_scope (c2m_ctx);
     break;
   case N_IF: {
@@ -16893,6 +17158,8 @@ static void context_init (c2m_ctx_t c2m_ctx) {
   HTAB_CREATE (case_t, case_tab, alloc, 100, case_hash, case_eq, NULL);
   VARR_CREATE (decl_t, func_decls_for_allocation, alloc, 1024);
   VARR_CREATE (node_t, possible_incomplete_decls, alloc, 512);
+  defer_method_bodies_p = FALSE;
+  VARR_CREATE (pending_body_t, pending_method_bodies, alloc, 32);
 }
 
 static void context_finish (c2m_ctx_t c2m_ctx) {
@@ -16905,6 +17172,7 @@ static void context_finish (c2m_ctx_t c2m_ctx) {
   if (case_tab != NULL) HTAB_DESTROY (case_t, case_tab);
   if (func_decls_for_allocation != NULL) VARR_DESTROY (decl_t, func_decls_for_allocation);
   if (possible_incomplete_decls != NULL) VARR_DESTROY (node_t, possible_incomplete_decls);
+  if (pending_method_bodies != NULL) VARR_DESTROY (pending_body_t, pending_method_bodies);
   reg_free (c2m_ctx, c2m_ctx->check_ctx);
 }
 
@@ -20951,6 +21219,142 @@ static MIR_item_t gen_func_proto_item (c2m_ctx_t c2m_ctx, struct func_type *ft) 
   return proto;
 }
 
+/* Compute the MIR-level name for a function definition.
+
+   Three name shapes, matching the original inline mangling in case N_FUNC_DEF:
+     - Ordinary methods:   Class_method__<param-types>  (via build_method_mir_name)
+     - Constructors/dtors: __ctor_Class__<params>_<uid>  (uid for overload uniqueness)
+     - Free functions:     base_name verbatim
+
+   Extracted so the pre-gen forward-declaration pass (gen_forward_class_methods)
+   can compute the same names that N_FUNC_DEF gen will later use, ensuring the
+   forward item and the eventual definition share a MIR symbol name (which is
+   what lets MIR_finish_module resolve cross-class call refs that are emitted
+   *before* the callee's class is processed in source order). */
+static void mangle_func_def_mir_name (c2m_ctx_t c2m_ctx, node_t func_def,
+                                       char *out, size_t outsz) {
+  node_t declarator = FUNC_DEF_DECL (func_def);
+  node_t id = DECL_ID (declarator);
+  const char *base_name = id->u.s.s;
+  decl_t func_decl = func_def->attr;
+  struct type *decl_type = func_decl->decl_spec.type;
+  struct func_type *ft = decl_type->u.func_type;
+  int is_method = FALSE;
+  const char *class_name = NULL;
+
+  if (ft != NULL && ft->class_scope != NULL && ft->class_scope->code == N_CLASS) {
+    node_t class_id = TAG_ID (ft->class_scope);
+    if (class_id != NULL && class_id->code == N_ID) {
+      is_method = TRUE;
+      class_name = class_id->u.s.s;
+    }
+  }
+
+  if (is_method && class_name != NULL
+      && strncmp (base_name, "__ctor_", 7) != 0
+      && strncmp (base_name, "__dtor_", 7) != 0) {
+    build_method_mir_name (c2m_ctx, out, outsz, class_name, base_name, ft);
+  } else if (is_method && class_name != NULL) {
+    /* Ctor/dtor: base name + "__" + param-type-suffix + UID. */
+    MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+    VARR (char) * b;
+    node_t param;
+    int any = FALSE;
+    VARR_CREATE (char, b, alloc, 128);
+    for (const char *p = base_name; *p != '\0'; p++) VARR_PUSH (char, b, *p);
+    VARR_PUSH (char, b, '_'); VARR_PUSH (char, b, '_');
+    param = (ft != NULL) ? NL_HEAD (ft->param_list->u.ops) : NULL;
+    if (param_is_this_p (param)) param = NL_NEXT (param);
+    for (; param != NULL; param = NL_NEXT (param)) {
+      struct decl_spec *ds;
+      if (param->code != N_SPEC_DECL) continue;
+      if (void_param_p (param)) continue;
+      ds = get_param_decl_spec (param);
+      if (ds == NULL) continue;
+      append_type_mangle (c2m_ctx, b, ds->type);
+      any = TRUE;
+    }
+    if (!any) VARR_PUSH (char, b, 'v');
+    {
+      char uid_buf[24];
+      snprintf (uid_buf, sizeof uid_buf, "_%u", func_def->uid);
+      for (const char *p = uid_buf; *p != '\0'; p++) VARR_PUSH (char, b, *p);
+    }
+    VARR_PUSH (char, b, '\0');
+    snprintf (out, outsz, "%s", VARR_ADDR (char, b));
+    VARR_DESTROY (char, b);
+  } else {
+    snprintf (out, outsz, "%s", base_name);
+  }
+}
+
+/* Pre-gen forward declarations for every class method, constructor, and
+   destructor in the translation unit.  Run once at the entry of gen_mir,
+   before the main top_gen() recursion.
+
+   Why this exists: with the check-phase cross-class fix, a method body in
+   class A may legally call `new B(...)` or `bptr->m()` even when class B is
+   declared *after* A in source order.  At gen time, A's body is emitted
+   first and tries to reference B's method/ctor MIR item, which has not been
+   created yet -- the emitted ref op carries u.ref == NULL, and the runtime
+   then segfaults dereferencing the null pointer.
+
+   The fix is to create a MIR_new_forward item per class method up front and
+   stash it in `decl->u.item`.  All subsequent ref ops emit a non-null pointer
+   to the forward item.  When N_FUNC_DEF gen later calls MIR_new_func with the
+   same mangled name, the real definition is created and assigned to
+   `decl->u.item`; refs emitted afterwards point straight at the real item,
+   refs emitted earlier point at the forward.  MIR_finish_module / link then
+   resolves all forward items by name to the real definitions, so both shapes
+   of ref reach the same code at runtime.
+
+   We deliberately limit this to class methods only (`ft->class_scope != NULL`)
+   so free functions still follow ordinary C ordering semantics -- a free
+   function called before its definition still needs an explicit prototype,
+   as in C11. */
+static void gen_forward_class_methods (c2m_ctx_t c2m_ctx, node_t module) {
+  MIR_context_t ctx = c2m_ctx->ctx;
+  node_t items;
+
+  if (module == NULL || module->code != N_MODULE) return;
+  items = NL_HEAD (module->u.ops);
+  if (items == NULL || items->code != N_LIST) return;
+
+  for (node_t it = NL_HEAD (items->u.ops); it != NULL; it = NL_NEXT (it)) {
+    if (it->code != N_SPEC_DECL) continue;
+    node_t specs = NL_HEAD (it->u.ops);
+    if (specs == NULL) continue;
+    if (specs->code == N_SHARE) specs = NL_HEAD (specs->u.ops);
+    if (specs == NULL || specs->code != N_LIST) continue;
+
+    node_t class_node = NULL;
+    for (node_t s = NL_HEAD (specs->u.ops); s != NULL; s = NL_NEXT (s))
+      if (s->code == N_CLASS) { class_node = s; break; }
+    if (class_node == NULL) continue;
+    /* Skip generic class templates -- only their concrete specializations
+       generate code.  Sentinel attr matches the marker set in type_spec. */
+    if (class_node->attr == (void *) ((intptr_t) -1)) continue;
+
+    node_t class_id = NL_HEAD (class_node->u.ops);
+    if (class_id == NULL || class_id->code != N_ID) continue;
+    node_t decl_list = NL_NEXT (class_id);
+    if (decl_list == NULL || decl_list->code != N_LIST) continue;
+
+    for (node_t m = NL_HEAD (decl_list->u.ops); m != NULL; m = NL_NEXT (m)) {
+      if (m->code != N_FUNC_DEF) continue;
+      decl_t mdecl = m->attr;
+      if (mdecl == NULL) continue;
+      if (mdecl->u.item != NULL) continue;  /* already (forward-)declared */
+      struct type *mtype = mdecl->decl_spec.type;
+      if (mtype == NULL || mtype->mode != TM_FUNC) continue;
+
+      char fname[256] = {0};
+      mangle_func_def_mir_name (c2m_ctx, m, fname, sizeof fname);
+      mdecl->u.item = MIR_new_forward (ctx, fname);
+    }
+  }
+}
+
 /* Emit a call FUNC_OP(args...) through PROTO for a function of type FT, where
    FUNC_OP is a func-item ref or a function address value and ARGS holds the
    already-evaluated argument values for every parameter (including 'this' for
@@ -23353,50 +23757,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     curr_call_arg_area_offset = 0;
     collect_args_and_func_types (c2m_ctx, decl_type->u.func_type);
 
-    // Generate the mangled name for class methods.
-    // Regular methods:  ClassName_method__<param-types>  (via build_method_mir_name)
-    // Ctors/dtors:      __ctor_ClassName__<param-types>  (suffix appended in-place)
-    //   This ensures overloaded constructors get distinct MIR function names while
-    //   keeping the well-known __ctor_/__dtor_ prefix intact.
-    if (is_method && class_name != NULL
-        && strncmp (base_name, "__ctor_", 7) != 0 && strncmp (base_name, "__dtor_", 7) != 0) {
-      build_method_mir_name (c2m_ctx, name, sizeof (name), class_name, base_name, gen_ft);
-    } else if (is_method && class_name != NULL) {
-      /* Ctor/dtor: base name + "__" + param-type-suffix (same encoding as regular methods). */
-      MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
-      VARR (char) * b;
-      node_t param;
-      int any = FALSE;
-      VARR_CREATE (char, b, alloc, 128);
-      for (const char *p = base_name; *p != '\0'; p++) VARR_PUSH (char, b, *p);
-      VARR_PUSH (char, b, '_'); VARR_PUSH (char, b, '_');
-      param = (gen_ft != NULL) ? NL_HEAD (gen_ft->param_list->u.ops) : NULL;
-      if (param_is_this_p (param)) param = NL_NEXT (param);
-      for (; param != NULL; param = NL_NEXT (param)) {
-        struct decl_spec *ds;
-        if (param->code != N_SPEC_DECL) continue;
-        if (void_param_p (param)) continue;
-        ds = get_param_decl_spec (param);
-        if (ds == NULL) continue;
-        append_type_mangle (c2m_ctx, b, ds->type);
-        any = TRUE;
-      }
-      if (!any) VARR_PUSH (char, b, 'v');
-      /* Append the node UID to guarantee uniqueness even when two ctor
-         overloads have identical parameter type signatures (e.g. List(int)
-         and List(T=int) for List<int>).  Callers use cdecl->u.item (the
-         pointer) so the suffix is invisible outside name-deduplication. */
-      {
-        char uid_buf[24];
-        snprintf (uid_buf, sizeof uid_buf, "_%u", r->uid);
-        for (const char *p = uid_buf; *p != '\0'; p++) VARR_PUSH (char, b, *p);
-      }
-      VARR_PUSH (char, b, '\0');
-      snprintf (name, sizeof (name), "%s", VARR_ADDR (char, b));
-      VARR_DESTROY (char, b);
-    } else {
-      snprintf (name, sizeof (name), "%s", base_name);
-    }
+    /* Mangled MIR name for this function/method; uses the same encoding as
+       the pre-gen forward-declaration pass (see gen_forward_class_methods)
+       so refs emitted before vs after this point all resolve to the same
+       MIR item at link time. */
+    mangle_func_def_mir_name (c2m_ctx, r, name, sizeof (name));
 
     curr_func = ((decl_type->u.func_type->dots_p
                     ? MIR_new_vararg_func_arr
@@ -25296,6 +25661,12 @@ static void gen_mir (c2m_ctx_t c2m_ctx, node_t r) {
   VARR_CREATE (node_t, defer_stmts, alloc, 16);
   memset_proto = memset_item = memcpy_proto = memcpy_item = NULL;
   memcmp_proto = memcmp_item = NULL;
+  /* Forward-declare every class method MIR item before generating any body,
+     so cross-class refs emitted while gen-ing an earlier class still have a
+     non-null MIR_op_t target (resolved to the real definition at
+     MIR_finish_module time).  Only class methods participate -- free
+     functions still follow C11 "declare before use" rules. */
+  gen_forward_class_methods (c2m_ctx, r);
   top_gen (c2m_ctx, r, NULL, NULL, NULL);
   gen_finish (c2m_ctx);
 }
