@@ -9,7 +9,7 @@ SEGFAULTS=()
 for example in examples/*.cy; do
     if [ -f "$example" ]; then
         echo "Running $example..."
-        bin/classyc -g "$example" -eg
+        bin/classyc -I include -g "$example" -eg
         status=$?
         if [ $status -gt 133 ]; then
             SEGFAULTS+=("$example")

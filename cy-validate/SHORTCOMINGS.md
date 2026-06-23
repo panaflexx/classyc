@@ -16,6 +16,89 @@ Compiler/runtime tested via: `./bin/classyc -g -I include <file>.cy -eg`
 > three ergonomics wins — A2 (`replace(needle, repl)` search-and-replace), B1
 > (String methods on a string-literal receiver), and B4 (`List<T>.Map`). Each
 > fix is marked inline and validated in `val-015` (and `val-013` for E1).
+>
+> **NEW (F0 + F1, fixed):** the automatic String / object arena now handles
+> cross-function allocations (`String` returned from any helper, including
+> `json()` and `List<String>.join(...)`) and is layered with a **per-iteration
+> loop scope** so tight loops driven by helper calls stay bounded — without
+> the user calling `c2m_str_checkpoint`/`release_to` manually (see
+> `examples/classy-fetch.cy` for the original manual pattern this replaces).
+> Validated in `val-019-loop-arena.cy`.
+
+---
+
+## F. Automatic arena reclamation across helpers & loop iterations
+
+### F0. (FIXED) Cross-function `String` allocations now activate the caller's arena
+**Before:** `subtree_allocates_string_p` in `src/classyc.c` only looked for
+`N_CONCAT` and a handful of method-specific `N_CALL` patterns rooted at
+`String`/string-literal receivers. A function like
+
+```c
+String label(int i) { return (String)"x#" + i; }
+int main(void) {
+    for (int i = 0; i < 200000; i++) { String t = label(i); /* ... */ }
+}
+```
+
+left `main`'s body looking allocation-free to the detector (no inline
+`N_CONCAT`, no string-literal method receiver), so no function-level
+checkpoint was emitted and 200 k tracked Strings piled up until `main`
+returned. Same issue for `json(v)`, `list->join(",")`, or any user helper
+that builds a `String` internally.
+
+**Fix:** the detector now treats **any `N_CALL` whose result type is
+`String`** as allocating in the caller's scope (return values are protected
+by `release_keeping` at the callee's `N_RETURN`, so they survive into the
+caller and *do* need cleanup there). The older method-specific patterns are
+kept as a defensive fast-path. Defensive `SM_JOIN` on `List<String>`
+receivers added in case the call expr's type isn't yet populated. See
+`subtree_allocates_string_p` (`src/classyc.c`).
+
+### F1. (FIXED) Per-iteration loop arena: bounded memory without manual hooks
+**Before:** the function-level checkpoint only released at function exit, so
+a hot loop allocating many Strings per iteration kept them ALL alive until
+the enclosing function returned. The work-around in `examples/classy-fetch.cy`
+was a manual `c2m_str_checkpoint()` / `c2m_str_release_to(mark)` pair at the
+start and end of each iteration body.
+
+**Fix:** `N_FOR`, `N_WHILE`, `N_DO`, and `N_FORIN` now emit a per-iteration
+String checkpoint at the top of the body and a release at the back-edge
+(`continue_label` for for/do/for-in, just before the back-edge cond for
+while). `N_CONTINUE` and `N_BREAK` emit a release before they jump, with
+`break` skipping the release when it exits a `switch` nested in the loop
+(`break_label != loop_break_label_for_scope`). The same machinery is
+layered for the object arena (`Any<I>` handles). State lives in `gen_ctx`
+fields `loop_str_scope_*` / `loop_obj_scope_*` / `loop_break_label_for_scope`;
+helpers are `gen_loop_body_scope_enter/release/leave` in `src/classyc.c`.
+
+**Per-iter is layered, not replacing, the function-level scope:**
+N_RETURN still releases back to the function-level mark and protects the
+returned String with `release_keeping`. So a String *returned* from a
+function whose loop took per-iter checkpoints still survives the per-iter
+release — verified by `val-019` test (c).
+
+**Safety guard against "escape via assignment":** if a loop body assigns
+through a tracked-typed identifier (`outerString = helper(i);`), the
+assigned value may outlive the iteration and a per-iter release would
+dangle the variable. The compiler detects this conservatively with
+`subtree_assigns_tracked_id_p` and **disables** per-iter for that loop
+(falls back to function-level cleanup at return). The common bounded
+patterns — `String t = helper(i);` (init, not assign), `Http.get(...)`
+returning a class pointer with `defer delete`, dict / header lookups
+consumed inline — remain eligible.
+
+**Known limit:** escape via a method/function call (e.g.
+`outerList->Add(s)` storing a tracked String into an outer collection) is
+NOT detected. Such patterns will still dangle. Users in doubt can either
+store the result through an assignment (suppressing per-iter) or wrap the
+inner work in a function (so the helper's function-level scope owns the
+lifetime).
+
+Validated by `cy-validate/val-019-loop-arena.cy`:
+- 200 k-iter helper-only loop grows ~28 kB RSS (~0.14 B/iter — slack only);
+- nested 1000×1000 `break` loop bounded under 8 MB;
+- a String returned from inside a per-iter loop scope survives the release.
 
 ---
 

@@ -16669,6 +16669,29 @@ struct gen_ctx {
   MIR_item_t obj_detach_proto, obj_detach_item;
   op_t obj_scope_mark;
   int obj_scope_active;
+  /* PER-ITERATION arena scope reclamation for the innermost loop body.
+     Layered inside the function-level str_scope_X / obj_scope_X state: a
+     fresh checkpoint is taken at the top of each iteration and released at
+     the bottom (and on continue/break), so a hot loop driving heap-String
+     allocations through helpers (the classy-fetch.cy pattern) stays bounded
+     without the user having to call c2m_str_checkpoint/release_to manually.
+     The active flag is TRUE only while we are emitting code inside a loop
+     body whose subtree allocates Strings (resp. Any<I> handles); the mark
+     op is the MIR register holding the iteration checkpoint value.  Loop
+     cases save/restore these around their body gen so nested loops compose. */
+  op_t loop_str_scope_mark;
+  int loop_str_scope_active;
+  op_t loop_obj_scope_mark;
+  int loop_obj_scope_active;
+  /* The break_label of the LOOP that owns the current per-iter scope.
+     We need this to disambiguate a `break` inside a switch nested in a loop:
+     in that case break_label is the switchs target, but the field below is
+     still the loop owners target, and they differ -- so N_BREAK must NOT
+     emit a per-iter release (the break stays inside the loop body).  When
+     they match, the break is exiting the loop owning the per-iter scope and
+     the release is required.  Switch cases do not touch this field; loop
+     cases save/restore it. */
+  MIR_label_t loop_break_label_for_scope;
   /* try/catch/throw exception runtime - lazily imported on first use.
      setjmp-frame model: cy_exc_push() pushes a frame and returns its jmp_buf,
      the generator calls setjmp() inline, cy_exc_throw() records the exception
@@ -16819,6 +16842,11 @@ struct gen_ctx {
 #define obj_detach_item gen_ctx->obj_detach_item
 #define obj_scope_mark gen_ctx->obj_scope_mark
 #define obj_scope_active gen_ctx->obj_scope_active
+#define loop_str_scope_mark gen_ctx->loop_str_scope_mark
+#define loop_str_scope_active gen_ctx->loop_str_scope_active
+#define loop_obj_scope_mark gen_ctx->loop_obj_scope_mark
+#define loop_obj_scope_active gen_ctx->loop_obj_scope_active
+#define loop_break_label_for_scope gen_ctx->loop_break_label_for_scope
 #define cy_exc_push_proto gen_ctx->cy_exc_push_proto
 #define cy_exc_push_item gen_ctx->cy_exc_push_item
 #define cy_exc_pop_proto gen_ctx->cy_exc_pop_proto
@@ -19636,10 +19664,20 @@ static int node_is_leaf_p (node_code_t c) {
 }
 
 /* Does this subtree contain any expression that allocates a tracked String?
-   Covers: the `+` concat operator (N_CONCAT), String.copy/attach (static
-   methods), and instance methods that return new Strings (.substr, .replace,
-   .upper, .lower, .trim).  Used to decide whether a function body needs
-   automatic scope reclamation via checkpoint/release_to.
+   Covers:
+     - the `+` concat operator (N_CONCAT) -- always heap-allocates;
+     - any N_CALL whose result type is `String` (TP_STRING) -- this catches
+       *cross-function* allocations transparently: a helper that internally
+       does `+`, .substr/.upper/..., String.copy, json(), List<String>.join,
+       or any other String-returning operation will be seen as allocating by
+       its caller.  Without this, a `main` that does all its work through
+       helpers gets no automatic scope reclamation, and memory grows across
+       loop iterations (the classy-fetch.cy pattern);
+     - the older specific N_CALL patterns kept as a defensive fast-path for
+       cases where the call expr's `attr` (type info) may not yet be set in
+       some specialised paths.
+   Used to decide whether a function body or a loop body needs automatic
+   scope reclamation via checkpoint/release_to.
    Nested function definitions are not descended into -- their allocations
    belong to their own scope. */
 static int subtree_allocates_string_p (node_t n) {
@@ -19647,31 +19685,44 @@ static int subtree_allocates_string_p (node_t n) {
   /* N_CONCAT is the `String +` operator node -- always heap-allocates. */
   if (n->code == N_CONCAT) return TRUE;
   if (n->code == N_CALL) {
+    /* General rule: any call returning a `String` produces a tracked
+       allocation in the caller's scope (return values are protected by
+       release_keeping at the callee's N_RETURN).  This subsumes the
+       method-specific patterns below and catches calls into user helpers,
+       library wrappers, json(...), List<String>.join(...), etc. */
+    struct expr *ce = (struct expr *) n->attr;
+    if (ce != NULL && builtin_string_type_p (ce->type)) return TRUE;
     node_t f = NL_HEAD (n->u.ops);
-	    if (f != NULL && (f->code == N_FIELD || f->code == N_DEREF_FIELD)) {
-	      node_t obj = NL_HEAD (f->u.ops);
-	      node_t m = obj == NULL ? NULL : NL_NEXT (obj);
-	      if (obj != NULL && obj->code == N_STRING && m != NULL && m->code == N_ID) {
-	        enum str_method sm = get_string_method (m->u.s.s, NULL, NULL);
-	        /* Both copy (allocates) and attach (registers external ptr) add to
-	           the tracker and need a scope checkpoint for cleanup. */
-	        if (sm == SM_COPY || sm == SM_ATTACH) return TRUE;
-	      }
-	      /* An allocating instance method on a UTF-8 string literal ("abc".upper())
-	         also produces a tracked String and needs a scope checkpoint. */
-	      if (obj != NULL && obj->code == N_STR && m != NULL && m->code == N_ID) {
-	        enum str_method sm = get_string_method (m->u.s.s, NULL, NULL);
-	        if (sm == SM_SUBSTR || sm == SM_REPLACE || sm == SM_UPPER
-	            || sm == SM_LOWER || sm == SM_TRIM)
-	          return TRUE;
-	      }
-	      struct expr *oe = obj == NULL ? NULL : obj->attr;
-	      if (oe != NULL && builtin_string_type_p (oe->type) && m != NULL && m->code == N_ID) {
-	        enum str_method sm = get_string_method (m->u.s.s, NULL, NULL);
-	        if (sm == SM_SUBSTR || sm == SM_REPLACE
-	            || sm == SM_UPPER || sm == SM_LOWER || sm == SM_TRIM) return TRUE;
-	      }
-	    }
+    if (f != NULL && (f->code == N_FIELD || f->code == N_DEREF_FIELD)) {
+      node_t obj = NL_HEAD (f->u.ops);
+      node_t m = obj == NULL ? NULL : NL_NEXT (obj);
+      if (obj != NULL && obj->code == N_STRING && m != NULL && m->code == N_ID) {
+        enum str_method sm = get_string_method (m->u.s.s, NULL, NULL);
+        /* Both copy (allocates) and attach (registers external ptr) add to
+           the tracker and need a scope checkpoint for cleanup. */
+        if (sm == SM_COPY || sm == SM_ATTACH) return TRUE;
+      }
+      /* An allocating instance method on a UTF-8 string literal ("abc".upper())
+         also produces a tracked String and needs a scope checkpoint. */
+      if (obj != NULL && obj->code == N_STR && m != NULL && m->code == N_ID) {
+        enum str_method sm = get_string_method (m->u.s.s, NULL, NULL);
+        if (sm == SM_SUBSTR || sm == SM_REPLACE || sm == SM_UPPER
+            || sm == SM_LOWER || sm == SM_TRIM)
+          return TRUE;
+      }
+      struct expr *oe = obj == NULL ? NULL : obj->attr;
+      if (oe != NULL && builtin_string_type_p (oe->type) && m != NULL && m->code == N_ID) {
+        enum str_method sm = get_string_method (m->u.s.s, NULL, NULL);
+        if (sm == SM_SUBSTR || sm == SM_REPLACE
+            || sm == SM_UPPER || sm == SM_LOWER || sm == SM_TRIM) return TRUE;
+      }
+      /* List<String>.join(delim) -> String : the receiver is a List<String>
+         (not a String/N_STRING), so the cases above miss it.  The general
+         attr-type check above already covers it when typing has populated
+         the call's expr, but be defensive in case it has not. */
+      if (oe != NULL && list_string_type_p (oe->type) && m != NULL && m->code == N_ID
+          && get_string_method (m->u.s.s, NULL, NULL) == SM_JOIN) return TRUE;
+    }
   }
   for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c)) {
     if (c->code == N_FUNC_DEF) continue; /* separate scope */
@@ -19690,6 +19741,113 @@ static int subtree_allocates_object_p (node_t n) {
     if (subtree_allocates_object_p (c)) return TRUE;
   }
   return FALSE;
+}
+
+/* Does this subtree contain an assignment whose LHS is a `String`-typed
+   identifier or a tracked-pointer-typed identifier?  Such an assignment can
+   smuggle a tracked allocation from inside the iteration into a variable
+   whose lifetime spans iterations -- so a per-iter release would dangle the
+   variable.  We use this as a conservative signal to DISABLE per-iter
+   reclamation for the loop body: correctness over peak memory.
+
+   This is over-conservative (catches body-local reassignments too), but the
+   common bounded patterns -- `String t = helper(i);` (init not assign),
+   `Http.get(...)` returning a class pointer + `defer delete`, dict/header
+   lookups consumed inline by printf -- all stay eligible and remain bounded.
+
+   Limits:
+     - We do NOT try to detect escape through method calls (e.g.
+       `list->Add(s)` storing a String into an outer-scope collection).
+       Such patterns will still dangle.  Users in doubt can wrap their loop
+       in `{ ... }` to defeat detection -- or, as before, keep using the
+       manual c2m_str_checkpoint/release_to runtime calls.
+     - We DO descend through nested blocks but stop at nested function
+       definitions (their allocations belong to their own scope). */
+static int subtree_assigns_tracked_id_p (node_t n) {
+  if (n == NULL || node_is_leaf_p (n->code)) return FALSE;
+  if (n->code == N_ASSIGN) {
+    node_t lhs = NL_HEAD (n->u.ops);
+    if (lhs != NULL && lhs->code == N_ID) {
+      struct expr *le = (struct expr *) lhs->attr;
+      if (le != NULL && builtin_string_type_p (le->type)) return TRUE;
+    }
+  }
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c)) {
+    if (c->code == N_FUNC_DEF) continue; /* separate scope */
+    if (subtree_assigns_tracked_id_p (c)) return TRUE;
+  }
+  return FALSE;
+}
+
+/* Per-loop-body arena scope helpers --------------------------------------
+   Layered inside the function-level str_scope_X / obj_scope_X state: each
+   loop iteration emits a fresh checkpoint at the top of the body and a
+   release at the bottom (and on continue/break).  This keeps per-iteration
+   allocations bounded for tight loops driven by helper-call allocations
+   (e.g. the classy-fetch.cy pattern -- a tight for(i<5) loop in main()
+   whose iterations allocate Strings only through helper calls like
+   Http.get(POKE_API + name)).  The function-level scope still owns the
+   wider lifetime: N_RETURN unconditionally releases back to the function
+   mark, which covers anything a loop missed (e.g. on break).
+
+   The helpers update loop_str_scope_X / loop_obj_scope_X only; the
+   function-level str_scope_X / obj_scope_X are untouched, so N_RETURN's
+   release_keeping for returned Strings keeps working unchanged.
+   N_BREAK/N_CONTINUE consult loop_X_scope_active and emit a release before
+   they jump, so the iteration that called break/continue is reclaimed. */
+static void gen_loop_body_scope_enter (c2m_ctx_t c2m_ctx, node_t body,
+                                       MIR_label_t this_loop_break_label,
+                                       int *str_was_active, op_t *str_saved_mark,
+                                       int *obj_was_active, op_t *obj_saved_mark,
+                                       MIR_label_t *saved_loop_break_label) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  *str_was_active = loop_str_scope_active;
+  *str_saved_mark = loop_str_scope_mark;
+  *obj_was_active = loop_obj_scope_active;
+  *obj_saved_mark = loop_obj_scope_mark;
+  *saved_loop_break_label = loop_break_label_for_scope;
+  loop_str_scope_active = FALSE;
+  loop_obj_scope_active = FALSE;
+  loop_break_label_for_scope = this_loop_break_label;
+  if (body == NULL) return;
+  /* Conservatism: if the body assigns a tracked-type identifier (e.g.
+     `outerString = helper(i);`), the assigned value may escape the
+     iteration and our release would dangle the variable.  Skip per-iter
+     reclamation in that case -- the function-level scope still cleans up
+     at return, so correctness is preserved (only the per-iter memory win
+     is lost). */
+  int safe_for_per_iter = !subtree_assigns_tracked_id_p (body);
+  if (safe_for_per_iter && subtree_allocates_string_p (body)) {
+    loop_str_scope_mark = gen_str_checkpoint (c2m_ctx);
+    loop_str_scope_active = TRUE;
+  }
+  if (safe_for_per_iter && subtree_allocates_object_p (body)) {
+    loop_obj_scope_mark = gen_obj_checkpoint (c2m_ctx);
+    loop_obj_scope_active = TRUE;
+  }
+}
+
+/* Emit release back to this iteration's mark (called at the bottom of the
+   body on fall-through, and before jumping for `break`/`continue`).  Safe
+   to call when not active (no-op). */
+static void gen_loop_body_scope_release (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  if (loop_obj_scope_active) gen_obj_release_to (c2m_ctx, loop_obj_scope_mark.mir_op);
+  if (loop_str_scope_active) gen_str_release_to (c2m_ctx, loop_str_scope_mark.mir_op);
+}
+
+/* Restore the enclosing loop's per-iter scope state (used after a loop
+   case finishes emitting code for its body and back-edge). */
+static void gen_loop_body_scope_leave (c2m_ctx_t c2m_ctx,
+                                       int str_was_active, op_t str_saved_mark,
+                                       int obj_was_active, op_t obj_saved_mark,
+                                       MIR_label_t saved_loop_break_label) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  loop_str_scope_active = str_was_active;
+  loop_str_scope_mark = str_saved_mark;
+  loop_obj_scope_active = obj_was_active;
+  loop_obj_scope_mark = obj_saved_mark;
+  loop_break_label_for_scope = saved_loop_break_label;
 }
 
 static void emit_scalar_assign (c2m_ctx_t c2m_ctx, op_t var, op_t *val, MIR_type_t t,
@@ -22677,8 +22835,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       op_t saved_str_scope_mark = str_scope_mark;
       int saved_obj_scope_active = obj_scope_active;
       op_t saved_obj_scope_mark = obj_scope_mark;
+      /* Per-loop nested scope state: always FALSE entering a function body
+         (we are not yet inside any loop).  Loop cases turn it on/off around
+         their body gen and save/restore it for nesting. */
+      int saved_loop_str_scope_active = loop_str_scope_active;
+      op_t saved_loop_str_scope_mark = loop_str_scope_mark;
+      int saved_loop_obj_scope_active = loop_obj_scope_active;
+      op_t saved_loop_obj_scope_mark = loop_obj_scope_mark;
       str_scope_active = FALSE;
       obj_scope_active = FALSE;
+      loop_str_scope_active = FALSE;
+      loop_obj_scope_active = FALSE;
+      loop_break_label_for_scope = NULL;
       if (subtree_allocates_string_p (stmt)) {
         str_scope_mark = gen_str_checkpoint (c2m_ctx);
         str_scope_active = TRUE;
@@ -22701,6 +22869,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       str_scope_mark = saved_str_scope_mark;
       obj_scope_active = saved_obj_scope_active;
       obj_scope_mark = saved_obj_scope_mark;
+      loop_str_scope_active = saved_loop_str_scope_active;
+      loop_str_scope_mark = saved_loop_str_scope_mark;
+      loop_obj_scope_active = saved_loop_obj_scope_active;
+      loop_obj_scope_mark = saved_loop_obj_scope_mark;
     }
     if ((insn = DLIST_TAIL (MIR_insn_t, curr_func->u.func->insns)) == NULL
         || (insn->code != MIR_RET && insn->code != MIR_JRET && insn->code != MIR_JMP)) {
@@ -22947,6 +23119,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     size_t saved_defer_break_mark = defer_break_mark;
     size_t saved_defer_continue_mark = defer_continue_mark;
     MIR_label_t start_label = MIR_new_label (ctx);
+    /* Per-iteration arena scope state (str/obj). */
+    int saved_loop_str_active, saved_loop_obj_active;
+    op_t saved_loop_str_mark, saved_loop_obj_mark;
+    MIR_label_t saved_loop_break_label;
 
     assert (false_label == NULL && true_label == NULL);
     continue_label = MIR_new_label (ctx);
@@ -22954,10 +23130,24 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     defer_break_mark = defer_continue_mark = VARR_LENGTH (node_t, defer_stmts);
     emit_label (c2m_ctx, r);
     emit_label_insn_opt (c2m_ctx, start_label);
+    /* Take per-iter checkpoint at the top of the body so the next iteration
+       starts fresh (released at continue_label below).  Position matters:
+       the checkpoint MIR call is emitted between start_label and the body,
+       so the back-edge jump to start_label runs it again each iteration. */
+    gen_loop_body_scope_enter (c2m_ctx, stmt, break_label,
+                               &saved_loop_str_active, &saved_loop_str_mark,
+                               &saved_loop_obj_active, &saved_loop_obj_mark,
+                               &saved_loop_break_label);
     gen (c2m_ctx, stmt, NULL, NULL, FALSE, NULL, NULL);
     emit_label_insn_opt (c2m_ctx, continue_label);
+    /* Release the iteration's allocations before the back-edge condition. */
+    gen_loop_body_scope_release (c2m_ctx);
     top_gen (c2m_ctx, expr, start_label, break_label, NULL);
     emit_label_insn_opt (c2m_ctx, break_label);
+    gen_loop_body_scope_leave (c2m_ctx,
+                               saved_loop_str_active, saved_loop_str_mark,
+                               saved_loop_obj_active, saved_loop_obj_mark,
+                               saved_loop_break_label);
     continue_label = saved_continue_label;
     break_label = saved_break_label;
     defer_break_mark = saved_defer_break_mark;
@@ -22971,6 +23161,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     MIR_label_t saved_continue_label = continue_label, saved_break_label = break_label;
     size_t saved_defer_break_mark = defer_break_mark;
     size_t saved_defer_continue_mark = defer_continue_mark;
+    int saved_loop_str_active, saved_loop_obj_active;
+    op_t saved_loop_str_mark, saved_loop_obj_mark;
+    MIR_label_t saved_loop_break_label;
 
     assert (false_label == NULL && true_label == NULL);
     continue_label = MIR_new_label (ctx);
@@ -22980,9 +23173,22 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     emit_label_insn_opt (c2m_ctx, continue_label);
     top_gen (c2m_ctx, expr, stmt_label, break_label, NULL);
     emit_label_insn_opt (c2m_ctx, stmt_label);
+    /* Checkpoint at top of body: hit by both initial entry and back-edge.
+       Note: `continue` jumps to continue_label which re-evaluates the cond
+       BEFORE re-entering stmt_label; N_CONTINUE itself emits the release. */
+    gen_loop_body_scope_enter (c2m_ctx, stmt, break_label,
+                               &saved_loop_str_active, &saved_loop_str_mark,
+                               &saved_loop_obj_active, &saved_loop_obj_mark,
+                               &saved_loop_break_label);
     gen (c2m_ctx, stmt, NULL, NULL, FALSE, NULL, NULL);
+    /* Release before the back-edge cond eval. */
+    gen_loop_body_scope_release (c2m_ctx);
     top_gen (c2m_ctx, expr, stmt_label, break_label, NULL);
     emit_label_insn_opt (c2m_ctx, break_label);
+    gen_loop_body_scope_leave (c2m_ctx,
+                               saved_loop_str_active, saved_loop_str_mark,
+                               saved_loop_obj_active, saved_loop_obj_mark,
+                               saved_loop_break_label);
     continue_label = saved_continue_label;
     break_label = saved_break_label;
     defer_break_mark = saved_defer_break_mark;
@@ -22998,6 +23204,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     MIR_label_t saved_continue_label = continue_label, saved_break_label = break_label;
     size_t saved_defer_break_mark = defer_break_mark;
     size_t saved_defer_continue_mark = defer_continue_mark;
+    int saved_loop_str_active, saved_loop_obj_active;
+    op_t saved_loop_str_mark, saved_loop_obj_mark;
+    MIR_label_t saved_loop_break_label;
 
     assert (false_label == NULL && true_label == NULL);
     continue_label = MIR_new_label (ctx);
@@ -23008,8 +23217,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     if (cond->code != N_IGNORE) /* non-empty condition: */
       top_gen (c2m_ctx, cond, stmt_label, break_label, NULL);
     emit_label_insn_opt (c2m_ctx, stmt_label);
+    /* Per-iter checkpoint at top of body (after cond ok, before body). */
+    gen_loop_body_scope_enter (c2m_ctx, stmt, break_label,
+                               &saved_loop_str_active, &saved_loop_str_mark,
+                               &saved_loop_obj_active, &saved_loop_obj_mark,
+                               &saved_loop_break_label);
     gen (c2m_ctx, stmt, NULL, NULL, FALSE, NULL, NULL);
     emit_label_insn_opt (c2m_ctx, continue_label);
+    /* Release before iter+cond.  `continue` jumps to continue_label and the
+       N_CONTINUE handler already emitted its own release; this second
+       release is idempotent (release_to is a no-op when the tracker is
+       already at or below the mark). */
+    gen_loop_body_scope_release (c2m_ctx);
     top_gen (c2m_ctx, iter, NULL, NULL, NULL);
     if (cond->code == N_IGNORE) { /* empty condition: */
       emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, stmt_label));
@@ -23017,6 +23236,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       top_gen (c2m_ctx, cond, stmt_label, break_label, NULL);
     }
     emit_label_insn_opt (c2m_ctx, break_label);
+    gen_loop_body_scope_leave (c2m_ctx,
+                               saved_loop_str_active, saved_loop_str_mark,
+                               saved_loop_obj_active, saved_loop_obj_mark,
+                               saved_loop_break_label);
     continue_label = saved_continue_label;
     break_label = saved_break_label;
     defer_break_mark = saved_defer_break_mark;
@@ -23055,6 +23278,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     MIR_label_t saved_break_label = break_label;
     size_t saved_defer_break_mark = defer_break_mark;
     size_t saved_defer_continue_mark = defer_continue_mark;
+    int saved_loop_str_active, saved_loop_obj_active;
+    op_t saved_loop_str_mark, saved_loop_obj_mark;
+    MIR_label_t saved_loop_break_label;
     continue_label = MIR_new_label (ctx);
     break_label = MIR_new_label (ctx);
     defer_break_mark = defer_continue_mark = VARR_LENGTH (node_t, defer_stmts);
@@ -23296,13 +23522,27 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       }
     }
 
+    /* Per-iter checkpoint right before the body (key/val regs already bound).
+       Released at continue_label below; the for-in back-edge is the i_reg++
+       and unconditional jump to loop_label, so every iteration re-enters the
+       body via body_label and takes a fresh checkpoint. */
+    gen_loop_body_scope_enter (c2m_ctx, body, break_label,
+                               &saved_loop_str_active, &saved_loop_str_mark,
+                               &saved_loop_obj_active, &saved_loop_obj_mark,
+                               &saved_loop_break_label);
     /* gen body */
     gen (c2m_ctx, body, NULL, NULL, FALSE, NULL, NULL);
     /* continue_label: i_reg++ */
     emit_label_insn_opt (c2m_ctx, continue_label);
+    /* Release iteration's per-loop allocations before back-edge. */
+    gen_loop_body_scope_release (c2m_ctx);
     emit3 (c2m_ctx, MIR_ADD, i_reg.mir_op, i_reg.mir_op, MIR_new_int_op (ctx, 1));
     emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, loop_label));
     emit_label_insn_opt (c2m_ctx, break_label);
+    gen_loop_body_scope_leave (c2m_ctx,
+                               saved_loop_str_active, saved_loop_str_mark,
+                               saved_loop_obj_active, saved_loop_obj_mark,
+                               saved_loop_break_label);
 
     continue_label = saved_continue_label;
     break_label = saved_break_label;
@@ -23331,12 +23571,22 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
     gen_run_defers (c2m_ctx, defer_continue_mark); /* unwind loop-body defers */
+    /* Reclaim this iteration's per-loop arena allocations before jumping to
+       the loop header.  Safe (no-op) if no per-iter scope is active. */
+    gen_loop_body_scope_release (c2m_ctx);
     emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, continue_label));
     break;
   case N_BREAK:
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
     gen_run_defers (c2m_ctx, defer_break_mark); /* unwind loop/switch-body defers */
+    /* Per-iter release on break: the iteration that called break would
+       otherwise leak its allocations until the function-level release fires
+       at return.  Skip the release when `break` exits a switch but stays
+       inside the loop owning the per-iter scope (current break_label is the
+       switch's, not the loop's). */
+    if (break_label == loop_break_label_for_scope)
+      gen_loop_body_scope_release (c2m_ctx);
     emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, break_label));
     break;
   case N_RETURN: {

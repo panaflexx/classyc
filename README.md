@@ -441,12 +441,23 @@ ClassyC manages high-level types with lightweight arenas. The big win: **heap
 `String`s are reclaimed automatically** — there is no manual API to call.
 
 - **String arena (automatic)** — every heap `String` (from `+`, `substr`,
-  `replace`, `upper`/`lower`/`trim`, `split` …) is tracked. The compiler emits a
-  checkpoint at the start of each allocating scope and reclaims it on exit; a
+  `replace`, `upper`/`lower`/`trim`, `split` …, *and* any helper / library
+  call that returns a `String`, including `json(v)` and
+  `List<String>.join(",")`) is tracked. The compiler emits a checkpoint at
+  the start of each allocating function body **and at the top of each loop
+  iteration** (`for`/`while`/`do`/`for-in`), and reclaims it at the bottom
+  of the iteration / on `continue` / on `break` that exits the loop. A
   `String` you `return` is automatically kept alive for the caller. An
-  `atexit` net guarantees a leak-free normal exit. You write no cleanup code.
+  `atexit` net guarantees a leak-free normal exit. You write no cleanup code
+  — tight loops driven by helper calls (the `examples/classy-fetch.cy` HTTP
+  fetcher pattern) stay bounded without manual `c2m_str_checkpoint`/
+  `release_to` hooks. Caveat: if you assign a tracked `String` to a
+  variable declared OUTSIDE the loop (`outerStr = helper(i);`), the
+  compiler conservatively disables per-iteration release for that loop
+  (the function-level scope still cleans up at return).
 - **Object arena (automatic)** — `any<I>(...)` handles use the same scope-bound
-  model and are reclaimed on scope exit; a handle you `return` is handed to the
+  model and are reclaimed on scope exit (function or per-iteration); a
+  handle you `return` is detached from the callee's arena and handed to the
   caller, who then owns it (`delete` it, or store it in a collection).
 - **Dict arena (explicit)** — `new dict(bytes)` is arena-backed; `delete d`
   (or `defer delete d`) frees the whole arena and its contents in one shot.
