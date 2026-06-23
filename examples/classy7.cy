@@ -37,8 +37,12 @@ class Fruit {
 void describe(int value) {
     for (auto name in Fruit.variants) {
         auto d = Fruit.variants[name];
-        if (d.value == value) {
-            printf("%s\n", d.desc);
+        /* `.value` / `.desc` are ordinary dict keys, so they return a
+           tagged DictValue*.  Cast to (int) / (char*) to unwrap the union
+           payload; without the cast the compiler keeps the box pointer
+           so `json(leaf)` and a typed binder can still walk the subtree. */
+        if ((int)d.value == value) {
+            printf("%s\n", (char*)d.desc);
             return;
         }
     }
@@ -50,16 +54,16 @@ void describe(int value) {
 void handle_fruit(int f) {
     switch (f) {
         case Fruit.Apple:   /* resolves to the .value from the dict at compile time */
-            printf("[switch] Handling %s (action: eat fresh)\n", Fruit.variants.Apple.desc);
+            printf("[switch] Handling %s (action: eat fresh)\n", (char*)Fruit.variants.Apple.desc);
             break;
         case Fruit.Banana:
-            printf("[switch] Handling %s (action: peel first)\n", Fruit.variants.Banana.desc);
+            printf("[switch] Handling %s (action: peel first)\n", (char*)Fruit.variants.Banana.desc);
             break;
         case Fruit.Kiwi:
-            printf("[switch] Handling %s (action: scoop with spoon)\n", Fruit.variants.Kiwi.desc);
+            printf("[switch] Handling %s (action: scoop with spoon)\n", (char*)Fruit.variants.Kiwi.desc);
             break;
         case Fruit.Mango:
-            printf("[switch] Handling %s (action: slice around pit)\n", Fruit.variants.Mango.desc);
+            printf("[switch] Handling %s (action: slice around pit)\n", (char*)Fruit.variants.Mango.desc);
             break;
         /* Compiler can warn: "non-exhaustive switch over Fruit variants"
            if you leave one out and omit default. */
@@ -83,7 +87,7 @@ int main() {
     printf("\nAll variants (single for-in over the unified dict):\n");
     for (auto name, data in Fruit.variants) {
         printf("  %s : value=%d  desc=\"%s\"\n",
-               name, (int)data.value, data.desc);
+               name, (int)data.value, (char*)data.desc);
     }
 
     printf("\nMembership: %s\n", ("Kiwi" in Fruit.variants) ? "yes" : "no");

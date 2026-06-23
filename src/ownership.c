@@ -461,6 +461,12 @@ typedef struct flowctx {
   int                 dead_p;
   int                 quiet_p;
   int                 verbose_p;
+  /* Set by transfer_return when the returned expression itself is an
+     acquire form (`return new T(...)`, `return malloc(...)`, `return
+     detach <acquire>`), even if no intermediate binding was tracked.
+     Drives returns_owned_p inference for thin-wrapper functions. */
+  int                 returns_owned_inline_p;
+  const char         *returns_release_fn_inline;
 } flowctx_t;
 
 /* Emit-or-suppress helpers used by the transfer functions below.
@@ -691,13 +697,22 @@ static void check_exit_state (flowctx_t *ctx, pos_t exit_pos, const char *exit_k
     /* `delete` is a statement keyword (`delete p;`), not a function call,
        so don't render it with the function-call parens that suit `free(p)`. */
     int delete_p = (c->release_fn != NULL && strcmp (c->release_fn, "delete") == 0);
+    /* `new T(...)` is the literal-acquire form; for IP-discovered wrappers
+       (acquire_fn is the wrapper's name like "spawn"), use the call-style
+       rendering instead so the message reads correctly. */
+    int literal_new_p = (c->acquire_fn != NULL && strcmp (c->acquire_fn, "new") == 0);
     if (c->state == OS_OWNED) {
       if (delete_p)
         warning (ctx->c2m_ctx, c->acquire_pos,
-                 "leak: `%s` allocated by `%s T(...)` is still owned at %s "
-                 "but never `delete`d, returned, or stored elsewhere\n"
-                 "  hint: add `defer delete %s;` right after this declaration, "
-                 "or mark the binding `unowned` to silence this check",
+                 literal_new_p
+                   ? "leak: `%s` allocated by `%s T(...)` is still owned at %s "
+                     "but never `delete`d, returned, or stored elsewhere\n"
+                     "  hint: add `defer delete %s;` right after this declaration, "
+                     "or mark the binding `unowned` to silence this check"
+                   : "leak: `%s` allocated by `%s(...)` is still owned at %s "
+                     "but never `delete`d, returned, or stored elsewhere\n"
+                     "  hint: add `defer delete %s;` right after this declaration, "
+                     "or mark the binding `unowned` to silence this check",
                  c->name, c->acquire_fn, exit_kind, c->name);
       else
         warning (ctx->c2m_ctx, c->acquire_pos,
@@ -711,11 +726,17 @@ static void check_exit_state (flowctx_t *ctx, pos_t exit_pos, const char *exit_k
     } else if (c->state == OS_MAYBE_OWNED) {
       if (delete_p)
         warning (ctx->c2m_ctx, c->acquire_pos,
-                 "potential leak: `%s` allocated by `%s T(...)` may be owned on "
-                 "some path reaching %s (some branches `delete` or escape it, "
-                 "others do not)\n"
-                 "  hint: add `delete %s;` on the branch that misses it, or mark "
-                 "the binding `unowned`",
+                 literal_new_p
+                   ? "potential leak: `%s` allocated by `%s T(...)` may be owned on "
+                     "some path reaching %s (some branches `delete` or escape it, "
+                     "others do not)\n"
+                     "  hint: add `delete %s;` on the branch that misses it, or mark "
+                     "the binding `unowned`"
+                   : "potential leak: `%s` allocated by `%s(...)` may be owned on "
+                     "some path reaching %s (some branches `delete` or escape it, "
+                     "others do not)\n"
+                     "  hint: add `delete %s;` on the branch that misses it, or mark "
+                     "the binding `unowned`",
                  c->name, c->acquire_fn, exit_kind, c->name);
       else
         warning (ctx->c2m_ctx, c->acquire_pos,
@@ -853,6 +874,52 @@ static param_attr_t summary_param_attr (node_t callee_def, size_t pos) {
   func_summary_t *s = summary_lookup (callee_def);
   if (s == NULL || pos >= s->param_count) return PA_DEFAULT;
   return s->param_attrs[pos];
+}
+
+/* Return TRUE and (via out_release_fn) the matching release form if `expr`
+   is an acquire shape:  N_NEW (anywhere), an N_CALL to a known acquire fn,
+   or an N_CALL to a function with returns_owned_p summary.  Peels
+   `(T)<expr>` casts and `detach <expr>` wrappers.  Used by transfer_return
+   so thin wrappers like  `Box* spawn(int v) { return detach new Box(v); }`
+   get returns_owned_p inferred even though there's no intermediate
+   binding to drive the candidate-based path. */
+static int return_expr_is_acquire_p (node_t expr, const char **out_release_fn) {
+  if (out_release_fn != NULL) *out_release_fn = NULL;
+  /* Peel any number of casts and a leading detach. */
+  for (;;) {
+    if (expr == NULL) return 0;
+    if (expr->code == N_CAST) { expr = NL_EL (expr->u.ops, 1); continue; }
+    if (expr->code == N_DETACH) { expr = NL_HEAD (expr->u.ops); continue; }
+    break;
+  }
+  if (expr->code == N_NEW) {
+    if (out_release_fn != NULL) *out_release_fn = "delete";
+    return 1;
+  }
+  if (expr->code == N_CALL) {
+    node_t callee = NL_HEAD (expr->u.ops);
+    if (callee == NULL || callee->code != N_ID || callee->u.s.s == NULL) return 0;
+    const char *cname = callee->u.s.s;
+    /* Hard-coded acquire table mirror.  Keep in sync with release_fn_for_acquire. */
+    const char *r = NULL;
+    if (strcmp (cname, "malloc")  == 0) r = "free";
+    else if (strcmp (cname, "calloc")  == 0) r = "free";
+    else if (strcmp (cname, "realloc") == 0) r = "free";
+    else if (strcmp (cname, "strdup")  == 0) r = "free";
+    else if (strcmp (cname, "strndup") == 0) r = "free";
+    if (r != NULL) { if (out_release_fn != NULL) *out_release_fn = r; return 1; }
+    /* IP-summary lookup. */
+    struct expr *ce = (struct expr *) callee->attr;
+    if (ce != NULL && ce->def_node != NULL) {
+      func_summary_t *s = summary_lookup (ce->def_node);
+      if (s != NULL && s->returns_owned_p) {
+        if (out_release_fn != NULL)
+          *out_release_fn = s->returns_release_fn != NULL ? s->returns_release_fn : "free";
+        return 1;
+      }
+    }
+  }
+  return 0;
 }
 
 /* IP variant of acquire detection: resolve an N_CALL init through summary
@@ -1256,6 +1323,17 @@ static void transfer_return (flowctx_t *ctx, node_t ret) {
         a[i].escapes_p = 1;
         record_disposition (ctx, &a[i], POS (ret), "returned to caller");
       }
+    /* Inline acquire-shape detection: even when there's no candidate to
+       track, `return new T(...)` / `return detach new T(...)` / `return
+       malloc(n)` / `return some_acquire_wrapper(...)` ships ownership
+       to the caller, so the function's summary should reflect that.
+       Record on the flowctx for summary derivation at function-end. */
+    const char *inline_release = NULL;
+    if (return_expr_is_acquire_p (expr, &inline_release) && inline_release != NULL) {
+      ctx->returns_owned_inline_p = 1;
+      if (ctx->returns_release_fn_inline == NULL)
+        ctx->returns_release_fn_inline = inline_release;
+    }
   }
 
   /* Check what's still Owned/MaybeOwned at this exit point. */
@@ -1308,8 +1386,17 @@ static void transfer_detach (flowctx_t *ctx, node_t det) {
   if (inner == NULL) return;
   /* Recurse first so nested effects (like a use inside the expression) fire. */
   analyze (ctx, inner);
+  /* `detach <expr>` escapes the *value* of <expr>, not every binding that
+     appears anywhere inside it.  Only act if the inner expression directly
+     names a tracked binding (after cast peeling); patterns like
+     `detach m.trim().upper()` produce a fresh value derived from `m` and
+     do NOT transfer m's ownership.  Patterns like `detach new Box(v)` or
+     `detach (String)"x#" + i` have no binding to transfer at all (the
+     value flows through transfer_return's return-owned detection). */
+  node_t direct = id_resolves_to_decl (inner);
+  if (direct == NULL) return;
   for (size_t i = 0; i < n; i++)
-    if (subtree_mentions_decl (inner, a[i].decl)) {
+    if (a[i].decl == direct) {
       a[i].state = OS_DETACHED;
       a[i].escapes_p = 1;
       record_disposition (ctx, &a[i], POS (det), "detached");
@@ -2356,6 +2443,14 @@ static void cfg_emit_diagnostics (flowctx_t *ctx, cfg_t *cfg) {
         }
       }
     }
+    /* Fold in the inline acquire-shape signal recorded by transfer_return:
+       a wrapper like  `Box* spawn(int) { return detach new Box(v); }`
+       has no intermediate candidate, so we'd otherwise miss returns_owned. */
+    if (!returns_owned_p && ctx->returns_owned_inline_p
+        && ctx->returns_release_fn_inline != NULL) {
+      returns_owned_p     = 1;
+      returns_release_fn = ctx->returns_release_fn_inline;
+    }
     summary_install (c2m_ctx, ctx->func_def, param_count, attrs,
                      returns_owned_p, returns_release_fn);
   }
@@ -2465,9 +2560,24 @@ static void emit_ownership_report (flowctx_t *ctx, node_t func_def,
   pos_t        fp      = POS (func_def);
   (void) c2m_ctx;
 
-  /* Quiet for functions with nothing tracked — the report is meant to
-     show *what we verified*, and an empty function isn't interesting. */
-  if (n == 0) return;
+  /* Quiet for functions with nothing tracked AND no interesting summary.
+     A summary with returns_owned_p or any non-default param attr is worth
+     reporting ("this wrapper returns ownership" is information the user
+     wants).  param-only candidates without an interesting summary are
+     skipped: incoming params alone aren't an interesting report row. */
+  {
+    func_summary_t *s = summary_lookup (func_def);
+    int summary_has_info = 0;
+    if (s != NULL) {
+      if (s->returns_owned_p) summary_has_info = 1;
+      for (size_t p = 0; !summary_has_info && p < s->param_count; p++)
+        if (s->param_attrs[p] != PA_DEFAULT) summary_has_info = 1;
+    }
+    int has_non_param_candidate = 0;
+    for (size_t k = 0; !has_non_param_candidate && k < n; k++)
+      if (!a[k].param_p) has_non_param_candidate = 1;
+    if (!has_non_param_candidate && !summary_has_info) return;
+  }
 
   if (!report_header_emitted_p) {
     fprintf (out, "\n[ownership report]\n");
@@ -2552,10 +2662,11 @@ static void analyze_function (c2m_ctx_t c2m_ctx, node_t func_def) {
   /* Seed param candidates so interprocedural summary inference can fire. */
   collect_param_candidates (c2m_ctx, func_def, cands);
 
-  if (VARR_LENGTH (candidate_t, cands) == 0) {
-    VARR_DESTROY (candidate_t, cands);
-    return;
-  }
+  /* Note: we used to early-exit when cands was empty, but the
+     interprocedural summary pass needs to run on every function so that
+     wrappers with no candidates (e.g. `Box* spawn(int v) { return new
+     Box(v); }`) still get returns_owned_p recorded.  cfg_emit_diagnostics
+     handles empty cands gracefully. */
 
   if (verbose_p) {
     pos_t fp = POS (func_def);
@@ -2594,6 +2705,8 @@ static void analyze_function (c2m_ctx_t c2m_ctx, node_t func_def) {
   ctx.dead_p    = 0;
   ctx.quiet_p   = 0;
   ctx.verbose_p = verbose_p;
+  ctx.returns_owned_inline_p   = 0;
+  ctx.returns_release_fn_inline = NULL;
 
   if (verbose_p) cfg_dump (&cfg);
   cfg_dataflow (&ctx, &cfg);

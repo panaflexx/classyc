@@ -592,6 +592,23 @@ C2M_DICT_API DictValue *dict_value_at(const DictValue *obj, size_t index) {
     return NULL;
 }
 
+/* Tag predicate: 1 iff `d` is a DICT_ARRAY.  Used by `for-in` codegen to
+ * dispatch between object iteration (key, value pairs) and array iteration
+ * (index, element). */
+C2M_DICT_API int dict_is_array(const DictValue *d) {
+    return (d != NULL && d->type == DICT_ARRAY) ? 1 : 0;
+}
+
+/* Unified iteration count: array length for DICT_ARRAY, pair count for
+ * DICT_OBJECT, 0 otherwise.  Lets `for-in` use a single count call regardless
+ * of which payload the dict carries at runtime. */
+C2M_DICT_API size_t dict_iter_count(const DictValue *d) {
+    if (!d) return 0;
+    if (d->type == DICT_ARRAY)  return d->array_value.length;
+    if (d->type == DICT_OBJECT) return d->object_value.count;
+    return 0;
+}
+
 C2M_DICT_API void dict_destroy(DictValue *val) {
     if (!val) return;
     DictArena *arena = val->owned_arena;

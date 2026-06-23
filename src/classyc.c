@@ -14596,17 +14596,20 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
              e->type->u.basic_type = TP_STRING;
              e->type->raw_size = 8;
              e->type->align    = 8;
-           } else if (strcmp(op2->u.s.s, "value") == 0) {
-             /* special for variant sub-dict .value to get the int */
-             e->type->mode = TM_BASIC;
-             e->type->u.basic_type = TP_INT;
-           } else if (strcmp(op2->u.s.s, "desc") == 0) {
-             /* special for .desc to get char* */
-             e->type->mode = TM_PTR;
-             struct type *c = create_basic_type(c2m_ctx, TP_CHAR);
-             e->type->u.ptr_type = create_ptr_type(c2m_ctx, c);
            } else {
-             /* dict member access: key = op2 (N_ID), treat as runtime lookup */
+             /* Dict member access: every leaf stays TM_DICT (a tagged
+                DictValue*), so chaining (`d.a.b.c`), `json(leaf)`, and a future
+                typed-class binder can walk the subtree losslessly.  Scalar
+                consumers (assignment to int/String, `(int)d.x`, varargs, etc.)
+                already unwrap the union payload via maybe_unwrap_dict_value /
+                the N_CAST path.  NOTE: this used to special-case `.value` and
+                `.desc` to scalar/char*, which produced a raw intptr_t when the
+                LHS was inferred `dict` and made `json(v)` SIGSEGV on a numeric
+                leaf (SHORTCOMINGS C2).  Use an explicit `(int)d.value` /
+                `(char*)d.desc` cast when you need the unwrapped scalar.
+                Dict-wide built-ins like `d.length()` / `d.count()` are
+                dispatched in the N_CALL handler (so they don't shadow real
+                dict keys named `length` / `count`). */
              e->type->mode = TM_DICT; /* keep TM_DICT for chaining */
            }
            e->u.lvalue_node = r; /* allow assignment */
@@ -15494,6 +15497,33 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	                  break;
 	                default: break;
 	                }
+	                ret_type = &res_type;
+	                method_call_p = TRUE;
+	              } else if (obj_type->mode == TM_DICT) {
+	                /* Built-in dict method call: d.length() / d.count() return
+	                   the unified iteration size (array length OR object
+	                   pair-count).  Implemented as methods, not properties, so
+	                   they cannot collide with real dict keys named `length` or
+	                   `count` (e.g. `d.count = 100; d.count` reads the user's
+	                   value back via the regular runtime lookup, while
+	                   `d.count()` always means the iteration size).  Lowered to
+	                   `dict_iter_count` in gen. */
+	                node_t method_id = NL_NEXT(obj);
+	                const char *mname = (method_id && method_id->code == N_ID)
+	                                      ? method_id->u.s.s : "?";
+	                if (strcmp(mname, "length") != 0 && strcmp(mname, "count") != 0) {
+	                  error(c2m_ctx, POS(r),
+	                        "unknown dict method '%s' (only 'length' / 'count' are built in)",
+	                        mname);
+	                  break;
+	                }
+	                if (NL_LENGTH(arg_list->u.ops) != 0)
+	                  error(c2m_ctx, POS(r),
+	                        "dict method '%s' takes no arguments", mname);
+	                init_type(&res_type);
+	                res_type.mode = TM_BASIC;
+	                res_type.u.basic_type = get_uint_basic_type(sizeof(mir_size_t)); /* size_t */
+	                set_type_layout(c2m_ctx, &res_type);
 	                ret_type = &res_type;
 	                method_call_p = TRUE;
 	              } else {
@@ -16921,6 +16951,8 @@ struct gen_ctx {
   MIR_item_t dict_object_key_at_proto, dict_object_key_at_item;
   MIR_item_t dict_object_value_at_proto, dict_object_value_at_item;
   MIR_item_t dict_value_at_proto, dict_value_at_item;
+  MIR_item_t dict_is_array_proto, dict_is_array_item;
+  MIR_item_t dict_iter_count_proto, dict_iter_count_item;
   MIR_item_t dict_create_array_proto, dict_create_array_item;
   MIR_item_t dict_array_append_proto, dict_array_append_item;
   MIR_item_t dict_serialize_json_proto, dict_serialize_json_item;
@@ -17064,6 +17096,10 @@ struct gen_ctx {
 #define dict_object_value_at_item gen_ctx->dict_object_value_at_item
 #define dict_value_at_proto gen_ctx->dict_value_at_proto
 #define dict_value_at_item gen_ctx->dict_value_at_item
+#define dict_is_array_proto gen_ctx->dict_is_array_proto
+#define dict_is_array_item gen_ctx->dict_is_array_item
+#define dict_iter_count_proto gen_ctx->dict_iter_count_proto
+#define dict_iter_count_item gen_ctx->dict_iter_count_item
 #define dict_create_array_proto gen_ctx->dict_create_array_proto
 #define dict_create_array_item gen_ctx->dict_create_array_item
 #define dict_array_append_proto gen_ctx->dict_array_append_proto
@@ -18965,6 +19001,21 @@ static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, dict_value_at_proto);
   move_item_to_module_start (module, dict_value_at_item);
 
+  /* dict_is_array(const DictValue *d) -> int   (1 iff d->type == DICT_ARRAY) */
+  vars[0].name = "d"; vars[0].type = MIR_T_I64;
+  dict_is_array_proto = MIR_new_proto_arr (ctx, "__dict_is_array_p", 1, &int_t, 1, vars);
+  dict_is_array_item = MIR_new_import (ctx, "dict_is_array");
+  move_item_to_module_start (module, dict_is_array_proto);
+  move_item_to_module_start (module, dict_is_array_item);
+
+  /* dict_iter_count(const DictValue *d) -> size_t
+     Array length for DICT_ARRAY, pair count for DICT_OBJECT, 0 otherwise. */
+  vars[0].name = "d"; vars[0].type = MIR_T_I64;
+  dict_iter_count_proto = MIR_new_proto_arr (ctx, "__dict_iter_count_p", 1, &sz_t, 1, vars);
+  dict_iter_count_item = MIR_new_import (ctx, "dict_iter_count");
+  move_item_to_module_start (module, dict_iter_count_proto);
+  move_item_to_module_start (module, dict_iter_count_item);
+
   /* dict_create_array() -> DictValue* */
   dict_create_array_proto = MIR_new_proto_arr (ctx, "__dict_create_array_p", 1, &ptr_t, 0, NULL);
   dict_create_array_item = MIR_new_import (ctx, "dict_create_array");
@@ -19370,6 +19421,20 @@ static op_t gen_dict_value_at (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, MIR_op_t idx_
   MIR_op_t a[2] = {obj_op, idx_op};
   dict_ensure_imports (c2m_ctx);
   return gen_rt_call (c2m_ctx, dict_value_at_proto, dict_value_at_item, 2, a);
+}
+
+/* Emit: res = dict_is_array(obj_op)   (used by for-in to dispatch on tag) */
+static op_t gen_dict_is_array (c2m_ctx_t c2m_ctx, MIR_op_t obj_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  dict_ensure_imports (c2m_ctx);
+  return gen_rt_call (c2m_ctx, dict_is_array_proto, dict_is_array_item, 1, &obj_op);
+}
+
+/* Emit: res = dict_iter_count(obj_op)  (array length OR object count) */
+static op_t gen_dict_iter_count (c2m_ctx_t c2m_ctx, MIR_op_t obj_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  dict_ensure_imports (c2m_ctx);
+  return gen_rt_call (c2m_ctx, dict_iter_count_proto, dict_iter_count_item, 1, &obj_op);
 }
 
 /* Create a named (uniquely-named) string-data item holding a dict key, returning
@@ -22328,6 +22393,23 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         goto finish;
       }
     }
+    /* Built-in dict method call: d.length() / d.count() -> dict_iter_count.
+       Recognized here (rather than as magic dot-access on TM_DICT) so that
+       a user-supplied dict key called `length` or `count` is still readable
+       via `d.length` / `d.count` and assignable via `d.length = ...`. */
+    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
+      node_t mobj = NL_HEAD (func->u.ops);
+      node_t mid  = NL_NEXT (mobj);
+      struct expr *obj_e = mobj->attr;
+      if (mid != NULL && mid->code == N_ID && obj_e != NULL
+          && obj_e->type != NULL && obj_e->type->mode == TM_DICT
+          && (strcmp (mid->u.s.s, "length") == 0 || strcmp (mid->u.s.s, "count") == 0)
+          && (args == NULL || NL_LENGTH (args->u.ops) == 0)) {
+        op_t recv = val_gen (c2m_ctx, mobj);
+        res = gen_dict_iter_count (c2m_ctx, recv.mir_op);
+        goto finish;
+      }
+    }
     /* Built-in String method call: lower s.method(...) to a UTF-8 runtime call. */
 	    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
 	      node_t mobj = NL_HEAD (func->u.ops);
@@ -23777,11 +23859,23 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       #undef STORE_FORIN_VAR
       #undef FORIN_AGG_DEST
     } else {
-      /* ---- Dict for-in ---- */
+      /* ---- Dict for-in ----
+         Dict carries a runtime tag (DICT_OBJECT vs DICT_ARRAY).  Use
+         `dict_iter_count` for the unified bound and `dict_is_array` to
+         dispatch the per-iteration variable bindings between
+           OBJECT:  key = dict_object_key_at(i)   val = dict_object_value_at(i)
+           ARRAY:   key = i (index)               val = dict_value_at(i)  (element)
+         Single-var form maps to `key` per the existing dict-forin convention
+         (key for objects, element for arrays). */
       op_t coll_val = val_gen (c2m_ctx, coll);
       op_t coll_reg = get_new_temp (c2m_ctx, MIR_T_I64);
       emit2 (c2m_ctx, MIR_MOV, coll_reg.mir_op, coll_val.mir_op);
-      op_t n_reg = gen_dict_object_count (c2m_ctx, coll_reg.mir_op);
+      /* Compute is_array tag once: dict identity does not change inside the
+         loop, so a single tag test outside the loop suffices. */
+      op_t is_arr_call = gen_dict_is_array (c2m_ctx, coll_reg.mir_op);
+      op_t is_arr_save = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, is_arr_save.mir_op, is_arr_call.mir_op);
+      op_t n_reg = gen_dict_iter_count (c2m_ctx, coll_reg.mir_op);
       op_t n_save = get_new_temp (c2m_ctx, MIR_T_I64);
       emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, n_reg.mir_op);
       i_reg = get_new_temp (c2m_ctx, MIR_T_I64);
@@ -23791,35 +23885,75 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
              i_reg.mir_op, n_save.mir_op);
       emit_label_insn_opt (c2m_ctx, body_label);
 
-      /* Store loop variables using each variable's *declared* MIR type so the
-         register name matches what N_ID reads in the body.  The dict key is a
-         char* (which get_mir_type maps to U64), the value is a dict (I64); a
-         hardcoded type here would mismatch the reader and yield a garbage
-         register. */
-      op_t key_reg = gen_dict_object_key_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
+      /* Resolve the destination registers for the loop variable(s) using
+         their *declared* MIR types so they match the readers in the body. */
+      MIR_type_t kt = MIR_T_I64;
       {
         symbol_t ksym;
-        MIR_type_t kt = MIR_T_I64;
         if (symbol_find (c2m_ctx, S_REGULAR, key_id, r, &ksym) && ksym.def_node != NULL
             && ksym.def_node->attr != NULL)
           kt = promote_mir_int_type (
                  get_mir_type (c2m_ctx, ((decl_t) ksym.def_node->attr)->decl_spec.type));
-        const char *kname = get_reg_var_name (c2m_ctx, kt, key_id->u.s.s, fsn);
-        reg_var_t kvar = get_reg_var (c2m_ctx, kt, kname, NULL);
-        emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, kvar.reg), key_reg.mir_op);
       }
-      if (val_id->code == N_ID) {
-        op_t val_reg = gen_dict_object_value_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
+      const char *kname = get_reg_var_name (c2m_ctx, kt, key_id->u.s.s, fsn);
+      reg_var_t kvar = get_reg_var (c2m_ctx, kt, kname, NULL);
+
+      reg_var_t vvar = {0};
+      MIR_type_t vt = MIR_T_I64;
+      int two_var = (val_id->code == N_ID);
+      if (two_var) {
         symbol_t vsym;
-        MIR_type_t vt = MIR_T_I64;
         if (symbol_find (c2m_ctx, S_REGULAR, val_id, r, &vsym) && vsym.def_node != NULL
             && vsym.def_node->attr != NULL)
           vt = promote_mir_int_type (
                  get_mir_type (c2m_ctx, ((decl_t) vsym.def_node->attr)->decl_spec.type));
         const char *vname = get_reg_var_name (c2m_ctx, vt, val_id->u.s.s, fsn);
-        reg_var_t vvar = get_reg_var (c2m_ctx, vt, vname, NULL);
-        emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, vvar.reg), val_reg.mir_op);
+        vvar = get_reg_var (c2m_ctx, vt, vname, NULL);
       }
+
+      /* Runtime dispatch on dict tag.
+           if (is_array) goto arr_body;
+           // object path:
+           key_var = dict_object_key_at(d, i)
+           if (two_var) val_var = dict_object_value_at(d, i)
+           goto after_dispatch
+         arr_body:
+           // array path:
+           if (two_var) key_var = i; val_var = dict_value_at(d, i)
+           else         key_var = dict_value_at(d, i)
+         after_dispatch: */
+      MIR_label_t arr_body_label = MIR_new_label (ctx);
+      MIR_label_t after_dispatch_label = MIR_new_label (ctx);
+      emit3 (c2m_ctx, MIR_BNE, MIR_new_label_op (ctx, arr_body_label),
+             is_arr_save.mir_op, MIR_new_int_op (ctx, 0));
+
+      /* ---- object path ---- */
+      {
+        op_t key_reg = gen_dict_object_key_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
+        emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, kvar.reg), key_reg.mir_op);
+        if (two_var) {
+          op_t val_reg = gen_dict_object_value_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
+          emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, vvar.reg), val_reg.mir_op);
+        }
+      }
+      emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, after_dispatch_label));
+
+      /* ---- array path ---- */
+      emit_label_insn_opt (c2m_ctx, arr_body_label);
+      {
+        op_t elem_reg = gen_dict_value_at (c2m_ctx, coll_reg.mir_op, i_reg.mir_op);
+        if (two_var) {
+          /* k = i (index), v = element */
+          emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, kvar.reg), i_reg.mir_op);
+          emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, vvar.reg), elem_reg.mir_op);
+        } else {
+          /* single var = element (DictValue*).  The declared variable type
+             is char* (per the type checker), but at MIR level both are I64
+             pointers; the dict-typed body code paths consume it correctly. */
+          emit2 (c2m_ctx, MIR_MOV, MIR_new_reg_op (ctx, kvar.reg), elem_reg.mir_op);
+        }
+      }
+      emit_label_insn_opt (c2m_ctx, after_dispatch_label);
     }
 
     /* Per-iter checkpoint right before the body (key/val regs already bound).
@@ -24381,6 +24515,15 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
             && sfe->type->u.basic_type == TP_VOID)
           continue;
       }
+      /* Built-in dict methods (d.length() / d.count()) are lowered directly
+         to dict_iter_count() in gen and carry no user-level C prototype.
+         Identified by: receiver type is TM_DICT and the method name is one
+         of the recognized dict builtins. */
+      if (smethod != NULL && smethod->code == N_ID && sobj_e != NULL
+          && sobj_e->type != NULL && sobj_e->type->mode == TM_DICT
+          && (strcmp (smethod->u.s.s, "length") == 0
+              || strcmp (smethod->u.s.s, "count") == 0))
+        continue;
     }
     type = ((struct expr *) func->attr)->type;
     assert (type->mode == TM_PTR && type->u.ptr_type->mode == TM_FUNC);

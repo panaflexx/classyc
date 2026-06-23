@@ -248,24 +248,43 @@ sections in `examples/classy-dict-arena.cy`).
 (round-trips and serializes correctly), or the runtime
 `dict_create_array` / `dict_array_append` helpers.
 
-### C2. Deep numeric leaf access unwraps to a raw scalar (crash if treated as dict)
-For `dict d = json("{\"items\":[{\"value\":7}]}");`:
+### C1b. (FIXED) `d.length()` / `d.count()` expose the size
+For any dict, `d.length()` and `d.count()` return the unified iteration size:
+array length for `DICT_ARRAY`, pair count for `DICT_OBJECT`, `0` otherwise.
+They are methods (not magic properties) so they cannot collide with real dict
+keys named `length` / `count` — those still round-trip through the normal
+`d.length = ...` / `d.length` runtime lookup.  Implementation:
+`dict_iter_count` in `ext/mir/inc/dict.h` plus the N_CALL dispatch in
+`src/classyc.c`.
+
+### C2. (FIXED) Deep dict-leaf access stays a tagged DictValue *
+`d.items[0].value` (and every other leaf field access on a dict) now produces
+a tagged `DictValue*` instead of an unwrapped scalar.  The previous behaviour
+special-cased the field names `.value` (→ `int`) and `.desc` (→ `char*`),
+which made
 ```c
-dict v = d.items[0].value;   // v becomes the raw int 7 reinterpreted as a dict
-json(v);                     // dereferences address 0x7 -> SIGSEGV
+dict v = d.items[0].value;
+json(v);  // SIGSEGV: 7 reinterpreted as DictValue*
 ```
-String leaves (`d.items[0].name`) behave like `char*` and are fine.
+dereference `0x7`.  Today `json(v)` returns `"7"`.
 
-**Workaround:** read numeric leaves directly as scalars:
-`int x = (int)d.items[0].value;` (validated to give 7/9). Reserve `json()` for
-dict/array/string values.
+To read a numeric/string leaf as a plain C scalar, use an explicit cast:
+`int x = (int)d.items[0].value;`, `char *s = (char*)d.items[0].name;`.
+The cast triggers the existing dict-union unwrap path; the box is what a
+future typed JSON binder (`dict → class` field assignment) walks.
 
-### C3. `for-in` does not iterate a dict array value
-`for (auto x in d.items)` runs **0 iterations** even when the JSON array is
-non-empty.
+### C3. (FIXED) `for-in` over a dict array iterates correctly
+Dict for-in now dispatches at runtime on the `DictType` tag:
+* `DICT_OBJECT` — single-var binds the key (`char*`); two-var binds
+  `(key, value)`.
+* `DICT_ARRAY` — single-var counts the elements (loop variable is still typed
+  `char*` per the existing dict for-in convention, holding a `DictValue*` at
+  MIR level); two-var binds `(index, element)` with the element typed as
+  `dict` so chained access like `x.name` and `(int)x` both work.
 
-**Workaround:** index by integer with a known count: `d.items[i]`. There is no
-exposed array-length builtin for dict arrays.
+Runtime helpers added: `dict_is_array`, `dict_iter_count` in `dict.h`; gen
+side in `src/classyc.c` (FORIN dict branch).  Covered by
+`cy-validate/val-004-dict-arrays.cy`.
 
 ---
 

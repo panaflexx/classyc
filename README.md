@@ -219,16 +219,21 @@ automatically.
 class Point {
     int x, y;
 
-    Point(int x, int y) { this.x = x; this.y = y; }
-    ~Point() { printf("~Point(%d,%d)\n", this.x, this.y); }
+    Point(int x, int y) { this.x = x; this.y = y; }   // `this.` disambiguates the field from the parameter
+    ~Point() { printf("~Point(%d,%d)\n", x, y); }
 
-    Point* withX(int v) { this.x = v; return this; }
+    Point* withX(int v) { x = v; return this; }       // bare field access; `this` is still the pronoun for chaining
     int sum() { return x + y; }
 };
 
 Point* p = new Point(3, 4).withX(10);         // heap + chaining
 defer delete p;                               // RAII-style cleanup for heap memory
 ```
+
+> `this.` on a field is **optional** inside method bodies — bare `x` resolves
+> to the field. You only need `this.x` when a parameter or local of the same
+> name shadows the field (as in the `Point` constructor above). `this` as a
+> standalone pronoun (e.g. `return this;`) is unrelated and always available.
 
 ### `defer`, `delete`, and Scoped Resource Management
 `defer` runs a statement on scope exit (LIFO, Go-style) — perfect for closing
@@ -275,7 +280,7 @@ Box* spawn(int v) {
 
 class Request {
     String method;
-    Request(String m) { this.method = detach m.trim().upper(); }   // store past scope
+    Request(String m) { method = detach m.trim().upper(); }   // store past scope
 }
 
 void handle() {

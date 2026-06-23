@@ -118,6 +118,8 @@ static void *import_resolver(const char *name) {
     if (strcmp(name, "dict_object_key_at")       == 0) return (void *)dict_object_key_at;
     if (strcmp(name, "dict_object_value_at")     == 0) return (void *)dict_object_value_at;
     if (strcmp(name, "dict_value_at")            == 0) return (void *)dict_value_at;
+    if (strcmp(name, "dict_is_array")            == 0) return (void *)dict_is_array;
+    if (strcmp(name, "dict_iter_count")          == 0) return (void *)dict_iter_count;
 
     /* String runtime */
     if (strcmp(name, "c2m_str_length")           == 0) return (void *)c2m_str_length;
