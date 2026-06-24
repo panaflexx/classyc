@@ -798,7 +798,7 @@ Contributions, bug reports, and wild ideas are welcome!
   See `JSONBINDING.md` for the design.
 - Richer `List<T>` / `Map<K,V>` syntactic sugar and initializer syntax (more Pythonic comprehensions, better literal support).
 - Safe / typed JSON parsing helpers that return `Result<T, ParseError>` or throw on failure (beyond the current `asDict()` which can produce a null-ish dict on bad input).
-- Lightweight SQLite wrapper (`include/sqlite.h`) with automatic binding of `dict` rows and `List<dict>` result sets — a natural fit given the existing `dict` infrastructure.
+- ~~Lightweight SQLite wrapper (`include/sqlite.h`) with automatic binding of `dict` rows and `List<dict>` result sets~~ **(landed)** — `Sqlite.open()`, `db->execute(sql, fmt, ...)`, `db->query(sql, fmt, ...) -> List<dict>*`, `db->prepare()` returning a real `Statement*` with overloaded `bind(int|long|double|const char*)`, RAII `Transaction*` for commit/rollback, `db->lastInsertRowId()`, and `SqliteError` exceptions on failure. SQL `NULL` round-trips as JSON `null` so `(T) row` bind-casts behave correctly. See `examples/classy-customers-rest.cy` for a Flask-style REST controller backed by an in-memory SQLite database.
 - Simple gunicorn-style HTTP server library (lower priority than SQLite).
 - Optional pretty-printing / symbolic names for user-defined exceptions at debug time.
 

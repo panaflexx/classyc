@@ -34,15 +34,31 @@
        tx->commit();
 
    What is and isn't implemented yet:
-     execute(sql)         — real, via sqlite3_exec
+     execute(sql)         — real, via sqlite3_exec  (no bind params)
      query(sql)           — real, materializes each row into a dict
                             (INTEGER/REAL/TEXT/NULL columns supported)
      query_one(sql)       — real, returns first row's dict (or NULL)
-     prepare()/Statement  — still a stub
-     Parameter binding    — NOT YET; embed values directly in the SQL string
-                            until we add a real binder.  This is fine for an
-                            in-memory smoke test but obviously not for
-                            production code (SQL injection).
+     prepare(sql)         — real, returns a heap Statement*
+     Statement::bind(i,v) — overloaded for int / long / double / String /
+                            const char*  (1-indexed, like sqlite C API)
+     Statement::bindNull  — explicit NULL bind
+     Statement::step      — returns SQLITE_ROW / SQLITE_DONE / error rc
+     Statement::execute   — step once; returns sqlite3_changes() or -1
+     Statement::query     — run-to-completion; List<dict>* of rows
+     Statement::reset     — reset for re-binding & re-running
+
+   Typical bound use:
+
+       Statement* ins = db->prepare(
+           "INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?)");
+       defer delete ins;
+       ins->bind(1, 42);
+       ins->bind(2, "Ada");
+       ins->bind(3, "Lovelace");
+       ins->bind(4, "ada@analytical.engine");
+       ins->bind(5, "555-0001");
+       ins->bind(6, "CA");
+       ins->execute();
    ========================================================================= */
 
 #ifndef SQLITE_CLASSYC_H
@@ -55,10 +71,18 @@
 
 /* ---- runtime dict helpers (linked via import_resolver) ---- */
 dict dict_create_object();
+dict dict_create_null();
 dict dict_create_int64(long n);
 dict dict_create_number(double n);
 dict dict_create_string(char *s);
 int  dict_object_set(dict obj, char *key, dict val);
+
+/* ---- user-defined exception class for SQLite errors ----
+   Throw with:  throw(SqliteError, "msg");
+   Catch with:  catch (SqliteError e) { ... e.id, e.msg ... } */
+enum {
+    SqliteError = 200
+};
 
 /* -------------------------------------------------------------------------
    Sqlite – connection wrapper
@@ -105,13 +129,13 @@ class Sqlite {
         int rc = sqlite3_exec(this->db, sql, 0, 0, &errmsg);
         if (rc != SQLITE_OK) {
             this->last_err = rc;
-            if (errmsg) {
-                printf("sqlite execute failed: %s\n", errmsg);
-                sqlite3_free(errmsg);
-            } else {
-                printf("sqlite execute failed (rc=%d)\n", rc);
-            }
-            return -1;
+            char* msg = errmsg ? errmsg : (char*)sqlite3_errmsg(this->db);
+            /* Copy to a stable buffer before freeing errmsg (the exception
+               machinery keeps msg as a pointer; sqlite3_free invalidates it). */
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "execute: %s", msg ? msg : "(no msg)");
+            if (errmsg) sqlite3_free(errmsg);
+            throw(SqliteError, buf);
         }
         return sqlite3_changes(this->db);
     }
@@ -129,9 +153,11 @@ class Sqlite {
         int rc = sqlite3_prepare_v2(this->db, sql, -1, &stmt, 0);
         if (rc != SQLITE_OK) {
             this->last_err = rc;
-            printf("sqlite prepare failed (rc=%d)\n", rc);
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "query/prepare: %s",
+                     sqlite3_errmsg(this->db));
             if (stmt) sqlite3_finalize(stmt);
-            return 0;
+            throw(SqliteError, buf);
         }
 
         List<dict>* rows = new List<dict>();
@@ -149,11 +175,10 @@ class Sqlite {
                     v = dict_create_number(sqlite3_column_double(stmt, i));
                 } else if (t == SQLITE_TEXT) {
                     v = dict_create_string((char*)sqlite3_column_text(stmt, i));
-                } else if (t == SQLITE_NULL) {
-                    v = dict_create_string("");
                 } else {
-                    /* SQLITE_BLOB — surface as empty string for now */
-                    v = dict_create_string("");
+                    /* SQLITE_NULL or SQLITE_BLOB — preserve as JSON null so
+                       (T) bind-cast and `"key" in row` work correctly. */
+                    v = dict_create_null();
                 }
                 dict_object_set(row, (char*)name, v);
             }
@@ -162,7 +187,12 @@ class Sqlite {
 
         if (rc != SQLITE_DONE) {
             this->last_err = rc;
-            printf("sqlite step failed (rc=%d)\n", rc);
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "query/step: %s",
+                     sqlite3_errmsg(this->db));
+            sqlite3_finalize(stmt);
+            delete rows;
+            throw(SqliteError, buf);
         }
         sqlite3_finalize(stmt);
         return rows;
@@ -182,9 +212,160 @@ class Sqlite {
         return r;
     }
 
-    /* Prepared statement for hot paths — still a stub. */
+    /* Prepared statement for hot paths.  Caller owns the returned
+       Statement* and should `defer delete stmt;` it.  Throws SqliteError
+       on a malformed statement. */
     Statement* prepare(const char* sql) {
-        return 0;
+        sqlite3_stmt* s = 0;
+        int rc = sqlite3_prepare_v2(this->db, sql, -1, &s, 0);
+        if (rc != SQLITE_OK) {
+            this->last_err = rc;
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "prepare: %s",
+                     sqlite3_errmsg(this->db));
+            if (s) sqlite3_finalize(s);
+            throw(SqliteError, buf);
+        }
+        return new Statement(this, s);
+    }
+
+    /* sqlite3_last_insert_rowid — the auto-increment id of the most recent
+       successful INSERT on this connection. */
+    long lastInsertRowId() {
+        return (long)sqlite3_last_insert_rowid(this->db);
+    }
+
+    /* sqlite3_changes — number of rows modified by the most recent
+       INSERT/UPDATE/DELETE on this connection. */
+    int changes() {
+        return sqlite3_changes(this->db);
+    }
+
+    /* ---------------------------------------------------------------------
+       One-shot bound execute / query (printf-ish format string).
+
+           db->execute("INSERT ... VALUES (?, ?, ?)", "isd", 1, "hello", 3.14);
+           List<dict>* rows = db->query(
+               "SELECT * FROM t WHERE x=? AND y=?", "is", 42, "NY");
+
+       Format chars (all 1-indexed):
+           i   int      -> sqlite3_bind_int
+           l   long     -> sqlite3_bind_int64
+           d   double   -> sqlite3_bind_double   (alias: 'f')
+           f   double   -> sqlite3_bind_double
+           s   char*    -> sqlite3_bind_text (SQLITE_TRANSIENT, sqlite copies)
+           n   (none)   -> sqlite3_bind_null    (no va_arg consumed)
+
+       Throws SqliteError on prepare/bind/step failure.
+       --------------------------------------------------------------------- */
+    int execute(const char* sql, const char* fmt, ...) {
+        sqlite3_stmt* stmt = 0;
+        int rc = sqlite3_prepare_v2(this->db, sql, -1, &stmt, 0);
+        if (rc != SQLITE_OK) {
+            this->last_err = rc;
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "execute/prepare: %s",
+                     sqlite3_errmsg(this->db));
+            if (stmt) sqlite3_finalize(stmt);
+            throw(SqliteError, buf);
+        }
+        va_list ap;
+        va_start(ap, fmt);
+        for (int i = 0; fmt[i] != 0; i++) {
+            int idx = i + 1;
+            char c = fmt[i];
+            if (c == 'i') {
+                sqlite3_bind_int(stmt, idx, va_arg(ap, int));
+            } else if (c == 'l') {
+                sqlite3_bind_int64(stmt, idx,
+                                   (sqlite3_int64)va_arg(ap, long));
+            } else if (c == 'd' || c == 'f') {
+                sqlite3_bind_double(stmt, idx, va_arg(ap, double));
+            } else if (c == 's') {
+                sqlite3_bind_text(stmt, idx, va_arg(ap, char*), -1,
+                                  (void(*)(void*))-1);
+            } else if (c == 'n') {
+                sqlite3_bind_null(stmt, idx);
+            }
+        }
+        va_end(ap);
+        rc = sqlite3_step(stmt);
+        int n = sqlite3_changes(this->db);
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
+            this->last_err = rc;
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "execute/step: %s",
+                     sqlite3_errmsg(this->db));
+            throw(SqliteError, buf);
+        }
+        return n;
+    }
+
+    List<dict>* query(const char* sql, const char* fmt, ...) {
+        sqlite3_stmt* stmt = 0;
+        int rc = sqlite3_prepare_v2(this->db, sql, -1, &stmt, 0);
+        if (rc != SQLITE_OK) {
+            this->last_err = rc;
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "query/prepare: %s",
+                     sqlite3_errmsg(this->db));
+            if (stmt) sqlite3_finalize(stmt);
+            throw(SqliteError, buf);
+        }
+        va_list ap;
+        va_start(ap, fmt);
+        for (int i = 0; fmt[i] != 0; i++) {
+            int idx = i + 1;
+            char c = fmt[i];
+            if (c == 'i') {
+                sqlite3_bind_int(stmt, idx, va_arg(ap, int));
+            } else if (c == 'l') {
+                sqlite3_bind_int64(stmt, idx,
+                                   (sqlite3_int64)va_arg(ap, long));
+            } else if (c == 'd' || c == 'f') {
+                sqlite3_bind_double(stmt, idx, va_arg(ap, double));
+            } else if (c == 's') {
+                sqlite3_bind_text(stmt, idx, va_arg(ap, char*), -1,
+                                  (void(*)(void*))-1);
+            } else if (c == 'n') {
+                sqlite3_bind_null(stmt, idx);
+            }
+        }
+        va_end(ap);
+
+        List<dict>* rows = new List<dict>();
+        int ncols = sqlite3_column_count(stmt);
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            dict row = dict_create_object();
+            for (int i = 0; i < ncols; i++) {
+                const char* name = sqlite3_column_name(stmt, i);
+                int t = sqlite3_column_type(stmt, i);
+                dict v = 0;
+                if (t == SQLITE_INTEGER) {
+                    v = dict_create_int64((long)sqlite3_column_int64(stmt, i));
+                } else if (t == SQLITE_FLOAT) {
+                    v = dict_create_number(sqlite3_column_double(stmt, i));
+                } else if (t == SQLITE_TEXT) {
+                    v = dict_create_string((char*)sqlite3_column_text(stmt, i));
+                } else {
+                    v = dict_create_null();
+                }
+                dict_object_set(row, (char*)name, v);
+            }
+            rows->Add(row);
+        }
+        if (rc != SQLITE_DONE) {
+            this->last_err = rc;
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "query/step: %s",
+                     sqlite3_errmsg(this->db));
+            sqlite3_finalize(stmt);
+            delete rows;
+            throw(SqliteError, buf);
+        }
+        sqlite3_finalize(stmt);
+        return rows;
     }
 
     /* Begin a transaction.  Returns a heap Transaction* the caller owns.
@@ -207,13 +388,28 @@ class Sqlite {
 };
 
 /* -------------------------------------------------------------------------
-   Statement – prepared-statement wrapper (still a stub)
+   Statement – prepared-statement wrapper.
+
+   bind() is overloaded so calls dispatch on the argument type:
+
+       stmt->bind(1, 42);            // int     -> sqlite3_bind_int
+       stmt->bind(2, 9000000000L);   // long    -> sqlite3_bind_int64
+       stmt->bind(3, 3.14);          // double  -> sqlite3_bind_double
+       stmt->bind(4, "hello");       // char*   -> sqlite3_bind_text
+       stmt->bindNull(5);            // NULL
+
+   Indices are 1-based, matching the underlying sqlite3 C API.
    ------------------------------------------------------------------------- */
 class Statement {
     sqlite3_stmt* stmt;
     Sqlite*       owner;
+    int           last_err;
 
-    Statement(Sqlite* o, sqlite3_stmt* s) { this->owner = o; this->stmt = s; }
+    Statement(Sqlite* o, sqlite3_stmt* s) {
+        this->owner = o;
+        this->stmt = s;
+        this->last_err = 0;
+    }
 
     ~Statement() {
         if (this->stmt) {
@@ -222,9 +418,128 @@ class Statement {
         }
     }
 
-    List<dict>* query()     { return 0; }   /* sketch */
-    dict        query_one() { return 0; }   /* sketch */
-    int         execute()   { return 0; }   /* sketch */
+    /* ---- bind overloads (1-indexed) ---- */
+
+    int bind(int idx, int val) {
+        int rc = sqlite3_bind_int(this->stmt, idx, val);
+        if (rc != SQLITE_OK) this->last_err = rc;
+        return rc;
+    }
+
+    int bind(int idx, long val) {
+        int rc = sqlite3_bind_int64(this->stmt, idx, (sqlite3_int64)val);
+        if (rc != SQLITE_OK) this->last_err = rc;
+        return rc;
+    }
+
+    int bind(int idx, double val) {
+        int rc = sqlite3_bind_double(this->stmt, idx, val);
+        if (rc != SQLITE_OK) this->last_err = rc;
+        return rc;
+    }
+
+    int bind(int idx, const char* val) {
+        /* SQLITE_TRANSIENT = (sqlite3_destructor_type)-1: ask sqlite to copy. */
+        int rc = sqlite3_bind_text(this->stmt, idx, val, -1,
+                                   (void(*)(void*))-1);
+        if (rc != SQLITE_OK) this->last_err = rc;
+        return rc;
+    }
+
+    int bindNull(int idx) {
+        int rc = sqlite3_bind_null(this->stmt, idx);
+        if (rc != SQLITE_OK) this->last_err = rc;
+        return rc;
+    }
+
+    /* Reset the statement so it can be re-bound and re-run.  Does NOT clear
+       previously-bound values — use clearBindings() for that. */
+    int reset() {
+        return sqlite3_reset(this->stmt);
+    }
+
+    int clearBindings() {
+        return sqlite3_clear_bindings(this->stmt);
+    }
+
+    /* Raw step — returns SQLITE_ROW, SQLITE_DONE, or an error rc. */
+    int step() {
+        return sqlite3_step(this->stmt);
+    }
+
+    /* Run once.  Returns number of rows affected (sqlite3_changes).
+       Resets the statement on the way out so it's ready for the next set
+       of binds.  Throws SqliteError on a step failure. */
+    int execute() {
+        sqlite3* h = sqlite3_db_handle(this->stmt);
+        int rc = sqlite3_step(this->stmt);
+        sqlite3_reset(this->stmt);
+        if (rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW) {
+            this->last_err = rc;
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "stmt/execute: %s",
+                     sqlite3_errmsg(h));
+            throw(SqliteError, buf);
+        }
+        return sqlite3_changes(h);
+    }
+
+    /* Run-to-completion, materializing all rows into a List<dict>*.
+       Resets the statement on the way out.  Throws SqliteError on a step
+       failure (the in-progress list is freed first). */
+    List<dict>* query() {
+        List<dict>* rows = new List<dict>();
+        int ncols = sqlite3_column_count(this->stmt);
+        int rc;
+        while ((rc = sqlite3_step(this->stmt)) == SQLITE_ROW) {
+            dict row = dict_create_object();
+            for (int i = 0; i < ncols; i++) {
+                const char* name = sqlite3_column_name(this->stmt, i);
+                int t = sqlite3_column_type(this->stmt, i);
+                dict v = 0;
+                if (t == SQLITE_INTEGER) {
+                    v = dict_create_int64(
+                        (long)sqlite3_column_int64(this->stmt, i));
+                } else if (t == SQLITE_FLOAT) {
+                    v = dict_create_number(
+                        sqlite3_column_double(this->stmt, i));
+                } else if (t == SQLITE_TEXT) {
+                    v = dict_create_string(
+                        (char*)sqlite3_column_text(this->stmt, i));
+                } else {
+                    /* SQLITE_NULL / SQLITE_BLOB -> JSON null */
+                    v = dict_create_null();
+                }
+                dict_object_set(row, (char*)name, v);
+            }
+            rows->Add(row);
+        }
+        if (rc != SQLITE_DONE) {
+            this->last_err = rc;
+            sqlite3* h = sqlite3_db_handle(this->stmt);
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "stmt/query: %s",
+                     sqlite3_errmsg(h));
+            sqlite3_reset(this->stmt);
+            delete rows;
+            throw(SqliteError, buf);
+        }
+        sqlite3_reset(this->stmt);
+        return rows;
+    }
+
+    /* Convenience: first row only.  Returns NULL on no match / error.
+       Resets the statement. */
+    dict query_one() {
+        List<dict>* rows = this->query();
+        if (!rows || rows->Count() == 0) {
+            if (rows) delete rows;
+            return 0;
+        }
+        dict r = rows->Get(0);
+        delete rows;
+        return r;
+    }
 };
 
 /* -------------------------------------------------------------------------

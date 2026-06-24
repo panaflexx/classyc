@@ -5,10 +5,16 @@
  *   1. Sqlite.open(":memory:")  + `defer delete db;`
  *   2. execute()  — CREATE TABLE, INSERTs
  *   3. query()    — full table scan, row -> dict
- *   4. query()    — filtered SELECT (literal in SQL; binders not landed yet)
+ *   4. query()    — filtered SELECT (literal in SQL)
  *   5. (Customer) bind-cast over dict rows
  *   6. Transaction with commit()
  *   7. Transaction rolled back automatically by ~Transaction()
+ *   8. Prepared Statement — bound INSERTs re-using one stmt
+ *   9. Prepared Statement — bound SELECT (parameter binding)
+ *  10. One-shot bound execute(sql, fmt, ...) / query(sql, fmt, ...)
+ *  11. lastInsertRowId()
+ *  12. NULL preserved as JSON null in dict rows
+ *  13. SqliteError exceptions (bad SQL, bad prepare)
  *
  * Run:
  *   ./bin/classyc -I sketch -I include -l sqlite3 \
@@ -171,7 +177,200 @@ int main() {
               "7a  still 5 rows after rollback (insert undone)");
     }
 
-    /* ---------- 8. final dump ---------- */
+    /* ---------- 8. prepared statement: bound INSERTs ---------- */
+    printf("\n-- prepared INSERT (re-used with bind) --\n");
+    {
+        Statement* ins = db->prepare(
+            "INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?)");
+        check(ins != 0, "8a  prepare INSERT");
+        if (ins) {
+            defer delete ins;
+
+            /* row 1 */
+            ins->bind(1, 10);
+            ins->bind(2, "Linus");
+            ins->bind(3, "Torvalds");
+            ins->bind(4, "linus@kernel.org");
+            ins->bind(5, "555-1010");
+            ins->bind(6, "OR");
+            int n1 = ins->execute();
+            check(n1 == 1, "8b  bound INSERT row 1 -> 1 row affected");
+
+            /* row 2 — same stmt, new binds */
+            ins->bind(1, 11);
+            ins->bind(2, "Brian");
+            ins->bind(3, "Kernighan");
+            ins->bind(4, "bwk@cs.princeton.edu");
+            ins->bind(5, "555-1111");
+            ins->bind(6, "NJ");
+            int n2 = ins->execute();
+            check(n2 == 1, "8c  bound INSERT row 2 -> 1 row affected");
+
+            /* row 3 — mixed types incl. bindNull */
+            ins->bind(1, 12);
+            ins->bind(2, "Dennis");
+            ins->bind(3, "Ritchie");
+            ins->bindNull(4);                /* no email */
+            ins->bind(5, "555-1212");
+            ins->bind(6, "NJ");
+            int n3 = ins->execute();
+            check(n3 == 1, "8d  bound INSERT row 3 (with NULL) -> 1 row");
+        }
+    }
+    List<dict>* after_prep = db->query("SELECT * FROM customers");
+    if (after_prep) {
+        defer delete after_prep;
+        check(after_prep->Count() == 8, "8e  8 rows after bound INSERTs");
+    }
+
+    /* ---------- 9. prepared statement: bound SELECT ---------- */
+    printf("\n-- prepared SELECT (bound parameter) --\n");
+    {
+        Statement* sel = db->prepare(
+            "SELECT id, firstName, lastName, state FROM customers "
+            "WHERE state = ? ORDER BY id");
+        check(sel != 0, "9a  prepare SELECT");
+        if (sel) {
+            defer delete sel;
+
+            /* ?1 = "NJ" -> expect Kernighan + Ritchie */
+            sel->bind(1, "NJ");
+            List<dict>* nj = sel->query();
+            if (nj) {
+                defer delete nj;
+                check(nj->Count() == 2, "9b  state='NJ' -> 2 rows");
+                for (auto r in nj) {
+                    printf("  NJ: #%d  %s %s\n",
+                           (int)(long)r.id,
+                           (char*)r.firstName,
+                           (char*)r.lastName);
+                }
+            }
+
+            /* Re-use the same Statement with a new bind */
+            sel->bind(1, "CA");
+            List<dict>* ca2 = sel->query();
+            if (ca2) {
+                defer delete ca2;
+                check(ca2->Count() == 2, "9c  state='CA' -> 2 rows (re-used stmt)");
+                for (auto r in ca2) {
+                    printf("  CA: #%d  %s %s\n",
+                           (int)(long)r.id,
+                           (char*)r.firstName,
+                           (char*)r.lastName);
+                }
+            }
+        }
+    }
+
+    /* ---------- 10. one-shot bound execute / query ---------- */
+    printf("\n-- one-shot bound execute / query --\n");
+    {
+        int n = db->execute(
+            "INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?)",
+            "isssss", 20, "Donald", "Knuth", "dek@cs.stanford.edu",
+            "555-2020", "CA");
+        check(n == 1, "10a one-shot execute -> 1 row inserted");
+
+        /* Mixed types in one call: int + string */
+        List<dict>* hits = db->query(
+            "SELECT id, firstName, lastName FROM customers "
+            "WHERE id >= ? AND state = ? ORDER BY id",
+            "is", 10, "CA");
+        if (hits) {
+            defer delete hits;
+            check(hits->Count() == 1, "10b one-shot query (id>=10 AND state=CA) -> 1 row");
+            for (auto r in hits) {
+                printf("  hit: #%d %s %s\n",
+                       (int)(long)r.id,
+                       (char*)r.firstName,
+                       (char*)r.lastName);
+            }
+        }
+
+        /* NULL bind via 'n' */
+        int n2 = db->execute(
+            "INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?)",
+            "isssss", 21, "Bjarne", "Stroustrup",
+            "bjarne@example.com", "555-2121", "NJ");
+        check(n2 == 1, "10c second one-shot insert");
+
+        /* The 'n' format char binds NULL without consuming a vararg. */
+        int n3 = db->execute(
+            "INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?)",
+            "issnss", 22, "Edsger", "Dijkstra",
+            "555-2222", "NL");
+        check(n3 == 1, "10d one-shot insert with explicit NULL bind");
+    }
+
+    /* ---------- 11. lastInsertRowId ---------- */
+    printf("\n-- lastInsertRowId --\n");
+    {
+        /* Use a table with auto-incrementing rowid */
+        db->execute("CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body TEXT)");
+        db->execute("INSERT INTO notes(body) VALUES ('first')", "");
+        long id1 = db->lastInsertRowId();
+        check(id1 == 1, "11a lastInsertRowId() == 1 after first INSERT");
+        db->execute("INSERT INTO notes(body) VALUES (?)", "s", "second");
+        long id2 = db->lastInsertRowId();
+        check(id2 == 2, "11b lastInsertRowId() == 2 after second INSERT");
+    }
+
+    /* ---------- 12. NULL preserved as JSON null ---------- */
+    printf("\n-- NULL preservation --\n");
+    {
+        /* Dijkstra (id=22) had email bound as NULL. */
+        List<dict>* dnk = db->query(
+            "SELECT id, firstName, email FROM customers WHERE id=?",
+            "i", 22);
+        if (dnk) {
+            defer delete dnk;
+            check(dnk->Count() == 1, "12a found Dijkstra");
+            dict d = dnk->Get(0);
+            /* JSON null serializes as the literal string "null". */
+            char* j = d.json;
+            printf("  row: %s\n", j);
+            /* Crude but effective: ensure the JSON contains `"email":null`. */
+            check(strstr(j, "\"email\":null") != 0,
+                  "12b email column preserved as JSON null");
+        }
+    }
+
+    /* ---------- 13. SqliteError exceptions ---------- */
+    printf("\n-- SqliteError exceptions --\n");
+    {
+        int caught = 0;
+        try {
+            db->execute("INSRT INTO customers VALUES (1)");   // typo
+        } catch (SqliteError e) {
+            caught = 1;
+            printf("  caught SqliteError: %s\n", e.msg);
+        }
+        check(caught == 1, "13a SqliteError on malformed SQL (execute)");
+
+        caught = 0;
+        try {
+            List<dict>* bad = db->query("SELECT * FROM no_such_table");
+            if (bad) delete bad;
+        } catch (SqliteError e) {
+            caught = 1;
+            printf("  caught SqliteError: %s\n", e.msg);
+        }
+        check(caught == 1, "13b SqliteError on missing table (query)");
+
+        caught = 0;
+        try {
+            db->execute("INSERT INTO customers VALUES (1, 'dup', 'dup', '', '', 'XX')",
+                        "");
+            /* row id=1 already exists -> PRIMARY KEY conflict */
+        } catch (SqliteError e) {
+            caught = 1;
+            printf("  caught SqliteError: %s\n", e.msg);
+        }
+        check(caught == 1, "13c SqliteError on PK conflict (bound execute)");
+    }
+
+    /* ---------- 14. final dump ---------- */
     printf("\n-- final table --\n");
     List<dict>* dump = db->query(
         "SELECT id, firstName, lastName, state FROM customers ORDER BY id");
