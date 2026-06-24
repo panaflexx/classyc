@@ -15920,6 +15920,64 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         }
       }
     }
+    /* classyc extension: minimal VLA support.
+       Lower a local declaration `T name[expr];` whose size expression is
+       a non-const integer into `T *name = alloca(sizeof(*name) * (expr));`.
+       This covers the common idiom (indexing, address-of, passing as a
+       pointer) without disturbing stack-frame layout or sizeof codegen.
+       Limitations vs. C99 VLAs:
+         * `sizeof(name)` returns `sizeof(void *)`, not `n * sizeof(T)`.
+         * Lifetime is the whole function (alloca), not the enclosing block.
+       Only the head of the declarator chain is rewritten, so any inner
+       declarators (e.g. `T name[n][C]` -> `T (*name)[C]`) compose correctly.
+       Skipped when the user already supplied an initializer, or when the
+       declaration is at file scope, static, extern, typedef, thread-local,
+       or register. */
+    if (declarator->code == N_DECL && initializer->code == N_IGNORE
+        && curr_scope != top_scope
+        && !decl_spec.typedef_p && !decl_spec.static_p
+        && !decl_spec.extern_p && !decl_spec.thread_local_p
+        && !decl_spec.register_p) {
+      node_t dlist = NL_EL (declarator->u.ops, 1);
+      node_t head = dlist != NULL ? NL_HEAD (dlist->u.ops) : NULL;
+      if (head != NULL && head->code == N_ARR) {
+        node_t s_static = NL_HEAD (head->u.ops);
+        node_t s_qual = NL_NEXT (s_static);
+        node_t size = NL_NEXT (s_qual);
+        if (size != NULL && size->code != N_IGNORE && size->code != N_STAR) {
+          unsigned saved_errs = n_errors;
+          check (c2m_ctx, size, head);
+          struct expr *se = size->attr;
+          if (n_errors == saved_errs && se != NULL
+              && integer_type_p (se->type) && !se->const_p) {
+            node_t id = NL_HEAD (declarator->u.ops);
+            pos_t pos = POS (head);
+            /* Detach size from N_ARR so we can splice it into the alloca call. */
+            NL_REMOVE (head->u.ops, size);
+            /* sizeof(*name) -- not evaluated, so referencing `name` here is safe. */
+            node_t deref = new_pos_node1 (c2m_ctx, N_DEREF, pos,
+                                          copy_node_with_pos (c2m_ctx, id, pos));
+            node_t sz = new_pos_node1 (c2m_ctx, N_EXPR_SIZEOF, pos, deref);
+            node_t mul = new_pos_node2 (c2m_ctx, N_MUL, pos, sz, size);
+            node_t arglist = new_pos_node (c2m_ctx, N_LIST, pos);
+            NL_APPEND (arglist->u.ops, mul);
+            node_t call = new_pos_node2 (c2m_ctx, N_CALL, pos,
+                                         build_id (c2m_ctx, "alloca", pos),
+                                         arglist);
+            /* Replace head N_ARR with N_POINTER (no type qualifiers). */
+            node_t ptr = new_pos_node1 (c2m_ctx, N_POINTER, pos,
+                                        new_pos_node (c2m_ctx, N_LIST, pos));
+            NL_REMOVE (dlist->u.ops, head);
+            NL_PREPEND (dlist->u.ops, ptr);
+            /* Install the alloca call as the SPEC_DECL_INIT slot (last op). */
+            node_t old_init = SPEC_DECL_INIT (r);
+            NL_REMOVE (r->u.ops, old_init);
+            NL_APPEND (r->u.ops, call);
+            initializer = call;
+          }
+        }
+      }
+    }
     if (declarator->code != N_IGNORE) {
       create_decl (c2m_ctx, curr_scope, r, decl_spec, initializer,
                    context != NULL && context->code == N_FUNC);
