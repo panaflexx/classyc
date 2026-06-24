@@ -17277,6 +17277,7 @@ struct gen_ctx {
   MIR_item_t dict_create_array_proto, dict_create_array_item;
   MIR_item_t dict_array_append_proto, dict_array_append_item;
   MIR_item_t dict_serialize_json_proto, dict_serialize_json_item;
+  MIR_item_t dict_serialize_json_heap_proto, dict_serialize_json_heap_item;
   MIR_item_t dict_deserialize_json_proto, dict_deserialize_json_item;
   MIR_item_t dict_destroy_proto, dict_destroy_item;              /* delete d  */
   MIR_item_t dict_create_heap_arena_proto, dict_create_heap_arena_item; /* new dict() */
@@ -17427,6 +17428,8 @@ struct gen_ctx {
 #define dict_array_append_item gen_ctx->dict_array_append_item
 #define dict_serialize_json_proto gen_ctx->dict_serialize_json_proto
 #define dict_serialize_json_item gen_ctx->dict_serialize_json_item
+#define dict_serialize_json_heap_proto gen_ctx->dict_serialize_json_heap_proto
+#define dict_serialize_json_heap_item gen_ctx->dict_serialize_json_heap_item
 #define dict_deserialize_json_proto gen_ctx->dict_deserialize_json_proto
 #define dict_deserialize_json_item gen_ctx->dict_deserialize_json_item
 #define dict_destroy_proto gen_ctx->dict_destroy_proto
@@ -19369,6 +19372,22 @@ static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, dict_serialize_json_proto);
   move_item_to_module_start (module, dict_serialize_json_item);
 
+  /* dict_serialize_json_heap(const DictValue *val, int pretty) -> char*
+     Heap-allocating, right-sized variant used by the compiler's `d.json` /
+     `json(d)` codegen.  The returned pointer is plain-malloc'd; the compiler
+     registers it with the String arena (c2m_str_attach) so the normal scope
+     cleanup / return-protection path manages its lifetime. */
+  {
+    MIR_var_t hvars[2];
+    hvars[0].name = "val";    hvars[0].type = MIR_T_I64;
+    hvars[1].name = "pretty"; hvars[1].type = MIR_T_I64;
+    dict_serialize_json_heap_proto = MIR_new_proto_arr (ctx, "__dict_serialize_json_heap_p",
+                                                        1, &ptr_t, 2, hvars);
+    dict_serialize_json_heap_item = MIR_new_import (ctx, "dict_serialize_json_heap");
+    move_item_to_module_start (module, dict_serialize_json_heap_proto);
+    move_item_to_module_start (module, dict_serialize_json_heap_item);
+  }
+
   /* dict_destroy(DictValue *val) -> void  — used by `delete d` for dict */
   vars[0].name = "val"; vars[0].type = MIR_T_I64;
   dict_destroy_proto = MIR_new_proto_arr (ctx, "__dict_destroy_p", 0, NULL, 1, vars);
@@ -20492,6 +20511,49 @@ static void gen_str_release_keeping (c2m_ctx_t c2m_ctx, MIR_op_t mark, MIR_op_t 
   MIR_op_t ops[2] = {mark, keep};
   string_ensure_imports (c2m_ctx);
   gen_rt_call_void (c2m_ctx, str_release_keeping_proto, str_release_keeping_item, 2, ops);
+}
+
+/* Serialize a dict to a JSON String that participates in the String arena.
+
+   The naive implementation (alloca-buffer + dict_serialize_json into it) hands
+   back a *stack pointer* whose lifetime ends with the producing function's
+   frame.  That works in trivial expressions but fails the moment the value
+   has to survive `return`, get stored on a heap object, cross a `try` boundary,
+   or interact with `defer`/exception cleanup.
+
+   Instead we delegate sizing and allocation to the runtime's
+   `dict_serialize_json_heap`, which doubles a heap buffer until the JSON fits
+   and returns a right-sized, plain-malloc'd pointer.  We then register that
+   pointer with the String arena via `c2m_str_attach`.  After that:
+
+     - the buffer survives across function returns,
+     - the function-level `c2m_str_release_to` reclaims it at scope exit,
+     - `c2m_str_release_keeping` protects it when it is the returned value,
+     - `String.detach()` cleanly hands it to a longer-lived owner,
+     - and the compiler imposes no fixed size cap on the output.
+
+   `dict_val_op` is the MIR operand carrying the source DictValue*; the result
+   is the tracked `char*` (a MIR I64 register).
+*/
+static op_t gen_dict_serialize_to_tracked_string (c2m_ctx_t c2m_ctx, MIR_op_t dict_val_op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+
+  dict_ensure_imports (c2m_ctx);
+  string_ensure_imports (c2m_ctx);
+
+  /* res = dict_serialize_json_heap(val, 0)   -- second arg is pretty=0 */
+  MIR_op_t heap_args[2] = { dict_val_op, MIR_new_int_op (ctx, 0) };
+  op_t res = gen_rt_call (c2m_ctx, dict_serialize_json_heap_proto,
+                          dict_serialize_json_heap_item, 2, heap_args);
+  res = force_reg (c2m_ctx, res, MIR_T_I64);
+
+  /* tracked = c2m_str_attach(res) — register with the String arena tracker
+     so scope cleanup / return protection / detach all behave correctly.
+     c2m_str_attach is NULL-safe, so a runtime allocation failure (res == NULL)
+     simply propagates as a NULL String to the caller. */
+  op_t tracked = gen_rt_call (c2m_ctx, str_attach_proto, str_attach_item, 1, &res.mir_op);
+  return force_reg (c2m_ctx, tracked, MIR_T_I64);
 }
 
 /* True for AST leaf nodes whose `u` union holds a scalar (not an op list), so
@@ -22522,23 +22584,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           && key_node != NULL && key_node->code == N_ID) {
         const char *key_str = key_node->u.s.s;
         if (strcmp (key_str, "json") == 0) {
-          /* d.json — serialize dict to JSON string */
+          /* d.json — serialize dict to JSON string.
+             The result must survive across returns / try-block cleanup, so
+             route through the String arena (see gen_dict_serialize_to_tracked_string). */
           op1 = val_gen (c2m_ctx, obj_node);
-          dict_ensure_imports (c2m_ctx);
-          MIR_op_t call_args[7];
-          op_t buf_reg = get_new_temp (c2m_ctx, MIR_T_I64);
-          MIR_append_insn (ctx, curr_func,
-                           MIR_new_insn (ctx, MIR_ALLOCA, buf_reg.mir_op,
-                                         MIR_new_int_op (ctx, 4096)));
-          res = get_new_temp (c2m_ctx, MIR_T_I64);
-          call_args[0] = MIR_new_ref_op (ctx, dict_serialize_json_proto);
-          call_args[1] = MIR_new_ref_op (ctx, dict_serialize_json_item);
-          call_args[2] = res.mir_op;
-          call_args[3] = op1.mir_op;
-          call_args[4] = buf_reg.mir_op;
-          call_args[5] = MIR_new_int_op (ctx, 4096);
-          call_args[6] = MIR_new_int_op (ctx, 0);
-          emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 7, call_args));
+          res = gen_dict_serialize_to_tracked_string (c2m_ctx, op1.mir_op);
           break;
         }
         op1 = val_gen (c2m_ctx, obj_node);
@@ -23004,21 +23054,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       op1 = val_gen (c2m_ctx, arg_node);
       dict_ensure_imports (c2m_ctx);
       if (arg_e->type->mode == TM_DICT) {
-        /* Serialize: alloca a buffer, call dict_serialize_json */
-        MIR_op_t call_args[7];
-        op_t buf_reg = get_new_temp (c2m_ctx, MIR_T_I64);
-        MIR_append_insn (ctx, curr_func,
-                         MIR_new_insn (ctx, MIR_ALLOCA, buf_reg.mir_op,
-                                       MIR_new_int_op (ctx, 4096)));
-        res = get_new_temp (c2m_ctx, MIR_T_I64);
-        call_args[0] = MIR_new_ref_op (ctx, dict_serialize_json_proto);
-        call_args[1] = MIR_new_ref_op (ctx, dict_serialize_json_item);
-        call_args[2] = res.mir_op;                       /* result: char* */
-        call_args[3] = op1.mir_op;                       /* val */
-        call_args[4] = buf_reg.mir_op;                   /* buf */
-        call_args[5] = MIR_new_int_op (ctx, 4096);       /* buflen */
-        call_args[6] = MIR_new_int_op (ctx, 0);          /* pretty=0 */
-        emit_insn (c2m_ctx, MIR_new_insn_arr (ctx, MIR_CALL, 7, call_args));
+        /* Serialize: route through the String arena so the result survives
+           across returns / try-block cleanup (see gen_dict_serialize_to_tracked_string). */
+        res = gen_dict_serialize_to_tracked_string (c2m_ctx, op1.mir_op);
       } else {
         /* Deserialize: call dict_deserialize_json */
         MIR_op_t call_args[4];

@@ -202,8 +202,7 @@ class CustomersController {
                 "SELECT * FROM customers WHERE id=?", "i", id);
             defer delete rows;
             if (rows->Count() == 0) return resp_not_found(f"Customer {id}");
-            String body = f"{rows->Get(0).json}";
-            return resp_ok(body);
+            return resp_ok(rows->Get(0).json);
         } catch (SqliteError e) {
             return resp_500(e.msg);
         }
@@ -246,15 +245,11 @@ class CustomersController {
             long new_id = this.db->lastInsertRowId();
             tx->commit();
 
-            /* Re-read the row so the response reflects what SQLite stored.
-               We materialise the JSON into a fresh String via f"{...}" so it
-               survives the defer-delete + try-scope cleanup before Response
-               can capture it. */
+            /* Re-read the row so the response reflects what SQLite stored. */
             List<dict>* created = this.db->query(
                 "SELECT * FROM customers WHERE id=?", "l", new_id);
             defer delete created;
-            String body = f"{created->Get(0).json}";
-            return resp_created(body);
+            return resp_created(created->Get(0).json);
         } catch (SqliteError e) {
             return resp_500(e.msg);
         }
@@ -301,8 +296,7 @@ class CustomersController {
             List<dict>* fresh = this.db->query(
                 "SELECT * FROM customers WHERE id=?", "i", id);
             defer delete fresh;
-            String body = f"{fresh->Get(0).json}";
-            return resp_ok(body);
+            return resp_ok(fresh->Get(0).json);
         } catch (SqliteError e) {
             return resp_500(e.msg);
         }

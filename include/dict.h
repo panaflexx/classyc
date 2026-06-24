@@ -525,6 +525,37 @@ C2M_DICT_API char *dict_serialize_json(const DictValue *val, char *buffer, size_
     return buffer;
 }
 
+/* Serialize a dict to a freshly-malloc'd, right-sized JSON string.
+ *
+ * Starts with a small buffer (256 bytes covers most rows / small configs) and
+ * doubles on overflow, so the final buffer is at most ~2x the JSON length.
+ * Returns NULL on allocation failure or if the value is malformed; otherwise
+ * the caller owns the returned pointer and must free() it.
+ *
+ * Used by the compiler's `d.json` and `json(d)` codegen so the result
+ * survives across function returns and `try`-block scope cleanup (the prior
+ * stack-alloca path returned a dangling pointer once the producing frame went
+ * away). */
+C2M_DICT_API char *dict_serialize_json_heap(const DictValue *val, int pretty) {
+    size_t cap = 256;
+    /* Cap at 1 GiB — a single JSON document beyond that is almost certainly a
+     * bug, and the unbounded retry below would otherwise be a denial-of-service. */
+    while (cap <= ((size_t)1 << 30)) {
+        char *buf = (char *)malloc(cap);
+        if (!buf) return NULL;
+        char *cursor = buf;
+        size_t remaining = cap;
+        if (dict_serialize_value_pretty(val, &cursor, &remaining, 0, pretty)
+            && remaining > 0) {
+            *cursor = '\0';
+            return buf;
+        }
+        free(buf);
+        cap *= 2;
+    }
+    return NULL;
+}
+
 /* Path lookup */
 C2M_DICT_API DictValue *dict_find_path(const DictValue *root, const char *path) {
     if (!root || root->type != DICT_OBJECT || !path || *path == '\0') return NULL;
