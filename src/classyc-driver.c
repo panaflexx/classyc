@@ -297,6 +297,7 @@ static void init_options (int argc, char *argv[]) {
   options.auto_release_p = FALSE; /* -fauto-release: synthesize free for definite leaks */
   options.ownership_report_p = FALSE; /* -fownership-report: dump alloc/release map */
   options.check_whole_allocs_p = FALSE; /* -fcheck-whole-allocs: whole-program ownership analysis */
+  options.no_ownership_p = FALSE; /* -fno-ownership: skip the ownership analysis pass entirely */
   gen_debug_level = -1;
   VARR_CREATE (char, temp_string, &default_alloc, 0);
   VARR_CREATE (char_ptr_t, headers, &default_alloc, 0);
@@ -339,6 +340,10 @@ static void init_options (int argc, char *argv[]) {
       options.check_whole_allocs_p = TRUE;
     } else if (strcmp (argv[i], "-fno-check-whole-allocs") == 0) {
       options.check_whole_allocs_p = FALSE;
+    } else if (strcmp (argv[i], "-fno-ownership") == 0) {
+      options.no_ownership_p = TRUE;
+    } else if (strcmp (argv[i], "-fownership") == 0) {
+      options.no_ownership_p = FALSE;
     } else if (strcmp (argv[i], "-pedantic") == 0) {
       options.pedantic_p = TRUE;
     } else if (strcmp (argv[i], "-g") == 0) {
@@ -417,6 +422,7 @@ static void init_options (int argc, char *argv[]) {
       fprintf (stderr, "  -fpreprocessed -- assume preprocessed input C\n");
       fprintf (stderr, "  -fsyntax-only -- check C code correctness only\n");
       fprintf (stderr, "  -fpedantic -- assume strict standard input C code\n");
+      fprintf (stderr, "  -fno-ownership -- disable ownership analysis (no leak/UAF/double-free diagnostics)\n");
       fprintf (stderr, "  -w -- do not print any warnings\n");
       fprintf (stderr, "  -g -- emit source-level debug info (source locations, types, variables)\n");
       fprintf (stderr, "  -S, -c -- generate corresponding textual or binary MIR files\n");

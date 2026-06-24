@@ -26466,7 +26466,11 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
            bindings and emits leak / UAF / double-free diagnostics.  See
            src/ownership.c for the planned state machine. */
         n_error_before = n_errors;
-        ownership_run (c2m_ctx, r);
+        if (!c2m_options->no_ownership_p) {
+          ownership_run (c2m_ctx, r);
+        } else if (c2m_options->verbose_p && c2m_options->message_file != NULL) {
+          fprintf (c2m_options->message_file, "ownership - SKIPPED (-fno-ownership)\n");
+        }
         t_ownership = stage_time (&prev_time);
         if (n_errors > n_error_before) {
           if (c2m_options->verbose_p && c2m_options->message_file != NULL)

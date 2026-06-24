@@ -27,6 +27,7 @@ struct c2mir_options {
   int auto_release_p; /* -fauto-release: synthesize defer free(p) for owned heap locals that would leak */
   int ownership_report_p; /* -fownership-report: dump per-function alloc/release map after analysis */
   int check_whole_allocs_p; /* -fcheck-whole-allocs: link-time-style whole-program ownership analysis */
+  int no_ownership_p; /* -fno-ownership: skip the ownership analysis pass entirely (no leak/UAF/double-free diagnostics, no -fauto-release synthesis) */
   size_t module_num;
   FILE *prepro_output_file; /* non-null for prepro_only_p */
   const char *output_file_name;
