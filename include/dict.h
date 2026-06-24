@@ -1093,6 +1093,7 @@ C2M_DICT_API DictValue *dict_deserialize_json(const char *json, char *err_buf, s
 C2M_DICT_API DictValue *dict_deserialize_json_len(const char *json, size_t len, char *err_buf, size_t err_len);
 
 C2M_DICT_API DictValue *dict_deserialize_json_len(const char *json, size_t len, char *err_buf, size_t err_len) {
+    if (json == NULL || len == 0) return dict_create_object();
     DictJsonParser parser = {json, len, 0, err_buf, err_len};
     DictValue *result = dict_parse_value(&parser);
     dict_parser_skip_whitespace(&parser);
@@ -1122,6 +1123,7 @@ C2M_DICT_API DictValue *dict_deserialize_json_len(const char *json, size_t len, 
 
 C2M_DICT_API DictValue *dict_deserialize_json(const char *json, char *err_buf, size_t err_len) {
     if (json == NULL) return NULL;
+    if (json[0] == '\0') return dict_create_object();
     return dict_deserialize_json_len(json, strlen(json), err_buf, err_len);
 }
 

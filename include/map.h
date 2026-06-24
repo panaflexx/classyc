@@ -278,6 +278,20 @@ class Map<K, V> {
     K KeyAt(int index) const { return this->keys[index]; }
     V ValAt(int index) const { return this->vals[index]; }
 
+    /* Human-readable JSON-ish representation (best for Map<String, String>).
+     * Example: {"page":"2","limit":"10"} */
+    String to_string() const {
+        if (this->count == 0) return "{}";
+        String s = "{";
+        int first = 1;
+        for (int i = 0; i < this->count; i++) {
+            if (!first) s = s + ",";
+            s = s + "\"" + (char*)this->keys[i] + "\":\"" + (char*)this->vals[i] + "\"";
+            first = 0;
+        }
+        return s + "}";
+    }
+
     /* ───────────────────── Mutation ───────────────────── */
 
     /* Insert or update `key` -> `val`.  Returns 1 if a new key was inserted,
