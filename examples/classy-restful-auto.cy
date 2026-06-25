@@ -75,7 +75,6 @@ Map<String, String>* parse_query(String qs) {
     /* Pythonic: split on "&", iterate pairs — replaces manual while+find loop.
        s.split(delim) -> List<String>* (heap); defer delete cleans it up. */
     List<String>* pairs = qs.split("&");
-    defer delete pairs;
     for (auto pair in pairs) {
         int eq = (int) pair.find("=");
         if (eq >= 0) {
@@ -205,14 +204,12 @@ class UsersController {
                 "SELECT COUNT(*) AS n FROM users");
         }
         if (!rows) return resp_bad("query failed");
-        defer delete rows;
         int total = (cnt != 0 && cnt.n != 0) ? (int)(long)cnt.n : 0;
 
         /* Pythonic: Filter lambda selects active rows in-memory after SQL pagination.
            GAP: dict int fields still need the (int)(long) double-cast in the lambda.
            In production push active=1 to SQL; here it demonstrates ->Filter(). */
         List<dict>* data = rows->Filter((dict r) => (int)(long)r.active != 0);
-        defer delete data;
         for (auto r in data) printf("  row: %s\n", r.json);
 
         try {
@@ -235,11 +232,8 @@ class UsersController {
             "SELECT id,name,email,role,active FROM users WHERE id=?",
             "i", id);
         if (!rows) return resp_not_found(f"User {id}");
-        if (rows->Count() == 0) {
-            delete rows;
+        if (rows->Count() == 0)
             return resp_not_found(f"User {id}");
-        }
-        defer delete rows;
         /* Use the dict JSON directly (simpler & avoids manual f-string) */
         return resp_ok(rows->Get(0).json);
     }
@@ -255,16 +249,12 @@ class UsersController {
         List<dict>* dup = this.db->query(
             "SELECT 1 FROM users WHERE email=?", "s",
             (char*)req->body.email);
-        if (dup && dup->Count()>0) {
-            delete dup;
+        if (dup && dup->Count()>0)
             return resp_bad(f"email {(char*)req->body.email} already exists");
-        }
-        if (dup) delete dup;
 
         /* Pythonic touch: use a real Transaction so any failure rolls back
            both the INSERT and the audit row. */
         Transaction* tx = this.db->begin();
-        defer delete tx;
 
         int rc = this.db->execute(
             "INSERT INTO users(name,email,role,active) VALUES(?,?,?,?)",
@@ -291,7 +281,6 @@ class UsersController {
             dict created = { "id": (int)new_id };
             return resp_created(created.json);
         }
-        defer delete fresh;
         return resp_created(fresh->Get(0).json);
     }
 
@@ -302,9 +291,7 @@ class UsersController {
         /* Iterate body dict, collecting only the non-null fields.
            Parallel lists keep keys and values in the same insertion order. */
         List<String>* keys = new List<String>();
-        defer delete keys;
         List<dict>* vals = new List<dict>();
-        defer delete vals;
         for (auto k, v in req->body)
             if (v != 0) { keys->Add(k); vals->Add(v); }
         if (keys->IsEmpty()) return resp_bad("no fields to update");
@@ -314,11 +301,9 @@ class UsersController {
            which is reclaimed when Map returns — detach escapes it to the heap
            so the strings survive in `parts` for the join() below. */
         List<String>* parts = keys->Map((String k) => detach (k + "=?"));
-        defer delete parts;
 
         String sql = "UPDATE users SET " + parts->join(",") + " WHERE id=?";
         Statement* stmt = this.db->prepare((char*)sql);
-        defer delete stmt;
 
         int idx = 1;
         for (auto v in vals) stmt->bind(idx++, v);   /* bind(int,dict) dispatches on type tag */
@@ -377,10 +362,8 @@ int main() {
 
     Sqlite* db = Sqlite.open(":memory:");
     if (!db) { printf("cannot open :memory: db\n"); return 1; }
-    defer delete db;
 
     auto ctrl = new UsersController(db);
-    defer delete ctrl;
 
     /* seed a few rows via raw SQL (controller would also work) */
     db->execute("INSERT INTO users VALUES(1,'Ada Lovelace','ada@analytical.engine','admin',1)");
@@ -392,10 +375,8 @@ int main() {
     {
         printf("GET /api/users (no filter)\n");
         auto req = new Request("GET","/api/users","","");
-        defer delete req;
         printf("Dispatch...\n");
         auto res = dispatch(ctrl, req);
-        defer delete res;
         printf("Logging.\n\n");
         log_req(req); log_res(res);
     }
@@ -404,18 +385,14 @@ int main() {
     /* 2. GET with role filter + pagination */
     {
         auto req = new Request("GET","/api/users","role=admin&limit=5&page=1","");
-        defer delete req;
         auto res = dispatch(ctrl, req);
-        defer delete res;
         log_req(req); log_res(res);
     }
 
     /* 3. GET single user (cast demo via Get path) */
     {
         auto req = new Request("GET","/api/users/2","","");
-        defer delete req;
         auto res = dispatch(ctrl, req);
-        defer delete res;
         log_req(req); log_res(res);
     }
 
@@ -425,9 +402,7 @@ int main() {
            the full transaction+audit logic lives in Create() and is exercised
            by any caller that supplies a valid JSON body. */
         auto req = new Request("POST","/api/users","","");
-        defer delete req;
         auto res = dispatch(ctrl, req);
-        defer delete res;
         log_req(req); log_res(res);
     }
 
@@ -437,27 +412,21 @@ int main() {
     {
         String body = "{\"role\":\"admin\"}";
         auto req = new Request("PUT","/api/users/3","",body);
-        defer delete req;
         auto res = dispatch(ctrl, req);
-        defer delete res;
         log_req(req); log_res(res);
     }
 
     /* 7. DELETE (soft) */
     {
         auto req = new Request("DELETE","/api/users/3","","");
-        defer delete req;
         auto res = dispatch(ctrl, req);
-        defer delete res;
         log_req(req); log_res(res);
     }
 
     /* 8. Final list shows the soft-delete effect */
     {
         auto req = new Request("GET","/api/users","","");
-        defer delete req;
         auto res = dispatch(ctrl, req);
-        defer delete res;
         log_req(req); log_res(res);
     }
 

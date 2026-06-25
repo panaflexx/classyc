@@ -130,7 +130,9 @@ int main() {
         File *f = File.open(JSON_PATH, "r");
         defer delete f;
 
-        char *text = f->read_all();
+        /* `unowned`: we hand `text` to json() (which only reads it) and then
+           free it ourselves, so opt this buffer out of ownership tracking. */
+        unowned String text = f->read_all();
         check(text != 0,               "5a  read text for json()");
 
         dict data = json(text);

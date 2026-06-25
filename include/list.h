@@ -41,6 +41,10 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
+struct DictValue;  /* opaque forward decl; real def in dict.h */
+struct DictValue* dict_create_array(void);
+int dict_array_append(struct DictValue* array_val, struct DictValue* new_val);
+
 class List<T> {
     T*  data;
     int length;
@@ -326,14 +330,25 @@ class List<T> {
         return result;
     }
 
-    /* Return new heap list with fn(item) applied to every element.
+	    /* Return new heap list with fn(item) applied to every element.
      * Same-type transform (T -> T), so it chains with Filter:
      *   nums->Filter(p)->Map(f).  Caller must `delete` the result. */
-    List<T>* Map(T(*fn)(T)) {
+	    List<T>* Map(T(*fn)(T)) {
         List<T>* result = new List<T>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++)
             result->Add(fn(this->data[i]));
         return result;
+    }
+
+    /* Convert List<dict> to DICT_ARRAY. Uses cast to force pointer type
+     * on element access so codegen does not insert spurious +8 offset load. */
+    struct DictValue* ToDict() {
+        struct DictValue* arr = dict_create_array();
+        struct DictValue** d = (struct DictValue**)this->data;
+        for (int i = 0; i < this->length; i++) {
+            dict_array_append(arr, d[i]);
+        }
+        return arr;
     }
 
 

@@ -8720,6 +8720,14 @@ struct decl {
      Cleared whenever the declaration is wrapped in `unowned`.
      See `src/ownership.c` for the planned state machine. */
   unsigned auto_defer_p : 1;
+  /* Set when this local declaration was wrapped in `unowned` (the user is
+     taking manual responsibility for its lifetime).  Persisted on the decl
+     — distinct from the transient check-time `in_unowned_p` — so the
+     ownership pass (src/ownership.c) can skip the binding for BOTH leak
+     diagnostics and -fauto-release synthesis, including the
+     interprocedural call-returned-owner path that `auto_defer_p` does not
+     cover. */
+  unsigned unowned_p : 1;
   int bit_offset, width; /* for bitfields, -1 bit_offset for non bitfields. */
   mir_size_t offset;     /* var offset in frame or bss */
   /* Extra stack bytes for a class/struct local whose trailing flexible array
@@ -9310,10 +9318,20 @@ static void cast_value (struct expr *to_e, struct expr *from_e, struct type *to)
     temp.mode = TM_BASIC;
     temp.u.basic_type = get_enum_basic_type (to);
     to = &temp;
+  } else if (to->mode == TM_BASIC && to->u.basic_type == TP_STRING) {
+    /* `String` is a TM_BASIC tag but a pointer-width handle at runtime.
+       Fold constant casts to it like a pointer so `(String)0` (a null
+       String) and friends don't fall through to the assert below. */
+    temp.mode = TM_PTR;
+    to = &temp;
   }
   if (from->mode == TM_ENUM) {
     temp2.mode = TM_BASIC;
     temp2.u.basic_type = get_enum_basic_type (from);
+    from = &temp2;
+  } else if (from->mode == TM_BASIC && from->u.basic_type == TP_STRING) {
+    /* Symmetric: a constant `String` source folds like a pointer source. */
+    temp2.mode = TM_PTR;
     from = &temp2;
   }
   if (to->mode == from->mode && (from->mode == TM_PTR || from->mode == TM_ENUM)) {
@@ -12198,6 +12216,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       decl->ctor_call = decl->dtor_call = NULL;
       decl->auto_release_call = NULL;
       decl->auto_defer_p = FALSE;
+      decl->unowned_p = FALSE;
       decl->scope = curr_scope;
       decl->containing_unnamed_anon_struct_union_member = curr_unnamed_anon_struct_union_member;
       decl->u.item = NULL;
@@ -14977,9 +14996,25 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
                  "the `?` (lenient) cast form is only valid when casting a dict to a class or struct");
         }
 
+        /* Escape hatch for generic code: casting a class/struct VALUE to a
+           pointer type (e.g. `(char*)this->vals[i]` inside a generic
+           Map<K,V>::to_string()).  ClassyC monomorphizes *every* method of a
+           generic class, so a method only meaningful for string/scalar
+           elements is still type-checked when the class is instantiated with
+           a by-value class element — where this cast is otherwise a hard
+           error even though the method is never called for that type.  Allow
+           it: gen reinterprets the value's storage (its first pointer word),
+           which is harmless for the uncalled instantiation and a no-op for
+           the string instantiations (String is scalar, so it never reaches
+           here).  Caveat: this also relaxes the diagnostic for a genuine
+           struct-to-pointer mistake in hand-written code. */
+        int aggregate_to_ptr_p
+          = (!void_p && decl_spec->type->mode == TM_PTR
+             && (t2->mode == TM_CLASS || t2->mode == TM_STRUCT));
         if (!void_p && !scalar_type_p (decl_spec->type)) {
           error (c2m_ctx, POS (r), "conversion to non-scalar type requested");
-        } else if (!void_p && !scalar_type_p (t2) && !void_type_p (t2)) {
+        } else if (!void_p && !scalar_type_p (t2) && !void_type_p (t2)
+                   && !aggregate_to_ptr_p) {
           error (c2m_ctx, POS (r), "conversion of non-scalar value requested");
         } else if (t2->mode == TM_PTR && floating_type_p (decl_spec->type)) {
           error (c2m_ctx, POS (r), "conversion of a pointer to floating value requested");
@@ -15632,7 +15667,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	                  res_type.align = 8;
 	                  break;
 	                case SM_EQUALS:
-	                  
+
 	                  res_type.u.basic_type = TP_INT;
 	                  set_type_layout(c2m_ctx, &res_type);
 	                  break;
@@ -15672,9 +15707,10 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	                node_t method_id = NL_NEXT(obj);
 	                const char *mname = (method_id && method_id->code == N_ID)
 	                                      ? method_id->u.s.s : "?";
-	                if (strcmp(mname, "length") != 0 && strcmp(mname, "count") != 0) {
+	                if (strcmp(mname, "length") != 0 && strcmp(mname, "count") != 0
+	                    && strcmp(mname, "type") != 0) {
 	                  error(c2m_ctx, POS(r),
-	                        "unknown dict method '%s' (only 'length' / 'count' are built in)",
+	                        "unknown dict method '%s' (only 'length' / 'count' / 'type' are built in)",
 	                        mname);
 	                  break;
 	                }
@@ -15683,7 +15719,10 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	                        "dict method '%s' takes no arguments", mname);
 	                init_type(&res_type);
 	                res_type.mode = TM_BASIC;
-	                res_type.u.basic_type = get_uint_basic_type(sizeof(mir_size_t)); /* size_t */
+	                if (strcmp(mname, "type") == 0)
+	                  res_type.u.basic_type = TP_INT;  /* DictType tag (DICT_NULL..DICT_OBJECT) */
+	                else
+	                  res_type.u.basic_type = get_uint_basic_type(sizeof(mir_size_t)); /* size_t */
 	                set_type_layout(c2m_ctx, &res_type);
 	                ret_type = &res_type;
 	                method_call_p = TRUE;
@@ -16020,6 +16059,10 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
            - simple identifier declarator (N_DECL with an N_ID)
            - initializer matches `is_resource_acquire` (today: `N_NEW`)
            - resulting type is a deletable category (TM_PTR or TM_DICT) */
+      /* Persist the `unowned` opt-out on the decl so the ownership pass can
+         skip this binding wholesale (leak checks AND -fauto-release), not
+         just the `new`-acquire auto_defer flag below. */
+      if (in_unowned_p) decl->unowned_p = TRUE;
       if (!in_unowned_p
           && initializer != NULL && initializer->code != N_IGNORE
           && declarator->code == N_DECL
@@ -17901,7 +17944,10 @@ static int push_const_val (c2m_ctx_t c2m_ctx, node_t r, op_t *res) {
                           : mir_type == MIR_T_D ? MIR_new_double_op (ctx, e->c.d_val)
                                                 : MIR_new_ldouble_op (ctx, e->c.d_val)));
   } else {
-    assert (integer_type_p (e->type) || e->type->mode == TM_PTR);
+    /* `String` is a pointer-width handle (TM_BASIC tag), so a constant
+       String (e.g. `(String)0`) is materialized like an unsigned pointer. */
+    assert (integer_type_p (e->type) || e->type->mode == TM_PTR
+            || builtin_string_type_p (e->type));
     *res = new_op (NULL, (signed_integer_type_p (e->type) ? MIR_new_int_op (ctx, e->c.i_val)
                                                           : MIR_new_uint_op (ctx, e->c.u_val)));
   }
@@ -20096,6 +20142,18 @@ static op_t gen_dict_value_for_init (c2m_ctx_t c2m_ctx, node_t value) {
        pointer (avoids aliasing / double-free with the source dict). */
     op_t v = val_gen (c2m_ctx, value);
     return gen_dict_value_copy (c2m_ctx, v.mir_op);
+  } else if (ve != NULL && ve->type->mode == TM_PTR) {
+    /* Pointer to DictValue* (e.g. result of List<dict>::ToDict or any
+       expression returning struct DictValue*).  Treat exactly like a
+       TM_DICT value: deep-copy so the initializer owns the dict. */
+    struct type *pt = ve->type->u.ptr_type;
+    if (pt && pt->mode == TM_STRUCT && pt->u.tag_type
+        && TAG_ID (pt->u.tag_type) != NULL
+        && strcmp (TAG_ID (pt->u.tag_type)->u.s.s, "DictValue") == 0) {
+      op_t v = val_gen (c2m_ctx, value);
+      return gen_dict_value_copy (c2m_ctx, v.mir_op);
+    }
+    /* fall through for other pointers (treated as int64 below) */
   } else if (ve != NULL && ve->type->mode == TM_BASIC
              && ve->type->u.basic_type == TP_BOOL) {
     /* runtime _Bool expression: wrap as JSON boolean */
@@ -20186,6 +20244,21 @@ static op_t gen_dict_unwrap (c2m_ctx_t c2m_ctx, op_t dop) {
   op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
   emit2 (c2m_ctx, MIR_MOV, res.mir_op,
          MIR_new_mem_op (ctx, MIR_T_I64, 8, ptr.mir_op.u.reg, 0, 1));
+  return res;
+}
+
+/* Read the DictType tag at offset 0 of a DictValue box WITHOUT unwrapping the
+   union payload.  Backs the `d.type()` builtin: user code cannot read the tag
+   via a cast (every dict->pointer cast unwraps to the payload at offset 8), so
+   this exposes it directly as an int.  Values match include/dict.h's DictType
+   enum (DICT_NULL=0 .. DICT_OBJECT=6). */
+static op_t gen_dict_type_tag (c2m_ctx_t c2m_ctx, op_t dop) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  op_t ptr = force_reg (c2m_ctx, dop, MIR_T_I64);
+  op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  emit2 (c2m_ctx, MIR_MOV, res.mir_op,
+         MIR_new_mem_op (ctx, MIR_T_I32, 0, ptr.mir_op.u.reg, 0, 1));
   return res;
 }
 
@@ -22799,6 +22872,23 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       res.decl = NULL;
       res.mir_op.mode = MIR_OP_UNDEF;
     } else {
+      /* Class/struct VALUE cast to a pointer type (the generic-code escape
+         hatch allowed in the N_CAST checker): reinterpret the aggregate as a
+         pointer by taking the address of its storage.  Without this the
+         aggregate MEM op (MIR_T_UNDEF) flows into a scalar MOV and MIR
+         rejects it ("wrong type memory").  This path is only reached for
+         by-value class/struct operands — String is scalar and never lands
+         here — so it doesn't affect string/scalar casts. */
+      {
+        node_t src_node = NL_EL (r->u.ops, 1);
+        struct expr *src_e = src_node ? (struct expr *) src_node->attr : NULL;
+        if (src_e && src_e->type
+            && (src_e->type->mode == TM_CLASS || src_e->type->mode == TM_STRUCT)
+            && type->mode == TM_PTR && op1.mir_op.mode == MIR_OP_MEM) {
+          res = mem_to_address (c2m_ctx, op1, TRUE);
+          break;
+        }
+      }
       /* If source is a DictValue* (TM_DICT), unwrap the union payload first.
          This extracts int64_value for integer targets, string_value for pointer
          targets.  Offset 8 in DictValue is the start of the value union. */
@@ -23161,6 +23251,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           && (args == NULL || NL_LENGTH (args->u.ops) == 0)) {
         op_t recv = val_gen (c2m_ctx, mobj);
         res = gen_dict_iter_count (c2m_ctx, recv.mir_op);
+        goto finish;
+      }
+      if (mid != NULL && mid->code == N_ID && obj_e != NULL
+          && obj_e->type != NULL && obj_e->type->mode == TM_DICT
+          && strcmp (mid->u.s.s, "type") == 0
+          && (args == NULL || NL_LENGTH (args->u.ops) == 0)) {
+        /* d.type() -> DictType tag at offset 0 (no payload unwrap). */
+        op_t recv = val_gen (c2m_ctx, mobj);
+        res = gen_dict_type_tag (c2m_ctx, recv);
         goto finish;
       }
     }
@@ -25237,7 +25336,8 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
       if (smethod != NULL && smethod->code == N_ID && sobj_e != NULL
           && sobj_e->type != NULL && sobj_e->type->mode == TM_DICT
           && (strcmp (smethod->u.s.s, "length") == 0
-              || strcmp (smethod->u.s.s, "count") == 0))
+              || strcmp (smethod->u.s.s, "count") == 0
+              || strcmp (smethod->u.s.s, "type") == 0))
         continue;
     }
     type = ((struct expr *) func->attr)->type;

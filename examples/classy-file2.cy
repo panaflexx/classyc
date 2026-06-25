@@ -135,7 +135,7 @@ int main() {
 
     /* ── 5. Load the JSON report back and print it ─────────────── */
     {
-        char *raw = File.read_text(REPORT_PATH);    /* static one-liner */
+        unowned String raw = File.read_text(REPORT_PATH);    /* static one-liner */
         dict  rep  = json(raw);
         free(raw);
 

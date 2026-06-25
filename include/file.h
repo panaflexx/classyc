@@ -284,7 +284,9 @@ class File {
         fseek(this->handle, 0, SEEK_SET);
 
         size_t cap = 512;
-        char  *buf = (char *)malloc(cap);
+        /* `unowned`: buf is grown via realloc, handed to the user callback,
+           and freed here — manual management, so opt it out of tracking. */
+        unowned char  *buf = (char *)malloc(cap);
         if (!buf) return;
 
         size_t len    = 0;
@@ -331,7 +333,8 @@ class File {
         if (!this->handle || chunk_size <= 0) return;
         fseek(this->handle, 0, SEEK_SET);
 
-        char *buf = (char *)malloc(chunk_size + 1);
+        /* `unowned`: manual buffer handed to the callback and freed here. */
+        unowned char *buf = (char *)malloc(chunk_size + 1);
         if (!buf) return;
 
         int got;

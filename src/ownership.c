@@ -339,6 +339,45 @@ static node_t id_resolves_to_decl (node_t n) {
   return e->def_node;
 }
 
+/* Resolve a call's callee expression to the function / method definition it
+ * invokes.  Handles three callee shapes uniformly:
+ *
+ *   foo(...)        — callee is N_ID         (ordinary free function)
+ *   obj->m(...)      — callee is N_DEREF_FIELD (pointer-receiver method)
+ *   obj.m(...) /     — callee is N_FIELD       (value-receiver or static
+ *   Class.m(...)                               method)
+ *
+ * In every case the check pass stashes the resolved declaration on the
+ * callee node's `struct expr`->def_node: the N_ID handler points it at the
+ * declaration, and the N_CALL method path assigns the *resolved overload's*
+ * N_FUNC_DEF onto the field-access node (see classyc.c, `fe->def_node =
+ * func_def`).  So consuming def_node here gives interprocedural reach into
+ * `db->query(...)` and `Sqlite.open(...)` exactly like a plain call.
+ * Returns NULL for indirect / unresolved calls. */
+static node_t callee_def_node (node_t callee) {
+  struct expr *ce;
+  if (callee == NULL) return NULL;
+  if (callee->code != N_ID && callee->code != N_DEREF_FIELD
+      && callee->code != N_FIELD)
+    return NULL;
+  ce = (struct expr *) callee->attr;
+  if (ce == NULL) return NULL;
+  return ce->def_node;
+}
+
+/* The source-level name of a call's callee for diagnostics / acquire-tag
+ * rendering.  For `foo(...)` that's "foo"; for `obj->query(...)` it's the
+ * method name "query".  NULL for shapes we can't name. */
+static const char *callee_name_of (node_t callee) {
+  if (callee == NULL) return NULL;
+  if (callee->code == N_ID) return callee->u.s.s;
+  if (callee->code == N_DEREF_FIELD || callee->code == N_FIELD) {
+    node_t mid = NL_EL (callee->u.ops, 1); /* operand 1 is the N_ID method name */
+    if (mid != NULL && mid->code == N_ID) return mid->u.s.s;
+  }
+  return NULL;
+}
+
 /* TRUE iff the subtree at `n` references the binding declared at `target`.
  * Stable under shadowing because we compare AST identity, not strings. */
 static int subtree_mentions_decl (node_t n, node_t target) {
@@ -416,6 +455,24 @@ typedef struct candidate {
      scope-exit free(p) on candidates that may have already escaped — doing
      so would double-free on the escaping branch. */
   int         escapes_p;
+  /* Sticky flag: set when this owned local was handed to the caller via
+     `return <candidate>;` on *some* path.  Distinct from the merged exit
+     state: a function can both `delete p;` on an error/throw path and
+     `return p;` on the success path (the canonical "cleanup on failure,
+     hand back on success" shape, e.g. Sqlite::query).  The merged exit
+     state is then MaybeOwned, which would hide the fact that the function
+     ships ownership on its normal return.  returns_owned_p inference reads
+     this flag so such functions are correctly summarised as owned-returning. */
+  int         returned_p;
+  /* Sticky flag: set when the *user* explicitly released this binding on
+     some path (`delete p;` / `free(p)` / a ((releases)) call).  Gates the
+     -fauto-release MaybeOwned relaxation: a binding that the user already
+     frees somewhere must NOT also get a synthesized scope-exit release
+     (that would double-free).  When this is clear and the binding never
+     escaped, a synthesized `defer delete p;` is always safe even at a
+     MaybeOwned merge, because delete/free are null-safe and the only way
+     to reach MaybeOwned without a release is a null-guard narrowing. */
+  int         released_p;
   /* First-observed disposition site (`-fownership-report`).  Populated
      during the diagnostic replay (quiet_p == 0) so it reflects source
      order, not worklist iteration order.  `release_kind` is a short human
@@ -550,7 +607,13 @@ static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) 
        in the check pass.  We only consider locals (scope != top_scope). */
     int auto_defer_path = (d != NULL && d->auto_defer_p);
     const char *ip_release_fn = NULL;
-    if (!auto_defer_path && d != NULL && d->scope != NULL
+    /* `unowned <decl>` opts the binding out of ALL ownership tracking: the
+       user takes manual responsibility, so we neither leak-warn nor
+       auto-release it, and the interprocedural call-returned-owner path
+       below must also skip it (auto_defer_p alone wouldn't, since that
+       flag is never set for call/method initializers). */
+    if (d != NULL && d->unowned_p) { auto_defer_path = 0; }
+    else if (!auto_defer_path && d != NULL && d->scope != NULL
         && d->decl_spec.type != NULL && d->decl_spec.type->mode == TM_PTR
         && !d->decl_spec.typedef_p && !d->decl_spec.static_p
         && !d->decl_spec.thread_local_p) {
@@ -571,9 +634,8 @@ static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) 
           ip_init = NL_EL (ip_init->u.ops, 1);
         node_t ip_callee = (ip_init != NULL && ip_init->code == N_CALL)
                             ? NL_HEAD (ip_init->u.ops) : NULL;
-        acquire = (ip_callee != NULL && ip_callee->code == N_ID
-                   && ip_callee->u.s.s != NULL)
-                    ? ip_callee->u.s.s : "<ip>";
+        const char *ip_name = callee_name_of (ip_callee);
+        acquire = ip_name != NULL ? ip_name : "<ip>";
         release = ip_release_fn;
       }
       name = ownership_spec_decl_name (n);
@@ -587,6 +649,8 @@ static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) 
         c.state        = OS_UNOWNED; /* becomes OS_OWNED when its decl is hit */
         c.warned_p     = 0;
         c.escapes_p    = 0;
+        c.returned_p   = 0;
+        c.released_p   = 0;
         c.release_kind = NULL;
         memset (&c.release_pos, 0, sizeof (c.release_pos));
         c.param_p      = 0;
@@ -898,20 +962,22 @@ static int return_expr_is_acquire_p (node_t expr, const char **out_release_fn) {
   }
   if (expr->code == N_CALL) {
     node_t callee = NL_HEAD (expr->u.ops);
-    if (callee == NULL || callee->code != N_ID || callee->u.s.s == NULL) return 0;
-    const char *cname = callee->u.s.s;
-    /* Hard-coded acquire table mirror.  Keep in sync with release_fn_for_acquire. */
-    const char *r = NULL;
-    if (strcmp (cname, "malloc")  == 0) r = "free";
-    else if (strcmp (cname, "calloc")  == 0) r = "free";
-    else if (strcmp (cname, "realloc") == 0) r = "free";
-    else if (strcmp (cname, "strdup")  == 0) r = "free";
-    else if (strcmp (cname, "strndup") == 0) r = "free";
-    if (r != NULL) { if (out_release_fn != NULL) *out_release_fn = r; return 1; }
-    /* IP-summary lookup. */
-    struct expr *ce = (struct expr *) callee->attr;
-    if (ce != NULL && ce->def_node != NULL) {
-      func_summary_t *s = summary_lookup (ce->def_node);
+    const char *cname = callee_name_of (callee);
+    if (cname != NULL && callee != NULL && callee->code == N_ID) {
+      /* Hard-coded acquire table mirror.  Keep in sync with
+         release_fn_for_acquire.  Only meaningful for free-function names. */
+      const char *r = NULL;
+      if (strcmp (cname, "malloc")  == 0) r = "free";
+      else if (strcmp (cname, "calloc")  == 0) r = "free";
+      else if (strcmp (cname, "realloc") == 0) r = "free";
+      else if (strcmp (cname, "strdup")  == 0) r = "free";
+      else if (strcmp (cname, "strndup") == 0) r = "free";
+      if (r != NULL) { if (out_release_fn != NULL) *out_release_fn = r; return 1; }
+    }
+    /* IP-summary lookup — works for both `wrap(...)` and `obj->method(...)`. */
+    node_t def = callee_def_node (callee);
+    if (def != NULL) {
+      func_summary_t *s = summary_lookup (def);
       if (s != NULL && s->returns_owned_p) {
         if (out_release_fn != NULL)
           *out_release_fn = s->returns_release_fn != NULL ? s->returns_release_fn : "free";
@@ -934,10 +1000,11 @@ static const char *summary_release_for_init (node_t init) {
     init = NL_EL (init->u.ops, 1);
   if (init == NULL || init->code != N_CALL) return NULL;
   node_t callee = NL_HEAD (init->u.ops);
-  if (callee == NULL || callee->code != N_ID) return NULL;
-  struct expr *ce = (struct expr *) callee->attr;
-  if (ce == NULL || ce->def_node == NULL) return NULL;
-  func_summary_t *s = summary_lookup (ce->def_node);
+  /* Resolve free-function *and* method callees (`obj->query(...)`,
+     `Class.open(...)`) to their def so the IP summary applies to both. */
+  node_t def = callee_def_node (callee);
+  if (def == NULL) return NULL;
+  func_summary_t *s = summary_lookup (def);
   if (s == NULL || !s->returns_owned_p) return NULL;
   /* Default to "free" if we somehow lost the release fn (shouldn't happen). */
   return s->returns_release_fn != NULL ? s->returns_release_fn : "free";
@@ -1004,12 +1071,10 @@ static param_attr_t classify_param_attr (node_t param) {
  * prototype.  Returns NULL for indirect calls (function-pointer expressions)
  * and for anything we can't statically resolve. */
 static node_t callee_def_of (node_t callee) {
-  struct expr *ce;
-  if (callee == NULL || callee->code != N_ID) return NULL;
-  ce = (struct expr *) callee->attr;
-  if (ce == NULL || ce->def_node == NULL) return NULL;
-  if (ce->def_node->code == N_FUNC_DEF) return ce->def_node;
-  if (ce->def_node->code == N_SPEC_DECL) return ce->def_node;
+  node_t def = callee_def_node (callee);
+  if (def == NULL) return NULL;
+  if (def->code == N_FUNC_DEF) return def;
+  if (def->code == N_SPEC_DECL) return def;
   return NULL;
 }
 
@@ -1258,6 +1323,7 @@ static void transfer_call (flowctx_t *ctx, node_t call) {
           diag_mark_warned (ctx, c);
         }
         c->state = OS_RELEASED;
+        c->released_p = 1; /* user released it here (sticky) */
         record_disposition (ctx, c, POS (call), "freed by release fn");
       } else {
         /* Non-release call carrying the candidate by N_ID. */
@@ -1302,27 +1368,54 @@ static void transfer_call (flowctx_t *ctx, node_t call) {
   }
 }
 
+/* Mark the candidate(s) a `return <expr>;` actually ships to the caller.
+ * Only the expression's *value* escapes: a direct binding reference (seen
+ * through casts, a leading `detach`, or either arm of a ?:), NOT a binding
+ * that merely appears as a method receiver or call argument somewhere in
+ * the expression — its pointer isn't what's returned.  This is the same
+ * value-vs-mention distinction transfer_assign / transfer_call already
+ * make; using it here avoids falsely escaping `return resp_ok(rows->Get(0))`
+ * (where `rows` is just the receiver and must stay owned so the function's
+ * other return paths get their leak fixed / auto-released). */
+static void mark_return_value_escape (flowctx_t *ctx, node_t expr) {
+  c2m_ctx_t c2m_ctx = ctx->c2m_ctx; /* for POS() */
+  candidate_t *a = VARR_ADDR (candidate_t, ctx->cands);
+  size_t n = VARR_LENGTH (candidate_t, ctx->cands);
+  (void) c2m_ctx;
+  /* Peel value-preserving wrappers: casts and a leading `detach`. */
+  while (expr != NULL && (expr->code == N_CAST || expr->code == N_DETACH))
+    expr = (expr->code == N_CAST) ? NL_EL (expr->u.ops, 1) : NL_HEAD (expr->u.ops);
+  if (expr == NULL) return;
+  if (expr->code == N_COND) {
+    /* `c ? t : f` ships whichever arm is taken; both are value positions. */
+    mark_return_value_escape (ctx, NL_EL (expr->u.ops, 1));
+    mark_return_value_escape (ctx, NL_EL (expr->u.ops, 2));
+    return;
+  }
+  if (expr->code != N_ID) return;
+  node_t decl = id_resolves_to_decl (expr);
+  for (size_t i = 0; i < n; i++)
+    if (a[i].decl == decl
+        && (a[i].state == OS_OWNED || a[i].state == OS_MAYBE_OWNED)) {
+      a[i].state = OS_DETACHED;
+      a[i].escapes_p = 1;
+      a[i].returned_p = 1; /* shipped to caller on this path (sticky) */
+      record_disposition (ctx, &a[i], POS (expr), "returned to caller");
+    }
+}
+
 /* Transfer: a `return <expr>;`. */
 static void transfer_return (flowctx_t *ctx, node_t ret) {
   c2m_ctx_t c2m_ctx = ctx->c2m_ctx; /* for POS() macro hygiene */
   (void) c2m_ctx;
   node_t expr = NL_EL (ret->u.ops, 1);
-  candidate_t *a = VARR_ADDR (candidate_t, ctx->cands);
-  size_t n = VARR_LENGTH (candidate_t, ctx->cands);
 
   if (expr != NULL && expr->code != N_IGNORE) {
     /* First, recurse into the return expression so any call effects /
        use-after-frees inside it fire properly. */
     analyze (ctx, expr);
-    /* Then mark any tracked binding mentioned in the return expression as
-       transferred to the caller. */
-    for (size_t i = 0; i < n; i++)
-      if (subtree_mentions_decl (expr, a[i].decl)
-          && (a[i].state == OS_OWNED || a[i].state == OS_MAYBE_OWNED)) {
-        a[i].state = OS_DETACHED;
-        a[i].escapes_p = 1;
-        record_disposition (ctx, &a[i], POS (ret), "returned to caller");
-      }
+    /* Then mark only the binding whose *value* is returned as escaped. */
+    mark_return_value_escape (ctx, expr);
     /* Inline acquire-shape detection: even when there's no candidate to
        track, `return new T(...)` / `return detach new T(...)` / `return
        malloc(n)` / `return some_acquire_wrapper(...)` ships ownership
@@ -1372,6 +1465,7 @@ static void transfer_delete (flowctx_t *ctx, node_t del) {
         diag_mark_warned (ctx, &a[i]);
       }
       a[i].state = OS_RELEASED;
+      a[i].released_p = 1; /* user released it here (sticky) */
       record_disposition (ctx, &a[i], POS (del), "deleted");
     }
 }
@@ -2151,7 +2245,20 @@ static void cfg_dataflow (flowctx_t *ctx, cfg_t *cfg) {
         heap_in = (owstate_t *) calloc (ncands, sizeof (owstate_t));
         in_buf = heap_in;
       }
-      for (size_t k = 0; k < ncands; k++) in_buf[k] = OS_UNOWNED;
+      /* Initial in-state: Unowned everywhere, EXCEPT that the function
+         entry block conceptually receives each pointer parameter already
+         Owned (the caller hands ownership in).  Without this seed every
+         param starts Unowned and stays Unowned, so the borrow inference
+         (Owned && !escapes -> ((borrows))) could never fire — only the
+         release inference worked, because free(p) forces RELEASED from any
+         prior state.  The entry block has no predecessors, so the
+         pred-merge below leaves this seed intact. */
+      {
+        candidate_t *ca = VARR_ADDR (candidate_t, ctx->cands);
+        int entry_p = (i == (size_t) cfg->entry_bb);
+        for (size_t k = 0; k < ncands; k++)
+          in_buf[k] = (entry_p && ca[k].param_p) ? OS_OWNED : OS_UNOWNED;
+      }
       size_t npreds = VARR_LENGTH (int, bb->preds);
       if (npreds > 0) {
         int *preds = VARR_ADDR (int, bb->preds);
@@ -2351,6 +2458,53 @@ static void cfg_emit_diagnostics (flowctx_t *ctx, cfg_t *cfg) {
   size_t nblocks = VARR_LENGTH (basic_block_t, cfg->blocks);
   basic_block_t *bbs = VARR_ADDR (basic_block_t, cfg->blocks);
   (void) c2m_ctx;
+  basic_block_t *exit_bb = &bbs[cfg->exit_bb];
+  candidate_t *cands = VARR_ADDR (candidate_t, ctx->cands);
+  size_t ncands = VARR_LENGTH (candidate_t, ctx->cands);
+
+  /* Step I (FIRST): -fauto-release silently fixes definite leaks by
+     synthesizing `defer release_fn(p);` on the binding.  This MUST run
+     before the diagnostic replay below.  Rationale: a synthesized
+     `defer delete p;` is placed at the *declaration*, so it covers every
+     scope exit — including early returns.  If we instead let the replay
+     run first, check_exit_state would fire the leak warning (and set
+     warned_p) at the first `return` it reaches, defeating synthesis on any
+     function that returns.  By deciding here, off the *aggregated* exit
+     state (`exit_bb->state_in`, the meet over all paths) plus the sticky
+     `escapes_p` flag, we get the multi-exit-safe gate: a binding that is
+     OS_OWNED on every path and never escaped is genuinely leaked and a
+     scope-bound delete is always correct.  Once synthesized, there's no
+     leak left to report — so we set warned_p to keep the replay silent. */
+  for (size_t k = 0; k < ncands; k++) cands[k].state = exit_bb->state_in[k];
+  if (c2m_options != NULL && c2m_options->auto_release_p && !ownership_silent_pass_p) {
+    for (size_t k = 0; k < ncands; k++) {
+      candidate_t *c = &cands[k];
+      if (c->warned_p) continue;
+      if (c->has_cleanup_p) continue;
+      if (c->escapes_p) continue;
+      if (c->param_p) continue;  /* never synthesize free on incoming params */
+      /* Eligible states:
+           OS_OWNED       — owned on every path; classic definite leak.
+           OS_MAYBE_OWNED — owned on some paths, "gone" (null) on others,
+                            but never user-released (released_p) and never
+                            escaped.  The only non-release way to reach
+                            MaybeOwned is a null-guard narrowing
+                            (`if (!p) return; ... use p ...`), and since
+                            delete/free are null-safe a scope-exit release
+                            is correct on every path.  Requiring
+                            !released_p keeps us from double-freeing a
+                            binding the user already frees on one branch. */
+      int eligible = (c->state == OS_OWNED)
+                     || (c->state == OS_MAYBE_OWNED && !c->released_p);
+      if (!eligible) continue;
+      if (try_synthesize_auto_release (ctx, c)) c->warned_p = 1;
+    }
+  }
+
+  /* Diagnostic replay: walk each reachable block once with quiet_p == 0 so
+     transfer functions emit real warnings / errors at the right positions.
+     Auto-released bindings already carry warned_p, so their (now-fixed)
+     leaks stay silent. */
   ctx->quiet_p = 0;
   for (size_t i = 0; i < nblocks; i++) {
     /* Unreachable blocks: no predecessors and not the entry.  Skip. */
@@ -2363,28 +2517,7 @@ static void cfg_emit_diagnostics (flowctx_t *ctx, cfg_t *cfg) {
      would have transitioned to Detached) nor via release (Released).
      check_exit_state guards itself with `warned_p` so we never duplicate
      a diagnostic that already fired at an explicit return. */
-  basic_block_t *exit_bb = &bbs[cfg->exit_bb];
-  candidate_t *cands = VARR_ADDR (candidate_t, ctx->cands);
-  size_t ncands = VARR_LENGTH (candidate_t, ctx->cands);
   for (size_t k = 0; k < ncands; k++) cands[k].state = exit_bb->state_in[k];
-
-  /* Step I: -fauto-release silently fixes definite leaks by synthesizing a
-     `defer release_fn(p);` on the binding.  Only candidates that are
-     OS_OWNED at the function exit AND never observed escaping anywhere
-     are eligible — see try_synthesize_auto_release for the full gate.
-     On success we mark warned_p so check_exit_state below doesn't also
-     emit the leak diagnostic (the leak is gone). */
-  if (c2m_options != NULL && c2m_options->auto_release_p && !ownership_silent_pass_p) {
-    for (size_t k = 0; k < ncands; k++) {
-      candidate_t *c = &cands[k];
-      if (c->warned_p) continue;
-      if (c->has_cleanup_p) continue;
-      if (c->escapes_p) continue;
-      if (c->param_p) continue;  /* never synthesize free on incoming params */
-      if (c->state != OS_OWNED) continue;
-      if (try_synthesize_auto_release (ctx, c)) c->warned_p = 1;
-    }
-  }
 
   check_exit_state (ctx, POS (ctx->func_def), "the end of this function");
 
@@ -2429,15 +2562,15 @@ static void cfg_emit_diagnostics (flowctx_t *ctx, cfg_t *cfg) {
         }
         if (c->param_pos < param_count) attrs[c->param_pos] = inferred;
       } else {
-        /* Local heap candidate.  If it ended Detached AND escapes_p was set
-           (return / store / detaching call), the function ships ownership
-           somewhere.  Combined with the absence of a release call on this
-           path, the most likely shape is "function returns owned".
-           Record the candidate's release_fn so callers know which
-           release form to expect ("free" vs. "delete"). */
-        if (c->state == OS_DETACHED && c->escapes_p
-            && c->release_kind != NULL
-            && strcmp (c->release_kind, "returned to caller") == 0) {
+        /* Local heap candidate that was handed to the caller via `return`
+           on some path ships ownership.  We key off the sticky returned_p
+           flag rather than the merged exit state: a function that both
+           `delete`s the binding on an error/throw path and `return`s it on
+           success (Sqlite::query, List::Slice with a guard, ...) has a
+           merged exit state of MaybeOwned, but it still returns owned on
+           its normal path.  Record the candidate's release_fn so callers
+           know which release form to expect ("free" vs. "delete"). */
+        if (c->returned_p) {
           returns_owned_p = 1;
           if (returns_release_fn == NULL) returns_release_fn = c->release_fn;
         }

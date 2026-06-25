@@ -82,10 +82,13 @@ int main() {
     /* ──────────────────────── Map<String,int> ─────────────────────── */
 
     /* Pre-materialize N distinct String keys so the timed phases measure map
-     * work, not key construction.  (Keys live in the String arena; we keep the
-     * pointers in a heap array.) */
+     * work, not key construction.  detach() is required: an f-string built in a
+     * loop lives in the per-iteration loop arena, which is reclaimed at the end
+     * of each iteration — so without detach the stored pointers would alias
+     * reclaimed slots (garbage contents, key collisions).  detach escapes each
+     * key to the heap so it survives in the array; we free them at the end. */
     String* keys = (String*) malloc(sizeof(String) * N);
-    for (int i = 0; i < N; i++) keys[i] = f"key_{i}";
+    for (int i = 0; i < N; i++) keys[i] = (f"key_{i}").detach();
 
     Map<String, int>* ms = new Map<String, int>((int)N);
     defer delete ms;
@@ -118,6 +121,8 @@ int main() {
     printf("  for-in   : %9.2f ms   %6.2f M ops/s\n", siter_ms, mops(N, siter_ms));
     printf("  remove   : %9.2f ms   %6.2f M ops/s\n", sdel,     mops(N, sdel));
 
+    /* keys were detach()'d to the heap, so free each one, then the array. */
+    for (int i = 0; i < N; i++) free((void*)keys[i]);
     free((void*)keys);
 
     if (failures == 0) printf("\n=== all checks passed ===\n");

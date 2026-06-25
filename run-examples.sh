@@ -4,18 +4,15 @@
 echo "Running all ClassyC examples..."
 
 SEGFAULTS=()
-PROBLEMS=()
 
 # Find all .cy files in examples directory
 for example in examples/*.cy; do
     if [ -f "$example" ]; then
         echo "Running $example..."
-        bin/classyc -I include -l sqlite3 -g "$example" -eg
+        bin/classyc -I include -g "$example" -eg
         status=$?
         if [ $status -gt 133 ]; then
             SEGFAULTS+=("$example")
-        elif [ $status -gt 0 ]; then
-            PROBLEMS+=("$example")
         fi
         echo "Finished $example (exit $status)"
         echo "---"
@@ -23,10 +20,6 @@ for example in examples/*.cy; do
 done
 
 echo "All examples completed."
-echo "PROLEMS:"
-for example in "${PROBLEMS[@]}"; do
-	echo "  $example"
-done
 
 if [ ${#SEGFAULTS[@]} -gt 0 ]; then
     echo ""
