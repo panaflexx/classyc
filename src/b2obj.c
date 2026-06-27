@@ -889,9 +889,24 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         /* Determine binding: global if exported, otherwise local */
         size_t dummy;
         int is_exported = name_set_find(&exports, fname, &dummy);
+        int binding = is_exported ? STB_GLOBAL : STB_LOCAL;
+        /* ClassyC class methods/ctors/dtors are lowered to free functions with
+           mangled names of the form `Class_method__<sig>` (see
+           mangle_func_def_mir_name in classyc.c).  When a class lives in a
+           header included by several translation units, every such unit emits
+           an identical copy of those methods, so the system linker would abort
+           with "multiple definition of `Class_method__...`".  Emit them as WEAK
+           instead so the linker folds the identical copies (C++-inline / ODR
+           semantics).  This is the AOT mirror of the JIT's MIR func-redef
+           permission.  The marker is the `__` the mangler always inserts before
+           the signature; plain free functions (no `__`) stay strong GLOBAL so a
+           genuine duplicate is still reported.  (Header-level free helpers that
+           are legitimately shared should be declared `static`.) */
+        if (is_exported && strstr(fname, "__") != NULL)
+            binding = STB_WEAK;
         Elf64_Sym s = {0};
         s.st_name = strtab_add(&strtab, &strtab_size, &strtab_cap, fname);
-        s.st_info = ELF64_ST_INFO(is_exported ? STB_GLOBAL : STB_LOCAL, STT_FUNC);
+        s.st_info = ELF64_ST_INFO(binding, STT_FUNC);
         s.st_shndx = SEC_TEXT;
         s.st_value = funcs[i].text_offset;
         s.st_size = funcs[i].code_len;

@@ -702,6 +702,21 @@ typedef enum {
                 automatic scope-bound cleanup.  Parses and is recorded in the
                 AST so users can start writing it now; no semantic effect until
                 auto-`defer delete` lands.  Wraps the inner declaration list. */
+  N_MOVE,    /* move <expr>  — transfer single ownership OUT of an owned binding
+                into the receiver.  Yields the same pointer value; the source
+                binding is left as a read-only view (any subsequent ownership
+                operation on it — move, delete, releasing call — is an error).
+                Part of the opt-in `owned`/`move`/`readonly` managed layer. */
+  N_READONLY,/* readonly <expr>  — borrow a read-only view of an owned object.
+                Yields the same pointer value but confers NO ownership: the
+                view never releases the object.  A view may be held anywhere —
+                a local, a global, or an object field; it just must not be used
+                after its owner is gone.  Inverse intent of `move`. */
+  N_OWNED,   /* owned <decl>  — wrap a declaration to opt INTO the managed,
+                single-owner, move-only lifetime (the GC-like layer).  The
+                binding's resource is guaranteed to be released exactly once at
+                the end of the owning scope unless ownership is `move`d out.
+                Mirror of `unowned`; wraps the inner declaration list. */
   N_LAMBDA, /* (params) => body — anonymous function (future: untyped/generic lambdas) */
   N_INTERFACE, /* interface Name { sig; ... } — named structural method-set contract */
   N_ANY,    /* any<I>(expr) — wrap a concrete C* as an erased Any<I>* handle */
@@ -5606,6 +5621,40 @@ D (assign_expr) {
     record_stop (c2m_ctx, mark, TRUE); /* rewind: `detach` is an ordinary id */
   }
 
+  /* move <expr>  — transfer single ownership out of an owned binding.  Same
+     soft-keyword discipline as `detach`: wraps the whole RHS at assign_expr
+     level so `auto y = move x;` parses as `auto y = move(x);`, and `move`
+     stays usable as an ordinary identifier elsewhere (rewind on the guard). */
+  if (C_SOFT ("move")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t dpos = curr_token->pos;
+    node_t inner;
+    M_SOFT ("move");
+    if (!C (';') && !C (',') && !C (')') && !C (']') && !C ('}')
+        && !C ('=') && !C (T_ASSIGN) && !C ('.') && !C ('[')
+        && (inner = TRY (assign_expr)) != err_node) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit */
+      return new_pos_node1 (c2m_ctx, N_MOVE, dpos, inner);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* rewind: `move` is an ordinary id */
+  }
+
+  /* readonly <expr>  — borrow a read-only view of an owned object.  Soft
+     keyword, same shape as `move`/`detach`. */
+  if (C_SOFT ("readonly")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t dpos = curr_token->pos;
+    node_t inner;
+    M_SOFT ("readonly");
+    if (!C (';') && !C (',') && !C (')') && !C (']') && !C ('}')
+        && !C ('=') && !C (T_ASSIGN) && !C ('.') && !C ('[')
+        && (inner = TRY (assign_expr)) != err_node) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit */
+      return new_pos_node1 (c2m_ctx, N_READONLY, dpos, inner);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* rewind: `readonly` is an ordinary id */
+  }
+
   P (cond_expr);
   if (MC (T_ASSIGN, pos, code) || MC ('=', pos, code)) {
     n = new_pos_node1 (c2m_ctx, code, pos, r);
@@ -5697,6 +5746,33 @@ D (declaration) {
   pos_t pos, last_pos;
   int unowned_p = FALSE;
   pos_t unowned_pos = no_pos;
+  int owned_p = FALSE;
+  pos_t owned_pos = no_pos;
+
+  /* owned <decl>  — declaration opts INTO the managed, single-owner, move-only
+     lifetime layer.  Soft keyword mirroring `unowned`: rewind if the rest does
+     not look like a real declaration, so `int owned = 5;` stays legal. */
+  if (C_SOFT ("owned")) {
+    size_t mark = record_start (c2m_ctx);
+    owned_pos = curr_token->pos;
+    M_SOFT ("owned");
+    if (curr_token->code == T_INT  || curr_token->code == T_CHAR
+        || curr_token->code == T_DOUBLE || curr_token->code == T_FLOAT
+        || curr_token->code == T_VOID   || curr_token->code == T_STRING
+        || curr_token->code == T_LONG   || curr_token->code == T_SHORT
+        || curr_token->code == T_UNSIGNED || curr_token->code == T_SIGNED
+        || curr_token->code == T_STRUCT || curr_token->code == T_CLASS
+        || curr_token->code == T_UNION  || curr_token->code == T_ENUM
+        || curr_token->code == T_CONST  || curr_token->code == T_VOLATILE
+        || curr_token->code == T_DICT   || curr_token->code == T_BOOL
+        || curr_token->code == T_AUTO
+        || curr_token->code == T_ID) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit */
+      owned_p = TRUE;
+    } else {
+      record_stop (c2m_ctx, mark, TRUE);  /* rewind: ordinary identifier use */
+    }
+  }
 
   /* unowned <decl>  — declaration opts out of any future automatic scope-bound
      cleanup.  Today this is a no-op (manual cleanup is still the default), but
@@ -5849,6 +5925,10 @@ D (declaration) {
      ownership-flow analysis) can see the opt-out marker.  Today: pass-through. */
   if (unowned_p && r != NULL && r != err_node)
     r = new_pos_node1 (c2m_ctx, N_UNOWNED, unowned_pos, r);
+  /* Wrap a committed `owned` declaration so the ownership pass can see the
+     managed-lifetime opt-in marker. */
+  if (owned_p && r != NULL && r != err_node)
+    r = new_pos_node1 (c2m_ctx, N_OWNED, owned_pos, r);
   return r;
 }
 
@@ -8261,6 +8341,9 @@ struct check_ctx {
      detection on `N_SPEC_DECL` knows to skip this binding.  Save/restore at
      N_UNOWNED entry/exit so nested declarations behave correctly. */
   int in_unowned_p;
+  /* Set while inside an `owned <decl>` wrapper so N_SPEC_DECL marks the binding
+     as part of the managed-ownership layer.  Save/restore at N_OWNED entry/exit. */
+  int in_owned_p;
   /* Sequence lambda methods (filter/map/reduce): module-level injection points
      for lambda FUNC_DEFs synthesized while checking a call site. */
   node_t module_item_list; /* the module's top-level N_LIST */
@@ -8296,6 +8379,7 @@ struct check_ctx {
 #define curr_module_item check_ctx->curr_module_item
 #define curr_lambda_def check_ctx->curr_lambda_def
 #define in_unowned_p check_ctx->in_unowned_p
+#define in_owned_p check_ctx->in_owned_p
 #define defer_method_bodies_p check_ctx->defer_method_bodies_p
 #define pending_method_bodies check_ctx->pending_method_bodies
 
@@ -8728,6 +8812,11 @@ struct decl {
      interprocedural call-returned-owner path that `auto_defer_p` does not
      cover. */
   unsigned unowned_p : 1;
+  /* Set when this local declaration is part of the managed ownership layer
+     (declared `owned`, or initialized by `new`/`move` of an owned value).
+     The ownership pass (src/ownership.c) tracks these bindings as single-owner,
+     move-only, and guarantees a single scope-exit release unless moved out. */
+  unsigned owned_p : 1;
   int bit_offset, width; /* for bitfields, -1 bit_offset for non bitfields. */
   mir_size_t offset;     /* var offset in frame or bss */
   /* Extra stack bytes for a class/struct local whose trailing flexible array
@@ -12217,6 +12306,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       decl->auto_release_call = NULL;
       decl->auto_defer_p = FALSE;
       decl->unowned_p = FALSE;
+      decl->owned_p = FALSE;
       decl->scope = curr_scope;
       decl->containing_unnamed_anon_struct_union_member = curr_unnamed_anon_struct_union_member;
       decl->u.item = NULL;
@@ -12913,6 +13003,8 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         NODE_CASE (LAMBDA)
         NODE_CASE (CONCAT)
         NODE_CASE (DETACH) /* expression: same type as inner operand */
+        NODE_CASE (MOVE)     /* expression: same pointer value as inner operand */
+        NODE_CASE (READONLY) /* expression: same pointer value as inner operand */
         *expr_attr_p = TRUE;
         break;
         REP8 (NODE_CASE, IF, SWITCH, WHILE, DO, FOR, GOTO, INDIRECT_GOTO, CONTINUE)
@@ -12923,6 +13015,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         NODE_CASE (ATTACH)  /* statement (stub today): like DEFER/DELETE */
         NODE_CASE (UNOWNED) /* declaration wrapper; treated as a statement-like
                                container so the inner SPEC_DECL list runs */
+        NODE_CASE (OWNED)   /* declaration wrapper (managed-ownership opt-in) */
         NODE_CASE (TRY)
         NODE_CASE (CATCH)
         NODE_CASE (THROW)
@@ -16076,6 +16169,27 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         if (spec_id != NULL && spec_id->code == N_ID)
           decl->auto_defer_p = TRUE;
       }
+      /* --- Managed-ownership marking (owned / move) --------------------------
+         A local pointer binding joins the managed layer when the user wrote
+         `owned` (in_owned_p) OR when it is initialized by `move <expr>` (which
+         transfers ownership of an existing owned value into this binding).
+         `unowned` always wins as an explicit opt-out. */
+      if (!decl->unowned_p
+          && declarator->code == N_DECL
+          && decl->scope != top_scope
+          && !decl->decl_spec.typedef_p && !decl->decl_spec.extern_p
+          && !decl->decl_spec.static_p && !decl->decl_spec.thread_local_p
+          && decl->decl_spec.type->mode == TM_PTR) {
+        node_t mv_init = initializer;
+        while (mv_init != NULL && mv_init->code == N_CAST)
+          mv_init = NL_EL (mv_init->u.ops, 1);
+        int init_is_move = (mv_init != NULL && mv_init->code == N_MOVE);
+        if (in_owned_p || init_is_move) {
+          node_t spec_id = NL_HEAD (declarator->u.ops);
+          if (spec_id != NULL && spec_id->code == N_ID)
+            decl->owned_p = TRUE;
+        }
+      }
     } else if (decl_spec.type->mode == TM_STRUCT || decl_spec.type->mode == TM_UNION ||
            decl_spec.type->mode == TM_CLASS) {
       if (NL_HEAD (decl_spec.type->u.tag_type->u.ops)->code != N_ID)
@@ -17117,6 +17231,52 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
     in_unowned_p = saved_unowned;
     break;
   }
+  case N_OWNED: {
+    /* owned <decl> — managed-ownership opt-in wrapper.  Recurse into the inner
+       declaration with `in_owned_p` raised so N_SPEC_DECL records the binding
+       as part of the managed layer (decl->owned_p).  The marker is preserved
+       in the AST for the ownership pass to consult. */
+    node_t inner = NL_HEAD (r->u.ops);
+    int saved_owned = in_owned_p;
+    in_owned_p = TRUE;
+    if (inner != NULL) check (c2m_ctx, inner, r);
+    in_owned_p = saved_owned;
+    break;
+  }
+  case N_MOVE:
+  case N_READONLY: {
+    /* move <expr> / readonly <expr>: both yield the SAME pointer value as the
+       inner expression — they are value-level pass-throughs whose meaning is
+       enforced by the ownership pass (move transfers ownership and leaves the
+       source a read-only view; readonly borrows a non-owning view).  The
+       result type equals the inner expression's type.
+
+       Like N_DETACH, these classify as expressions, so we MUST assign to the
+       outer `e` (not a shadowing local) to suppress the trailing error-
+       recovery TP_INT path. */
+    node_t inner = NL_HEAD (r->u.ops);
+    struct expr *ie;
+    struct type *it;
+    const char *kw = (r->code == N_MOVE) ? "move" : "readonly";
+
+    check (c2m_ctx, inner, r);
+    ie = inner->attr;
+    if (ie == NULL || ie->type == NULL) break; /* degrade: tail stamps int expr */
+    it = ie->type;
+    /* Managed ownership is a pointer-to-object concept today.  Applying the
+       keyword to a non-pointer is almost certainly a mistake; warn but keep
+       the value flowing so generic code still compiles. */
+    if (it->mode != TM_PTR)
+      warning (c2m_ctx, POS (r),
+               "`%s` applies to owned pointer values; this operand is not a "
+               "pointer, so it has no managed-ownership effect", kw);
+    e = create_expr (c2m_ctx, r);
+    /* Share the inner's type pointer verbatim (same pointer type / pointee).
+       The result is a freshly produced value (the moved / borrowed pointer),
+       not an lvalue — create_expr already nulled u.lvalue_node. */
+    e->type = it;
+    break;
+  }
   case N_INTERFACE:
     /* A pure compile-time contract: no type, no layout, no code.  Conformance
        (impl checks) is verified elsewhere; nothing to do here. */
@@ -17400,6 +17560,8 @@ struct gen_ctx {
   MIR_item_t str_equals_proto, str_equals_item;
   MIR_item_t str_detach_proto, str_detach_item;
   MIR_item_t str_attach_proto, str_attach_item;
+  MIR_item_t str_own_proto, str_own_item;     /* c2m_str_own  — object-owned copy */
+  MIR_item_t str_drop_proto, str_drop_item;   /* c2m_str_drop — free owned field  */
   MIR_item_t str_checkpoint_proto, str_checkpoint_item;
   MIR_item_t str_release_to_proto, str_release_to_item;
   MIR_item_t str_release_keeping_proto, str_release_keeping_item;
@@ -17569,6 +17731,10 @@ struct gen_ctx {
 #define str_equals_item gen_ctx->str_equals_item
 #define str_detach_proto gen_ctx->str_detach_proto
 #define str_detach_item gen_ctx->str_detach_item
+#define str_own_proto gen_ctx->str_own_proto
+#define str_own_item gen_ctx->str_own_item
+#define str_drop_proto gen_ctx->str_drop_proto
+#define str_drop_item gen_ctx->str_drop_item
 #define str_attach_proto gen_ctx->str_attach_proto
 #define str_attach_item gen_ctx->str_attach_item
 #define str_checkpoint_proto gen_ctx->str_checkpoint_proto
@@ -19897,6 +20063,9 @@ static op_t gen_dict_iter_count (c2m_ctx_t c2m_ctx, MIR_op_t obj_op) {
    front lets us keep the bind code grouped with the other dict gen helpers. */
 static MIR_op_t gen_dict_key_op (c2m_ctx_t c2m_ctx, const char *key_str, size_t len);
 static op_t gen_dict_unwrap (c2m_ctx_t c2m_ctx, op_t dop);
+/* c2m_str_own import setup (defined later) — the binder copies value-semantic
+   String fields into class targets via str_own, matching the assignment path. */
+static void string_ensure_imports (c2m_ctx_t c2m_ctx);
 
 /* Intern STR as an anonymous string data item in the current module and return
    a ref op pointing to it.  Mirrors gen_dict_key_op's strategy so the string
@@ -20027,9 +20196,35 @@ static void gen_dict_bind_into (c2m_ctx_t c2m_ctx, struct type *cls_type,
       /* Nested class or struct: recurse with field_addr as the new
          destination base.  Identical layout walk regardless of kind. */
       gen_dict_bind_into (c2m_ctx, mtype, val_dv, field_addr, lenient, pos);
+    } else if (builtin_string_type_p (mtype) && cls_type->mode == TM_CLASS) {
+      /* Value-semantic String field (Option D): a `String` stored in a CLASS
+         field is owned by the object.  Gated on builtin_string_type_p (the
+         real `String`, not any char*) so it matches exactly what the
+         destructor's gen_class_string_members_drop frees — a plain char*
+         field falls through to the borrow path below and is never dropped.  The dict's string payload lives in the
+         dict's arena, so we must NOT store that borrowed pointer — once the
+         dict is freed the field would dangle (and the destructor's
+         c2m_str_drop would free arena memory).  Instead take a private heap
+         copy via c2m_str_own, exactly like `this.s = ...` does, so the bound
+         object owns its strings and `delete obj` frees them.  The destination
+         was zero-initialized before the walk, so there is no old buffer to
+         drop.  This is what makes typed JSON binding "just work" C#-style:
+         the source dict can be deleted right after the bind. */
+      op_t unwrapped = gen_dict_unwrap (c2m_ctx, val_dv);
+      string_ensure_imports (c2m_ctx);
+      MIR_op_t own_arg = force_reg (c2m_ctx, unwrapped, MIR_T_I64).mir_op;
+      op_t owned = gen_rt_call (c2m_ctx, str_own_proto, str_own_item, 1, &own_arg);
+      owned = force_reg (c2m_ctx, owned, MIR_T_I64);
+      MIR_type_t mir_t = get_mir_type (c2m_ctx, mtype);
+      MIR_alias_t alias = get_type_alias (c2m_ctx, mtype);
+      emit2 (c2m_ctx, tp_mov (mir_t),
+             MIR_new_alias_mem_op (ctx, mir_t, 0, field_addr.mir_op.u.reg, 0, 1, alias, 0),
+             owned.mir_op);
     } else if (scalar_type_p (mtype) || string_type_p (mtype)) {
       /* Unwrap the union payload (offset 8 of DictValue) and store into the
-         class slot.  Same path as `(T)d.x` would take for a scalar leaf. */
+         slot.  Same path as `(T)d.x` would take for a scalar leaf.  Struct
+         String fields land here too: structs have no destructor, so they keep
+         borrowing the dict-arena pointer (the dict must outlive them). */
       op_t unwrapped = gen_dict_unwrap (c2m_ctx, val_dv);
       MIR_type_t mir_t = get_mir_type (c2m_ctx, mtype);
       MIR_alias_t alias = get_type_alias (c2m_ctx, mtype);
@@ -20413,6 +20608,20 @@ static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, str_detach_proto);
   move_item_to_module_start (module, str_detach_item);
 
+  /* char *c2m_str_own(const char *s) -- fresh untracked owned heap copy */
+  vars[0].name = "s"; vars[0].type = MIR_T_I64;
+  str_own_proto = MIR_new_proto_arr (ctx, "__c2m_str_own_p", 1, &ptr_t, 1, vars);
+  str_own_item = MIR_new_import (ctx, "c2m_str_own");
+  move_item_to_module_start (module, str_own_proto);
+  move_item_to_module_start (module, str_own_item);
+
+  /* void c2m_str_drop(const char *s) -- free an object-owned String field */
+  vars[0].name = "s"; vars[0].type = MIR_T_I64;
+  str_drop_proto = MIR_new_proto_arr (ctx, "__c2m_str_drop_p", 0, NULL, 1, vars);
+  str_drop_item = MIR_new_import (ctx, "c2m_str_drop");
+  move_item_to_module_start (module, str_drop_proto);
+  move_item_to_module_start (module, str_drop_item);
+
   /* char *c2m_str_attach(const char *s) */
   vars[0].name = "s"; vars[0].type = MIR_T_I64;
   str_attach_proto = MIR_new_proto_arr (ctx, "__c2m_str_attach_p", 1, &ptr_t, 1, vars);
@@ -20563,6 +20772,93 @@ static op_t gen_string_call (c2m_ctx_t c2m_ctx, enum str_method sm, MIR_op_t *va
   default:             assert (0);                                                 break;
   }
   return gen_rt_call (c2m_ctx, proto, item, (size_t) n, vals);
+}
+
+/* ── Value-semantic String fields (Option D) ──────────────────────────────
+   A `String` stored in a CLASS field is owned by the object: assignment
+   copies into a private heap buffer (c2m_str_own) and the destructor frees it
+   (c2m_str_drop).  This gives C#/Java-like "strings just live with the object"
+   semantics without a GC, by keeping every owned field pointing at either NULL
+   or a freeable heap buffer.
+
+   class_string_member_store_p: TRUE when `assign` writes a `String` member of
+   a class object (`this.s = ...`, `obj.s = ...`, `obj->s = ...`).  Struct/dict
+   members and non-String fields are excluded — only classes participate. */
+static int class_string_member_store_p (node_t assign) {
+  node_t lhs, parent;
+  struct expr *pe, *fe;
+  struct type *pt;
+  if (assign == NULL || assign->code != N_ASSIGN) return 0;
+  lhs = NL_HEAD (assign->u.ops);
+  if (lhs == NULL || (lhs->code != N_FIELD && lhs->code != N_DEREF_FIELD)) return 0;
+  parent = NL_HEAD (lhs->u.ops);
+  pe = parent != NULL ? (struct expr *) parent->attr : NULL;
+  pt = pe != NULL ? pe->type : NULL;
+  if (pt == NULL) return 0;
+  if (lhs->code == N_DEREF_FIELD && pt->mode == TM_PTR) pt = pt->u.ptr_type;
+  if (pt == NULL || pt->mode != TM_CLASS) return 0;
+  fe = (struct expr *) lhs->attr;
+  return fe != NULL && builtin_string_type_p (fe->type);
+}
+
+/* Free every owned `String` member of the class object at `obj_ptr_op`.
+   Emitted at object destruction (before the heap is freed) so each value-
+   semantic String field is reclaimed exactly once.  No-op for non-class
+   types or classes without String members.  `obj_ptr_op` must hold the
+   object's address.
+
+   Recurses into nested BY-VALUE class members (e.g. a class field of class
+   type), so an object tree of value-semantic strings "just lives and dies"
+   with the root object — a `String` on a nested class field is freed exactly
+   once when the enclosing object is destroyed.  Class *pointer* members are
+   NOT followed (they are separate objects with their own lifetime). */
+static void gen_class_string_members_drop (c2m_ctx_t c2m_ctx, MIR_op_t obj_ptr_op,
+                                           struct type *cls) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  node_t tag, member_list;
+  op_t base;
+  if (cls == NULL || cls->mode != TM_CLASS || cls->u.tag_type == NULL) return;
+  tag = cls->u.tag_type;
+  member_list = TAG_MEMBER_LIST (tag);
+  if (member_list == NULL || member_list->code != N_LIST) return;
+  /* Cheap pre-scan: skip the whole dance unless there is a String member or a
+     nested by-value class member that might itself contain one. */
+  {
+    int any = 0;
+    for (node_t m = NL_HEAD (member_list->u.ops); m != NULL; m = NL_NEXT (m)) {
+      decl_t md;
+      struct type *mt;
+      if (m->code != N_MEMBER) continue;
+      md = (decl_t) m->attr;
+      if (md == NULL || (mt = md->decl_spec.type) == NULL) continue;
+      if (builtin_string_type_p (mt) || mt->mode == TM_CLASS) { any = 1; break; }
+    }
+    if (!any) return;
+  }
+  string_ensure_imports (c2m_ctx);
+  base = force_reg (c2m_ctx, new_op (NULL, obj_ptr_op), MIR_T_I64);
+  for (node_t m = NL_HEAD (member_list->u.ops); m != NULL; m = NL_NEXT (m)) {
+    decl_t md;
+    struct type *mt;
+    if (m->code != N_MEMBER) continue;
+    md = (decl_t) m->attr;
+    if (md == NULL || (mt = md->decl_spec.type) == NULL) continue;
+    if (builtin_string_type_p (mt)) {
+      op_t fld = get_new_temp (c2m_ctx, MIR_T_I64);
+      MIR_op_t darg;
+      emit2 (c2m_ctx, MIR_MOV, fld.mir_op,
+             MIR_new_mem_op (ctx, MIR_T_I64, (MIR_disp_t) md->offset, base.mir_op.u.reg, 0, 1));
+      darg = fld.mir_op;
+      gen_rt_call_void (c2m_ctx, str_drop_proto, str_drop_item, 1, &darg);
+    } else if (mt->mode == TM_CLASS) {
+      /* Nested by-value class field: recurse with its address (base+offset). */
+      op_t nested = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit3 (c2m_ctx, MIR_ADD, nested.mir_op, base.mir_op,
+             MIR_new_int_op (ctx, (long) md->offset));
+      gen_class_string_members_drop (c2m_ctx, nested.mir_op, mt);
+    }
+  }
 }
 
 /* Import the object-arena runtime helpers (c2m_obj_checkpoint / release_to) the
@@ -20818,6 +21114,54 @@ static int subtree_assigns_tracked_id_p (node_t n) {
   return FALSE;
 }
 
+/* TRUE if the subtree stores a tracked `String` into a String-holding
+   collection via a method call, e.g. `names->Add(s)` / `ages->Set(key, v)`
+   where the receiver is a `List<String>` / `Set<String>` / `Map<String,...>`
+   (or `Map<...,String>`).  Such a store smuggles an arena-tracked String out
+   of the loop iteration into a collection whose lifetime spans iterations, so
+   a per-iteration `c2m_str_release_to` would free the buffer the collection
+   still points at — a use-after-free once the collection is read after the
+   loop.  Like `subtree_assigns_tracked_id_p`, we use this to DISABLE per-iter
+   reclamation for the loop body and fall back to function-scope cleanup
+   (correctness over peak memory).
+
+   Detection is deliberately narrow — it only fires when the receiver is a
+   generic collection specialization whose element/key/value set includes
+   `String` (mangled class name `__generic_*_String*`) AND an argument is a
+   String value.  That keeps bounded patterns that merely *pass* a String to a
+   non-retaining callee (e.g. `printf("%s", s)`, `Http.get(BASE + name)`) out
+   of scope, so the classy-fetch-style tight loops stay per-iteration bounded. */
+static int subtree_retains_string_in_collection_p (node_t n) {
+  if (n == NULL || node_is_leaf_p (n->code)) return FALSE;
+  if (n->code == N_CALL) {
+    node_t callee = NL_HEAD (n->u.ops);
+    if (callee != NULL && (callee->code == N_FIELD || callee->code == N_DEREF_FIELD)) {
+      node_t recv = NL_HEAD (callee->u.ops);
+      struct expr *re = recv == NULL ? NULL : (struct expr *) recv->attr;
+      const char *cname = NULL;
+      if (re != NULL && re->type != NULL) {
+        const struct type *t = re->type;
+        if (t->mode == TM_PTR) t = t->u.ptr_type;
+        cname = class_type_name (t);
+      }
+      if (cname != NULL && strncmp (cname, "__generic_", 10) == 0
+          && strstr (cname, "_String") != NULL) {
+        node_t args = NL_NEXT (callee);
+        if (args != NULL && args->code == N_LIST)
+          for (node_t a = NL_HEAD (args->u.ops); a != NULL; a = NL_NEXT (a)) {
+            struct expr *ae = (struct expr *) a->attr;
+            if (ae != NULL && builtin_string_type_p (ae->type)) return TRUE;
+          }
+      }
+    }
+  }
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c)) {
+    if (c->code == N_FUNC_DEF) continue; /* separate scope */
+    if (subtree_retains_string_in_collection_p (c)) return TRUE;
+  }
+  return FALSE;
+}
+
 /* Per-loop-body arena scope helpers --------------------------------------
    Layered inside the function-level str_scope_X / obj_scope_X state: each
    loop iteration emits a fresh checkpoint at the top of the body and a
@@ -20855,7 +21199,8 @@ static void gen_loop_body_scope_enter (c2m_ctx_t c2m_ctx, node_t body,
      reclamation in that case -- the function-level scope still cleans up
      at return, so correctness is preserved (only the per-iter memory win
      is lost). */
-  int safe_for_per_iter = !subtree_assigns_tracked_id_p (body);
+  int safe_for_per_iter = !subtree_assigns_tracked_id_p (body)
+                          && !subtree_retains_string_in_collection_p (body);
   if (safe_for_per_iter && subtree_allocates_string_p (body)) {
     loop_str_scope_mark = gen_str_checkpoint (c2m_ctx);
     loop_str_scope_active = TRUE;
@@ -22363,6 +22708,23 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     if (scalar_type_p (((struct expr *) r->attr)->type)) {
       assert (t != MIR_T_UNDEF);
       val = cast (c2m_ctx, val, get_mir_type (c2m_ctx, ((struct expr *) r->attr)->type), FALSE);
+      /* Value-semantic String field (Option D): when storing a String into a
+         class member, the object takes a private owned copy and frees the old
+         buffer.  This keeps the field pointing at a freeable heap buffer (or
+         NULL), so the destructor's c2m_str_drop is always safe — strings live
+         and die with the object, no GC. */
+      if (class_string_member_store_p (r)) {
+        string_ensure_imports (c2m_ctx);
+        MIR_op_t own_arg = force_reg (c2m_ctx, val, MIR_T_I64).mir_op;
+        op_t owned = gen_rt_call (c2m_ctx, str_own_proto, str_own_item, 1, &own_arg);
+        owned = force_reg (c2m_ctx, owned, MIR_T_I64);
+        /* Free the field's previous buffer (NULL-safe) before overwriting. */
+        op_t oldv = get_new_temp (c2m_ctx, MIR_T_I64);
+        emit2 (c2m_ctx, MIR_MOV, oldv.mir_op, var.mir_op);
+        MIR_op_t drop_arg = oldv.mir_op;
+        gen_rt_call_void (c2m_ctx, str_drop_proto, str_drop_item, 1, &drop_arg);
+        val = owned;
+      }
       emit_scalar_assign (c2m_ctx, var, &val, t, FALSE);
       if ((val_p || true_label != NULL) && r->code != N_POST_INC && r->code != N_POST_DEC)
         emit2_noopt (c2m_ctx, tp_mov (t), res.mir_op, val.mir_op);
@@ -23725,11 +24087,6 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             gen (c2m_ctx, decl->ctor_call, NULL, NULL, FALSE, NULL, NULL);
           if (decl->dtor_call != NULL)
             VARR_PUSH (node_t, defer_stmts, decl->dtor_call);
-          /* -fauto-release: ownership pass proved this binding leaks; run the
-             synthesized free()/release at scope exit through the same defer
-             stack so returns/breaks/continues all unwind through it. */
-          if (decl->auto_release_call != NULL)
-            VARR_PUSH (node_t, defer_stmts, decl->auto_release_call);
           /* Null-initialize uninitialized local String variables, so that
              `String x;` is a well-defined null String (x == null is true and
              x.empty() is safe). */
@@ -23856,6 +24213,16 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                            local_p);
           VARR_TRUNC (init_el_t, init_els, init_start);
         }
+        /* Managed-ownership (`owned`/`move`) and -fauto-release: register the
+           synthesized scope-exit release for this binding.  Done here — after
+           the whole initializer if/else chain — so it fires for BOTH
+           initialized (`owned auto x = new T();`, `auto y = move x;`,
+           `char *p = malloc(n);`) and uninitialized declarators.  The
+           ownership pass set decl->auto_release_call to a checked `delete p;`
+           / `release(p);` node; routing it through defer_stmts makes it unwind
+           at scope exit and on every return/break/continue. */
+        if (decl->auto_release_call != NULL)
+          VARR_PUSH (node_t, defer_stmts, decl->auto_release_call);
         if (decl->u.item != NULL && decl->scope == top_scope && !decl->decl_spec.static_p) {
           MIR_new_export (ctx, name);
         } else if (decl->u.item != NULL && decl->scope != top_scope && decl->decl_spec.static_p) {
@@ -24938,6 +25305,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           gen_obj_detach (c2m_ctx, op1.mir_op);
       }
     }
+    /* Null-safe delete: skip the destructor + free when the pointer is NULL.
+       This makes `delete null;` a no-op and — crucially — makes the synthesized
+       scope-exit delete of a `move`d-out owned binding (whose source `move`
+       nulled) a harmless no-op, so single-owner cleanup never double-frees. */
+    MIR_label_t del_skip = MIR_new_label (ctx);
+    emit3 (c2m_ctx, MIR_BEQ, MIR_new_label_op (ctx, del_skip), op1.mir_op,
+           MIR_new_int_op (ctx, 0));
     if (dtor_def != NULL) {
       decl_t cdecl = dtor_def->attr;
       struct func_type *ft = cdecl->decl_spec.type->u.func_type;
@@ -24963,7 +25337,19 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                                    VARR_ADDR (MIR_op_t, call_ops) + ops_start));
       VARR_TRUNC (MIR_op_t, call_ops, ops_start);
     }
+    /* Value-semantic String fields (Option D): free the object's owned String
+       members AFTER the user destructor ran (it may still read them) and
+       BEFORE the heap is released.  No-op unless the deleted type is a class
+       with String members. */
+    {
+      struct expr *del_e2 = (struct expr *) expr->attr;
+      struct type *cls = (del_e2 != NULL && del_e2->type != NULL
+                          && del_e2->type->mode == TM_PTR)
+                           ? del_e2->type->u.ptr_type : NULL;
+      gen_class_string_members_drop (c2m_ctx, op1.mir_op, cls);
+    }
     gen_heap_free (c2m_ctx, op1.mir_op, (long) POS (r).lno);
+    emit_label_insn_opt (c2m_ctx, del_skip); /* null pointers land here (no-op) */
     /* Use-after-free mitigation: null out the deleted pointer's lvalue so that
        any subsequent access through the same variable hits the null guard. */
     if (c2m_options->exceptions_p
@@ -25025,6 +25411,51 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
        AST for future passes but has no codegen effect today. */
     (void) gen (c2m_ctx, NL_HEAD (r->u.ops), true_label, false_label, FALSE, NULL, NULL);
     break;
+  case N_OWNED:
+    /* owned <decl>  — managed-ownership wrapper.  Recurse into the inner
+       declaration list; the scope-exit release for an owned binding is wired
+       through decl->auto_release_call by the ownership pass (same path as a
+       synthesized `defer delete`), so there is no extra codegen here. */
+    (void) gen (c2m_ctx, NL_HEAD (r->u.ops), true_label, false_label, FALSE, NULL, NULL);
+    break;
+  case N_MOVE: {
+    /* move <expr>: yield the inner pointer value, then NULL the source lvalue
+       so the moved-from binding is no longer an owner.  Combined with the
+       null-safe `delete` above, this is what makes single-ownership transfer
+       double-free-proof: a later explicit `delete src;` or the synthesized
+       scope-exit delete of `src` sees NULL and does nothing, while the move
+       target (or owning collection) becomes the sole owner.
+
+       Only a simple lvalue source is neutralized (local / field / deref);
+       `move new T(...)` / `move f()` have no source to null and pass through. */
+    node_t inner = NL_HEAD (r->u.ops);
+    node_t src = inner;
+    while (src != NULL && src->code == N_CAST) src = NL_EL (src->u.ops, 1);
+    op_t mval = gen (c2m_ctx, inner, NULL, NULL, TRUE, NULL, NULL);
+    mval = force_val (c2m_ctx, mval, FALSE);
+    /* Copy into a fresh temp first: nulling the source may share the same
+       reg/mem as `mval`, and we must return the original pointer value. */
+    res = get_new_temp (c2m_ctx, MIR_T_I64);
+    emit2 (c2m_ctx, MIR_MOV, res.mir_op, mval.mir_op);
+    if (src != NULL
+        && (src->code == N_ID || src->code == N_DEREF_FIELD || src->code == N_FIELD
+            || src->code == N_DEREF || src->code == N_IND)) {
+      op_t lval = gen (c2m_ctx, src, NULL, NULL, FALSE, NULL, NULL);
+      if (lval.mir_op.mode == MIR_OP_MEM || lval.mir_op.mode == MIR_OP_REG) {
+        MIR_op_t lm = lval.mir_op;
+        if (lm.mode == MIR_OP_MEM) lm.u.mem.type = MIR_T_I64;
+        emit2 (c2m_ctx, MIR_MOV, lm, zero_op.mir_op);
+      }
+    }
+    break;
+  }
+  case N_READONLY: {
+    /* readonly <expr>: a non-owning borrow — a plain value pass-through.  The
+       source keeps ownership; the view never releases anything. */
+    res = gen (c2m_ctx, NL_HEAD (r->u.ops), NULL, NULL, TRUE, NULL, NULL);
+    res = force_val (c2m_ctx, res, FALSE);
+    break;
+  }
   case N_CONCAT: {
     /* String `+` concatenation.  Each operand is lowered to a char* (string
        operands directly, basic arithmetic operands auto-cast via the
@@ -25787,6 +26218,7 @@ static void dbinfo_walk_stmt (c2m_ctx_t c2m_ctx, MIR_module_t mod, MIR_func_t fu
     dbinfo_walk_stmt (c2m_ctx, mod, func, NL_EL (n->u.ops, 1));
     break;
   case N_UNOWNED: /* wrapper around an inner declaration list */
+  case N_OWNED:   /* managed-ownership wrapper around an inner declaration list */
     dbinfo_walk_stmt (c2m_ctx, mod, func, NL_HEAD (n->u.ops));
     break;
   case N_TRY: { /* labels, body_block, catch_list */
@@ -25898,6 +26330,8 @@ static const char *get_node_name (node_code_t code) {
     C (TRY); C (CATCH); C (THROW);
     /* Arena-ownership keywords (see Memory Management in README). */
     C (DETACH); C (ATTACH); C (UNOWNED);
+    /* Managed-ownership keywords (owned/move/readonly layer). */
+    C (MOVE); C (READONLY); C (OWNED);
   default: abort ();
   }
 #undef C
@@ -26187,6 +26621,9 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_DETACH:
   case N_ATTACH:
   case N_UNOWNED:
+  case N_MOVE:
+  case N_READONLY:
+  case N_OWNED:
   case N_TRY:
   case N_CATCH:
   case N_THROW:

@@ -1,3 +1,5 @@
+/* test-stacktrace-abort.cy
+   @expect: crash   (intentionally calls abort() to demo the stack trace) */
 #include <stdio.h>
 #include <stdlib.h>
 

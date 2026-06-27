@@ -1,5 +1,7 @@
 /* test-leak-paths.cy — exercises the flow-sensitive analysis.
  *
+ * @expect: fail   (deliberately demonstrates leak / UAF / double-free diagnostics)
+ *
  * Each function below has a comment annotating the expected diagnostics.
  * Run with: bin/classyc -I include examples/test-leak-paths.cy -eg
  */

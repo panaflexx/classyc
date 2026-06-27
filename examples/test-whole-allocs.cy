@@ -1,5 +1,8 @@
 /* test-whole-allocs.cy — first TU of a 2-file -fcheck-whole-allocs demo.
  *
+ * @expect: skip   (has no main(); only meaningful when stitched with
+ *                  test-whole-allocs-2.cy under -fcheck-whole-allocs)
+ *
  *   bin/classyc -fcheck-whole-allocs -fownership-report \
  *               examples/test-whole-allocs.cy examples/test-whole-allocs-2.cy
  *

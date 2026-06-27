@@ -1,3 +1,5 @@
+/* test-stacktrace.cy
+   @expect: crash   (intentionally dereferences null to demo the stack trace) */
 #include <stdio.h>
 
 class Point {

@@ -540,6 +540,8 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "c2m_str_join") == 0) return (void *) c2m_str_join;
     if (strcmp (name, "c2m_str_detach") == 0) return (void *) c2m_str_detach;
     if (strcmp (name, "c2m_str_attach") == 0) return (void *) c2m_str_attach;
+    if (strcmp (name, "c2m_str_own") == 0) return (void *) c2m_str_own;
+    if (strcmp (name, "c2m_str_drop") == 0) return (void *) c2m_str_drop;
     if (strcmp (name, "c2m_str_cleanup") == 0) return (void *) c2m_str_cleanup;
     if (strcmp (name, "c2m_str_checkpoint") == 0) return (void *) c2m_str_checkpoint;
     if (strcmp (name, "c2m_str_release_to") == 0) return (void *) c2m_str_release_to;
@@ -1080,6 +1082,16 @@ int main (int argc, char *argv[], char *env[]) {
       sort_modules (main_ctx);
     }
 #endif
+    /* Permit identical function definitions to appear in more than one loaded
+       module.  Compiling several source files together produces one MIR module
+       per file (per TU); a class (or any inline helper) defined in a shared
+       header is therefore emitted by every TU that includes it, yielding
+       duplicate `Class_method__...` symbols.  Without this, MIR_load_module
+       aborts with "func ... is prohibited for redefinition".  Enabling redef
+       permission gives C++-inline / ODR semantics: the definitions are
+       identical, so linking to any one of them is correct.  (For a single TU
+       there are no cross-module duplicates, so this is a no-op there.) */
+    MIR_set_func_redef_permission (main_ctx, TRUE);
     for (module = DLIST_HEAD (MIR_module_t, *MIR_get_module_list (main_ctx)); module != NULL;
          module = DLIST_NEXT (MIR_module_t, module)) {
       for (func = DLIST_HEAD (MIR_item_t, module->items); func != NULL;

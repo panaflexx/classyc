@@ -1,4 +1,6 @@
-/* test-interface-bad.c — Phase 1 negative test (NOT in run-examples.sh).
+/* test-interface-bad.c — Phase 1 negative test.
+ *
+ * @expect: fail
  *
  * `Broken impl Greeter` is missing rank(), so the compiler must reject it with
  * a precise diagnostic, e.g.:

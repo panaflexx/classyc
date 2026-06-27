@@ -363,6 +363,105 @@ declaration-start respectively.
 
 See `examples/test-ownership-keywords.cy` for a runnable demo.
 
+### Managed Ownership: `owned`, `move`, `readonly`
+
+On top of unmanaged C11 and plain `new`/`delete`, ClassyC offers an **opt-in**,
+GC-like layer for single-owner heap objects. You mark a binding `owned` and the
+compiler guarantees it is released **exactly once** — no `defer delete`, no
+manual cleanup, and no double frees — by statically tracking where ownership
+lives at every point in the function. Nothing here is on by default: ordinary
+pointers, `new`/`delete`, and the arena keywords above keep working unchanged.
+
+| Keyword | Position | What it does |
+|---|---|---|
+| `owned` | declaration prefix | opt a binding into the managed, single-owner, move-only lifetime |
+| `move` | expression | transfer ownership out of a binding; the source becomes a read-only view |
+| `readonly` | expression | borrow a non-owning read-only view of an owned object |
+
+```c
+class Box {
+    int v;
+    Box(int v) { this.v = v; }
+    ~Box() { /* freed automatically — you never call delete */ }
+};
+
+void demo() {
+    owned auto x = new Box(1);   // x is the single owner
+    auto y = move x;             // ownership x -> y; x is now a read-only view
+    auto z = readonly y;         // z borrows a non-owning view of y
+
+    printf("%d %d %d\n", x->v, y->v, z->v);  // reads through all three are fine
+}   // <- compiler releases `y` here (runs ~Box once); x and z are never freed
+```
+
+#### How `owned` cleans up and deletes
+
+Between the type checker and code generator, the static ownership pass
+(`src/ownership.c`) follows each managed binding through a small ownership
+lattice (Owned → moved/escaped → released). At every scope exit it knows which
+binding currently *owns* the object, and it synthesizes a `delete <owner>;`
+for it. That synthesized release is routed through the same `defer` machinery
+that backs explicit `defer delete`, so it unwinds at the end of the block
+**and** on every `return` / `break` / `continue` path — running the
+destructor (`~Box`) and freeing the object exactly once.
+
+- **No keyword needed at the call site.** `owned` is the whole contract; the
+  cleanup is invisible in the source but real in the generated code. Releasing
+  happens at the end of the *owning binding's* scope — including a nested
+  `{ ... }` block, not just the function body.
+- **Move means the new owner cleans up.** Once ownership is `move`d out of a
+  binding, that binding is no longer the owner, so it is **not** freed — only
+  the binding that holds ownership at scope exit is. This is how single
+  ownership avoids double frees across `auto y = move x;` and longer chains
+  (`x -> y -> w` frees once, via `w`).
+- **`move`-initialized bindings are managed too.** `auto y = move x;` makes
+  `y` the new managed owner even though it is declared with a plain `auto`;
+  ownership flowing in via `move` promotes the receiver automatically.
+- **`unowned` is still the opt-out.** Prefix a declaration with `unowned` to
+  take manual responsibility and suppress all managed cleanup for it.
+
+#### How `readonly` works
+
+`readonly <expr>` yields the *same* pointer value as its operand but confers
+**no ownership**: a read-only view never releases the object and is never
+counted as an owner. A view can be held anywhere — a local, a global, or an
+object field — with the single rule that it must not be used after its owner
+is gone. Because views don't own, creating one has no effect on when (or
+whether) the underlying object is freed:
+
+```c
+owned auto cfg = new Config();
+auto v = readonly cfg;     // borrow; cfg still owns and will be released once
+use(v->host);              // reading through the view is fine
+```
+
+A binding left behind by `move` is itself a read-only view of the moved-from
+object — you may still *read* through it, but you may no longer treat it as an
+owner.
+
+#### What the compiler enforces
+
+The ownership pass turns single-owner violations into compile-time
+diagnostics:
+
+- **Use-after-move** — `move`ing or otherwise consuming a binding whose
+  ownership already moved out is an `error` (the binding is now just a view).
+- **`delete` of a moved-from view** — an `error`: the new owner is responsible
+  for the object, not this view.
+- **Redundant `delete` of an `owned` binding** — a `warning`: the compiler
+  already releases it at scope exit, so an explicit `delete` is unnecessary
+  (and would risk a double free).
+
+Soft-keyword notes: `move` and `readonly` are **expression-leading** soft
+keywords — like `detach`/`new`, they only shadow an identifier when they start
+an expression, so `a + move` reads the variable `move` while `move x`
+transfers ownership. `owned` is a **declaration-prefix** soft keyword (like
+`unowned`), so it stays freely usable as an identifier in expressions.
+
+See `examples/test-owned-move-readonly.cy` for a runnable demo,
+`examples/test-owned-errors.cy` for the rejected cases, and
+`cy-validate/val-022-owned-move-readonly.cy` for the executable spec.
+
 ### f-Strings (Interpolated Strings)
 ```c
 String user = "bob";
@@ -578,6 +677,14 @@ ClassyC manages high-level types with lightweight arenas. The big win: **heap
   own; pair them with `defer delete`. For collections of pointers, add `.owns()`
   (`.ownsValues()` / `.ownsKeys()` on `Map`) and `delete` will also free the
   pointed-to objects — see *Element ownership* below.
+- **Managed ownership (`owned` / `move` / `readonly`)** — opt a single-owner
+  heap object into automatic cleanup: `owned auto x = new Box();` is released
+  exactly once at the end of its scope with no `defer delete`. `move` transfers
+  ownership (the source becomes a read-only view; the new owner does the
+  cleanup), and `readonly` borrows a non-owning view. The static ownership
+  pass proves single ownership and rejects use-after-move / view-deletes at
+  compile time. Fully opt-in — see *Managed Ownership* in the feature list
+  above.
 - **Manual escape (`detach`)** — when you need a value to outlive the current
   scope (return it, store it in a long-lived class field, hand it to an outer
   collection), `detach <expr>` removes it from the local arena's tracking set

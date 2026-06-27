@@ -454,6 +454,36 @@ C2M_STR_API char *c2m_str_attach (const char *s) {
   return (char *) c2m__str_track ((void *) s);
 }
 
+/* ── Object-owned String value semantics ──────────────────────────────────
+   These back the value-field model: a `String` stored in a class field is
+   owned by the object and freed when the object is destroyed.
+
+   c2m_str_own(s): return a fresh, UNTRACKED heap copy of `s` (or NULL).
+   Because the copy is NOT registered with the scope arena, ordinary scope
+   cleanup never touches it -- the owning object is solely responsible for it
+   (via c2m_str_drop in its destructor).  Copying rather than detaching keeps
+   pure value semantics: the source keeps its own lifetime, and an owned field
+   therefore always holds either NULL or a plain-malloc'd buffer (never a
+   literal), so c2m_str_drop is always safe to call. */
+C2M_STR_API char *c2m_str_own (const char *s) {
+  size_t n;
+  char *r;
+  if (s == NULL) return NULL;
+  n = c2m__bytelen (s);
+  r = (char *) malloc (n + 1);
+  if (r == NULL) return NULL;
+  if (n != 0) c2m__copy (r, s, n);
+  r[n] = '\0';
+  return r;
+}
+
+/* Free an object-owned String field.  Null-safe.  The field always holds
+   either NULL or a plain-malloc'd buffer (see c2m_str_own), so a direct
+   free() is correct -- it never touches the scope arena or a literal. */
+C2M_STR_API void c2m_str_drop (const char *s) {
+  free ((void *) s);
+}
+
 /* Return a fresh lower-cased copy of s.  Only ASCII A-Z become a-z; all other
    bytes (including UTF-8 multi-byte sequences) are passed through unchanged.
    NULL s acts as the empty string.  Never aliases its input. */

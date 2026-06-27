@@ -1,5 +1,7 @@
 /* test-leak-attrs.cy — exercises Step H: parameter attributes.
  *
+ * @expect: fail   (deliberately demonstrates leak + double-free diagnostics)
+ *
  * KNOWN LIMITATION: classyc currently does not pre-define `__GNUC__`, so
  * including <stdio.h>, <stdlib.h>, etc. causes `<sys/cdefs.h>` (or the
  * macOS equivalent) to `#define __attribute__(x)` to nothing — which would

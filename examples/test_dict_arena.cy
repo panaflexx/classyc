@@ -1,4 +1,11 @@
-/* Quick test for dict.h arena allocator using c2m */
+/* Quick test for dict.h arena allocator using c2m.
+ *
+ * @expect: skip   (directly includes the compiler-internal include/dict.h to
+ *                  poke its raw arena API; user code should use the `dict`
+ *                  language type or include/dict_types.h instead.  Pulling
+ *                  dict.h straight into a .cy unit subjects the runtime's own
+ *                  internals to the ownership analyzer, which is not the
+ *                  intended use.  Run manually with -fno-ownership if needed.) */
 #include <stdio.h>
 #include "include/dict.h"
 

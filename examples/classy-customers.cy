@@ -2,18 +2,18 @@
  *
  * Reads examples/customers.json (an array of ~50 customer records), uses the
  * typed JSON binder `(Customer)? d` to materialize each record into a strongly
- * typed `Customer` class, indexes them by id into a `Map<int, Customer>*`, and
+ * typed `Customer` class, indexes them by id into a `Map<int, Customer*>`, and
  * then runs a handful of "database-style" queries against the map.
  *
  * Highlights
  *   - File.read_text reads the whole file in one call (include/file.h).
  *   - json(...) parses the array into a tagged dict.
  *   - d.length()  / for-in over a dict array  (the C1/C3 features).
- *   - (Customer)? customer_dict   — Phase 1 typed bind cast: missing fields
- *     default to zero/NULL rather than throwing.  Lets us tolerate slightly
- *     irregular records without try/catch around every iteration.
+ *   - (Customer)? customer_dict   — typed bind cast: missing fields default to
+ *     zero/NULL rather than throwing.  Lets us tolerate slightly irregular
+ *     records without try/catch around every iteration.
  *   - Map<int, Customer*> with `.ownsValues()`: each record lives in a
- *     heap-allocated Customer and `delete db` frees them all in one shot.
+ *     heap-allocated Customer and releasing the map frees them all in one shot.
  *     (The Map<K,V> for-in protocol requires V to be scalar or pointer, so a
  *     by-value Customer would not be iterable; the pointer storage trivially
  *     sidesteps that constraint and is what production code would use anyway.)
@@ -21,11 +21,14 @@
  * Run:
  *   ./bin/classyc -g -I include examples/classy-customers.cy -eg
  *
- * The dict that parsed the JSON is *intentionally* never deleted: the
- * Customer.String fields are `char*` pointers into the dict's own arena, so
- * the dict must outlive any Customer we keep around.  In a service you'd
- * either use String.copy() during ingest or keep the dict for the process
- * lifetime (as we do here).
+ * Memory model (the C#-like "just works" path): because Customer/Address are
+ * *classes*, the typed bind gives their `String` fields VALUE SEMANTICS — the
+ * binder copies each string into a private heap buffer the object owns, and the
+ * object's destructor frees them (recursing into the nested Address).  So the
+ * parsing dict is just a transient: we `delete` it right after ingest and the
+ * customers keep their own string copies.  The map binding is `owned`, so the
+ * whole database (the Map's table *and* every Customer, with all their strings)
+ * is released automatically at the end of main — no manual `free`, no leaks.
  */
 #include <stdio.h>
 #include <string.h>
@@ -33,29 +36,28 @@
 #include "map.h"
 
 /* ── Schema ─────────────────────────────────────────────────────────
-   These mirror customers.json one-for-one.  Plain `struct` is the right tool
-   here — the records are pure data, no invariants, no methods — and the bind
-   cast `(T)? d` accepts struct targets identically to class targets, walking
-   the same member list and recursing into nested struct fields. */
-
-/* typedef both structs to single-token names so they slot into a generic
-   type-arg list (`Map<int, Customer*>`) without parser gymnastics. */
-typedef struct {
+   These mirror customers.json one-for-one.  We use `class` (not plain struct)
+   so the `String` fields get VALUE SEMANTICS: the typed bind copies each
+   string into a buffer the object owns, and the auto-generated destructor
+   frees them when the Customer is destroyed (recursing into the nested
+   Address).  That is what lets us throw the parsing dict away after ingest. */
+class Address {
     String street;
     String city;
     String state;
     String zipCode;
     String country;
-} Address;
+};
 
-typedef struct {
+class Customer {
     int     id;
     String  firstName;
     String  lastName;
     String  fullName;
     String  email;
     String  phone;
-    Address address;          /* nested by-value struct field */
+    Address address;          /* nested by-value class field (its strings are
+                                 freed with the Customer, see destructor cascade) */
     String  dateOfBirth;
     String  sex;
     String  race;
@@ -63,13 +65,13 @@ typedef struct {
     int     heightInches;
     int     weightLbs;
     String  occupation;
-} Customer;
+};
 
 /* ── Ingest ────────────────────────────────────────────────────────────────
    Read the file, parse JSON, bind each element, insert into the map keyed by
-   the customer's `id`.  Returns the populated map (caller owns; we `defer
-   delete` it in main).  Prints a progress line for visibility. */
-Map<int, Customer*>* load_customers(char *path, dict *out_source_dict) {
+   the customer's `id`.  Returns the populated map; the caller owns it (we use
+   an `owned` binding in main).  Prints a progress line for visibility. */
+Map<int, Customer*>* load_customers(char *path) {
     char *text = File.read_text(path);
     if (!text) {
         printf("FATAL: could not read %s\n", path);
@@ -77,33 +79,31 @@ Map<int, Customer*>* load_customers(char *path, dict *out_source_dict) {
     }
 
     /* Parse the whole file into a dict.  customers.json is a bare JSON array,
-       so the result has DICT_ARRAY at its root. */
+       so the result has DICT_ARRAY at its root.  The dict is a transient: once
+       we have bound every record (which copies the strings into the owning
+       Customer objects) we delete it here — the customers keep their own
+       copies, so nothing dangles. */
     dict d = json(text);
     free(text);
+    defer delete d;
 
-    /* Keep the parsed dict alive — the Customer.String fields point into the
-       dict's arena.  We hand it back to main so it can outlive the map. */
-    *out_source_dict = d;
-
-    /* `.ownsValues()` flips the value-ownership flag: `delete db` frees each
-       heap struct in addition to releasing the Map's own table.  `delete` on
-       a plain struct pointer just runs `free()` (no destructor to run). */
+    /* `.ownsValues()` flips the value-ownership flag: releasing the map runs
+       each Customer's destructor (freeing its owned String fields, including
+       the nested Address) in addition to releasing the Map's own table. */
     Map<int, Customer*>* db = (new Map<int, Customer*>())->ownsValues();
 
     /* for-in over a dict array binds (index, element-as-dict). */
     int n = 0;
     for (auto i, rec in d) {
         /* Lenient cast: any field missing in a record gets the zero default
-           rather than aborting the load.  Switch to `(struct Customer) rec`
-           for a strict ingest that throws KeyException on the first missing
-           key.
+           rather than aborting the load.  Switch to `(Customer) rec` for a
+           strict ingest that throws KeyException on the first missing key.
 
-           Bind into a heap-allocated struct so the map can store a pointer
-           (which the for-in protocol accepts) and so `delete db` reclaims
-           every record in one call via .ownsValues().  A plain struct has
-           no constructor, so plain `malloc` is the right way to allocate; we
-           then overwrite every field via the bind cast in one statement. */
-        Customer* c = (Customer*) malloc(sizeof(Customer));
+           Bind into a heap-allocated Customer so the map can store a pointer
+           (which the for-in protocol accepts).  Binding into a class copies
+           every String field into a buffer the Customer owns, so the parsing
+           dict no longer has to outlive it. */
+        Customer* c = new Customer();
         *c = (Customer)? rec;
         db->Set(c->id, c);
         n = n + 1;
@@ -243,15 +243,13 @@ void q_top3_weight(Map<int, Customer*>* db) {
 int main(void) {
     printf("=== ClassyC customers demo ===\n");
 
-    /* Hold the parsed dict in main so it outlives the map.  The map's
-       Customer values reference strings that live inside this dict's arena. */
-    dict source;
-    Map<int, Customer*>* db = load_customers("examples/customers.json", &source);
+    /* `owned`: the map (its table plus every Customer it owns, plus all of
+       their value-semantic String fields) is released automatically at the
+       end of main — no `defer delete`, no manual free, no leaks. */
+    owned auto db = load_customers("examples/customers.json");
     if (db == NULL) return 1;
-    defer delete db;     /* frees the Map's table + each owned struct pointer */
 
-    printf("\ndatabase: %d records, %d unique ids\n",
-           (int)source.length(), (int)db->Count());
+    printf("\ndatabase: %d unique ids\n", (int)db->Count());
 
     /* Run the queries */
     q_lookup(db, 5);

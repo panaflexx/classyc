@@ -2,14 +2,19 @@
  *
  * A "what-if" REST API for a tiny user directory.  Nothing is wired to a
  * network — requests are constructed in code and dispatched through a
- * router — but every line is written the way you would write real classyc:
+ * router — but every line is written the way you would write real classyc,
+ * leaning on the managed memory model for a Python/C#-like feel:
  *
  *   · HTTP request/response as first-class objects
  *   · In-memory store as List<dict>   (each dict IS the row)
  *   · String methods for routing, parsing, and formatting
  *   · f-strings for log lines and human-readable messages
  *   · d.json now returns String, so it composes with + and f"{…}"
- *   · defer for response cleanup
+ *   · VALUE-SEMANTIC String fields: `this.path = path.trim().lower()` just
+ *     copies into the object and is freed with it — no `.detach()`, no manual
+ *     free.  Strings live and die with their object, like C# `string`.
+ *   · `owned` bindings: every request/response is `owned auto …`, released
+ *     automatically at scope exit on every path — no `defer delete`, no leaks.
  *
  * Routes handled
  *   GET    /api/users            – list (optional ?page=N&limit=N&role=X)
@@ -110,12 +115,19 @@ class Request {
     dict   body;     /* parsed from JSON body, or NULL                    */
 
     Request(String method, String path, String query, String bodyJson) {
-        this.method = method.trim().upper().detach();
-        this.path   = path.trim().lower().detach();
+        /* Value-semantic String fields: the transient arena strings produced by
+           trim()/upper()/lower() are *copied* into the object, which then owns
+           and frees them.  No `.detach()`, no manual cleanup. */
+        this.method = method.trim().upper();
+        this.path   = path.trim().lower();
         if ((char*)query != NULL) this.query = query; else this.query = "";
         this.body   = 0;
         if ((char*)bodyJson != NULL) this.body = json(bodyJson);
     }
+
+    /* The Request owns the dict it parsed from the JSON body; free it with the
+       request.  `delete` is null-safe, so the no-body case is fine. */
+    ~Request() { delete this.body; }
 
     int IsGet()    { return strcmp(this.method, "GET")    == 0; }
     int IsPost()   { return strcmp(this.method, "POST")   == 0; }
@@ -137,7 +149,10 @@ class Response {
     Response(int status, String statusText, String body) {
         this.status     = status;
         this.statusText = statusText;
-        this.body       = body.detach();
+        /* `body` is a transient arena String (an f-string, a `+` chain, or a
+           `d.json` result); assigning it to this String field copies it into
+           a buffer the Response owns and frees on destruction. */
+        this.body       = body;
     }
 
     void Print() {
@@ -194,6 +209,10 @@ class UsersController {
     }
 
     ~UsersController() {
+        /* The controller owns its rows: free each dict, then the list itself.
+           (List<dict> is the teaching generic above — its destructor frees the
+           backing array but not the dict elements, so we free those here.) */
+        for (int i = 0; i < this.db->Count(); i++) delete this.db->Get(i);
         delete this.db;
     }
 
@@ -224,8 +243,7 @@ class UsersController {
 
         /* optional ?role=X filter — build a filtered snapshot */
         String role_filter = req->QueryParam("role");
-        List<dict>* view = new List<dict>(total);
-        defer delete view;
+        owned auto view = new List<dict>(total);   // auto-released at scope exit
 
         for (int i = 0; i < total; i++) {
             dict u = this.db->Get(i);
@@ -328,6 +346,7 @@ class UsersController {
         int idx = this->FindIndex(id);
         if (idx < 0)
             return resp_not_found(f"User {id}");
+        delete this.db->Get(idx);   // free the row's dict before dropping it
         this.db->RemoveAt(idx);
         return resp_no_content();
     }
@@ -378,113 +397,97 @@ void log_response(Response* res) {
    ═══════════════════════════════════════════════════════════════════════ */
 
 int main() {
-    auto ctrl = new UsersController();
-    defer delete ctrl;
+    /* `owned`: the controller (and, through its destructor, the whole in-memory
+       store) is released automatically when main returns. */
+    owned auto ctrl = new UsersController();
 
-    printf("════════════════════════════════════════\n");
+    printf("══════════════════════════════════════════\n");
     printf("  classyc REST controller (in-process)  \n");
-    printf("════════════════════════════════════════\n\n");
+    printf("══════════════════════════════════════════\n\n");
 
-    /* ── 1. List all users ─────────────────────────────────────────── */
+    /* Each request/response is `owned`: created at the top of the block and
+       released automatically at the closing brace — no `defer delete`. */
+
+    /* ── 1. List all users ────────────────────────────────── */
     {
-        auto req = new Request("GET", "/api/users", "", NULL);
-        defer delete req;
-        auto res = dispatch(ctrl, req);
-        defer delete res;
+        owned auto req = new Request("GET", "/api/users", "", NULL);
+        owned auto res = dispatch(ctrl, req);
         log_request(req);
         log_response(res);
     }
 
-    /* ── 2. Paginated + role-filtered listing ──────────────────────── */
+    /* ── 2. Paginated + role-filtered listing ───────────────── */
     {
-        auto req = new Request("GET", "/api/users", "role=editor&limit=5&page=1", NULL);
-        defer delete req;
-        auto res = dispatch(ctrl, req);
-        defer delete res;
+        owned auto req = new Request("GET", "/api/users", "role=editor&limit=5&page=1", NULL);
+        owned auto res = dispatch(ctrl, req);
         log_request(req);
         log_response(res);
     }
 
-    /* ── 3. Get by id ──────────────────────────────────────────────── */
+    /* ── 3. Get by id ─────────────────────────────────── */
     {
-        auto req = new Request("GET", "/api/users/2", "", NULL);
-        defer delete req;
-        auto res = dispatch(ctrl, req);
-        defer delete res;
+        owned auto req = new Request("GET", "/api/users/2", "", NULL);
+        owned auto res = dispatch(ctrl, req);
         log_request(req);
         log_response(res);
     }
 
-    /* ── 4. Get non-existent id ────────────────────────────────────── */
+    /* ── 4. Get non-existent id ──────────────────────── */
     {
-        auto req = new Request("GET", "/api/users/99", "", NULL);
-        defer delete req;
-        auto res = dispatch(ctrl, req);
-        defer delete res;
+        owned auto req = new Request("GET", "/api/users/99", "", NULL);
+        owned auto res = dispatch(ctrl, req);
         log_request(req);
         log_response(res);
     }
 
-    /* ── 5. Create a new user ──────────────────────────────────────── */
+    /* ── 5. Create a new user ────────────────────────── */
     {
-        auto req = new Request("POST", "/api/users", "",
+        owned auto req = new Request("POST", "/api/users", "",
             "{\"name\":\"Dave Singh\",\"email\":\"dave@example.com\",\"role\":\"editor\"}");
-        defer delete req;
-        auto res = dispatch(ctrl, req);
-        defer delete res;
+        owned auto res = dispatch(ctrl, req);
         log_request(req);
         log_response(res);
     }
 
-    /* ── 6. Create duplicate email → 409 ──────────────────────────── */
+    /* ── 6. Create duplicate email → 409 ────────────── */
     {
-        auto req = new Request("POST", "/api/users", "",
+        owned auto req = new Request("POST", "/api/users", "",
             "{\"name\":\"Alice Clone\",\"email\":\"alice@example.com\"}");
-        defer delete req;
-        auto res = dispatch(ctrl, req);
-        defer delete res;
+        owned auto res = dispatch(ctrl, req);
         log_request(req);
         log_response(res);
     }
 
-    /* ── 7. Create with missing fields → 400 ──────────────────────── */
+    /* ── 7. Create with missing fields → 400 ─────────── */
     {
-        auto req = new Request("POST", "/api/users", "",
+        owned auto req = new Request("POST", "/api/users", "",
             "{\"name\":\"No Email\"}");
-        defer delete req;
-        auto res = dispatch(ctrl, req);
-        defer delete res;
+        owned auto res = dispatch(ctrl, req);
         log_request(req);
         log_response(res);
     }
 
-    /* ── 8. Partial update ─────────────────────────────────────────── */
+    /* ── 8. Partial update ──────────────────────────── */
     {
-        auto req = new Request("PUT", "/api/users/1", "",
+        owned auto req = new Request("PUT", "/api/users/1", "",
             "{\"role\":\"superadmin\"}");
-        defer delete req;
-        auto res = dispatch(ctrl, req);
-        defer delete res;
+        owned auto res = dispatch(ctrl, req);
         log_request(req);
         log_response(res);
     }
 
-    /* ── 9. Delete ─────────────────────────────────────────────────── */
+    /* ── 9. Delete ──────────────────────────────── */
     {
-        auto req = new Request("DELETE", "/api/users/3", "", NULL);
-        defer delete req;
-        auto res = dispatch(ctrl, req);
-        defer delete res;
+        owned auto req = new Request("DELETE", "/api/users/3", "", NULL);
+        owned auto res = dispatch(ctrl, req);
         log_request(req);
         log_response(res);
     }
 
     /* ── 10. List after mutations: f-string shows final state ──────── */
     {
-        auto req = new Request("GET", "/api/users", "", NULL);
-        defer delete req;
-        auto res = dispatch(ctrl, req);
-        defer delete res;
+        owned auto req = new Request("GET", "/api/users", "", NULL);
+        owned auto res = dispatch(ctrl, req);
         printf("── Final state ─────────────────────────\n");
         log_request(req);
         log_response(res);

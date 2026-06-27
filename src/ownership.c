@@ -309,6 +309,14 @@ static int is_non_retaining_consumer (const char *fn) {
   if (strcmp (fn, "fscanf")     == 0) return 1;
   if (strcmp (fn, "sscanf")     == 0) return 1;
   if (strcmp (fn, "read")       == 0) return 1;
+  /* ClassyC builtins that read a pointer arg but never retain it.  `json` is
+     a special compiler-lowered call (parsed as an N_CALL to the builtin
+     `json` before codegen): `json(string)` parses a fresh dict OUT of the
+     input buffer (copying every leaf), and `json(dict)` serializes into a
+     fresh String.  In both forms the pointer argument is only read, so a
+     buffer passed to `json(...)` is still the caller's to free — without
+     this, `dict d = json(text); free(text);` is a spurious double-free. */
+  if (strcmp (fn, "json")       == 0) return 1;
   return 0;
 }
 
@@ -403,6 +411,9 @@ typedef enum {
   OS_DETACHED,           /* ownership transferred out (detach / return)      */
   OS_RELEASED,           /* explicitly released; any further use is UAF      */
   OS_MAYBE_OWNED,        /* join-point conflict between Owned and !Owned     */
+  OS_MOVED,              /* consumed by `move`: the binding is dead — ANY use
+                            (read or write) is an error.  At runtime the source
+                            pointer was nulled; the new owner holds the value. */
 } owstate_t;
 
 static const char *owstate_name (owstate_t s) {
@@ -412,6 +423,7 @@ static const char *owstate_name (owstate_t s) {
   case OS_DETACHED:    return "Detached";
   case OS_RELEASED:    return "Released";
   case OS_MAYBE_OWNED: return "MaybeOwned";
+  case OS_MOVED:       return "Moved";
   default:             return "?";
   }
 }
@@ -433,9 +445,18 @@ static owstate_t state_meet (owstate_t a, owstate_t b) {
   if (a == b) return a;
   if (a == OS_UNOWNED) return b;
   if (b == OS_UNOWNED) return a;
-  if ((a == OS_RELEASED && b == OS_DETACHED)
-      || (a == OS_DETACHED && b == OS_RELEASED))
-    return OS_DETACHED;
+  /* OS_MOVED is a "gone" state like OS_DETACHED for merge purposes: a binding
+     that is Moved on one path and Detached/Released on another is simply gone.
+     Moved meeting Owned is a genuine conflict (MaybeOwned) — e.g. a
+     conditional move — so a later use is not flagged (it may still be live). */
+  {
+    owstate_t na = (a == OS_MOVED) ? OS_DETACHED : a;
+    owstate_t nb = (b == OS_MOVED) ? OS_DETACHED : b;
+    if (na == nb) return na;
+    if ((na == OS_RELEASED && nb == OS_DETACHED)
+        || (na == OS_DETACHED && nb == OS_RELEASED))
+      return OS_DETACHED;
+  }
   return OS_MAYBE_OWNED;
 }
 
@@ -489,6 +510,26 @@ typedef struct candidate {
         anything else           -> conservative PA_DEFAULT) */
   unsigned    param_p : 1;
   size_t      param_pos;
+  /* Managed-ownership layer (owned / move / readonly).  `managed_p` is set for
+     bindings declared `owned` (or `move`-initialized from an owned value):
+     they are single-owner and the compiler GUARANTEES a single scope-exit
+     release unless ownership is moved out — their leak diagnostics are
+     suppressed and a `delete` is synthesized unconditionally (no
+     -fauto-release needed).  `moved_p` is set once ownership has been moved
+     OUT of this binding via `move`; the binding then behaves as a read-only
+     view and any further ownership operation on it is an error. */
+  int         managed_p;
+  int         moved_p;
+  /* Set when the binding escaped via a mechanism we CANNOT neutralize at the
+     source: `return`, store into a non-tracked location (global/field), an
+     unknown/owning call, a plain `=` alias, `detach`, or a user `defer`
+     release.  A `move` escape is deliberately NOT counted here, because
+     `move` nulls the source pointer — so a synthesized null-safe `delete` on
+     the moved-from binding is a no-op on the moved path.  Managed-binding
+     auto-release synthesis is gated on this flag (not the broader escapes_p),
+     which lets conditionally-moved owned locals still get cleaned up on the
+     paths where they were NOT moved out. */
+  int         unsafe_escape_p;
 } candidate_t;
 
 DEF_VARR (candidate_t);
@@ -607,6 +648,12 @@ static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) 
        in the check pass.  We only consider locals (scope != top_scope). */
     int auto_defer_path = (d != NULL && d->auto_defer_p);
     const char *ip_release_fn = NULL;
+    /* Managed-ownership opt-in: a binding declared `owned` (or `move`-
+       initialized from an owned value) joins the GC-like layer.  When its
+       initializer isn't already a recognized acquire (the `new`-init case
+       sets auto_defer_p too), this flag is what gets it collected — e.g.
+       `auto y = move x;`. */
+    int owned_managed = (d != NULL && d->owned_p && !d->unowned_p);
     /* `unowned <decl>` opts the binding out of ALL ownership tracking: the
        user takes manual responsibility, so we neither leak-warn nor
        auto-release it, and the interprocedural call-returned-owner path
@@ -619,12 +666,21 @@ static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) 
         && !d->decl_spec.thread_local_p) {
       ip_release_fn = summary_release_for_init (SPEC_DECL_INIT (n));
     }
-    if (auto_defer_path || ip_release_fn != NULL) {
+    if (auto_defer_path || ip_release_fn != NULL || owned_managed) {
       node_t init = SPEC_DECL_INIT (n);
       const char *acquire, *release, *name;
       if (auto_defer_path) {
         acquire = acquire_fn_name_of_init (init);
         release = release_fn_for_acquire (acquire);
+      } else if (ip_release_fn == NULL && owned_managed) {
+        /* Managed binding whose initializer is not a direct acquire — the
+           canonical case is `auto y = move x;`.  Ownership of an existing
+           owned object flows in; the paired release is `delete`. */
+        node_t om_init = init;
+        while (om_init != NULL && om_init->code == N_CAST)
+          om_init = NL_EL (om_init->u.ops, 1);
+        acquire = (om_init != NULL && om_init->code == N_MOVE) ? "move" : "owned";
+        release = "delete";
       } else {
         /* IP path: use the callee's actual name as the acquire tag so the
            ownership report reads `x = make_buf(...)` not `x = <ip>(...)`.
@@ -655,6 +711,9 @@ static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) 
         memset (&c.release_pos, 0, sizeof (c.release_pos));
         c.param_p      = 0;
         c.param_pos    = 0;
+        c.managed_p    = (d != NULL && d->owned_p) ? 1 : 0;
+        c.moved_p      = 0;
+        c.unsafe_escape_p = 0;
         /* Honour __attribute__((cleanup(fn))) — the GCC RAII attribute that
            tells the compiler to call `fn(&var)` at scope exit.  If the user
            has wired up explicit cleanup that way, suppress our leak warning
@@ -758,6 +817,11 @@ static void check_exit_state (flowctx_t *ctx, pos_t exit_pos, const char *exit_k
     /* Parameters are tracked only to infer summaries; the caller still
        owns them, so it's not a leak if they stay Owned at function exit. */
     if (c->param_p) continue;
+    /* Managed (`owned` / `move`) bindings never leak: the compiler
+       guarantees a scope-exit release (synthesized in cfg_emit_diagnostics)
+       unless ownership was moved out (escapes_p).  Suppress all leak
+       diagnostics for them. */
+    if (c->managed_p) continue;
     /* `delete` is a statement keyword (`delete p;`), not a function call,
        so don't render it with the function-call parens that suit `free(p)`. */
     int delete_p = (c->release_fn != NULL && strcmp (c->release_fn, "delete") == 0);
@@ -1163,11 +1227,13 @@ static void transfer_assign (flowctx_t *ctx, node_t assign) {
       a[lhs_idx].state = OS_OWNED;
       a[rhs_idx].state = OS_DETACHED;
       a[rhs_idx].escapes_p = 1;
+      a[rhs_idx].unsafe_escape_p = 1; /* plain `=` alias is not a nulling move */
       record_disposition (ctx, &a[rhs_idx], POS (assign), "moved to another binding");
     } else if (rs == OS_MAYBE_OWNED) {
       a[lhs_idx].state = OS_MAYBE_OWNED;
       a[rhs_idx].state = OS_DETACHED;
       a[rhs_idx].escapes_p = 1;
+      a[rhs_idx].unsafe_escape_p = 1;
       record_disposition (ctx, &a[rhs_idx], POS (assign), "moved to another binding");
     } else if (rs == OS_DETACHED) {
       /* Copying a dead pointer.  lhs inherits the disposed state. */
@@ -1191,6 +1257,7 @@ static void transfer_assign (flowctx_t *ctx, node_t assign) {
       && (a[rhs_idx].state == OS_OWNED || a[rhs_idx].state == OS_MAYBE_OWNED)) {
     a[rhs_idx].state = OS_DETACHED;
     a[rhs_idx].escapes_p = 1;
+    a[rhs_idx].unsafe_escape_p = 1;
     record_disposition (ctx, &a[rhs_idx], POS (assign), "stored into non-tracked location");
     return;
   }
@@ -1332,6 +1399,11 @@ static void transfer_call (flowctx_t *ctx, node_t call) {
                  "use-after-free: `%s` was released earlier on this path",
                  c->name);
           diag_mark_warned (ctx, c);
+        } else if (c->state == OS_MOVED && !c->warned_p && diag_active_p (ctx)) {
+          error (ctx->c2m_ctx, POS (arg),
+                 "use of moved value: `%s` was consumed by `move` on this path "
+                 "and is dead; use the new owner instead", c->name);
+          diag_mark_warned (ctx, c);
         }
         /* `__attribute__((borrows))` on the matching parameter is the
            per-arg form of the non-retaining-consumer table.  When it's
@@ -1340,6 +1412,7 @@ static void transfer_call (flowctx_t *ctx, node_t call) {
         if (!non_retaining && !param_is_borrowing && c->state == OS_OWNED) {
           c->state = OS_DETACHED;
           c->escapes_p = 1;
+          c->unsafe_escape_p = 1;
           record_disposition (ctx, c, POS (call), "escaped via call");
         }
       }
@@ -1399,6 +1472,7 @@ static void mark_return_value_escape (flowctx_t *ctx, node_t expr) {
         && (a[i].state == OS_OWNED || a[i].state == OS_MAYBE_OWNED)) {
       a[i].state = OS_DETACHED;
       a[i].escapes_p = 1;
+      a[i].unsafe_escape_p = 1; /* returned value escapes; delete would UAF */
       a[i].returned_p = 1; /* shipped to caller on this path (sticky) */
       record_disposition (ctx, &a[i], POS (expr), "returned to caller");
     }
@@ -1463,6 +1537,21 @@ static void transfer_delete (flowctx_t *ctx, node_t del) {
                "double-free: `%s` was already released on this path",
                a[i].name);
         diag_mark_warned (ctx, &a[i]);
+      } else if (a[i].state == OS_MOVED
+                 && !a[i].warned_p && diag_active_p (ctx)) {
+        error (ctx->c2m_ctx, POS (del),
+               "use of moved value: `%s` was consumed by `move` on this path "
+               "and is dead; the new owner releases the object", a[i].name);
+        diag_mark_warned (ctx, &a[i]);
+      } else if (a[i].managed_p && a[i].state == OS_OWNED
+                 && !a[i].warned_p && diag_active_p (ctx)) {
+        /* Managed bindings are released automatically at scope exit; an
+           explicit `delete` would double-free. */
+        warning (ctx->c2m_ctx, POS (del),
+                 "redundant `delete` of managed (`owned`) binding `%s`: the "
+                 "compiler already releases it at the end of its scope",
+                 a[i].name);
+        diag_mark_warned (ctx, &a[i]);
       }
       a[i].state = OS_RELEASED;
       a[i].released_p = 1; /* user released it here (sticky) */
@@ -1493,8 +1582,61 @@ static void transfer_detach (flowctx_t *ctx, node_t det) {
     if (a[i].decl == direct) {
       a[i].state = OS_DETACHED;
       a[i].escapes_p = 1;
+      a[i].unsafe_escape_p = 1;
       record_disposition (ctx, &a[i], POS (det), "detached");
     }
+}
+
+/* Transfer: `move <expr>` — transfer single ownership OUT of a managed
+ * binding into the receiver.  The source binding becomes a read-only view:
+ * ownership has left it, so it must not be released or moved again, but reads
+ * through it remain legal (the receiver keeps the object alive).
+ *
+ * The receiver's acquisition (it becomes Owned) is handled at the enclosing
+ * N_SPEC_DECL / N_ASSIGN; this function only neutralizes the *source*. */
+static void transfer_move (flowctx_t *ctx, node_t mov) {
+  c2m_ctx_t c2m_ctx = ctx->c2m_ctx; /* for POS() */
+  (void) c2m_ctx;
+  node_t inner = NL_HEAD (mov->u.ops);
+  candidate_t *a = VARR_ADDR (candidate_t, ctx->cands);
+  size_t n = VARR_LENGTH (candidate_t, ctx->cands);
+  if (inner == NULL) return;
+  /* `move <expr>` transfers the value of <expr>.  Only a direct binding
+     reference (after cast peeling) names a source whose ownership moves;
+     `move new Box(v)` or `move f()` produce a fresh value with no source to
+     neutralize (the receiver simply owns it). */
+  node_t direct = id_resolves_to_decl (inner);
+  if (direct == NULL) return;
+  int idx = cand_lookup (ctx, direct);
+  if (idx < 0) return;
+  candidate_t *c = &a[idx];
+  /* Use-after-move / move-after-release diagnostics, keyed off the per-path
+     STATE (not the sticky moved_p flag, which is set during the silent
+     fixpoint and would otherwise mis-fire on the first move during replay). */
+  if (diag_active_p (ctx) && !c->warned_p) {
+    if (c->state == OS_MOVED) {
+      error (ctx->c2m_ctx, POS (mov),
+             "use of moved value: `%s` was already consumed by `move` on this "
+             "path; it is dead (use the new owner, or take a fresh `readonly`)",
+             c->name);
+      diag_mark_warned (ctx, c);
+    } else if (c->state == OS_DETACHED) {
+      error (ctx->c2m_ctx, POS (mov),
+             "use of escaped value: `%s` already had its ownership transferred "
+             "out on this path and cannot be moved again", c->name);
+      diag_mark_warned (ctx, c);
+    } else if (c->state == OS_RELEASED) {
+      error (ctx->c2m_ctx, POS (mov),
+             "use-after-free: `%s` was released earlier on this path", c->name);
+      diag_mark_warned (ctx, c);
+    }
+  }
+  /* Consumed move: the source binding is now dead (OS_MOVED).  gen nulls the
+     source pointer, so the synthesized scope-exit delete is a safe no-op. */
+  c->state = OS_MOVED;
+  c->escapes_p = 1;
+  c->moved_p = 1;
+  record_disposition (ctx, c, POS (mov), "moved out");
 }
 
 /* Analyse an if-statement with structured split-and-meet. */
@@ -1704,6 +1846,7 @@ static void analyze (flowctx_t *ctx, node_t n) {
             && (a[i].state == OS_OWNED || a[i].state == OS_MAYBE_OWNED)) {
           a[i].state = OS_DETACHED;
           a[i].escapes_p = 1;
+          a[i].unsafe_escape_p = 1; /* user wired a defer release; don't double up */
           record_disposition (ctx, &a[i], POS (n), release_kind_str);
         }
     }
@@ -1712,6 +1855,18 @@ static void analyze (flowctx_t *ctx, node_t n) {
   case N_DETACH:
     transfer_detach (ctx, n);
     return;
+  case N_MOVE:
+    transfer_move (ctx, n);
+    return;
+  case N_READONLY: {
+    /* `readonly <expr>` borrows a non-owning view.  It confers no ownership
+       and leaves the viewed binding's state untouched; we only recurse into
+       the inner expression so a use-after-free on a released view still
+       fires. */
+    node_t inner = NL_HEAD (n->u.ops);
+    if (inner != NULL) analyze (ctx, inner);
+    return;
+  }
   case N_ASSIGN: {
     /* Recurse into the RHS for nested effects (calls, reads).  For the
        LHS, recurse only if it's a complex expression (subscript, deref,
@@ -1762,6 +1917,13 @@ static void analyze (flowctx_t *ctx, node_t n) {
         error (ctx->c2m_ctx, POS (n),
                "use-after-free: `%s` was released earlier on this path",
                c->name);
+        diag_mark_warned (ctx, c);
+      } else if (c->state == OS_MOVED && !c->warned_p && diag_active_p (ctx)) {
+        /* Consumed-move: the moved-from binding is dead, so reading it is an
+           error.  Use the new owner, or take a fresh `readonly` before moving. */
+        error (ctx->c2m_ctx, POS (n),
+               "use of moved value: `%s` was consumed by `move` on this path "
+               "and is dead; use the new owner instead", c->name);
         diag_mark_warned (ctx, c);
       }
     }
@@ -2389,7 +2551,8 @@ static int try_synthesize_auto_release (flowctx_t *ctx, candidate_t *c) {
       return 0;
     }
     d->auto_release_call = del;
-    c->release_kind = "auto-released (-fauto-release)";
+    c->release_kind = c->managed_p ? "auto-deleted at scope exit (owned)"
+                                   : "auto-released (-fauto-release)";
     c->release_pos  = POS (id);
     if (verbose_p) {
       pos_t p = c->acquire_pos;
@@ -2439,7 +2602,8 @@ static int try_synthesize_auto_release (flowctx_t *ctx, candidate_t *c) {
   d->auto_release_call = call;
   /* Mark disposition for -fownership-report.  Reuse the decl pos so the
      report says "auto-released at scope exit" at the same line as the alloc. */
-  c->release_kind = "auto-released (-fauto-release)";
+  c->release_kind = c->managed_p ? "auto-released at scope exit (owned)"
+                                 : "auto-released (-fauto-release)";
   c->release_pos  = POS (id);
   if (verbose_p) {
     pos_t p = c->acquire_pos;
@@ -2476,13 +2640,28 @@ static void cfg_emit_diagnostics (flowctx_t *ctx, cfg_t *cfg) {
      scope-bound delete is always correct.  Once synthesized, there's no
      leak left to report — so we set warned_p to keep the replay silent. */
   for (size_t k = 0; k < ncands; k++) cands[k].state = exit_bb->state_in[k];
-  if (c2m_options != NULL && c2m_options->auto_release_p && !ownership_silent_pass_p) {
+  if (!ownership_silent_pass_p) {
+    int global_auto = (c2m_options != NULL && c2m_options->auto_release_p);
     for (size_t k = 0; k < ncands; k++) {
       candidate_t *c = &cands[k];
+      /* Managed (`owned`/`move`) bindings ALWAYS get their release
+         synthesized — that is the whole point of the GC-like layer.  Other
+         bindings only get the silent fix under -fauto-release. */
+      if (!c->managed_p && !global_auto) continue;
       if (c->warned_p) continue;
       if (c->has_cleanup_p) continue;
-      if (c->escapes_p) continue;
       if (c->param_p) continue;  /* never synthesize free on incoming params */
+      /* Escape gate.  A binding that escaped UNSAFELY (returned, stored into a
+         non-tracked location, handed to an unknown/owning call, aliased by a
+         plain `=`, detached, or already covered by a user `defer`) must not
+         get a synthesized scope-exit delete — that would double-free / UAF.
+         For managed (`owned`/`move`) bindings a `move` escape is SAFE: `move`
+         nulls the source pointer, so the synthesized null-safe `delete` is a
+         no-op on the moved path while the NON-moved paths still get correct
+         cleanup (the conditional-move case).  Non-managed (-fauto-release)
+         bindings keep the stricter any-escape gate. */
+      if (c->managed_p) { if (c->unsafe_escape_p) continue; }
+      else              { if (c->escapes_p)        continue; }
       /* Eligible states:
            OS_OWNED       — owned on every path; classic definite leak.
            OS_MAYBE_OWNED — owned on some paths, "gone" (null) on others,

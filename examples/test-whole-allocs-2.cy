@@ -1,5 +1,8 @@
 /* test-whole-allocs-2.cy — second TU of the -fcheck-whole-allocs demo.
- * See examples/test-whole-allocs.cy for the run command. */
+ * See examples/test-whole-allocs.cy for the run command.
+ *
+ * @expect: skip   (references symbols defined in test-whole-allocs.cy; only
+ *                  meaningful when the two are compiled together) */
 #include <stdio.h>
 #include <stdlib.h>
 

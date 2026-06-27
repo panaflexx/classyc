@@ -1,5 +1,8 @@
 /* classy-curl.cy — CURL-like command line HTTP client
  *
+ * @expect: skip   (a CLI tool: with no URL argument it prints usage and exits
+ *                  non-zero, and otherwise needs live network access)
+ *
  * Supports curl-like options:
  *   -X/--request METHOD   Specify request method (GET, POST, PUT, DELETE, etc.)
  *   -d/--data DATA        HTTP POST data

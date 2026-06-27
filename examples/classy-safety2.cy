@@ -2,8 +2,11 @@
  *
  * When -fexceptions is active the compiler emits safety guards for:
  *   - new OOM          : malloc failure throws RuntimeException("out of memory")
- *   - double-free      : delete of null / already-deleted ptr throws RuntimeException
- *   - use-after-free   : ptr->field after delete throws RuntimeException
+ *   - delete null      : null-safe — deleting null (or an already-deleted, and
+ *                        therefore nulled-out, variable) is a silent no-op
+ *   - use-after-free   : ptr->field after delete throws NullException (the
+ *                        deleted variable is nulled out, so the deref hits the
+ *                        null guard)
  *
  * Build & run:
  *   classyc examples/classy-safety2.cy -eg
@@ -32,16 +35,12 @@ void test_normal() {
     printf("  deleted successfully\n");
 }
 
-/* ── 2. delete null → RuntimeException ───────────────────────────────── */
+/* ── 2. delete null → null-safe no-op ──────────────────────────── */
 void test_delete_null() {
-    printf("[2] delete of null pointer\n");
+    printf("[2] delete of null pointer (null-safe no-op)\n");
     Node *p = 0;
-    try {
-        delete p;
-        printf("  ERROR: should not reach here\n");
-    } catch (Exception e) {
-        caught("RuntimeException", e);
-    }
+    delete p;             /* null-safe: does nothing, throws nothing */
+    printf("  deleted null harmlessly (no exception)\n");
 }
 
 /* ── 3. double-free via alias ───────────────────────────────────────── */
@@ -49,21 +48,21 @@ void test_delete_null() {
    Alias double-free requires a full malloc intercept to detect reliably;
    without that, the best protection is the null check on the deleted var. */
 void test_double_free() {
-    printf("[3] double-free via same variable (null-out catches it)\n");
-    Node *p = new Node(7);
+    printf("[3] double-free via same variable (null-out makes it a no-op)\n");
+    /* `unowned`: this is a deliberate runtime double-delete demo, so opt out of
+     * the static ownership analyzer and let the runtime null-out handle it. */
+    unowned Node *p = new Node(7);
     delete p;             /* p is nulled out after delete */
-    try {
-        delete p;         /* p == NULL now → null guard in cy_safe_free fires */
-        printf("  ERROR: should not reach here\n");
-    } catch (Exception e) {
-        caught("RuntimeException (null after delete)", e);
-    }
+    delete p;             /* p == NULL now → null-safe delete is a no-op */
+    printf("  second delete was a harmless no-op (p nulled out)\n");
 }
 
 /* ── 4. delete + use of the same variable ──────────────────────────── */
 void test_double_free_same_var() {
     printf("[4] same-variable UAF: null-out converts it to null-deref\n");
-    Node *p = new Node(3);
+    /* `unowned`: deliberate use-after-delete demo — the runtime null guard,
+     * not the static analyzer, is what we are exercising here. */
+    unowned Node *p = new Node(3);
     delete p;             /* p gets nulled out after delete */
     try {
         int v = p->get(); /* p == NULL → null guard fires before field access */
@@ -94,7 +93,8 @@ void test_use_after_free() {
 /* ── 6. use-after-free: same variable (null-out turns it into null deref) */
 void test_uaf_same_var() {
     printf("[6] use-after-free via same variable (null-out → null deref)\n");
-    Node *p = new Node(5);
+    /* `unowned`: deliberate use-after-delete demo (see test [4]). */
+    unowned Node *p = new Node(5);
     delete p;             /* p gets nulled out */
     try {
         int v = p->get(); /* p == NULL → NullException fires */
