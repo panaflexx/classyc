@@ -4306,6 +4306,20 @@ typedef struct {
 
 DEF_VARR (generic_spec_t);
 
+/* Pending cross-generic reference: when specialize_node resolves a
+   cross-reference like `Is<T>` inside `As<T>`'s body, it records the
+   referenced template name + concrete args here.  get_or_create_specialization
+   drains this after specialize_node returns, creating the referenced
+   specializations without recursive calls that corrupt state. */
+typedef struct {
+  const char *ref_name;     /* "Is" */
+  int n_args;               /* 1 */
+  node_t args[4];           /* [N_ID("Drawable")] */
+  pos_t pos;
+} generic_crossref_t;
+
+DEF_VARR (generic_crossref_t);
+
 /* Interface registry (Phase 1): a named, STRUCTURAL method-set contract.
    Recording the signatures by name lets later phases ask "does class C satisfy
    interface I?" structurally — the same duck-typing the compiler already does
@@ -4328,6 +4342,7 @@ struct parse_ctx {
   unsigned lambda_uid;             /* counter for unique lambda names */
   VARR (generic_tmpl_t) * generic_templates; /* registered generic class templates */
   VARR (generic_spec_t) * generic_specs;     /* created specializations (dedup cache) */
+  VARR (generic_crossref_t) * generic_crossrefs; /* pending cross-generic refs */
   VARR (iface_t) * interfaces;               /* registered interface contracts */
 };
 
@@ -4340,6 +4355,7 @@ struct parse_ctx {
 #define lambda_uid parse_ctx->lambda_uid
 #define generic_templates parse_ctx->generic_templates
 #define generic_specs parse_ctx->generic_specs
+#define generic_crossrefs parse_ctx->generic_crossrefs
 #define interfaces parse_ctx->interfaces
 
 static struct node err_struct;
@@ -4557,6 +4573,10 @@ typedef node_t (*nonterm_arg_func_t) (c2m_ctx_t c2m_ctx, int, node_t);
 #define D(f) static node_t f (c2m_ctx_t c2m_ctx, int no_err_p MIR_UNUSED)
 #define DA(f) static node_t f (c2m_ctx_t c2m_ctx, int no_err_p, node_t arg)
 
+/* Forward decl: primary_expr (expression-context generic instantiation)
+   composes postfix operators via post_expr_part, which is defined later. */
+static node_t post_expr_part (c2m_ctx_t c2m_ctx, int no_err_p, node_t arg);
+
 #define C(c) (curr_token->code == c)
 
 static int match (c2m_ctx_t c2m_ctx, int c, pos_t *pos, node_code_t *node_code, node_t *node) {
@@ -4704,6 +4724,7 @@ static int generic_node_has_scalar_data (node_code_t code) {
 static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
                                 const char *orig_name, const char *spec_name,
                                 int n_params, const char **params, node_t *args) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   if (n == NULL) return NULL;
 
   if (n->code == N_ID) {
@@ -4729,29 +4750,54 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
        embedded type-parameter name to its concrete type argument and re-mangle so
        it becomes the concrete spec name (__generic_List_String /
        __generic_Map_String_int).  Works for any parameter count; assumes
-       type-parameter names contain no '_' (so the joined names tokenize cleanly). */
-    {
-      char _pfx[512];
-      snprintf (_pfx, sizeof (_pfx), "__generic_%s_", orig_name);
-      size_t _plen = strlen (_pfx);
-      if (n_params > 0 && strncmp (s, _pfx, _plen) == 0) {
-        node_t _resolved[4];
-        int _nr = 0, _ok = 1;
-        const char *_cur = s + _plen;
-        while (*_cur != '\0' && _ok) {
-          const char *_us = strchr (_cur, '_');
-          size_t _len = _us != NULL ? (size_t) (_us - _cur) : strlen (_cur);
-          int _pi = -1;
-          for (int _i = 0; _i < n_params; _i++)
-            if (params[_i] != NULL && strlen (params[_i]) == _len
-                && strncmp (_cur, params[_i], _len) == 0) { _pi = _i; break; }
-          if (_pi < 0 || _nr >= 4) { _ok = 0; break; }
-          _resolved[_nr++] = args[_pi];
-          _cur = _us != NULL ? _us + 1 : _cur + _len;
-        }
-        if (_ok && _nr > 0) {
-          const char *_new = mangle_generic_name (c2m_ctx, orig_name, _nr, _resolved);
-          return build_id (c2m_ctx, _new, POS (n));
+       type-parameter names contain no '_' (so the joined names tokenize cleanly).
+
+       Also handles CROSS-references to other generic classes: e.g. `Is<T>.Of(h)`
+       inside `As<T>`'s body parses as `__generic_Is_T.Of(h)`.  When `As<Circle>`
+       is specialised, `__generic_Is_T` must resolve to `__generic_Is_Circle`.
+       We scan every registered generic template (not just orig_name) for a
+       matching prefix, then resolve the embedded params the same way.
+       Self-references (orig_name) just resolve the name; cross-references
+       (other templates) are recorded in generic_crossrefs for deferred
+       materialization by get_or_create_specialization. */
+    if (n_params > 0 && strncmp (s, "__generic_", 10) == 0) {
+      VARR (generic_tmpl_t) *_gt = generic_templates;
+      if (_gt != NULL) {
+        for (size_t _ti = 0; _ti < VARR_LENGTH (generic_tmpl_t, _gt); _ti++) {
+          generic_tmpl_t *_t = &VARR_ADDR (generic_tmpl_t, _gt)[_ti];
+          char _pfx[512];
+          snprintf (_pfx, sizeof (_pfx), "__generic_%s_", _t->name);
+          size_t _plen = strlen (_pfx);
+          if (strncmp (s, _pfx, _plen) != 0) continue;
+          node_t _resolved[4];
+          int _nr = 0, _ok = 1;
+          const char *_cur = s + _plen;
+          while (*_cur != '\0' && _ok) {
+            const char *_us = strchr (_cur, '_');
+            size_t _len = _us != NULL ? (size_t) (_us - _cur) : strlen (_cur);
+            int _pi = -1;
+            for (int _i = 0; _i < n_params; _i++)
+              if (params[_i] != NULL && strlen (params[_i]) == _len
+                  && strncmp (_cur, params[_i], _len) == 0) { _pi = _i; break; }
+            if (_pi < 0 || _nr >= 4) { _ok = 0; break; }
+            _resolved[_nr++] = args[_pi];
+            _cur = _us != NULL ? _us + 1 : _cur + _len;
+          }
+          if (_ok && _nr > 0) {
+            const char *_new = mangle_generic_name (c2m_ctx, _t->name, _nr, _resolved);
+            if (strcmp (_t->name, orig_name) != 0) {
+              /* Cross-reference to a different generic class: record for
+                 deferred materialization (avoids recursive
+                 get_or_create_specialization that corrupts state). */
+              generic_crossref_t _cr;
+              _cr.ref_name = _t->name;
+              _cr.n_args = _nr;
+              for (int _ci = 0; _ci < _nr; _ci++) _cr.args[_ci] = _resolved[_ci];
+              _cr.pos = POS (n);
+              VARR_PUSH (generic_crossref_t, generic_crossrefs, _cr);
+            }
+            return build_id (c2m_ctx, _new, POS (n));
+          }
         }
       }
     }
@@ -4793,6 +4839,42 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
             node_t new_alist = new_node (c2m_ctx, N_LIST);
             node_t new_id = build_id (c2m_ctx, "is_pointer", POS (callee));
             return new_pos_node3 (c2m_ctx, N_CALL, POS (n), new_id, new_tlist, new_alist);
+          }
+        }
+      }
+    }
+    /* nameof<T>() intrinsic: substitute the whole call with an N_STR whose
+       value is the concrete type-arg's name.  This is the compile-time
+       reflection primitive that lets a generic class body stringify T (e.g.
+       for RTTI comparisons in Is<T>/As<T>).  Pointer wrapping is stripped:
+       nameof<int*>() returns "int" (the base type name), matching how the
+       declarator substitution unwraps N_POINTER. */
+    if (callee != NULL && callee->code == N_ID && callee->u.s.s != NULL
+        && strcmp (callee->u.s.s, "nameof") == 0) {
+      node_t tlist = NL_NEXT (callee);
+      node_t targ = (tlist != NULL) ? NL_HEAD (tlist->u.ops) : NULL;
+      if (targ != NULL && targ->code == N_ID) {
+        for (int i = 0; i < n_params; i++) {
+          if (params[i] != NULL && strcmp (targ->u.s.s, params[i]) == 0) {
+            node_t a = args[i];
+            while (a->code == N_POINTER) a = NL_HEAD (a->u.ops);
+            const char *nm = NULL;
+            switch (a->code) {
+            case N_STRING:   nm = "String"; break;
+            case N_INT:      nm = "int"; break;
+            case N_DOUBLE:   nm = "double"; break;
+            case N_FLOAT:    nm = "float"; break;
+            case N_CHAR:     nm = "char"; break;
+            case N_LONG:     nm = "long"; break;
+            case N_SHORT:    nm = "short"; break;
+            case N_UNSIGNED: nm = "unsigned"; break;
+            case N_VOID:     nm = "void"; break;
+            case N_DICT:     nm = "dict"; break;
+            case N_BOOL:     nm = "bool"; break;
+            case N_ID:       nm = a->u.s.s; break;
+            default:         nm = "T"; break;
+            }
+            return new_str_node (c2m_ctx, N_STR, uniq_cstr (c2m_ctx, nm), POS (n));
           }
         }
       }
@@ -4913,26 +4995,49 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
                                              pos_t pos) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
 
-  /* Self-reference inside a generic class body: if the class being specialised
-     is the class currently being parsed (class_node == NULL in the pre-registered
-     entry) AND every type arg is one of its own type parameters, return the
-     mangled placeholder name without creating a real specialisation.  The
-     placeholder looks like "__generic_List_T" and is resolved to the concrete
-     name ("__generic_List_String") by specialize_node when the template is later
-     instantiated with a real type argument. */
+  /* Self-reference or cross-reference inside a generic class body: if we are
+     currently parsing a generic class body (curr_class != NULL) AND every type
+     arg is one of the CURRENT class's type parameters, return the mangled
+     placeholder name without creating a real specialisation.  The placeholder
+     looks like "__generic_List_T" (self-ref) or "__generic_Is_T" (cross-ref
+     to Is from within As<T>'s body) and is resolved to the concrete name
+     ("__generic_List_String" / "__generic_Is_Circle") by specialize_node when
+     the template is later instantiated with a real type argument.
+
+     This covers two cases:
+       1. Self-reference:  List<T> inside List<T>'s body (base_name == curr class)
+       2. Cross-reference: Is<T>  inside As<T>'s body  (base_name != curr class)
+     Both produce a placeholder that specialize_node resolves at instantiation
+     time; cross-refs are also recorded in generic_crossrefs for deferred
+     materialization of the referenced specialization. */
   if (parse_ctx != NULL && parse_ctx->curr_class != NULL) {
+    /* Find the current class's template entry to get its type params.  During
+       body parsing the template's class_node may still be NULL (pre-registered),
+       so match by name from the curr_class node's id. */
     VARR (generic_tmpl_t) *gt = generic_templates;
-    for (size_t _si = 0; gt != NULL && _si < VARR_LENGTH (generic_tmpl_t, gt); _si++) {
+    const char *curr_cls_name = NULL;
+    int curr_n_params = 0;
+    const char **curr_params = NULL;
+    node_t _cc = parse_ctx->curr_class;
+    const char *_cname = (_cc != NULL && _cc->code == N_ID) ? _cc->u.s.s : NULL;
+    for (size_t _si = 0; gt != NULL && _cname != NULL
+         && _si < VARR_LENGTH (generic_tmpl_t, gt); _si++) {
       generic_tmpl_t *_t = VARR_ADDR (generic_tmpl_t, gt) + _si;
-      if (_t->class_node != NULL || strcmp (_t->name, base_name) != 0) continue;
-      /* This is the pre-registered (partially-parsed) template — check that every
-         supplied type arg is one of its own type parameters. */
+      if (strcmp (_t->name, _cname) == 0) {
+        curr_cls_name = _t->name;
+        curr_n_params = _t->n_type_params;
+        curr_params = _t->type_params;
+        break;
+      }
+    }
+    if (curr_cls_name != NULL && curr_n_params > 0) {
+      /* Check that every supplied type arg is one of the current class's params. */
       int _all_params = (n_args > 0);
       for (int _j = 0; _j < n_args && _all_params; _j++) {
         if (args[_j]->code != N_ID) { _all_params = 0; break; }
         int _found = 0;
-        for (int _k = 0; _k < _t->n_type_params; _k++)
-          if (_t->type_params[_k] && strcmp (args[_j]->u.s.s, _t->type_params[_k]) == 0)
+        for (int _k = 0; _k < curr_n_params; _k++)
+          if (curr_params[_k] && strcmp (args[_j]->u.s.s, curr_params[_k]) == 0)
             { _found = 1; break; }
         if (!_found) _all_params = 0;
       }
@@ -4975,12 +5080,22 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
   }
 
   /* Deep-copy the template with type substitution */
+  size_t _xref_mark = VARR_LENGTH (generic_crossref_t, generic_crossrefs);
   node_t spec_class = specialize_node (c2m_ctx, tmpl->class_node,
                                         base_name, spec_name,
                                         tmpl->n_type_params, tmpl->type_params, args);
   if (spec_class == NULL) {
     error (c2m_ctx, pos, "cannot instantiate generic class '%s'", base_name);
     return build_id (c2m_ctx, base_name, pos);
+  }
+
+  /* Drain cross-generic references that specialize_node recorded (e.g.
+     Is<Drawable> referenced from within As<Drawable>'s body).  Each is
+     materialized now, after the outer specialization is complete, avoiding
+     recursive get_or_create_specialization calls that corrupt state. */
+  while (VARR_LENGTH (generic_crossref_t, generic_crossrefs) > _xref_mark) {
+    generic_crossref_t _cr = VARR_POP (generic_crossref_t, generic_crossrefs);
+    (void) get_or_create_specialization (c2m_ctx, _cr.ref_name, _cr.n_args, _cr.args, _cr.pos);
   }
 
   /* Register spec_name as a tpname so declarations like `List<String> x` work */
@@ -5194,6 +5309,34 @@ D (primary_expr) {
     record_stop (c2m_ctx, ip_mark, TRUE); /* not is_pointer<T>(): rewind */
   }
 
+  /* nameof<T>(): compile-time reflection intrinsic.  Returns the C-level name
+     of T as a string literal (char[N]).  Inside a generic class body, T is a
+     type parameter; specialize_node substitutes nameof<T>() with an N_STR
+     whose value is the concrete type-arg name at instantiation time.  Used
+     outside a generic (e.g. nameof<Circle>()) it resolves in check() to the
+     class/interface name.  Parses like is_pointer<T>() so '<' '>' are not
+     comparison operators. */
+  if (C (T_ID) && curr_token->repr != NULL && strcmp (curr_token->repr, "nameof") == 0) {
+    size_t nm_mark = record_start (c2m_ctx);
+    node_t nm_id;
+    pos_t nm_pos = curr_token->pos;
+    MN (T_ID, nm_id);
+    if (C (T_CMP) && curr_token->node_code == N_LT) {
+      M (T_CMP); /* consume '<' */
+      node_t targ = parse_generic_type_arg (c2m_ctx);
+      if (targ != NULL && C (T_CMP) && curr_token->node_code == N_GT) {
+        M (T_CMP); /* consume '>' */
+        if (M ('(') && M (')')) {
+          record_stop (c2m_ctx, nm_mark, FALSE); /* commit */
+          node_t tlist = new_node1 (c2m_ctx, N_LIST, targ);
+          node_t alist = new_node (c2m_ctx, N_LIST);
+          return new_pos_node3 (c2m_ctx, N_CALL, nm_pos, nm_id, tlist, alist);
+        }
+      }
+    }
+    record_stop (c2m_ctx, nm_mark, TRUE); /* not nameof<T>(): rewind */
+  }
+
   /* Shorthand untyped lambda:  x => body  (single parameter, no parens).
      The parameter type is inferred at the call site during check. */
   if (C (T_ID)) {
@@ -5209,6 +5352,30 @@ D (primary_expr) {
       return new_pos_node2 (c2m_ctx, N_LAMBDA, pos, plist, body);
     }
     record_stop (c2m_ctx, mark, TRUE); /* not a lambda: rewind */
+  }
+
+  /* Generic class instantiation in expression context:  Name<TypeArg>.method()
+     or Name<TypeArg>(args).  Without this, `Is<T>.Of(h)` parses as
+     `(Is < T) > (.Of(h))` because '<' is treated as comparison.  When a bare
+     identifier is a registered generic class and '<' follows, monomorphize via
+     parse_generic_instantiation (which returns an N_ID naming the specialized
+     class), then run post_expr_part so '.method()' / '(args)' compose.
+     Rewinds on mismatch so `Name` stays a plain identifier. */
+  if (C (T_ID) && curr_token->repr != NULL
+      && is_generic_class_p (c2m_ctx, curr_token->repr)) {
+    size_t g_mark = record_start (c2m_ctx);
+    pos_t g_pos = curr_token->pos;
+    char g_name_buf[256];
+    snprintf (g_name_buf, sizeof (g_name_buf), "%s", curr_token->repr);
+    node_t g_id;
+    MN (T_ID, g_id);
+    if (C (T_CMP) && curr_token->node_code == N_LT) {
+      record_stop (c2m_ctx, g_mark, FALSE); /* commit: this is Name<...> */
+      r = parse_generic_instantiation (c2m_ctx, g_name_buf, g_pos);
+      PA (post_expr_part, r);
+      return r;
+    }
+    record_stop (c2m_ctx, g_mark, TRUE); /* not Name<...>: rewind */
   }
 
   	if (MN (T_ID, r) || MN (T_NUMBER, r) || MN (T_CH, r) || MN (T_STR, r)) {
@@ -8149,6 +8316,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   lambda_uid = 0;
   VARR_CREATE (generic_tmpl_t, generic_templates, alloc, 4);
   VARR_CREATE (generic_spec_t, generic_specs, alloc, 8);
+  VARR_CREATE (generic_crossref_t, generic_crossrefs, alloc, 4);
   VARR_CREATE (iface_t, interfaces, alloc, 4);
 }
 
@@ -8247,6 +8415,8 @@ static void parse_finish (c2m_ctx_t c2m_ctx) {
       VARR_DESTROY (generic_tmpl_t, generic_templates);
     if (generic_specs != NULL)
       VARR_DESTROY (generic_spec_t, generic_specs);
+    if (generic_crossrefs != NULL)
+      VARR_DESTROY (generic_crossref_t, generic_crossrefs);
   }
   finish_streams (c2m_ctx);
   reg_free (c2m_ctx, c2m_ctx->parse_ctx);
@@ -15213,6 +15383,46 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
             }
           }
           /* Malformed is_pointer<...>(...); fall through to error */
+        }
+        /* nameof<T>(): compile-time reflection intrinsic.  Returns the C-level
+           name of T as a string literal (char[N]).  Inside a generic body,
+           specialize_node already substituted this to an N_STR, so this path
+           only fires for nameof<ConcreteType>() used directly (e.g.
+           nameof<Circle>()).  Resolves T to its class/interface name string. */
+        if (op1->code == N_ID && strcmp (op1->u.s.s, "nameof") == 0) {
+          node_t type_args = NL_NEXT (op1);
+          if (type_args != NULL && type_args->code == N_LIST) {
+            node_t type_arg = NL_HEAD (type_args->u.ops);
+            node_t call_args = NL_NEXT (type_args);
+            if (type_arg != NULL && NL_NEXT (type_arg) == NULL
+                && call_args != NULL && NL_HEAD (call_args->u.ops) == NULL) {
+              const char *nm = NULL;
+              node_t a = type_arg;
+              while (a->code == N_POINTER) a = NL_HEAD (a->u.ops);
+              switch (a->code) {
+              case N_STRING:   nm = "String"; break;
+              case N_INT:      nm = "int"; break;
+              case N_DOUBLE:   nm = "double"; break;
+              case N_FLOAT:    nm = "float"; break;
+              case N_CHAR:     nm = "char"; break;
+              case N_LONG:     nm = "long"; break;
+              case N_SHORT:    nm = "short"; break;
+              case N_UNSIGNED: nm = "unsigned"; break;
+              case N_VOID:     nm = "void"; break;
+              case N_DICT:     nm = "dict"; break;
+              case N_BOOL:     nm = "bool"; break;
+              case N_ID:       nm = a->u.s.s; break;
+              default:         nm = "?"; break;
+              }
+              node_t str_node = new_str_node (c2m_ctx, N_STR,
+                                             uniq_cstr (c2m_ctx, nm), POS (r));
+              check (c2m_ctx, str_node, NULL);
+              *r = *str_node;
+              e = r->attr;
+              break;
+            }
+          }
+          /* Malformed nameof<...>(...); fall through to error */
         }
         /* __destroy(x): compiler intrinsic used by generic collection templates to
            run an element's destructor before the backing buffer is freed.  It is
