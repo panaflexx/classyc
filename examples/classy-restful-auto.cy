@@ -209,7 +209,7 @@ class UsersController {
         /* Pythonic: Filter lambda selects active rows in-memory after SQL pagination.
            GAP: dict int fields still need the (int)(long) double-cast in the lambda.
            In production push active=1 to SQL; here it demonstrates ->Filter(). */
-        List<dict>* data = rows->Filter((dict r) => (int)(long)r.active != 0);
+        owned List<dict>* data = rows->Filter((dict r) => (int)(long)r.active != 0);
         for (auto r in data) printf("  row: %s\n", r.json);
 
         try {
@@ -228,7 +228,7 @@ class UsersController {
 
     /* ── GET /api/users/{id} ──────────────────────────────────────────── */
     Response* Get(Request* req, int id) {
-        List<dict>* rows = this.db->query(
+        owned List<dict>* rows = this.db->query(
             "SELECT id,name,email,role,active FROM users WHERE id=?",
             "i", id);
         if (!rows) return resp_not_found(f"User {id}");
@@ -246,7 +246,7 @@ class UsersController {
             return resp_bad("name and email required");
 
         /* duplicate email check via query */
-        List<dict>* dup = this.db->query(
+        owned List<dict>* dup = this.db->query(
             "SELECT 1 FROM users WHERE email=?", "s",
             (char*)req->body.email);
         if (dup && dup->Count()>0)
@@ -254,7 +254,7 @@ class UsersController {
 
         /* Pythonic touch: use a real Transaction so any failure rolls back
            both the INSERT and the audit row. */
-        Transaction* tx = this.db->begin();
+        owned Transaction* tx = this.db->begin();
 
         int rc = this.db->execute(
             "INSERT INTO users(name,email,role,active) VALUES(?,?,?,?)",
@@ -274,7 +274,7 @@ class UsersController {
         tx->commit();          /* explicit commit — dtor would rollback */
 
         /* return the freshly inserted row (single query) */
-        List<dict>* fresh = this.db->query(
+        owned List<dict>* fresh = this.db->query(
             "SELECT id,name,email,role,active FROM users WHERE id=?",
             "i", (int)new_id);
         if (!fresh) {
@@ -290,8 +290,8 @@ class UsersController {
 
         /* Iterate body dict, collecting only the non-null fields.
            Parallel lists keep keys and values in the same insertion order. */
-        List<String>* keys = new List<String>();
-        List<dict>* vals = new List<dict>();
+        owned List<String>* keys = new List<String>();
+        owned List<dict>* vals = new List<dict>();
         for (auto k, v in req->body)
             if (v != 0) { keys->Add(k); vals->Add(v); }
         if (keys->IsEmpty()) return resp_bad("no fields to update");
@@ -300,10 +300,10 @@ class UsersController {
            detach is required: the concatenation is allocated in Map's arena,
            which is reclaimed when Map returns — detach escapes it to the heap
            so the strings survive in `parts` for the join() below. */
-        List<String>* parts = keys->Map((String k) => detach (k + "=?"));
+        owned List<String>* parts = keys->Map((String k) => detach (k + "=?"));
 
         String sql = "UPDATE users SET " + parts->join(",") + " WHERE id=?";
-        Statement* stmt = this.db->prepare((char*)sql);
+        owned Statement* stmt = this.db->prepare((char*)sql);
 
         int idx = 1;
         for (auto v in vals) stmt->bind(idx++, v);   /* bind(int,dict) dispatches on type tag */
@@ -360,10 +360,10 @@ int main() {
     printf("   classh-restful  —  SQLite-backed classy REST controller   \n");
     printf("════════════════════════════════════════════════════════════\n\n");
 
-    Sqlite* db = Sqlite.open(":memory:");
+    owned Sqlite* db = Sqlite.open(":memory:");
     if (!db) { printf("cannot open :memory: db\n"); return 1; }
 
-    auto ctrl = new UsersController(db);
+    owned auto ctrl = new UsersController(db);
 
     /* seed a few rows via raw SQL (controller would also work) */
     db->execute("INSERT INTO users VALUES(1,'Ada Lovelace','ada@analytical.engine','admin',1)");
@@ -374,9 +374,9 @@ int main() {
     /* 1. GET collection (no filter) */
     {
         printf("GET /api/users (no filter)\n");
-        auto req = new Request("GET","/api/users","","");
+        owned auto req = new Request("GET","/api/users","","");
         printf("Dispatch...\n");
-        auto res = dispatch(ctrl, req);
+        owned auto res = dispatch(ctrl, req);
         printf("Logging.\n\n");
         log_req(req); log_res(res);
     }
@@ -384,15 +384,15 @@ int main() {
 
     /* 2. GET with role filter + pagination */
     {
-        auto req = new Request("GET","/api/users","role=admin&limit=5&page=1","");
-        auto res = dispatch(ctrl, req);
+        owned auto req = new Request("GET","/api/users","role=admin&limit=5&page=1","");
+        owned auto res = dispatch(ctrl, req);
         log_req(req); log_res(res);
     }
 
     /* 3. GET single user (cast demo via Get path) */
     {
-        auto req = new Request("GET","/api/users/2","","");
-        auto res = dispatch(ctrl, req);
+        owned auto req = new Request("GET","/api/users/2","","");
+        owned auto res = dispatch(ctrl, req);
         log_req(req); log_res(res);
     }
 
@@ -401,8 +401,8 @@ int main() {
         /* body-less triggers the early "JSON body required" path in this run;
            the full transaction+audit logic lives in Create() and is exercised
            by any caller that supplies a valid JSON body. */
-        auto req = new Request("POST","/api/users","","");
-        auto res = dispatch(ctrl, req);
+        owned auto req = new Request("POST","/api/users","","");
+        owned auto res = dispatch(ctrl, req);
         log_req(req); log_res(res);
     }
 
@@ -411,22 +411,22 @@ int main() {
     /* 6. PUT partial update */
     {
         String body = "{\"role\":\"admin\"}";
-        auto req = new Request("PUT","/api/users/3","",body);
-        auto res = dispatch(ctrl, req);
+        owned auto req = new Request("PUT","/api/users/3","",body);
+        owned auto res = dispatch(ctrl, req);
         log_req(req); log_res(res);
     }
 
     /* 7. DELETE (soft) */
     {
-        auto req = new Request("DELETE","/api/users/3","","");
-        auto res = dispatch(ctrl, req);
+        owned auto req = new Request("DELETE","/api/users/3","","");
+        owned auto res = dispatch(ctrl, req);
         log_req(req); log_res(res);
     }
 
     /* 8. Final list shows the soft-delete effect */
     {
-        auto req = new Request("GET","/api/users","","");
-        auto res = dispatch(ctrl, req);
+        owned auto req = new Request("GET","/api/users","","");
+        owned auto res = dispatch(ctrl, req);
         log_req(req); log_res(res);
     }
 

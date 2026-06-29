@@ -15177,7 +15177,103 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	  }
 	}
 
-	        process_unop (c2m_ctx, r, &op1, &e1, &t1, r);
+/* Static dispatch on a class name: ClassName.method() where ClassName
+   is an N_ID that resolves to a class type (not a variable).  This is
+   what makes T::tableName() work after generic specialization: T is
+   substituted with the concrete class name, and we treat the base
+   N_ID as a static type reference rather than a variable.
+   Mirrors the String.method() handling above. */
+if (base != NULL && base->code == N_ID) {
+  /* Only treat as static dispatch if the N_ID does NOT resolve to a
+     regular variable/decl — i.e. it's purely a class name or a
+     generic type parameter. */
+  symbol_t vsym;
+  int is_var = symbol_find (c2m_ctx, S_REGULAR, base, curr_scope, &vsym)
+               && vsym.def_node != NULL
+               && vsym.def_node->code != N_CLASS;
+  if (!is_var) {
+    symbol_t csym;
+    int found_class = (symbol_find (c2m_ctx, S_TAG, base, NULL, &csym)
+                       && csym.def_node != NULL
+                       && csym.def_node->code == N_CLASS);
+    /* Also check if it's a generic type parameter name by scanning
+       the registered generic templates for a matching param name. */
+    int is_tpname = 0;
+    if (!found_class) {
+      /* Check if base->u.s.s is a type parameter of any registered
+         generic class template. */
+      struct parse_ctx *parse_ctx = c2m_ctx->parse_ctx;
+      if (parse_ctx != NULL && generic_templates != NULL) {
+        VARR (generic_tmpl_t) *_gt = generic_templates;
+        for (size_t ti = 0; ti < VARR_LENGTH (generic_tmpl_t, _gt); ti++) {
+          generic_tmpl_t *t = &VARR_ADDR (generic_tmpl_t, _gt)[ti];
+          if (t->class_node != NULL) {
+            node_t params = NL_NEXT (NL_HEAD (t->class_node->u.ops));
+            if (params != NULL && params->code == N_LIST) {
+              for (node_t p = NL_HEAD (params->u.ops); p != NULL; p = NL_NEXT (p)) {
+                if (p->code == N_ID && strcmp (p->u.s.s, base->u.s.s) == 0) {
+                  is_tpname = 1;
+                  break;
+                }
+              }
+            }
+          }
+          if (is_tpname) break;
+        }
+      }
+    }
+    /* Also handle mangled generic specialization names like
+       __generic_EntityOps_Patient that haven't been materialized yet. */
+    int is_generic_spec = (!found_class && !is_tpname
+                           && strncmp(base->u.s.s, "__generic_", 10) == 0);
+    if (found_class || is_tpname || is_generic_spec) {
+      node_t mem = NL_NEXT (base);
+      if (mem != NULL && mem->code == N_ID) {
+        if (found_class) {
+          node_t class_node = csym.def_node;
+          symbol_t msym;
+          node_t mfunc = NULL, mfunc_op = NULL;
+          if (symbol_find (c2m_ctx, S_REGULAR, mem, class_node, &msym)) {
+            if (msym.def_node && msym.def_node->code == N_FUNC_DEF) {
+              mfunc = msym.def_node;
+            }
+          }
+          if (!mfunc)
+            mfunc = find_def (c2m_ctx, S_REGULAR, mem, class_node, &mfunc_op);
+          if (mfunc && mfunc->code == N_FUNC_DEF) {
+            e = create_expr (c2m_ctx, r);
+            e->type->mode = TM_BASIC;
+            e->type->u.basic_type = TP_VOID;
+            e->u.lvalue_node = NULL;
+            struct expr *be = create_expr (c2m_ctx, base);
+            be->type->mode = TM_CLASS;
+            be->type->u.tag_type = class_node;
+            be->def_node = class_node;
+            be->u.lvalue_node = NULL;
+            base->attr = be;
+            break;
+          }
+          error (c2m_ctx, POS (r),
+                 "class %s has no static method %s",
+                 base->u.s.s, mem->u.s.s);
+          break;
+        } else {
+          /* Generic type parameter or mangled generic specialization:
+             set a void placeholder.  For type parameters, specialization
+             will substitute T with the concrete class name.  For mangled
+             specialization names, the class will be materialized later. */
+          e = create_expr (c2m_ctx, r);
+          e->type->mode = TM_BASIC;
+          e->type->u.basic_type = TP_VOID;
+          e->u.lvalue_node = NULL;
+          break;
+        }
+      }
+    }
+  }
+}
+
+        process_unop (c2m_ctx, r, &op1, &e1, &t1, r);
 	        e = create_expr (c2m_ctx, r);
 	        e->type->mode = TM_BASIC;
 	        e->type->u.basic_type = TP_INT;
@@ -16111,6 +16207,102 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
 	              }
 	              ret_type = &res_type;
 	              method_call_p = TRUE;
+	            } else if (obj->code == N_ID) {
+	              /* Static dispatch on a class name: ClassName.method(args).
+	                 The N_FIELD checker already resolved this to a static method
+	                 and set a void placeholder.  Here we resolve the actual
+	                 function type and check arguments (no implicit 'this'). */
+	              symbol_t csym;
+	              if (symbol_find(c2m_ctx, S_TAG, obj, NULL, &csym)
+	                  && csym.def_node != NULL && csym.def_node->code == N_CLASS) {
+	                node_t class_node = csym.def_node;
+	                node_t method_id = NL_NEXT(obj);
+	                symbol_t msym;
+	                node_t func_def = NULL;
+	                if (symbol_find(c2m_ctx, S_REGULAR, method_id, class_node, &msym))
+	                  if (msym.def_node && msym.def_node->code == N_FUNC_DEF)
+	                    func_def = msym.def_node;
+	                if (!func_def)
+	                  func_def = find_def(c2m_ctx, S_REGULAR, method_id, class_node, NULL);
+	                if (!func_def || func_def->code != N_FUNC_DEF) {
+	                  error(c2m_ctx, POS(r), "class %s has no static method %s",
+	                        obj->u.s.s, method_id->u.s.s);
+	                  break;
+	                }
+	                decl_t mdecl = func_def->attr;
+	                struct type *ft = mdecl->decl_spec.type;
+	                if (ft->mode != TM_FUNC) {
+	                  error(c2m_ctx, POS(r), "static member %s is not a function", method_id->u.s.s);
+	                  break;
+	                }
+	                func_type = ft->u.func_type;
+	                ret_type = func_type->ret_type;
+	                /* Point the N_FIELD expr at the resolved func_def so gen
+	                   emits a direct call (no 'this'). */
+	                {
+	                  struct expr *fe = op1->attr;
+	                  if (fe != NULL) {
+	                    struct type *pf = create_type(c2m_ctx, NULL);
+	                    pf->mode = TM_PTR;
+	                    pf->u.ptr_type = ft;
+	                    set_type_layout(c2m_ctx, pf);
+	                    fe->type = pf;
+	                    fe->def_node = func_def;
+	                  }
+	                }
+	                /* Check user args against params (no implicit 'this'). */
+	                param_list = func_type->param_list;
+	                param = NL_HEAD(param_list->u.ops);
+	                for (arg = NL_HEAD(arg_list->u.ops); arg != NULL;) {
+	                  node_t arg_next = NL_NEXT(arg);
+	                  if (!arg->attr) check(c2m_ctx, arg, r);
+	                  e2 = arg->attr;
+	                  if (param == NULL) {
+	                    if (!func_type->dots_p)
+	                      error(c2m_ctx, POS(arg), "too many arguments in static method call");
+	                    arg = arg_next;
+	                    continue;
+	                  }
+	                  struct decl_spec *ds = get_param_decl_spec(param);
+	                  check_assignment_types(c2m_ctx, ds->type, NULL, e2, r);
+	                  param = NL_NEXT(param);
+	                  arg = arg_next;
+	                }
+	                if (param != NULL)
+	                  error(c2m_ctx, POS(r), "too few arguments in static method call");
+	                method_call_p = TRUE;
+	              }
+	              /* If the class wasn't found via S_TAG, check if it's a
+	                 generic specialization name (__generic_...) or a type
+	                 parameter.  In that case, just set a void return type
+	                 placeholder — the specialized body will re-check with
+	                 the real class. */
+	              else if (strncmp(obj->u.s.s, "__generic_", 10) == 0) {
+	                /* Generic specialization name not yet materialized.
+	                   Set a permissive return type.  The N_FIELD expr needs
+	                   a function-pointer type so gen_mir_protos doesn't assert. */
+	                for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg))
+	                  if (!arg->attr) check(c2m_ctx, arg, r);
+	                init_type(&res_type);
+	                res_type.mode = TM_BASIC;
+	                res_type.u.basic_type = TP_LONG;
+	                ret_type = &res_type;
+	                /* Set the N_FIELD expr to a dummy function-pointer type. */
+	                {
+	                  struct expr *fe = op1->attr;
+	                  if (fe != NULL) {
+	                    struct type *pf = create_type(c2m_ctx, NULL);
+	                    pf->mode = TM_PTR;
+	                    struct type *ff = create_type(c2m_ctx, NULL);
+	                    ff->mode = TM_FUNC;
+	                    ff->u.func_type = c2m_alloc(c2m_ctx) ? NULL : NULL;
+	                    pf->u.ptr_type = ff;
+	                    set_type_layout(c2m_ctx, pf);
+	                    fe->type = pf;
+	                  }
+	                }
+	                method_call_p = TRUE;
+	              }
 	            } else {
 	              struct type *obj_type = ((struct expr *)obj->attr)->type;
 	              /* A bare UTF-8 string literal used as a method receiver
