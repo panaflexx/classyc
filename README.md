@@ -108,14 +108,19 @@ User u = (User)? d;             // lenient: missing fields default to 0 / NULL
   recursively into nested class and struct members.
 * Works on **plain C structs** too — `struct Point { int x, y; }; Point p = (struct Point) d;`
   — and freely mixes class and struct nesting (`class Sprite { struct Pixel pixel; }`).
-* Scalars, `String`, and nested by-value classes / structs are supported today.
-  `List<T>*` / `Set<T>*` / `Map<K,V>*` and pointer-to-class fields are
-  Phase 2 (planned).
+* Scalars, `String`, nested by-value classes / structs, and **collection fields**
+  (`List<T>*` from a JSON array) are supported.  The bound object owns the
+  heap collection (its destructor must `delete` it, as `List<T>::~List` does);
+  `String` elements are private copies, so the source dict can be freed right
+  after the bind.  `Set<T>*` works the same way (any class with a default ctor
+  + `Add(T)`); `Map<K,V>*` and pointer-to-class elements (`List<User*>*`) are
+  Phase 3.
 * No annotations needed — the binder works off the class's declared members.
   Field names must match the dict keys verbatim (no case conversion).
 
-See `cy-validate/val-020-json-binding.cy` for the full coverage matrix and
-`JSONBINDING.md` for the design rationale and phasing.
+See `cy-validate/val-020-json-binding.cy` (scalars/structs) and
+`cy-validate/val-024-json-binding-collections.cy` (collection fields) for the
+full coverage matrix.
 
 ### Typed `Map<K, V>` Hash Maps (`include/map.h`)
 The typed, type-safe sibling of `dict`: a generic open-addressing hash map that
@@ -224,6 +229,34 @@ Rules of thumb:
 This works for any custom collection that follows the same `~Dtor` + element
 loop pattern (it is powered by the `is_pointer<T>` compiler intrinsic and a
 per-collection ownership flag); see `include/list.h`, `set.h`, and `map.h`.
+
+#### Generic Functions & Methods
+
+Generic *functions* (free functions, not class methods) let you write one
+definition that is monomorphized for each distinct inferred type-argument set —
+the foundation for `sort`, `map`, `reduce`, `hash`, and equality utilities:
+
+```c
+T Max<T>(T a, T b) { return a > b ? a : b; }
+
+auto m = Max(3, 5);              // T=int inferred -> __genfn_Max_int
+auto d = Max(1.5, 2.5);          // T=double inferred -> __genfn_Max_double
+
+// Multi-parameter generics infer each parameter from the matching argument:
+K First<K, V>(K k, V v) { return k; }
+auto f = First(1, "hello");      // K=int, V=String
+```
+
+At a call site, the compiler infers the type arguments from the call's argument
+types (the first parameter whose declared type is exactly `T` fixes `T`),
+deep-copies the template with `T` substituted, renames it to a mangled
+specialization (`__genfn_<Name>_<args>`), and injects it into the module so it
+is checked and code-generated like any other function. Repeated calls with the
+same inferred types reuse the cached specialization.
+
+The template itself is skipped during checking and codegen (only its
+monomorphized specializations are real functions), mirroring how generic *class*
+templates work.
 
 ### Arrays & Slices → `List<T>` (lengths flow into generics)
 A C array or a filter/map slice converts to a heap `List<T>` with `.ToList()`,
@@ -861,12 +894,17 @@ The runtime support for String methods and dict operations lives in small C help
 ClassyC is a pragmatic, evolving experiment in "C but pleasant". It already delivers a delightful developer experience for data-heavy systems code (proxies, config-driven services, CLIs, embedded scripting).
 
 Shipped since the early roadmap: typed lambdas, generics (`List<T>` and
-user-defined collections), `interface`/`Any<I>` erasure, default-on exceptions +
-safety guards, array/slice → `List<T>` conversion with lengths flowing into
-generics, and **typed JSON binding** (`(T) d` / `(T)? d` for class or struct,
-with `KeyException` on missing required fields). In-progress directions include
-richer container types, broader standard-library coverage, and Phase 2 of the
-JSON binder (collection-valued fields, see `JSONBINDING.md`).
+user-defined collections, plus **generic functions** with call-site type
+inference), `interface`/`Any<I>` erasure, default-on exceptions + safety
+guards, array/slice → `List<T>` conversion with lengths flowing into
+generics, **typed JSON binding** (`(T) d` / `(T)? d` for class or struct,
+with `KeyException` on missing required fields — including **collection
+fields** (`List<T>*` / `Set<T>*` from a JSON array), Phase 2), a lightweight
+**SQLite wrapper** (`include/sqlite.h`) with `dict`-row binding and
+`List<dict>` result sets, and a **gunicorn-style HTTP server** library
+(`include/httpserve.h`). In-progress directions include richer container
+types, broader standard-library coverage, and Phase 3 of the JSON binder
+(`Map<K,V>*` and pointer-to-class elements, plus per-field annotations).
 
 The behavior described in this README is exercised by the executable validation
 suite in **[`cy-validate/`](cy-validate/)** (run `sh cy-validate/run-validate.sh`).
@@ -887,26 +925,35 @@ Contributions, bug reports, and wild ideas are welcome!
   `.count()` expose the size. The remaining gap is **array-literal assignment**
   (`d.tags = ["fast", "safe"];`) — unimplemented; use JSON or the runtime
   `dict_create_array`/`dict_array_append` helpers.
-- Typed JSON binding `(T) d` / `(T)? d` covers scalars, `String`, and nested
-  class/struct members. Field types that map to a `List<T>*`, `Set<T>*`,
-  `Map<K,V>*`, or pointer-to-class are **Phase 2** — the compiler currently
+- Typed JSON binding `(T) d` / `(T)? d` covers scalars, `String`, nested
+  class/struct members, and **collection fields** (`List<T>*` / `Set<T>*` from a
+  JSON array — any class with a default ctor + `Add(T)`).  `Map<K,V>*` and
+  pointer-to-class elements (`List<User*>*`) are **Phase 3** — the compiler
   reports a clear error directing you to write that field by hand.
-- Stack value-construction works for plain classes: `Point p = Point(1, 2);` runs the constructor in place and `~Point()` at scope exit. It is the **generic collections** (`List<T>` / `Set<T>` / `Map<K,V>`) that are reference types only — instantiate them with `new` (a bare `Map<K,V> m = ...` value expression does not parse).
+- Stack value-construction works for plain classes (including those with constructor arguments): `Point p = Point(1, 2);` runs the constructor in place and `~Point()` at scope exit. It is the **generic collections** (`List<T>` / `Set<T>` / `Map<K,V>`) that are reference types only — instantiate them with `new` (a bare `Map<K,V> m = ...` value expression does not parse).
 - Exception names are resolved only at compile time. Runtime stores integer IDs only; there is no symbolic pretty-printing or `nameof`-style reflection for exceptions. The prelude ships `KeyException = 8` and `TypeException = 7` (used by the typed JSON binder); user code can extend the set with `enum { MyErr = 100 }`.
-- `List<T>.sort` / `Set<T>` and a few other methods have minor edge-case limitations documented in the headers.
+- `List<T>.Sort` / `Set<T>` and a few other methods have minor edge-case limitations documented in the headers.
+- **Generic functions** (`T Max<T>(T a, T b)`) work with call-site type inference and multi-parameter templates, but two gaps remain: (1) **self-referential signatures** — a generic function whose return type or parameter type is itself a generic class instantiated on the function's own type param (`List<T>* Sort<T>(List<T>* xs)`) does not yet parse, because the `<T>` in the signature is not resolved as a placeholder the way it is inside generic class bodies; (2) **explicit type arguments at the call site** (`Max<int>(3, 5)`) are not yet supported — use inference (`Max(3, 5)`) or cast the arguments to disambiguate. These are the blockers for writing collection-level algorithms (`Sort`/`Distinct`/`GroupBy`/`Reduce`) as free generic functions; the value-level primitives (`Max`/`Cmp`/`Eq`/`First`/`Second`) already work.
 
 ### Want-to-have features (prioritized)
 - ~~Automatic `defer delete` for `new`-bound locals, with `unowned` as the opt-out~~ **(landed)** — the static ownership analyzer in `src/ownership.c` tracks `malloc`-family and `new`-bound locals through a 5-state lattice, and `-fauto-release` synthesizes `defer free(p);` for definite leaks (see *Memory Management*). `unowned` is the opt-out at the declaration site.
 - A working `attach <expr>;` paired with a lightweight dataflow / borrow-check pass: today `attach` parses and type-checks but emits no runtime call. Once the analysis is in, `attach` will adopt an externally-owned value into the current arena and the compiler will be able to prove every owning binding is matched by exactly one of `{scope-end defer, detach, attach-into-another-scope}`.
-- **Typed JSON binding — Phase 2**: extend `(T) d` / `(T)? d` to populate
-  `List<T>*` from array dicts, then `Set<T>*` and `Map<String, V>*`. Phase 3 then
-  adds an opt-in `Bindable` marker for per-field `required` / `optional(=default)`
-  / `renamed("x")` annotations (C# `[JsonRequired]` / `[JsonPropertyName]` parity).
-  See `JSONBINDING.md` for the design.
+- ~~**Typed JSON binding — Phase 2**~~ **(landed)** — `(T) d` / `(T)? d` now
+  populates `List<T>*` (and any `Add(T)`-protocol collection, e.g. `Set<T>*`)
+  from a JSON array: allocates the collection, calls the default ctor, loops the
+  array unwrapping each element (scalar / String private-copy / nested object
+  via recursion), and calls `Add`.  The bound object owns the collection.  See
+  `cy-validate/val-024-json-binding-collections.cy`.
+- **Typed JSON binding — Phase 3**: extend collection binding to `Map<K,V>*`
+  (needs `set(K,V)` dispatch) and pointer-to-class elements (`List<User*>*` from
+  a JSON array of nested objects).  Then add an opt-in `Bindable` marker for
+  per-field `required` / `optional(=default)` / `renamed("x")` annotations
+  (C# `[JsonRequired]` / `[JsonPropertyName]` parity).
 - Richer `List<T>` / `Map<K,V>` syntactic sugar and initializer syntax (more Pythonic comprehensions, better literal support).
 - Safe / typed JSON parsing helpers that return `Result<T, ParseError>` or throw on failure (beyond the current `asDict()` which can produce a null-ish dict on bad input).
 - ~~Lightweight SQLite wrapper (`include/sqlite.h`) with automatic binding of `dict` rows and `List<dict>` result sets~~ **(landed)** — `Sqlite.open()`, `db->execute(sql, fmt, ...)`, `db->query(sql, fmt, ...) -> List<dict>*`, `db->prepare()` returning a real `Statement*` with overloaded `bind(int|long|double|const char*)`, RAII `Transaction*` for commit/rollback, `db->lastInsertRowId()`, and `SqliteError` exceptions on failure. SQL `NULL` round-trips as JSON `null` so `(T) row` bind-casts behave correctly. See `examples/classy-customers-rest.cy` for a Flask-style REST controller backed by an in-memory SQLite database.
-- Simple gunicorn-style HTTP server library (lower priority than SQLite).
+- ~~Simple gunicorn-style HTTP server library~~ **(landed)** — `include/httpserve.h` plus `examples/http-serve.c` / `examples/classy-http-app.c` implement a shared `Request`/`Response` server with routing helpers; the two TUs link into one program (the driver enables MIR func-redef for ODR-style inline linkage across the boundary).
+- **Generic function improvements**: (1) self-referential signatures (`List<T>* Sort<T>(List<T>* xs)`) — extend the placeholder-resolution path already used by generic class bodies to function signatures, unlocking collection-level algorithms; (2) explicit type arguments at the call site (`Max<int>(3, 5)`) — parse-time detection with check-time materialization, mirroring the inference path. These two close the gap between value-level generic primitives and the sort/map/reduce/hash/equality utilities the foundation is meant to enable.
 - Optional pretty-printing / symbolic names for user-defined exceptions at debug time.
 
 ## Linking Shared Libraries (`-l` / `-L`)

@@ -4320,6 +4320,43 @@ typedef struct {
 
 DEF_VARR (generic_crossref_t);
 
+/* Generic function template registry.
+
+   A generic function is declared like:
+
+       T Max<T>(T a, T b) { return a > b ? a : b; }
+
+   The template's N_FUNC_DEF is stored verbatim (with type-parameter N_ID
+   placeholders like "T" in its specs, parameter types, and body).  At a call
+   site `Max(3, 5)`, the checker infers T=int from the argument types,
+   deep-copies the template with specialize_node (substituting T -> int),
+   renames the function to a mangled specialization name
+   (e.g. "__genfn_Max_int"), and injects the specialization into the module
+   so it is checked and generated like any other function.  Subsequent calls
+   with the same inferred type arguments reuse the cached specialization.
+
+   This mirrors the generic-class machinery (generic_tmpl_t /
+   generic_spec_t / specialize_node / pending_lambdas) and reuses the same
+   specialize_node deep-copy + substitution walker. */
+typedef struct {
+  const char *name;           /* original function name, e.g. "Max" */
+  node_t func_node;          /* N_FUNC_DEF template (unchecked, with T placeholders) */
+  int n_type_params;          /* number of type parameters */
+  const char *type_params[4]; /* parameter names: ["T", ...] */
+} generic_fn_tmpl_t;
+
+DEF_VARR (generic_fn_tmpl_t);
+
+/* Specialization cache for generic functions: tracks which Max<int>,
+   Max<String>, etc. have been materialized so repeated call sites reuse the
+   same mangled function instead of re-instantiating. */
+typedef struct {
+  const char *orig_name;  /* "Max" */
+  const char *spec_name;  /* "__genfn_Max_int" */
+} generic_fn_spec_t;
+
+DEF_VARR (generic_fn_spec_t);
+
 /* Interface registry (Phase 1): a named, STRUCTURAL method-set contract.
    Recording the signatures by name lets later phases ask "does class C satisfy
    interface I?" structurally — the same duck-typing the compiler already does
@@ -4344,6 +4381,8 @@ struct parse_ctx {
   VARR (generic_spec_t) * generic_specs;     /* created specializations (dedup cache) */
   VARR (generic_crossref_t) * generic_crossrefs; /* pending cross-generic refs */
   VARR (iface_t) * interfaces;               /* registered interface contracts */
+  VARR (generic_fn_tmpl_t) * generic_fn_templates; /* registered generic function templates */
+  VARR (generic_fn_spec_t) * generic_fn_specs;     /* generic function specialization cache */
 };
 
 #define record_level parse_ctx->record_level
@@ -4357,6 +4396,8 @@ struct parse_ctx {
 #define generic_specs parse_ctx->generic_specs
 #define generic_crossrefs parse_ctx->generic_crossrefs
 #define interfaces parse_ctx->interfaces
+#define generic_fn_templates parse_ctx->generic_fn_templates
+#define generic_fn_specs parse_ctx->generic_fn_specs
 
 static struct node err_struct;
 static const node_t err_node = &err_struct;
@@ -5139,6 +5180,136 @@ static node_t parse_generic_instantiation (c2m_ctx_t c2m_ctx,
   return get_or_create_specialization (c2m_ctx, base_name, n_args, type_args, pos);
 }
 
+/* ─────────────────── Generic function helpers ───────────────────────── */
+
+/* Forward declarations: defined later (in the check phase).  The call-site
+   resolver needs them to materialize a freshly-instantiated specialization. */
+static void materialize_pending_specs (c2m_ctx_t c2m_ctx, size_t mark);
+
+/* Returns 1 if `name` is a registered generic function template. */
+static int is_generic_fn_p (c2m_ctx_t c2m_ctx, const char *name) {
+  if (c2m_ctx->parse_ctx == NULL) return 0;
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  VARR (generic_fn_tmpl_t) *gt = generic_fn_templates;
+  if (gt == NULL) return 0;
+  for (size_t i = 0; i < VARR_LENGTH (generic_fn_tmpl_t, gt); i++)
+    if (strcmp (VARR_GET (generic_fn_tmpl_t, gt, i).name, name) == 0) return 1;
+  return 0;
+}
+
+/* Returns a pointer to the generic function template for `name`, or NULL. */
+static generic_fn_tmpl_t *get_generic_fn_template (c2m_ctx_t c2m_ctx, const char *name) {
+  if (c2m_ctx->parse_ctx == NULL) return NULL;
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  VARR (generic_fn_tmpl_t) *gt = generic_fn_templates;
+  if (gt == NULL) return NULL;
+  for (size_t i = 0; i < VARR_LENGTH (generic_fn_tmpl_t, gt); i++) {
+    generic_fn_tmpl_t *t = &VARR_ADDR (generic_fn_tmpl_t, gt)[i];
+    if (strcmp (t->name, name) == 0) return t;
+  }
+  return NULL;
+}
+
+/* Build a mangled specialization name for a generic function, e.g.
+   Max + int -> "__genfn_Max_int".  Reuses the same arg-name mapping as
+   mangle_generic_name so the spelling of primitive/class args is consistent
+   across generic classes and functions. */
+static const char *mangle_generic_fn_name (c2m_ctx_t c2m_ctx,
+                                           const char *base_name,
+                                           int n_args, node_t *args) {
+  VARR_TRUNC (char, temp_string, 0);
+  add_to_temp_string (c2m_ctx, "__genfn_");
+  add_to_temp_string (c2m_ctx, base_name);
+  for (int i = 0; i < n_args; i++) {
+    add_to_temp_string (c2m_ctx, "_");
+    node_t a = args[i];
+    int ptr_depth = 0;
+    while (a->code == N_POINTER) { ptr_depth++; a = NL_HEAD (a->u.ops); }
+    const char *arg_name;
+    switch (a->code) {
+    case N_STRING:   arg_name = "String"; break;
+    case N_INT:      arg_name = "int"; break;
+    case N_DOUBLE:   arg_name = "double"; break;
+    case N_FLOAT:    arg_name = "float"; break;
+    case N_CHAR:     arg_name = "char"; break;
+    case N_LONG:     arg_name = "long"; break;
+    case N_SHORT:    arg_name = "short"; break;
+    case N_UNSIGNED: arg_name = "unsigned"; break;
+    case N_VOID:     arg_name = "void"; break;
+    case N_DICT:     arg_name = "dict"; break;
+    case N_BOOL:     arg_name = "bool"; break;
+    case N_ID:       arg_name = a->u.s.s; break;
+    default:         arg_name = "T"; break;
+    }
+    add_to_temp_string (c2m_ctx, arg_name);
+    for (int p = 0; p < ptr_depth; p++) add_to_temp_string (c2m_ctx, "P");
+  }
+  return uniq_cstr (c2m_ctx, VARR_ADDR (char, temp_string)).s;
+}
+
+/* Get or create the specialization of generic function `base_name` with the
+   given (already-inferred) type args.  Returns an N_ID for the mangled
+   specialization name.  Pushes the specialized N_FUNC_DEF onto pending_lambdas
+   if it's new; the caller is responsible for draining via
+   materialize_pending_specs so the specialization is checked and injected
+   into the module before the call site is fully resolved. */
+static node_t get_or_create_generic_fn_specialization (c2m_ctx_t c2m_ctx,
+                                                       const char *base_name,
+                                                       int n_args, node_t *args,
+                                                       pos_t pos) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+
+  generic_fn_tmpl_t *tmpl = get_generic_fn_template (c2m_ctx, base_name);
+  if (tmpl == NULL) {
+    error (c2m_ctx, pos, "'%s' is not a generic function", base_name);
+    return build_id (c2m_ctx, base_name, pos);
+  }
+  if (n_args != tmpl->n_type_params) {
+    error (c2m_ctx, pos,
+           "generic function '%s' expects %d type argument(s), got %d",
+           base_name, tmpl->n_type_params, n_args);
+    return build_id (c2m_ctx, base_name, pos);
+  }
+  if (tmpl->func_node == NULL) {
+    error (c2m_ctx, pos,
+           "cannot instantiate generic function '%s': its definition failed to parse",
+           base_name);
+    return build_id (c2m_ctx, base_name, pos);
+  }
+
+  const char *spec_name = mangle_generic_fn_name (c2m_ctx, base_name, n_args, args);
+
+  /* Check cache: already created? */
+  for (size_t i = 0; i < VARR_LENGTH (generic_fn_spec_t, generic_fn_specs); i++) {
+    if (strcmp (VARR_GET (generic_fn_spec_t, generic_fn_specs, i).spec_name, spec_name) == 0)
+      return build_id (c2m_ctx, spec_name, pos);
+  }
+
+  /* Deep-copy the template N_FUNC_DEF with type substitution.  specialize_node
+     also renames the function name (orig_name -> spec_name) and any
+     __ctor_/__dtor_ references (none for a free function).  The function name
+     N_ID inside the declarator matches orig_name and is rewritten to spec_name. */
+  node_t spec_fn = specialize_node (c2m_ctx, tmpl->func_node,
+                                    base_name, spec_name,
+                                    tmpl->n_type_params, tmpl->type_params, args);
+  if (spec_fn == NULL) {
+    error (c2m_ctx, pos, "cannot instantiate generic function '%s'", base_name);
+    return build_id (c2m_ctx, base_name, pos);
+  }
+
+  /* Record in specialization cache */
+  generic_fn_spec_t gs;
+  gs.orig_name = base_name;
+  gs.spec_name = spec_name;
+  VARR_PUSH (generic_fn_spec_t, generic_fn_specs, gs);
+
+  /* Inject before the containing top-level item (materialized by the caller
+     via materialize_pending_specs, which calls check_lambda_func_def on it). */
+  VARR_PUSH (node_t, pending_lambdas, spec_fn);
+
+  return build_id (c2m_ctx, spec_name, pos);
+}
+
 /* ─────────────────────────── Generics helpers end ─────────────────────── */
 
 D (compound_stmt);
@@ -5377,6 +5548,15 @@ D (primary_expr) {
     }
     record_stop (c2m_ctx, g_mark, TRUE); /* not Name<...>: rewind */
   }
+
+  /* Explicit type arguments on a generic function call (Max<int>(3, 5)) are
+     not yet supported at the call site — type inference (Max(3, 5)) handles
+     the common case.  The parse-time detection of `Name<` for generic classes
+     above does not fire for generic functions because materializing a
+     specialization at parse time would not be checked before the call site
+     (the check phase processes module items in order, and the specialization
+     would be injected after the calling item).  Inference at check time avoids
+     this by materializing in-place via materialize_pending_specs. */
 
   	if (MN (T_ID, r) || MN (T_NUMBER, r) || MN (T_CH, r) || MN (T_STR, r)) {
   	    return r;
@@ -6812,6 +6992,54 @@ D (direct_declarator) {
 
   if (MN (T_ID, r)) {
     res = new_node2 (c2m_ctx, N_DECL, r, new_node (c2m_ctx, N_LIST));
+    /* Generic function template declarator:  Name<T,...>(params) { ... }
+       Detect `<` after the function name and parse a comma-separated list of
+       type-parameter identifiers, requiring a matching `>` followed by `(`
+       (the parameter list of a function).  The clause is communicated to
+       transl_unit via the parse_ctx side channel (n_func_type_params /
+       func_type_params) so the N_FUNC_DEF can be registered as a template.
+       Speculative: if the shape doesn't match, rewind and treat `<` as an
+       ordinary token (e.g. a comparison in an expression-like initializer). */
+    if (C (T_CMP) && curr_token->node_code == N_LT) {
+      size_t g_mark = record_start (c2m_ctx);
+      pos_t g_pos = curr_token->pos;
+      int n_tp = 0;
+      const char *tps[4] = {NULL, NULL, NULL, NULL};
+      M (T_CMP); /* consume '<' */
+      int ok = 1;
+      do {
+        node_t tp_id;
+        if (!MN (T_ID, tp_id)) { ok = 0; break; }
+        if (n_tp < 4) {
+          tps[n_tp++] = tp_id->u.s.s;
+          /* Register as a temporary typedef so the function signature and body
+             can reference the type parameter by name. */
+          tpname_add (c2m_ctx, tp_id, curr_scope, TRUE);
+        }
+      } while (M (',') && n_tp < 4);
+      if (ok && C (T_CMP) && curr_token->node_code == N_GT) {
+        M (T_CMP); /* consume '>' */
+        if (C ('(')) {
+          /* Commit: this is a generic function declarator.  Stash the type
+             params on the N_DECL node's attr so transl_unit can recover them
+             after the parameter-list parse (which re-enters direct_declarator
+             for each parameter and would clobber a parse_ctx side channel). */
+          record_stop (c2m_ctx, g_mark, FALSE);
+          /* Allocate a small carrier struct in reg-memory so it survives until
+             transl_unit reads it.  Layout: { int n; const char *tps[4]; }. */
+          int *carrier = reg_malloc (c2m_ctx, sizeof (int) + 4 * sizeof (const char *));
+          carrier[0] = n_tp;
+          const char **carr_tps = (const char **) (carrier + 1);
+          for (int i = 0; i < 4; i++) carr_tps[i] = tps[i];
+          res->attr = carrier;
+          (void) g_pos;
+        } else {
+          record_stop (c2m_ctx, g_mark, TRUE); /* rewind */
+        }
+      } else {
+        record_stop (c2m_ctx, g_mark, TRUE); /* rewind */
+      }
+    }
   } else if (M ('(')) {
     P (declarator);
     res = r;
@@ -8188,6 +8416,20 @@ D (transl_unit) {
       ds = r;
       PE (declarator, err);
       d = r;
+      /* Recover the generic-function `<T,...>` clause (if any) stashed on the
+         N_DECL node's attr by direct_declarator.  Using a node-carried carrier
+         instead of a parse_ctx side channel survives the parameter-list parse,
+         which re-enters direct_declarator for each parameter.  NULL/0 means this
+         is an ordinary function. */
+      int fn_n_tp = 0;
+      const char *fn_tps[4] = {NULL, NULL, NULL, NULL};
+      if (d->attr != NULL) {
+        int *carrier = (int *) d->attr;
+        fn_n_tp = carrier[0];
+        const char **carr_tps = (const char **) (carrier + 1);
+        for (int i = 0; i < 4; i++) fn_tps[i] = carr_tps[i];
+        d->attr = NULL; /* clear the carrier before check sets the real attr */
+      }
       dl = new_node (c2m_ctx, N_LIST);
       d->attr = curr_scope;
       curr_scope = d;
@@ -8214,6 +8456,23 @@ D (transl_unit) {
       P (compound_stmt);
       r = new_pos_node4 (c2m_ctx, N_FUNC_DEF, POS (d), ds, d, dl, r);
       curr_scope = d->attr;
+      /* Generic function template: register the N_FUNC_DEF verbatim and mark it
+         with the sentinel attr so check/gen skip it (only its monomorphized
+         specializations are real functions).  Mirrors the N_CLASS template
+         handling above. */
+      if (fn_n_tp > 0) {
+        node_t fn_id = NL_HEAD (d->u.ops); /* N_DECL's id(0) */
+        const char *fn_name = (fn_id != NULL && fn_id->code == N_ID) ? fn_id->u.s.s : NULL;
+        if (fn_name != NULL) {
+          generic_fn_tmpl_t tmpl;
+          tmpl.name = fn_name;
+          tmpl.func_node = r;
+          tmpl.n_type_params = fn_n_tp;
+          for (int i = 0; i < 4; i++) tmpl.type_params[i] = fn_tps[i];
+          VARR_PUSH (generic_fn_tmpl_t, generic_fn_templates, tmpl);
+          r->attr = (void *)((intptr_t)-1); /* sentinel: template, not a real function */
+        }
+      }
     }
     /* Inject any lambdas defined while parsing this top-level item (they must
        precede the item in the module so their MIR functions are generated first). */
@@ -8318,6 +8577,8 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (generic_spec_t, generic_specs, alloc, 8);
   VARR_CREATE (generic_crossref_t, generic_crossrefs, alloc, 4);
   VARR_CREATE (iface_t, interfaces, alloc, 4);
+  VARR_CREATE (generic_fn_tmpl_t, generic_fn_templates, alloc, 4);
+  VARR_CREATE (generic_fn_spec_t, generic_fn_specs, alloc, 8);
 }
 
 /* ClassyC exception prelude — injected into every translation unit so that
@@ -8392,11 +8653,70 @@ static void pre_register_class_tpnames (c2m_ctx_t c2m_ctx) {
   }
 }
 
+/* Pre-scan for generic function templates:  T Name<T, U>(params) { ... }
+   At file scope, detect the shape  ID '<' ID (',' ID)* '>' '('  and pre-register
+   each type-parameter identifier as a tpname, so the return type and parameter
+   types (which mention T before the '<' clause is parsed) resolve.
+
+   Mirrors pre_register_class_tpnames.  Conservative: only fires at brace_depth
+   0 (file scope) and only when the full `<...>(` shape matches, so an ordinary
+   comparison `a < b` at file scope (rare, and not followed by `> (`) is left
+   alone.  tpname_add is idempotent. */
+static void pre_register_generic_fn_tpnames (c2m_ctx_t c2m_ctx) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  size_t n = VARR_LENGTH (token_t, recorded_tokens);
+  int brace_depth = 0;
+
+  if (n < 4) return;
+  for (size_t i = 0; i < n; i++) {
+    token_t t = VARR_GET (token_t, recorded_tokens, i);
+    int c = t->code;
+    if (c == '{') { brace_depth++; continue; }
+    if (c == '}') { if (brace_depth > 0) brace_depth--; continue; }
+    if (brace_depth != 0) continue;
+    /* Need: ID '<' ... '>' '('  with the '<' immediately after an ID. */
+    if (c != T_CMP || t->node_code != N_LT) continue;
+    if (i == 0) continue;
+    token_t prev = VARR_GET (token_t, recorded_tokens, i - 1);
+    if (prev->code != T_ID || prev->node == NULL) continue;
+    /* Walk the type-param list: ID (',' ID)* '>' */
+    size_t j = i + 1;
+    if (j >= n) continue;
+    token_t tt = VARR_GET (token_t, recorded_tokens, j);
+    if (tt->code != T_ID || tt->node == NULL) continue;
+    /* Collect param ids until '>' */
+    size_t params[4];
+    int np = 0;
+    for (;;) {
+      tt = VARR_GET (token_t, recorded_tokens, j);
+      if (tt->code != T_ID || tt->node == NULL) break;
+      if (np < 4) params[np++] = j;
+      j++;
+      if (j >= n) { np = 0; break; }
+      token_t nx = VARR_GET (token_t, recorded_tokens, j);
+      if (nx->code == ',') { j++; continue; }
+      if (nx->code == T_CMP && nx->node_code == N_GT) { j++; break; }
+      np = 0; break;
+    }
+    if (np == 0) continue;
+    /* Require '(' immediately after '>' */
+    if (j >= n) continue;
+    token_t after = VARR_GET (token_t, recorded_tokens, j);
+    if (after->code != '(') continue;
+    /* Register each type-param id as a tpname at file scope. */
+    for (int k = 0; k < np; k++) {
+      token_t pt = VARR_GET (token_t, recorded_tokens, params[k]);
+      tpname_add (c2m_ctx, pt->node, curr_scope, TRUE);
+    }
+  }
+}
+
 static node_t parse (c2m_ctx_t c2m_ctx) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
 
   next_token_index = 0;
   pre_register_class_tpnames (c2m_ctx);
+  pre_register_generic_fn_tpnames (c2m_ctx);
   return transl_unit (c2m_ctx, FALSE);
 }
 
@@ -8417,6 +8737,10 @@ static void parse_finish (c2m_ctx_t c2m_ctx) {
       VARR_DESTROY (generic_spec_t, generic_specs);
     if (generic_crossrefs != NULL)
       VARR_DESTROY (generic_crossref_t, generic_crossrefs);
+    if (generic_fn_templates != NULL)
+      VARR_DESTROY (generic_fn_tmpl_t, generic_fn_templates);
+    if (generic_fn_specs != NULL)
+      VARR_DESTROY (generic_fn_spec_t, generic_fn_specs);
   }
   finish_streams (c2m_ctx);
   reg_free (c2m_ctx, c2m_ctx->parse_ctx);
@@ -15124,6 +15448,11 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         } else if ((t2->mode == TM_PTR && null_const_p (e3, t3))
                    || (t3->mode == TM_PTR && null_const_p (e2, t2))) {
           e->type = null_const_p (e2, t2) ? t3 : t2;
+        } else if (builtin_string_type_p (t2) && builtin_string_type_p (t3)) {
+          /* String ? String : String  — String is a pointer-width basic type;
+             modelled like the pointer case below so generic functions like
+             Max<String> can use `?:` over String operands. */
+          *e->type = *t2;
         } else if (t2->mode != TM_PTR || t3->mode != TM_PTR) {
           error (c2m_ctx, POS (r), "incompatible types in true and false parts of cond-expression");
           break;
@@ -15491,6 +15820,110 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           if ((cdef == NULL || cdef->code == N_MEMBER || cdef->code == N_FUNC_DEF)
               && try_rewrite_implicit_this(c2m_ctx, op1)) {
             /* op1 is now N_DEREF_FIELD(this, m); the method-call path handles it. */
+          }
+        }
+        /* Generic function call-site inference:  Max(3, 5)  ->  Max<int>(3, 5).
+           When the callee is an unresolved N_ID that names a registered generic
+           function template, infer the type arguments from the call's argument
+           types, materialize (or reuse) the specialization, and rewrite the
+           callee N_ID in place to the mangled specialization name.  The call
+           then falls through to ordinary function-call resolution.
+
+           Only fires when no concrete function/decl with this name is in scope
+           (so a real function shadows a same-named template, and a template
+           name used as a value is left alone). */
+        if (op1->code == N_ID && find_def(c2m_ctx, S_REGULAR, op1, curr_scope, NULL) == NULL
+            && is_generic_fn_p (c2m_ctx, op1->u.s.s)) {
+          parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+          generic_fn_tmpl_t *gtmpl = get_generic_fn_template (c2m_ctx, op1->u.s.s);
+          arg_list = NL_NEXT (op1);
+          /* Pre-check the arguments so their types are known for inference.
+             Guard with attr==NULL so a re-check (e.g. dict-init walk) doesn't
+             re-check and double-prepend. */
+          for (arg = NL_HEAD (arg_list->u.ops); arg != NULL; arg = NL_NEXT (arg))
+            if (arg->attr == NULL) check (c2m_ctx, arg, r);
+          /* Infer each type parameter by scanning the template's parameter list
+             in order and picking the first parameter whose declared type is
+             exactly that type parameter (T).  For `T Max<T>(T a, T b)`, both
+             params are T, so the first argument's type fixes T.  Multi-param
+             templates (e.g. `Pair<K,V>(K k, V v)`) infer K from arg 0 and V
+             from arg 1.  If a parameter's type is not a bare type parameter,
+             it contributes no inference. */
+          node_t inferred[4] = {NULL, NULL, NULL, NULL};
+          int n_inferred = 0;
+          int infer_ok = 1;
+          if (gtmpl != NULL && gtmpl->func_node != NULL) {
+            node_t tdecl = FUNC_DEF_DECL (gtmpl->func_node);
+            node_t tdecl_list = DECL_LIST (tdecl);
+            node_t tfunc = (tdecl_list != NULL) ? NL_HEAD (tdecl_list->u.ops) : NULL;
+            /* tfunc is the first (and usually only) N_FUNC in the decoration list. */
+            while (tfunc != NULL && tfunc->code != N_FUNC)
+              tfunc = NL_NEXT (tfunc);
+            if (tfunc != NULL) {
+              node_t tparams = NL_HEAD (tfunc->u.ops); /* N_LIST of N_SPEC_DECL/N_ID/N_TYPE */
+              node_t tp = NL_HEAD (tparams->u.ops);
+              node_t ca = NL_HEAD (arg_list->u.ops);
+              for (; tp != NULL && ca != NULL; tp = NL_NEXT (tp), ca = NL_NEXT (ca)) {
+                /* Resolve the parameter's declared type-spec node: for N_SPEC_DECL
+                   it's the (shared) spec list at op 0; for N_TYPE it's the type
+                   list at op 0.  We only handle the bare-T case: a single N_ID
+                   child that names one of the template's type parameters. */
+                node_t specs = NULL;
+                if (tp->code == N_SPEC_DECL) specs = NL_HEAD (tp->u.ops);
+                else if (tp->code == N_TYPE) specs = NL_HEAD (tp->u.ops);
+                if (specs == NULL) continue;
+                /* Unwrap N_SHARE. */
+                if (specs->code == N_SHARE) specs = NL_HEAD (specs->u.ops);
+                if (specs->code != N_LIST) continue;
+                node_t only = NL_HEAD (specs->u.ops);
+                if (only == NULL || only->code != N_ID || NL_NEXT (only) != NULL) continue;
+                /* Is this N_ID one of the template's type parameters? */
+                int pi = -1;
+                for (int i = 0; i < gtmpl->n_type_params; i++)
+                  if (gtmpl->type_params[i] != NULL
+                      && strcmp (only->u.s.s, gtmpl->type_params[i]) == 0) { pi = i; break; }
+                if (pi < 0) continue;
+                /* Already inferred this parameter from an earlier arg? Keep
+                   the first binding (later args must be compatible, checked
+                   by the normal assignment-type check after rewrite). */
+                if (inferred[pi] != NULL) continue;
+                struct expr *ae = ca->attr;
+                if (ae == NULL || ae->type == NULL) { infer_ok = 0; break; }
+                node_t targ = build_seq_type_arg (c2m_ctx, ae->type, POS (op1));
+                if (targ == NULL) { infer_ok = 0; break; }
+                inferred[pi] = targ;
+                if (pi + 1 > n_inferred) n_inferred = pi + 1;
+              }
+            }
+          }
+          if (gtmpl != NULL) {
+            /* Fill any unfilled slots (e.g. a type param not used in any
+               parameter signature) with a fallback int arg so mangle/substitute
+               still produce a valid name.  This is a best-effort fallback;
+               correct inference requires the parameter to appear in the
+               signature. */
+            for (int i = 0; i < gtmpl->n_type_params; i++) {
+              if (inferred[i] == NULL)
+                inferred[i] = new_pos_node (c2m_ctx, N_INT, POS (op1));
+              if (i + 1 > n_inferred) n_inferred = i + 1;
+            }
+          }
+          if (gtmpl != NULL && infer_ok && n_inferred == gtmpl->n_type_params) {
+            size_t pend_mark = VARR_LENGTH (node_t, pending_lambdas);
+            node_t spec_id = get_or_create_generic_fn_specialization (
+              c2m_ctx, op1->u.s.s, n_inferred, inferred, POS (op1));
+            materialize_pending_specs (c2m_ctx, pend_mark);
+            if (spec_id != NULL && spec_id->code == N_ID) {
+              /* Rewrite the callee N_ID in place so the normal call-resolution
+                 path below resolves the specialization as a regular function. */
+              op1->u.s = spec_id->u.s;
+              /* Clear any stale attr so check(op1) re-resolves the new name. */
+              op1->attr = NULL;
+            }
+          } else {
+            error (c2m_ctx, POS (op1),
+                   "cannot infer type arguments for generic function '%s'",
+                   op1->u.s.s);
           }
         }
         if (op1->code == N_ID && find_def(c2m_ctx, S_REGULAR, op1, curr_scope, NULL) == NULL) {
@@ -16513,6 +16946,10 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
     break;
   }
   case N_FUNC_DEF: {
+    /* Skip generic function templates (sentinel attr): only their
+       monomorphized specializations are real functions, checked via
+       check_lambda_func_def when instantiated at a call site. */
+    if (r->attr == (void *)((intptr_t)-1)) break;
     node_t specs = FUNC_DEF_SPECS (r);
     node_t declarator = FUNC_DEF_DECL (r);
     node_t declarations = FUNC_DEF_DECLS (r);
@@ -20310,6 +20747,177 @@ static void gen_dict_bind_throw_key_exception (c2m_ctx_t c2m_ctx,
   gen_exception_throw_call (c2m_ctx, id_op, msg_op);
 }
 
+/* Phase 2: bind a dict array (DICT_ARRAY DictValue*) into a heap-allocated
+   collection (List<T>* / Set<T>* / any class with a default ctor + Add(T)).
+
+   CLS_PTR_TYPE is the field's declared type (TM_PTR -> TM_CLASS).  VAL_DV is
+   the DictValue* for the field (already fetched from the parent dict object).
+   Returns an op holding the new collection's pointer, ready to store into the
+   field slot.
+
+   Lowering:
+     obj = malloc(sizeof(C)); memset(obj, 0, sizeof(C));
+     C::C(obj);                       // default ctor (zero user params)
+     n = dict_iter_count(val_dv);
+     for (i = 0; i < n; i++) {
+         el_dv = dict_value_at(val_dv, i);
+         el    = unwrap(el_dv);        // scalar/String payload, or recurse for nested
+         obj->Add(el);
+     }
+
+   The element type T is recovered from Add's first user parameter, so this
+   works for any Add-protocol collection, not just List<T>.  Nested class
+   elements recurse through gen_dict_bind_into; String elements take a private
+   copy (c2m_str_own) so the bound object owns them, mirroring the String-field
+   path.  Pointer-to-class elements (T = C*) are Phase 3. */
+/* Forward declarations: gen_dict_bind_into (defined just below) recurses into
+   nested class/struct elements; gen_class_method_call is defined later in the
+   gen section. */
+static void gen_dict_bind_into (c2m_ctx_t c2m_ctx, struct type *cls_type,
+                                op_t src_dv_op, op_t dst_addr_op,
+                                int lenient, pos_t pos);
+static op_t gen_class_method_call (c2m_ctx_t c2m_ctx, node_t func_def, struct type *this_type,
+                                   op_t this_op, op_t *args, int n_args);
+static op_t gen_dict_bind_collection_field (c2m_ctx_t c2m_ctx, struct type *cls_ptr_type,
+                                            op_t val_dv, pos_t pos) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  struct type *cls_type = cls_ptr_type->u.ptr_type;
+  node_t class_tag = cls_type->u.tag_type;
+  const char *cname = class_type_name (cls_type);
+
+  /* Find Add(T) to get the element type and the method to call. */
+  node_t add_def = find_class_protocol_method (c2m_ctx, class_tag, "Add", 1, pos);
+  if (add_def == NULL) {
+    error (c2m_ctx, pos,
+           "dict->collection bind: '%s' has no Add(T) method (Phase 2 needs the Add protocol)",
+           cname != NULL ? cname : "<class>");
+    return new_op (NULL, MIR_new_int_op (ctx, 0));
+  }
+  decl_t add_decl = add_def->attr;
+  struct func_type *add_ft = add_decl->decl_spec.type->u.func_type;
+  /* Add's param list: [this, T item].  Skip 'this' to reach the element param. */
+  node_t add_param = NL_HEAD (add_ft->param_list->u.ops);
+  if (add_param != NULL) add_param = NL_NEXT (add_param); /* skip this */
+  if (add_param == NULL) {
+    error (c2m_ctx, pos, "dict->collection bind: '%s' Add has no element parameter", cname != NULL ? cname : "<class>");
+    return new_op (NULL, MIR_new_int_op (ctx, 0));
+  }
+  struct decl_spec *el_ds = get_param_decl_spec (add_param);
+  struct type *el_type = el_ds->type;
+
+  /* Find the default ctor (zero user params).  List<T> always has one; a
+     user collection without a default ctor is a Phase-2 error (we can't
+     construct it). */
+  node_t ctor_def = NULL;
+  if (cname != NULL) {
+    char ctor_name[320];
+    symbol_t ctor_sym;
+    snprintf (ctor_name, sizeof (ctor_name), "__ctor_%s", cname);
+    node_t ctor_id = build_id (c2m_ctx, ctor_name, pos);
+    if (find_overload_sym (c2m_ctx, ctor_id, class_tag, &ctor_sym)) {
+      for (size_t ci = 0; ci < VARR_LENGTH (node_t, ctor_sym.defs); ci++) {
+        node_t cand = VARR_GET (node_t, ctor_sym.defs, ci);
+        decl_t cd;
+        struct func_type *cft;
+        node_t cp;
+        if (cand == NULL || cand->code != N_FUNC_DEF) continue;
+        cd = cand->attr;
+        if (cd == NULL || cd->decl_spec.type == NULL || cd->decl_spec.type->mode != TM_FUNC) continue;
+        if (cd->decl_spec.static_p) continue;
+        cft = cd->decl_spec.type->u.func_type;
+        if (cft->class_scope != class_tag) continue;
+        cp = NL_HEAD (cft->param_list->u.ops);
+        if (cp != NULL) cp = NL_NEXT (cp); /* skip this */
+        if (cp == NULL) { ctor_def = cand; break; } /* no user params */
+      }
+    }
+  }
+  if (ctor_def == NULL) {
+    error (c2m_ctx, pos,
+           "dict->collection bind: '%s' has no default constructor (Phase 2 needs a zero-arg ctor)",
+           cname != NULL ? cname : "<class>");
+    return new_op (NULL, MIR_new_int_op (ctx, 0));
+  }
+
+  /* 1. Allocate + zero-fill the collection object. */
+  mir_size_t csize = type_size (c2m_ctx, cls_type);
+  op_t obj = gen_heap_alloc (c2m_ctx, csize == 0 ? 1 : csize);
+  if (csize > 0) gen_memset (c2m_ctx, 0, obj.mir_op.u.reg, csize);
+
+  /* 2. Call the default ctor: obj.__ctor_C(). */
+  gen_class_method_call (c2m_ctx, ctor_def, cls_ptr_type, obj, NULL, 0);
+
+  /* 3. Loop over the dict array, unwrapping each element and calling Add. */
+  op_t val_reg = force_reg (c2m_ctx, val_dv, MIR_T_I64);
+  op_t n_reg = gen_dict_iter_count (c2m_ctx, val_reg.mir_op);
+  n_reg = force_reg (c2m_ctx, n_reg, MIR_T_I64);
+  op_t i_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+  emit2 (c2m_ctx, MIR_MOV, i_reg.mir_op, MIR_new_int_op (ctx, 0));
+  MIR_label_t cond_label = MIR_new_label (ctx);
+  MIR_label_t body_label = MIR_new_label (ctx);
+  MIR_label_t end_label  = MIR_new_label (ctx);
+  emit_label_insn_opt (c2m_ctx, cond_label);
+  emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (ctx, end_label), i_reg.mir_op, n_reg.mir_op);
+  emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, body_label));
+  emit_label_insn_opt (c2m_ctx, body_label);
+  {
+    /* el_dv = dict_value_at(val_reg, i_reg) */
+    op_t el_dv = gen_dict_value_at (c2m_ctx, val_reg.mir_op, i_reg.mir_op);
+    el_dv = force_reg (c2m_ctx, el_dv, MIR_T_I64);
+    /* Convert the element DictValue* to T, mirroring the field dispatch in
+       gen_dict_bind_into. */
+    op_t el_arg;
+    if (el_type->mode == TM_CLASS || el_type->mode == TM_STRUCT) {
+      /* Nested object: alloca + recurse gen_dict_bind_into, then pass by value.
+         Add(T) for a by-value T takes the value, so build it in a temp and load. */
+      mir_size_t esz = type_size (c2m_ctx, el_type);
+      op_t el_addr = get_new_temp (c2m_ctx, MIR_T_I64);
+      MIR_append_insn (ctx, curr_func,
+                       MIR_new_insn (ctx, MIR_ALLOCA, el_addr.mir_op,
+                                     MIR_new_int_op (ctx, (long) esz)));
+      gen_memset (c2m_ctx, 0, el_addr.mir_op.u.reg, esz);
+      gen_dict_bind_into (c2m_ctx, el_type, el_dv, el_addr, FALSE, pos);
+      el_arg = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, el_addr.mir_op.u.reg, 0, 1));
+    } else if (builtin_string_type_p (el_type)) {
+      /* String element: take a private copy so the collection owns it. */
+      op_t unwrapped = gen_dict_unwrap (c2m_ctx, el_dv);
+      string_ensure_imports (c2m_ctx);
+      MIR_op_t own_arg = force_reg (c2m_ctx, unwrapped, MIR_T_I64).mir_op;
+      el_arg = gen_rt_call (c2m_ctx, str_own_proto, str_own_item, 1, &own_arg);
+      el_arg = force_reg (c2m_ctx, el_arg, MIR_T_I64);
+    } else if (scalar_type_p (el_type) || string_type_p (el_type)) {
+      /* Scalar / pointer element: unwrap the union payload. */
+      op_t unwrapped = gen_dict_unwrap (c2m_ctx, el_dv);
+      /* Cast the I64 payload to the element's MIR type if needed. */
+      MIR_type_t el_mir_t = get_mir_type (c2m_ctx, el_type);
+      if (el_mir_t != MIR_T_I64 && el_mir_t != MIR_T_UNDEF) {
+        op_t src = force_reg (c2m_ctx, unwrapped, MIR_T_I64);
+        op_t dst = get_new_temp (c2m_ctx, el_mir_t);
+        emit2 (c2m_ctx, tp_mov (el_mir_t), dst.mir_op, src.mir_op);
+        el_arg = dst;
+      } else {
+        el_arg = force_reg (c2m_ctx, unwrapped, MIR_T_I64);
+      }
+    } else {
+      /* Pointer-to-class element (T = C*): Phase 3.  Skip with a warning so the
+         collection still builds; the slot is left at the raw unwrapped value. */
+      warning (c2m_ctx, pos,
+               "dict->collection bind: element type of '%s' is a pointer-to-class (Phase 3); element left unwrapped",
+               cname != NULL ? cname : "<class>");
+      el_arg = gen_dict_unwrap (c2m_ctx, el_dv);
+      el_arg = force_reg (c2m_ctx, el_arg, MIR_T_I64);
+    }
+    gen_class_method_call (c2m_ctx, add_def, cls_ptr_type, obj, &el_arg, 1);
+  }
+  /* i++ and loop back to cond. */
+  emit3 (c2m_ctx, MIR_ADD, i_reg.mir_op, i_reg.mir_op, MIR_new_int_op (ctx, 1));
+  emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, cond_label));
+  emit_label_insn_opt (c2m_ctx, end_label);
+
+  return obj;
+}
+
 /* Walk CLS_TYPE's by-value members, reading each one from the source dict
    pointer SRC_DV_OP (a DictValue* in an I64 register) and writing it into the
    destination object whose base address is DST_ADDR_OP (also an I64 register).
@@ -20430,6 +21038,19 @@ static void gen_dict_bind_into (c2m_ctx_t c2m_ctx, struct type *cls_type,
       emit2 (c2m_ctx, tp_mov (mir_t),
              MIR_new_alias_mem_op (ctx, mir_t, 0, field_addr.mir_op.u.reg, 0, 1, alias, 0),
              owned.mir_op);
+    } else if (mtype->mode == TM_PTR && mtype->u.ptr_type != NULL
+               && mtype->u.ptr_type->mode == TM_CLASS) {
+      /* Phase 2: pointer-to-collection field (List<T>* / Set<T>* / any class
+         with a default ctor + Add(T)).  Build a heap collection from the dict
+         array and store its pointer into the field.  The bound object owns the
+         new collection (its destructor must `delete` it, as List<T>::~List does). */
+      op_t coll = gen_dict_bind_collection_field (c2m_ctx, mtype, val_dv, pos);
+      coll = force_reg (c2m_ctx, coll, MIR_T_I64);
+      MIR_type_t mir_t = get_mir_type (c2m_ctx, mtype);
+      MIR_alias_t alias = get_type_alias (c2m_ctx, mtype);
+      emit2 (c2m_ctx, tp_mov (mir_t),
+             MIR_new_alias_mem_op (ctx, mir_t, 0, field_addr.mir_op.u.reg, 0, 1, alias, 0),
+             coll.mir_op);
     } else if (scalar_type_p (mtype) || string_type_p (mtype)) {
       /* Unwrap the union payload (offset 8 of DictValue) and store into the
          slot.  Same path as `(T)d.x` would take for a scalar leaf.  Struct
@@ -20444,7 +21065,8 @@ static void gen_dict_bind_into (c2m_ctx_t c2m_ctx, struct type *cls_type,
     } else {
       error (c2m_ctx, pos,
              "dict->aggregate bind: unsupported field type for '%s.%s' "
-             "(Phase 1 supports scalars, String, and nested class/struct only)",
+             "(Phase 2 supports scalars, String, nested class/struct, and "
+             "pointer-to-collection fields)",
              cls_name, mname);
     }
     emit_label_insn_opt (c2m_ctx, after_field);
@@ -24488,6 +25110,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     break;
   }
   case N_FUNC_DEF: {
+    /* Skip generic function templates (sentinel attr): only their
+       monomorphized specializations are generated. */
+    if (r->attr == (void *)((intptr_t)-1)) break;
     node_t decl_specs = FUNC_DEF_SPECS (r);
     node_t declarator = FUNC_DEF_DECL (r);
     node_t decls = FUNC_DEF_DECLS (r);

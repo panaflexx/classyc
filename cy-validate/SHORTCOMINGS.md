@@ -225,16 +225,16 @@ List<int>* big2 = nums->Filter((int x) => x > 1)->Map((int x) => x * 2);
 defer delete nums; defer delete big2;
 ```
 
-### B5. Stack class instance with constructor arguments is not supported
+### B5. (FIXED) Stack class instance with constructor arguments
 ```c
-Wizard w = Wizard(5, 1, 'L');   // error: called object is not a function...
+Wizard w = Wizard(5, 1, 'L');   // now works: in-place ctor + ~Wizard() at scope exit
 ```
-Classes are reference types; there is no value-construction-with-args form.
-A default-constructed stack object (e.g. `StringPet p; p.name = ...;`) works
-only when the class has a zero-arg construction and you set fields manually.
-
-**Workaround:** allocate on the heap — `Wizard* w = new Wizard(5,1,'L'); defer
-delete w;` — which is the idiomatic form for objects with constructors.
+Stack value-construction with constructor arguments now works for plain
+classes: `Point p = Point(1, 2);` runs the constructor in place and the
+destructor at scope exit (RAII, no `new`/`delete` needed).  The **generic
+collections** (`List<T>` / `Set<T>` / `Map<K,V>`) remain reference types only —
+instantiate them with `new` (a bare `Map<K,V> m = ...` value expression does
+not parse).
 
 ---
 
@@ -285,6 +285,20 @@ Dict for-in now dispatches at runtime on the `DictType` tag:
 Runtime helpers added: `dict_is_array`, `dict_iter_count` in `dict.h`; gen
 side in `src/classyc.c` (FORIN dict branch).  Covered by
 `cy-validate/val-004-dict-arrays.cy`.
+
+### C4. (LANDED) Typed JSON binding — Phase 2 (collection fields)
+`(T) d` / `(T)? d` now populates `List<T>*` (and any `Add(T)`-protocol
+collection, e.g. `Set<T>*`) from a JSON array field.  The binder allocates the
+collection, calls its default ctor, loops the dict array unwrapping each
+element (scalar / String private-copy / nested object via recursion into
+`gen_dict_bind_into`), and calls `Add`.  The bound object owns the heap
+collection; `String` elements are private copies so the source dict can be
+freed right after the bind.  Strict `(T) d` throws `KeyException` on a missing
+array field; lenient `(T)? d` leaves it at NULL.
+
+Remaining gaps (Phase 3): `Map<K,V>*` fields (need `set(K,V)` dispatch) and
+pointer-to-class elements (`List<User*>*` from a JSON array of nested objects).
+Covered by `cy-validate/val-024-json-binding-collections.cy`.
 
 ---
 
@@ -372,3 +386,12 @@ handles in `List<Any<I>*>` **and** `Map<K, Any<I>*>` (for-in over both). See
 - Automatic String arena: returns survive (release_keeping), tight 200k-alloc
   loops stay bounded (~18 MB RSS) and correct.
 - The runtime stack-trace on faults (shows `main() [file:line]`).
+- Typed JSON binding (`(T) d` / `(T)? d`): scalars, `String`, nested class/struct,
+  and collection fields (`List<T>*` / `Set<T>*` from a JSON array, with owned
+  private copies).  Strict throws `KeyException` on missing fields; lenient
+  defaults to 0/NULL.  See `val-020` / `val-024`.
+- Generic functions (`T Max<T>(T a, T b)`): call-site type inference,
+  multi-parameter templates (`First<K,V>`), specialization cache.  See
+  `val-023`.
+- Stack value-construction with constructor arguments: `Point p = Point(1,2);`
+  runs the ctor in place and `~Point()` at scope exit (RAII).
