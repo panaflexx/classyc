@@ -44,6 +44,7 @@
 struct DictValue;  /* opaque forward decl; real def in dict.h */
 struct DictValue* dict_create_array(void);
 int dict_array_append(struct DictValue* array_val, struct DictValue* new_val);
+struct DictValue* dict_create_string(const char *s);
 
 class List<T> {
     T*  data;
@@ -347,6 +348,23 @@ class List<T> {
         struct DictValue** d = (struct DictValue**)this->data;
         for (int i = 0; i < this->length; i++) {
             dict_array_append(arr, d[i]);
+        }
+        return arr;
+    }
+
+    /* Convert List<String> to a DICT_ARRAY of DICT_STRING values.
+     * Idiomatic JSON serialization for string lists:
+     *
+     *   List<String>* parts = s.split(",");
+     *   dict out = { "items": parts->StringsToJsonArray() };
+     *   return resp_ok(out.json);
+     *
+     * The returned DictValue* is a heap-allocated array owned by whatever
+     * dict references it (or freed when that dict is deleted). */
+    struct DictValue* StringsToJsonArray() {
+        struct DictValue* arr = dict_create_array();
+        for (int i = 0; i < this->length; i++) {
+            dict_array_append(arr, dict_create_string((char*)this->data[i]));
         }
         return arr;
     }

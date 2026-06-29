@@ -15253,10 +15253,10 @@ if (base != NULL && base->code == N_ID) {
             base->attr = be;
             break;
           }
-          error (c2m_ctx, POS (r),
-                 "class %s has no static method %s",
-                 base->u.s.s, mem->u.s.s);
-          break;
+          /* Not a static method — could be a static data member (e.g.
+             Fruit.variants dict).  Fall through to the normal N_FIELD
+             handling below instead of erroring, so static data members
+             resolve via the regular member-access path. */
         } else {
           /* Generic type parameter or mangled generic specialization:
              set a void placeholder.  For type parameters, specialization
@@ -15799,10 +15799,15 @@ if (base != NULL && base->code == N_ID) {
                   }
                 }
               }
-              /* Replace the entire call expression with an integer literal */
+              /* Replace the entire call expression with an integer literal.
+                 Preserve r's op_link (sibling chain) — *r = *lit would
+                 overwrite it with lit's (NULL) links, corrupting the
+                 parent's child list and crashing gen. */
               node_t lit = new_i_node (c2m_ctx, (long) is_ptr, POS (r));
               check (c2m_ctx, lit, NULL);
+              DLIST_LINK (node_t) saved_link = r->op_link;
               *r = *lit;
+              r->op_link = saved_link;
               e = r->attr;
               break;
             }
@@ -15842,7 +15847,9 @@ if (base != NULL && base->code == N_ID) {
               node_t str_node = new_str_node (c2m_ctx, N_STR,
                                              uniq_cstr (c2m_ctx, nm), POS (r));
               check (c2m_ctx, str_node, NULL);
+              DLIST_LINK (node_t) saved_link = r->op_link;
               *r = *str_node;
+              r->op_link = saved_link;
               e = r->attr;
               break;
             }
@@ -16207,15 +16214,27 @@ if (base != NULL && base->code == N_ID) {
 	              }
 	              ret_type = &res_type;
 	              method_call_p = TRUE;
-	            } else if (obj->code == N_ID) {
-	              /* Static dispatch on a class name: ClassName.method(args).
-	                 The N_FIELD checker already resolved this to a static method
-	                 and set a void placeholder.  Here we resolve the actual
-	                 function type and check arguments (no implicit 'this'). */
-	              symbol_t csym;
-	              if (symbol_find(c2m_ctx, S_TAG, obj, NULL, &csym)
-	                  && csym.def_node != NULL && csym.def_node->code == N_CLASS) {
-	                node_t class_node = csym.def_node;
+	                    } else if (obj->code == N_ID) {
+	                      /* Static dispatch on a class name: ClassName.method(args).
+	                         The N_FIELD checker already resolved this to a static method
+	                         and set a void placeholder.  Here we resolve the actual
+	                         function type and check arguments (no implicit 'this').
+
+	                         Use find_def (which walks the scope chain from top_scope)
+	                         rather than symbol_find with scope=NULL: a generic
+	                         specialization's tag is inserted at top_scope (a non-NULL
+	                         pointer), so a NULL-scope lookup misses it.
+
+	                         Only enter this branch when obj is actually a class name
+	                         (found via S_TAG) or a mangled __generic_ specialization
+	                         name.  An N_ID that is a plain variable (e.g. `v` in
+	                         `v->render()`) must fall through to the `else` branch
+	                         below so it is handled as a method call on a value. */
+	                      node_t class_node = find_def (c2m_ctx, S_TAG, obj, top_scope, NULL);
+	                      int is_generic_spec = (strncmp(obj->u.s.s, "__generic_", 10) == 0);
+	                      if ((class_node != NULL && class_node->code == N_CLASS)
+	                          || is_generic_spec) {
+	                        if (class_node != NULL && class_node->code == N_CLASS) {
 	                node_t method_id = NL_NEXT(obj);
 	                symbol_t msym;
 	                node_t func_def = NULL;
@@ -16277,7 +16296,7 @@ if (base != NULL && base->code == N_ID) {
 	                 parameter.  In that case, just set a void return type
 	                 placeholder — the specialized body will re-check with
 	                 the real class. */
-	              else if (strncmp(obj->u.s.s, "__generic_", 10) == 0) {
+	              else {
 	                /* Generic specialization name not yet materialized.
 	                   Set a permissive return type.  The N_FIELD expr needs
 	                   a function-pointer type so gen_mir_protos doesn't assert. */
@@ -16303,7 +16322,10 @@ if (base != NULL && base->code == N_ID) {
 	                }
 	                method_call_p = TRUE;
 	              }
-	            } else {
+	                      } /* end: obj is a class name or __generic_ spec */
+	                      else goto method_call_on_value;
+	                    } else {
+	              method_call_on_value:;
 	              struct type *obj_type = ((struct expr *)obj->attr)->type;
 	              /* A bare UTF-8 string literal used as a method receiver
 	                 ("abc".lower()) is an N_STR node: dispatch the built-in String
@@ -16313,7 +16335,7 @@ if (base != NULL && base->code == N_ID) {
 	              // For N_DEREF_FIELD, dereference the pointer to get the actual type
 	              if (op1->code == N_DEREF_FIELD) {
 	                if (obj_type->mode != TM_PTR) {
-	                  error(c2m_ctx, POS(r), "dereference operator applied to non-pointer in method call");
+	                  error (c2m_ctx, POS(r), "dereference operator applied to non-pointer in method call");
 	                  break;
 	                }
 	                obj_type = obj_type->u.ptr_type;  // Get the pointed-to type
