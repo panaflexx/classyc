@@ -13,7 +13,7 @@
 
 #include <stdio.h>
 #include <string.h>
-#include "include/list.h"
+#include "list.h"
 
 int    passed = 0;
 int    failed = 0;

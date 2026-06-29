@@ -99,15 +99,9 @@
 #include <sqlite3.h>
 #include <stdarg.h>
 #include <stdio.h>
-#include "list.h"      /* List<T> — query() returns List<dict>* */
-
-/* ---- runtime dict helpers (linked via import_resolver) ---- */
-dict dict_create_object();
-dict dict_create_null();
-dict dict_create_int64(long n);
-dict dict_create_number(double n);
-dict dict_create_string(char *s);
-int  dict_object_set(dict obj, char *key, dict val);
+#include "list.h"      /* List<T> — query() returns List<dict>*; also the single
+                          source of truth for the dict_* runtime helpers below */
+#include "dict_types.h" /* DictType tag (DICT_INT64 …) for bind(int, dict) */
 
 /* ---- user-defined exception class for SQLite errors ----
    Throw with:  throw(SqliteError, "msg");
@@ -400,6 +394,74 @@ class Sqlite {
         return rows;
     }
 
+    /* Convenience: first row only, with one-shot bound params (or NULL on no
+       match).  The bound sibling of query_one(sql) — mirrors the
+       query(sql, fmt, ...) binding rules.  Builds just the first row, so it
+       does not leak the remainder of a result set. */
+    dict query_one(const char* sql, const char* fmt, ...) {
+        sqlite3_stmt* stmt = 0;
+        int rc = sqlite3_prepare_v2(this->db, sql, -1, &stmt, 0);
+        if (rc != SQLITE_OK) {
+            this->last_err = rc;
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "query_one/prepare: %s",
+                     sqlite3_errmsg(this->db));
+            if (stmt) sqlite3_finalize(stmt);
+            throw(SqliteError, buf);
+        }
+        va_list ap;
+        va_start(ap, fmt);
+        for (int i = 0; fmt[i] != 0; i++) {
+            int idx = i + 1;
+            char c = fmt[i];
+            if (c == 'i') {
+                sqlite3_bind_int(stmt, idx, va_arg(ap, int));
+            } else if (c == 'l') {
+                sqlite3_bind_int64(stmt, idx,
+                                   (sqlite3_int64)va_arg(ap, long));
+            } else if (c == 'd' || c == 'f') {
+                sqlite3_bind_double(stmt, idx, va_arg(ap, double));
+            } else if (c == 's') {
+                sqlite3_bind_text(stmt, idx, va_arg(ap, char*), -1,
+                                  (void(*)(void*))-1);
+            } else if (c == 'n') {
+                sqlite3_bind_null(stmt, idx);
+            }
+        }
+        va_end(ap);
+
+        int ncols = sqlite3_column_count(stmt);
+        dict result = 0;
+        rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW) {
+            result = dict_create_object();
+            for (int i = 0; i < ncols; i++) {
+                const char* name = sqlite3_column_name(stmt, i);
+                int t = sqlite3_column_type(stmt, i);
+                dict v = 0;
+                if (t == SQLITE_INTEGER) {
+                    v = dict_create_int64((long)sqlite3_column_int64(stmt, i));
+                } else if (t == SQLITE_FLOAT) {
+                    v = dict_create_number(sqlite3_column_double(stmt, i));
+                } else if (t == SQLITE_TEXT) {
+                    v = dict_create_string((char*)sqlite3_column_text(stmt, i));
+                } else {
+                    v = dict_create_null();
+                }
+                dict_object_set(result, (char*)name, v);
+            }
+        } else if (rc != SQLITE_DONE) {
+            this->last_err = rc;
+            static char buf[512];
+            snprintf(buf, sizeof(buf), "query_one/step: %s",
+                     sqlite3_errmsg(this->db));
+            sqlite3_finalize(stmt);
+            throw(SqliteError, buf);
+        }
+        sqlite3_finalize(stmt);
+        return result;
+    }
+
     /* Begin a transaction.  Returns a heap Transaction* the caller owns.
 
        Idiomatic use:
@@ -474,6 +536,26 @@ class Statement {
         /* SQLITE_TRANSIENT = (sqlite3_destructor_type)-1: ask sqlite to copy. */
         int rc = sqlite3_bind_text(this->stmt, idx, val, -1,
                                    (void(*)(void*))-1);
+        if (rc != SQLITE_OK) this->last_err = rc;
+        return rc;
+    }
+
+    /* Bind a dict value, dispatching on its runtime type tag.  val.type() reads
+       the tag without unwrapping; the scalar payload is then extracted with an
+       ordinary cast ((long)/(double)/(char*)) which DOES unwrap.  Covers the
+       cases that arise from JSON-parsed bodies and SQLite row dicts;
+       DICT_ARRAY / DICT_OBJECT bind as NULL. */
+    int bind(int idx, dict val) {
+        int rc;
+        switch (val.type()) {
+        case DICT_INT64:  rc = sqlite3_bind_int64(this->stmt, idx,
+                                                  (sqlite3_int64)(long)val);           break;
+        case DICT_NUMBER: rc = sqlite3_bind_double(this->stmt, idx, (double)val);      break;
+        case DICT_BOOL:   rc = sqlite3_bind_int(this->stmt, idx, (int)(long)val);      break;
+        case DICT_STRING: rc = sqlite3_bind_text(this->stmt, idx, (char*)val, -1,
+                                                 (void(*)(void*))-1);                  break;
+        default:          rc = sqlite3_bind_null(this->stmt, idx);                     break;
+        }
         if (rc != SQLITE_OK) this->last_err = rc;
         return rc;
     }

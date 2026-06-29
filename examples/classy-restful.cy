@@ -26,7 +26,7 @@
  *       examples/classh-restful.cy -eg
  */
 
-#include "sketch/sqlite-classyc.h"
+#include "include/sqlite.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

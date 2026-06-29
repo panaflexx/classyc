@@ -7,7 +7,9 @@
  *       raw pointer.  Explicit casts unwrap the union payload as before.
  *   C3: `for (auto x in d.arr)` dispatches to the array iterator at runtime
  *       (tag check on the DictValue header), so the loop runs N iterations
- *       and `x` is the element (DictValue*).
+ *       and `x` is the element (DictValue*).  The single-var form types `x` as
+ *       char* (the object-key convention); for a typed element use the two-var
+ *       form or the typed for-in `for (int x in d.arr)`.
  *
  * Still unimplemented:
  *   · array *literal* assignment `d.k = [...]` (C1 in the doc).
@@ -64,11 +66,16 @@ int main() {
     /* C3: for-in over a dict array iterates N times.
        The single-var form declares the loop variable as char* (per the
        existing dict for-in convention where single-var = key), so it serves
-       primarily as a count guard; use the two-var form when you need the
-       element as a typed `dict`. */
+       primarily as a count guard; use the two-var form or a typed for-in when
+       you need the element as a typed value. */
     int n = 0;
     for (auto x in d.nums) n++;
     check(n == 3,                                   "C3: for-in over dict array runs N iterations");
+
+    /* C3b: typed single-var for-in binds the element coerced to the type. */
+    int typed_sum = 0;
+    for (int x in d.nums) typed_sum += x;
+    check(typed_sum == 60,                          "C3: typed for-in (int x): elements unwrap (10+20+30)");
 
     /* C3: two-var form binds (index, element-as-dict).  Now `(int)x` triggers
        the dict-to-scalar unwrap and reads the int64 payload. */

@@ -40,11 +40,25 @@
 
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
 
-struct DictValue;  /* opaque forward decl; real def in dict.h */
-struct DictValue* dict_create_array(void);
-int dict_array_append(struct DictValue* array_val, struct DictValue* new_val);
-struct DictValue* dict_create_string(const char *s);
+/* ── Runtime dict helpers (resolved at link / JIT time) ────────────────────
+ * Declared with the ClassyC `dict` type on purpose.  A value produced by these
+ * (`dict d = dict_create_object()`) must keep its dict identity; declaring them
+ * `struct DictValue*` instead silently breaks dict_object_set / dict_array_append
+ * (the result is treated as a plain pointer rather than a tagged dict, so writes
+ * land on the wrong thing and rows come back empty).  This is the single source
+ * of truth shared coherently with sqlite.h. */
+dict dict_create_array(void);
+dict dict_create_object(void);
+dict dict_create_null(void);
+dict dict_create_bool(int b);
+dict dict_create_int64(long n);
+dict dict_create_number(double n);
+dict dict_create_string(char *s);
+int  dict_array_append(dict array_val, dict new_val);
+int  dict_object_set(dict obj_val, char *key, dict new_val);
 
 class List<T> {
     T*  data;
@@ -306,6 +320,31 @@ class List<T> {
         return c;
     }
 
+    /* ═════════════════════════ Array conversions ═══════════════════════ */
+
+    /* Bulk-copy the live elements into a fresh heap T[] and return it.
+     * Mirrors C#'s `T[] List<T>.ToArray()`: the result is an independent
+     * copy (mutating it does not touch the list).  The element count is the
+     * list's Count() — a bare T* carries no length of its own, so keep
+     * Count() around if you need the bound.  Caller owns the result and must
+     * `free()` it.  Empty lists return a 1-slot buffer (never NULL), matching
+     * the never-null spirit of Array.Empty<T>(). */
+    T* ToArray() {
+        int n = this->length > 0 ? this->length : 1;
+        T* array = (T*) malloc(sizeof(T) * n);
+        if (this->length > 0)
+            memcpy((void*) array, (void*) this->data, sizeof(T) * this->length);
+        return array;
+    }
+
+    /* Bulk-copy the live elements into a caller-provided buffer starting at
+     * index 0.  Mirrors C#'s `List<T>.CopyTo(T[] array)`.  The destination
+     * must have room for at least Count() elements. */
+    void CopyTo(T* destination) {
+        if (this->length > 0)
+            memcpy((void*) destination, (void*) this->data, sizeof(T) * this->length);
+    }
+
     /* Structural equality: same count + pairwise ==. Returns 1 or 0. */
     int Equals(List<T>* other) {
         if (other == NULL || other->Count() != this->length) return 0;
@@ -341,11 +380,12 @@ class List<T> {
         return result;
     }
 
-    /* Convert List<dict> to DICT_ARRAY. Uses cast to force pointer type
-     * on element access so codegen does not insert spurious +8 offset load. */
-    struct DictValue* ToDict() {
-        struct DictValue* arr = dict_create_array();
-        struct DictValue** d = (struct DictValue**)this->data;
+    /* Convert List<dict> to DICT_ARRAY. Casts the backing store to dict* so the
+     * generic body type-checks for every element specialization (the method is
+     * only meaningful for List<dict>). */
+    dict ToDict() {
+        dict arr = dict_create_array();
+        dict* d = (dict*)this->data;
         for (int i = 0; i < this->length; i++) {
             dict_array_append(arr, d[i]);
         }
@@ -359,14 +399,65 @@ class List<T> {
      *   dict out = { "items": parts->StringsToJsonArray() };
      *   return resp_ok(out.json);
      *
-     * The returned DictValue* is a heap-allocated array owned by whatever
-     * dict references it (or freed when that dict is deleted). */
-    struct DictValue* StringsToJsonArray() {
-        struct DictValue* arr = dict_create_array();
+     * The returned dict is a heap-allocated array owned by whatever dict
+     * references it (or freed when that dict is deleted). */
+    dict StringsToJsonArray() {
+        dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
             dict_array_append(arr, dict_create_string((char*)this->data[i]));
         }
         return arr;
+    }
+
+    /* Convert List<int> to a DICT_ARRAY of DICT_INT64 values. The integer
+     * sibling of StringsToJsonArray() — idiomatic JSON serialization for
+     * integer lists. */
+    dict IntsToJsonArray() {
+        dict arr = dict_create_array();
+        for (int i = 0; i < this->length; i++) {
+            /* The double cast (long)(char*) mirrors StringsToJsonArray's
+             * (char*)element form so this generic body still type-checks for
+             * non-scalar element specializations (e.g. List<Point>) where it is
+             * never actually called; for List<int> it round-trips the value. */
+            dict_array_append(arr, dict_create_int64((long)(char*)this->data[i]));
+        }
+        return arr;
+    }
+
+    /* Generic projection to a DICT_ARRAY: apply `项` to every element and
+     * append the resulting DictValue* to the array. This is the
+     * Select(x => ...).ToArray() of JSON building — StringsToJsonArray() and
+     * IntsToJsonArray() are just the common specializations:
+     *
+     *   dict asNum(int x) { return dict_create_int64(x); }
+     *   dict out = { "items": nums->ToJsonArrayBy(asNum) };
+     *
+     * `fn(item)` is responsible for producing each element value. */
+    dict ToJsonArrayBy(dict(*fn)(T)) {
+        dict arr = dict_create_array();
+        for (int i = 0; i < this->length; i++) {
+            dict_array_append(arr, fn(this->data[i]));
+        }
+        return arr;
+    }
+
+    /* Build a DICT_OBJECT keyed by `keyFn(item)` with values `valFn(item)`.
+     * Mirrors C#'s LINQ `ToDictionary(keySelector, valueSelector)`:
+     *
+     *   const char* nameOf(Track* t) { return (char*)t->title; }
+     *   dict idOf(Track* t) { return dict_create_int64(t->id); }
+     *   dict byName = library->ToDictBy(nameOf, idOf);
+     *
+     * Duplicate keys follow dict_object_set semantics: a later element with
+     * the same key overwrites the earlier value (last-one-wins, as in C#'s
+     * indexer-based fill).  The returned dict is owned by whatever dict
+     * references it. */
+    dict ToDictBy(const char*(*keyFn)(T), dict(*valFn)(T)) {
+        dict obj = dict_create_object();
+        for (int i = 0; i < this->length; i++) {
+            dict_object_set(obj, (char*)keyFn(this->data[i]), valFn(this->data[i]));
+        }
+        return obj;
     }
 
 

@@ -7556,6 +7556,84 @@ D (stmt) {
         goto normal_for;
       }
     } else {
+    /* ── Typed for-in:  for (<type> id in expr)                       ──
+                       for (<type1> id1, <type2> id2 in expr)         ──
+       Desugar to an `auto` for-in plus typed copies at the head of the body,
+       so the existing array/dict element coercion on assignment performs the
+       conversion (no new N_FORIN check/gen paths needed):
+         for (String s in arr)        =>  for (auto __v in arr) { String s = __v; <body> }
+         for (int i, String s in d)   =>  for (auto __k, __v in d)
+                                              { int i = __k; String s = __v; <body> }
+       Detection backtracks: if the type/declarator(s) are not followed by the
+       soft keyword `in`, we rewind and fall through to the normal for-loop. */
+    {
+      size_t tf_mark = record_start (c2m_ctx);
+      node_t ts1 = declaration_specs (c2m_ctx, TRUE, NULL);
+      node_t td1 = (ts1 != err_node) ? declarator (c2m_ctx, TRUE) : err_node;
+      node_t ts2 = NULL, td2 = NULL;
+      int tok = FALSE, ttwo = FALSE;
+
+      if (ts1 != err_node && td1 != err_node) {
+        if (M (',')) {
+          ts2 = declaration_specs (c2m_ctx, TRUE, NULL);
+          td2 = (ts2 != err_node) ? declarator (c2m_ctx, TRUE) : err_node;
+          if (ts2 != err_node && td2 != err_node && C_SOFT ("in")) { tok = TRUE; ttwo = TRUE; }
+        } else if (C_SOFT ("in")) {
+          tok = TRUE;
+        }
+      }
+      if (tok) {
+        node_t coll, fin_k, fin_v, body_items, body_block;
+        char kbuf[64], vbuf[64];
+        unsigned uid = lambda_uid++;
+        record_stop (c2m_ctx, tf_mark, FALSE); /* commit */
+        M_SOFT ("in");
+        P (expr); coll = r;
+        PT (')');
+        P (stmt); /* original body */
+
+        /* Always lower to a *two-var* auto for-in.  The value variable then
+           carries its natural element/value type (TM_DICT for dicts, the
+           element type for arrays / Count-Get collections), independent of the
+           single-var dict convention; the typed copies injected at the head of
+           the body perform the coercion to the user-declared type(s).  For the
+           single-var form the key/index var is an unused throwaway. */
+        snprintf (kbuf, sizeof (kbuf), "__forin_k_%u", uid);
+        snprintf (vbuf, sizeof (vbuf), "__forin_v_%u", uid);
+        fin_k = build_id (c2m_ctx, kbuf, pos);
+        fin_v = build_id (c2m_ctx, vbuf, pos);
+        body_items = new_node (c2m_ctx, N_LIST);
+        if (ttwo) {
+          /* T1 id1 = __k;  (object key / array index) */
+          op_append (c2m_ctx, body_items,
+                     new_pos_node5 (c2m_ctx, N_SPEC_DECL, POS (td1),
+                                    new_node1 (c2m_ctx, N_SHARE, ts1), td1,
+                                    new_node (c2m_ctx, N_IGNORE), new_node (c2m_ctx, N_IGNORE),
+                                    build_id (c2m_ctx, kbuf, pos)));
+          /* T2 id2 = __v;  (value / element) */
+          op_append (c2m_ctx, body_items,
+                     new_pos_node5 (c2m_ctx, N_SPEC_DECL, POS (td2),
+                                    new_node1 (c2m_ctx, N_SHARE, ts2), td2,
+                                    new_node (c2m_ctx, N_IGNORE), new_node (c2m_ctx, N_IGNORE),
+                                    build_id (c2m_ctx, vbuf, pos)));
+        } else {
+          /* single-var: T id = __v;  (the value / element) */
+          op_append (c2m_ctx, body_items,
+                     new_pos_node5 (c2m_ctx, N_SPEC_DECL, POS (td1),
+                                    new_node1 (c2m_ctx, N_SHARE, ts1), td1,
+                                    new_node (c2m_ctx, N_IGNORE), new_node (c2m_ctx, N_IGNORE),
+                                    build_id (c2m_ctx, vbuf, pos)));
+        }
+        op_append (c2m_ctx, body_items, r); /* original body last */
+        body_block = new_pos_node2 (c2m_ctx, N_BLOCK, pos, new_node (c2m_ctx, N_LIST),
+                                    body_items);
+        body_block->attr = NULL; /* scope established during check */
+        n = new_pos_node5 (c2m_ctx, N_FORIN, pos, l, fin_k, fin_v, coll, body_block);
+        r = n;
+        goto forin_typed_done;
+      }
+      record_stop (c2m_ctx, tf_mark, TRUE); /* rewind: not a typed for-in */
+    }
     normal_for:;
     n = new_pos_node (c2m_ctx, N_FOR, pos);
     n->attr = curr_scope;
@@ -7594,6 +7672,7 @@ D (stmt) {
     op_append (c2m_ctx, n, op3);
     op_append (c2m_ctx, n, r);
     r = n;
+    forin_typed_done:;
     } /* end normal_for else */
   } else if (MP (T_GOTO, pos)) { /* jump-statement */
     int indirect_p = FALSE;
