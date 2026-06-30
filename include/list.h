@@ -59,6 +59,7 @@ dict dict_create_number(double n);
 dict dict_create_string(char *s);
 int  dict_array_append(dict array_val, dict new_val);
 int  dict_object_set(dict obj_val, char *key, dict new_val);
+void dict_destroy(dict v);
 
 class List<T> {
     T*  data;
@@ -400,26 +401,68 @@ class List<T> {
      *   return resp_ok(out.json);
      *
      * The returned dict is a heap-allocated array owned by whatever dict
-     * references it (or freed when that dict is deleted). */
+     * references it (or freed when that dict is deleted).
+     *
+     * Reads each String through `*(char**)&elem` rather than `(char*)elem`: the
+     * address-of + typed-pointer-deref keeps this generic body type-checking
+     * for *every* element specialization (a bare `(char*)elem` cast is rejected
+     * for floating-point T like List<double>), while reading the real value
+     * when the list actually holds Strings. */
     dict StringsToJsonArray() {
         dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
-            dict_array_append(arr, dict_create_string((char*)this->data[i]));
+            dict_array_append(arr, dict_create_string(*(char**)&this->data[i]));
         }
         return arr;
     }
 
     /* Convert List<int> to a DICT_ARRAY of DICT_INT64 values. The integer
-     * sibling of StringsToJsonArray() — idiomatic JSON serialization for
-     * integer lists. */
+     * sibling of StringsToJsonArray(); reads via `*(int*)&elem` so the body
+     * type-checks for all T and round-trips the value for List<int>. */
     dict IntsToJsonArray() {
         dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
-            /* The double cast (long)(char*) mirrors StringsToJsonArray's
-             * (char*)element form so this generic body still type-checks for
-             * non-scalar element specializations (e.g. List<Point>) where it is
-             * never actually called; for List<int> it round-trips the value. */
-            dict_array_append(arr, dict_create_int64((long)(char*)this->data[i]));
+            dict_array_append(arr, dict_create_int64((long)*(int*)&this->data[i]));
+        }
+        return arr;
+    }
+
+    /* Automagical JSON-array conversion: inspect the element type T at compile
+     * time via nameof<T>() and emit the matching DICT value for every element
+     * (int/long/short -> int64, double/float -> number, String/char* -> string,
+     * dict -> passthrough, anything else -> null).  One call converts a
+     * List<int>, List<double>, or List<String> with no per-type helper:
+     *
+     *   dict out = { "items": scores->ToJsonArray() };
+     *
+     * Each branch reads the element through a typed pointer (`*(int*)&elem`,
+     * `*(double*)&elem`, `*(char**)&elem`): those casts are pointer-to-pointer
+     * (always valid for any T), and only the nameof-selected branch runs, so
+     * the body both type-checks for every specialization and reads correctly. */
+    dict ToJsonArray() {
+        dict arr = dict_create_array();
+        const char* tn = nameof<T>();
+        for (int i = 0; i < this->length; i++) {
+            T* p = &this->data[i];
+            dict v;
+            if (strcmp(tn, "String") == 0 || strcmp(tn, "char") == 0)
+                v = dict_create_string(*(char**)p);
+            else if (strcmp(tn, "double") == 0)
+                v = dict_create_number(*(double*)p);
+            else if (strcmp(tn, "float") == 0)
+                v = dict_create_number((double)*(float*)p);
+            else if (strcmp(tn, "long") == 0)
+                v = dict_create_int64(*(long*)p);
+            else if (strcmp(tn, "short") == 0)
+                v = dict_create_int64((long)*(short*)p);
+            else if (strcmp(tn, "int") == 0 || strcmp(tn, "unsigned") == 0
+                     || strcmp(tn, "bool") == 0)
+                v = dict_create_int64((long)*(int*)p);
+            else if (strcmp(tn, "dict") == 0)
+                v = *(dict*)p;
+            else
+                v = dict_create_null();
+            dict_array_append(arr, v);
         }
         return arr;
     }
@@ -458,6 +501,45 @@ class List<T> {
             dict_object_set(obj, (char*)keyFn(this->data[i]), valFn(this->data[i]));
         }
         return obj;
+    }
+
+    /* Build a List<T> from a dict DICT_ARRAY, coercing each element to T.  The
+     * automagical reverse of ToJsonArray(): the per-element `(T)array[i]` cast
+     * unwraps each element to the right type, so this works for List<int>,
+     * List<double>, List<String>, and List<dict> (passthrough) with no per-type
+     * helper.  Because it is a cast (not a bare `T v = array[i]` assignment) the
+     * generic body also type-checks for class element types: `(T)array[i]`
+     * lowers to the dict-bind cast for List<SomeClass>.  Caller owns the result
+     * (`defer delete`):
+     *
+     *   List<String>* tags = List<String>.FromJson(req->body.tags);
+     *   List<int>*    xs   = List<int>.FromJson(d.xs);
+     *
+     * `array` should be a JSON array; a scalar/object dict yields a length of 0
+     * (or 1) per the dict length() rules. */
+    static List<T>* FromJson(dict array) {
+        List<T>* r = new List<T>();
+        int n = (int)array.length();
+        for (int i = 0; i < n; i++) {
+            r->Add((T)array[i]);
+        }
+        return r;
+    }
+
+    /* Serialize the list to a JSON-array String, e.g. "[1,2,3]" or
+     * '["a","b"]'.  Builds a transient dict via ToJsonArray(), serializes it,
+     * then frees it (the returned String is independent and survives):
+     *
+     *   String body = scores->ToJson();   // "[10,20,30]"
+     *
+     * Intended for scalar element lists (int/double/String); for a List<dict>
+     * use ToDict() and serialize the owning dict yourself (ToJson() would free
+     * the referenced element dicts). */
+    String ToJson() {
+        dict arr = this->ToJsonArray();
+        String j = arr.json;
+        dict_destroy(arr);
+        return j;
     }
 
 

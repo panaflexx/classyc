@@ -16317,9 +16317,14 @@ if (base != NULL && base->code == N_ID) {
 	                node_t method_id = NL_NEXT(obj);
 	                symbol_t msym;
 	                node_t func_def = NULL;
-	                if (symbol_find(c2m_ctx, S_REGULAR, method_id, class_node, &msym))
-	                  if (msym.def_node && msym.def_node->code == N_FUNC_DEF)
-	                    func_def = msym.def_node;
+	                /* Pre-check the user arguments so their types are known for
+	                   overload resolution, then pick the best-matching static
+	                   overload (several static methods may share a name,
+	                   distinguished by arity/parameter types). */
+	                for (arg = NL_HEAD(arg_list->u.ops); arg != NULL; arg = NL_NEXT(arg))
+	                  if (!arg->attr) check(c2m_ctx, arg, r);
+	                if (find_overload_sym(c2m_ctx, method_id, class_node, &msym))
+	                  func_def = select_method_overload(c2m_ctx, &msym, class_node, arg_list);
 	                if (!func_def)
 	                  func_def = find_def(c2m_ctx, S_REGULAR, method_id, class_node, NULL);
 	                if (!func_def || func_def->code != N_FUNC_DEF) {

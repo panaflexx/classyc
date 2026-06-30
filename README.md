@@ -150,6 +150,31 @@ defer delete ages;
 
 `Map<K, V>` plugs into the same language sugar as `List<T>` / `Set<T>`: subscript (`m[k]` / `m[k] = v`) lowers to `Get`/`Set`, and `for (auto k in m)` / `for (auto k, v in m)` iterate keys and key/value pairs in insertion order (the same `Count()` / `KeyAt(int)` / `ValAt(int)` protocol the compiler duck-types over). See `examples/classy-map.cy` for the full tour and `examples/classy-map-bench.cy` for a 100k-entry throughput benchmark.
 
+#### `dict` / JSON conversions
+A `Map<String, V>` converts straight to a JSON `dict` or String. `ToDict()`
+dispatches the value type `V` automagically (via `nameof<V>()`): scalars → number,
+`String` → string, `dict` → passthrough. `ToJson()` serializes that to an
+independent String. `Keys()` / `Values()` collect into heap `List<K>` / `List<V>`
+that feed straight back into the `List<T>` converters:
+
+```c
+Map<String, int>* ages = new Map<String, int>();
+ages["ada"] = 36;
+ages["alan"] = 41;
+
+dict   d = ages->ToDict();   // {"ada":36,"alan":41}
+String j = ages->ToJson();   // "{\"ada\":36,\"alan\":41}"
+
+List<String>* ks = ages->Keys();        // ["ada", "alan"]
+List<int>*    vs = ages->Values();       // [36, 41]
+String        vj = vs->ToJson();         // "[36,41]"
+defer delete ks; defer delete vs;
+```
+
+Keys are read as `String`, so these are intended for `Map<String, V>`; for
+`Map<String, dict>` serialize `ToDict()` yourself (`ToJson()` would free the
+referenced value dicts).
+
 ### Generics, `List<T>`, `Set<T>` & Lambdas
 Collections are reference types: allocate with `new`, call methods with `->`,
 and brace-init with `new List<T>{ ... }`.
@@ -293,6 +318,89 @@ This is not special-cased to `List<T>`: any class collection whose constructor
 (or method) takes a bare `T*` may recover the caller's element count with
 `items.count()`, and call sites such as `new Bag<int>(arr)` fill it in
 automatically.
+
+### `List<T>` → Arrays & `dict` Conversions
+`include/list.h` ships C#/LINQ-flavored converters that go the other way — from a
+`List<T>` back to a raw array or a JSON `dict`:
+
+```c
+#include "list.h"
+
+List<int>* nums = new List<int>{ 10, 20, 30 };
+
+// — to a base array —
+int* arr = nums->ToArray();   // fresh heap T[] (bulk memcpy); caller frees
+int  buf[3];
+nums->CopyTo(buf);            // bulk-copy into a caller-provided buffer
+
+// — to a dict / JSON —
+dict out = { "items": nums->ToJsonArray() };   // {"items":[10,20,30]}
+```
+
+`ToJsonArray()` is **automagical**: it inspects the element type at compile time
+(via `nameof<T>()`) and emits the matching JSON value for every element —
+`int`/`long`/`short` → number, `double`/`float` → number, `String` → string,
+`dict` → passthrough. One call converts a `List<int>`, `List<double>`, or
+`List<String>` with no per-type helper:
+
+```c
+List<double>* ds = new List<double>{ 1.5, 2.5, 3.0 };
+List<String>* ws = "a,b,c".split(",");
+
+dict payload = {
+    "nums":    ds->ToJsonArray(),   // [1.5,2.5,3]
+    "words":   ws->ToJsonArray(),   // ["a","b","c"]
+};
+```
+
+For full control there are projection-based converters (the `Select` / `ToDictionary`
+of JSON building), plus the named shortcuts:
+
+```c
+// project each element to a dict value
+dict arr = library->ToJsonArrayBy((Track* t) => dict_create_string(t->title));
+
+// build a JSON object keyed by a selector (LINQ ToDictionary)
+dict byId = library->ToDictBy(
+    (Track* t) => (char*)t->title,          // key selector
+    (Track* t) => dict_create_int64(t->id)  // value selector
+);
+
+List<String>* parts = csv.split(",");
+dict items = { "items": parts->StringsToJsonArray() };  // List<String> shortcut
+dict ids   = { "ids":   nums->IntsToJsonArray() };      // List<int>    shortcut
+```
+
+`ToDict()` converts a `List<dict>` straight to a JSON array (e.g. SQL rows from
+`db->query(...)` → a JSON response body).
+
+#### Round-trip: `FromJson(dict)` and `ToJson()`
+The converters also run in reverse. `List<T>.FromJson(dict array)` is a static
+factory that rebuilds a typed list from a JSON array — the **automagical reverse**
+of `ToJsonArray()`. The dict→scalar coercion unwraps each element to `T`, so one
+call covers `List<int>`, `List<double>`, `List<String>`, and `List<dict>`
+(passthrough) with no per-type helper. The caller owns the result:
+
+```c
+dict d = json("{\"xs\":[10,20,30],\"tags\":[\"a\",\"bb\",\"ccc\"]}");
+
+List<int>*    xs   = List<int>.FromJson(d.xs);     // [10, 20, 30]
+List<String>* tags = List<String>.FromJson(d.tags); // ["a", "bb", "ccc"]
+defer delete xs;
+defer delete tags;
+```
+
+`ToJson()` serializes a scalar list (`int`/`double`/`String`) straight to a JSON
+String — it builds a transient dict via `ToJsonArray()`, serializes it, and frees
+it, so the returned String is independent:
+
+```c
+String a = xs->ToJson();    // "[10,20,30]"
+String b = tags->ToJson();  // ["a","bb","ccc"]
+```
+
+> For a `List<dict>` use `ToDict()` and serialize the owning dict yourself —
+> `ToJson()` would free the referenced element dicts.
 
 ### Classes with Constructors, Destructors & `new`/`delete`
 ```c
@@ -513,6 +621,20 @@ auto arr = {1, 2, 3};           // int[3]
 ### `for (auto x in ...)` Loops
 Works over arrays, `dict`, `List<T>`, `Set<T>`, `Map<K,V>`, and (via methods) strings. Keyed variant `for (auto k, v in m)` is supported for `dict` and `Map`. For a `dict` carrying a JSON **array**, the two-var form binds `(index, element)` (runtime-tag dispatched) so the same loop walks both objects and arrays without a type switch.
 
+**Typed loop variables.** Instead of `auto`, name the element type and the loop binds the element *coerced to that type* — handy for JSON arrays, where the element would otherwise be a tagged `dict` you have to cast:
+
+```c
+dict d = json("{\"tags\":[\"fever\",\"cough\"], \"xs\":[10,20,30]}");
+
+for (String s in d.tags) printf("%s\n", s);   // each element unwrapped to String
+for (int n in d.xs)      sum += n;             // each element unwrapped to int
+
+for (int v in carray)    total += v;          // also works for C arrays / List<T>
+for (String k, auto v in obj) { /* k = key */ }  // two-var typed form
+```
+
+The typed form desugars to the two-var loop internally, so the element keeps its natural type before being coerced. (For a plain `auto` single-var loop over a dict *object*, the variable is the key, as before; use the two-var form for keys + values.)
+
 ### Interfaces & `Any<I>` Erasure
 ```c
 interface Drawable { void draw(); }
@@ -658,6 +780,9 @@ Look in the `examples/` directory:
 | `classy-lambda.c`          | Typed lambdas for map/filter/sort/etc. |
 | `test-list-stdlib.c`       | Full stdlib List<T> validation |
 | `test-array-to-list.cy`    | Array/slice `.ToList()`, `auto` deduction, `List(T*)` ctor |
+| `test-list-conversions.cy` | `List<T>` → array/`dict`: `ToArray`, `CopyTo`, `ToJsonArray`, `ToDictBy` |
+| `test-auto-conversions.cy` | Automagical round-trips: `List<T>.FromJson`/`ToJson`, `Map<String,V>.ToDict`/`ToJson`, `Map.Keys()`/`Values()` → `List<T>` |
+| `test-typed-forin.cy`      | Typed for-in (`for (String s in arr)`, `for (int n in arr)`) |
 | `classy-sets.cy`           | Generic `Set<T>` hash set (content-aware `String` hashing) |
 | `classy-map.cy`            | Generic `Map<K,V>` hash map (`m[k]`, `for (auto k,v in m)`, string→object) |
 | `classy-map-bench.cy`      | `Map<K,V>` throughput benchmark (100k entries, int & String keys) |
@@ -673,6 +798,7 @@ Look in the `examples/` directory:
 | `classy-safety.cy`         | JIT safety guards: null-ptr, div-by-zero, array/slice OOB (auto-emitted with `-fexceptions`) |
 | `classy-fetch.cy`          | HTTP/HTTPS client (`include/httpclient.h`): calls the PokéAPI over TLS, headers as a `dict`, `List<String>` |
 | `classy-customers.cy`      | End-to-end typed JSON ingest: `(Customer)? rec` binds each record from `customers.json` into a `Map<int, Customer*>`, then runs 6 database-style queries (lookup, filter, group-by, aggregate, top-K) |
+| `classy-restful.cy`        | SQLite-backed REST controller (`include/sqlite.h`): bound queries, `(User) row` binding, `List<dict>` → `ToDict()` JSON responses, transactions (`-l sqlite3`) |
 | `test-customexception.cy`  | User-defined exceptions via `enum { MyErr = 100 }` |
 
 Run them all with:

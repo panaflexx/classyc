@@ -65,6 +65,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include "list.h"   /* List<T> for Keys()/Values(); shared dict_* declarations
+                      and the `dict` type for ToDict()/ToJson() */
 
 /* ───────────────────────────── Hash helpers ───────────────────────────── */
 
@@ -370,6 +372,73 @@ class Map<K, V> {
     void ForEach(void(*action)(K, V)) const {
         for (int i = 0; i < this->count; i++)
             action(this->keys[i], this->vals[i]);
+    }
+
+    /* ───────────────────── Conversions ───────────────────── */
+
+    /* Collect the keys (insertion order) into a new heap List<K>.  Caller
+     * `delete`s the result.  Pairs naturally with the List<T> converters. */
+    List<K>* Keys() const {
+        List<K>* r = new List<K>(this->count > 0 ? this->count : 4);
+        for (int i = 0; i < this->count; i++) r->Add(this->keys[i]);
+        return r;
+    }
+
+    /* Collect the values (insertion order) into a new heap List<V>. */
+    List<V>* Values() const {
+        List<V>* r = new List<V>(this->count > 0 ? this->count : 4);
+        for (int i = 0; i < this->count; i++) r->Add(this->vals[i]);
+        return r;
+    }
+
+    /* Serialize to a JSON object `dict`.  Keys are read as String (intended for
+     * Map<String, V>); the value is dispatched automagically over V at compile
+     * time via nameof<V>(): int/long/short -> number, double/float -> number,
+     * String -> string, dict -> passthrough, anything else -> null.  Each value
+     * is read through a typed pointer (`*(int*)&v`, `*(double*)&v`, ...) so the
+     * generic body type-checks for every V and only the matched branch runs.
+     *
+     *   dict cfg = settings->ToDict();   // {"limit":10,"name":"prod"}
+     */
+    dict ToDict() const {
+        dict obj = dict_create_object();
+        const char* vt = nameof<V>();
+        for (int i = 0; i < this->count; i++) {
+            V* p = &this->vals[i];
+            dict dv;
+            if (strcmp(vt, "String") == 0 || strcmp(vt, "char") == 0)
+                dv = dict_create_string(*(char**)p);
+            else if (strcmp(vt, "double") == 0)
+                dv = dict_create_number(*(double*)p);
+            else if (strcmp(vt, "float") == 0)
+                dv = dict_create_number((double)*(float*)p);
+            else if (strcmp(vt, "long") == 0)
+                dv = dict_create_int64(*(long*)p);
+            else if (strcmp(vt, "short") == 0)
+                dv = dict_create_int64((long)*(short*)p);
+            else if (strcmp(vt, "int") == 0 || strcmp(vt, "unsigned") == 0
+                     || strcmp(vt, "bool") == 0)
+                dv = dict_create_int64((long)*(int*)p);
+            else if (strcmp(vt, "dict") == 0)
+                dv = *(dict*)p;
+            else
+                dv = dict_create_null();
+            /* Read the key as String via address so the body type-checks for
+             * every K; correct for Map<String, V>. */
+            dict_object_set(obj, *(char**)&this->keys[i], dv);
+        }
+        return obj;
+    }
+
+    /* Serialize to a JSON object String (e.g. {"a":1,"b":2}).  Builds a
+     * transient dict via ToDict(), serializes it, then frees it.  Intended for
+     * Map<String, scalar V>; for Map<String, dict> serialize ToDict() yourself
+     * (ToJson() would free the referenced value dicts). */
+    String ToJson() const {
+        dict obj = this->ToDict();
+        String j = obj.json;
+        dict_destroy(obj);
+        return j;
     }
 
 };
