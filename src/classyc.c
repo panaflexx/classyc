@@ -21484,11 +21484,10 @@ static op_t gen_dict_value_for_init (c2m_ctx_t c2m_ctx, node_t value) {
     /* runtime _Bool expression: wrap as JSON boolean */
     op_t v = val_gen (c2m_ctx, value);
     return gen_dict_create_bool (c2m_ctx, v.mir_op);
-  } else {
-    /* runtime expression: evaluate then wrap as int64 */
-    op_t v = val_gen (c2m_ctx, value);
-    return gen_dict_create_int64 (c2m_ctx, v.mir_op);
-  }
+  } 
+  /* Fallthrough - runtime expression: evaluate then wrap as int64 */
+  op_t v = val_gen (c2m_ctx, value);
+  return gen_dict_create_int64 (c2m_ctx, v.mir_op);
 }
 
 /* Locate the named dict member (a member whose brace initializer is an N_LIST)
