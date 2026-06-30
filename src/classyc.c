@@ -5764,7 +5764,36 @@ D (unary_expr) {
         }
       }
       PT (')');
-      r = new_pos_node2 (c2m_ctx, N_NEW, npos, tid, args);
+      /* Optional object-initializer block (C/C++23-style designated fields):
+           new T(args) { .field = value, .field = value }
+         Each `.name = expr` runs as a post-construction field assignment on
+         the freshly-allocated object.  Stored as the optional third N_NEW
+         child: an N_LIST of N_FIELD_ID(name, value) nodes (the same shape as
+         named constructor arguments).  Distinguished from the collection
+         brace-init `new T{e1, e2}` by the leading `.` designators. */
+      if (C ('{')) {
+        node_t inits = new_node (c2m_ctx, N_LIST);
+        M ('{');
+        if (!C ('}')) {
+          for (;;) {
+            node_t fnm;
+            pos_t fpos;
+            PT ('.');
+            fpos = curr_token->pos;
+            if (!MN (T_ID, fnm)) PTFAIL (T_ID);
+            PT ('=');
+            P (assign_expr);
+            op_append (c2m_ctx, inits,
+                       new_pos_node2 (c2m_ctx, N_FIELD_ID, fpos, fnm, r));
+            if (!M (',')) break;
+            if (C ('}')) break; /* allow trailing comma */
+          }
+        }
+        PT ('}');
+        r = new_pos_node3 (c2m_ctx, N_NEW, npos, tid, args, inits);
+      } else {
+        r = new_pos_node2 (c2m_ctx, N_NEW, npos, tid, args);
+      }
       PA (post_expr_part, r); /* allow chaining: new Foo(..).method(..) */
       return r;
       } /* end if C('(') */
@@ -11142,6 +11171,34 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
       return name != NULL && strcmp (name, "__generic_List_String") == 0;
     }
 
+    /* Find a non-static DATA member NAME in class CLASS_TAG and return its
+       N_MEMBER node (whose attr is the decl_t carrying the member's offset and
+       type).  Method members and static members are skipped.  Used by the
+       object-initializer form `new T(args) { .field = value, ... }` so check
+       and gen agree on which field each designator targets. */
+    static node_t find_class_field_member (c2m_ctx_t c2m_ctx MIR_UNUSED, node_t class_tag,
+                                           const char *name) {
+      node_t member_list;
+      if (class_tag == NULL) return NULL;
+      member_list = TAG_MEMBER_LIST (class_tag);
+      if (member_list == NULL || member_list->code != N_LIST) return NULL;
+      for (node_t m = NL_HEAD (member_list->u.ops); m != NULL; m = NL_NEXT (m)) {
+        node_t declarator, mid;
+        decl_t md;
+        struct type *mt;
+        if (m->code != N_MEMBER) continue;
+        md = (decl_t) m->attr;
+        if (md == NULL || (mt = md->decl_spec.type) == NULL) continue;
+        if (mt->mode == TM_FUNC || md->decl_spec.static_p) continue;
+        declarator = NL_EL (m->u.ops, 1);
+        mid = (declarator != NULL && declarator->code == N_DECL)
+                ? NL_HEAD (declarator->u.ops) : NULL;
+        if (mid != NULL && mid->code == N_ID && strcmp (mid->u.s.s, name) == 0)
+          return m;
+      }
+      return NULL;
+    }
+
     /* Duck-typed protocol lookup: find an instance method NAME belonging to
        class CLASS_TAG (methods are registered by plain name in an enclosing
        scope, so candidates are filtered by their func_type->class_scope; a
@@ -14901,10 +14958,41 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         /* Brace-init:  new T{e1, e2, ...}  (init_list is the optional third
            child).  Protocol: the class must have an instance method 'Add'
            taking exactly one argument; each element is type-checked against
-           that parameter.  Gen re-resolves Add via the same helper. */
+           that parameter.  Gen re-resolves Add via the same helper.
+
+           Object-initializer form:  new T(args) { .field = value, ... } uses
+           the same third child but with N_FIELD_ID(name, value) elements;
+           each names a data member that is assigned post-construction. */
         {
           node_t init_list = NL_NEXT (arg_list);
+          node_t first_init = (init_list != NULL) ? NL_HEAD (init_list->u.ops) : NULL;
 
+          if (first_init != NULL && first_init->code == N_FIELD_ID) {
+            /* Object initializer: type-check each `.field = value` against the
+               named member's declared type. */
+            for (node_t el = NL_HEAD (init_list->u.ops); el != NULL; el = NL_NEXT (el)) {
+              node_t fname = (el->code == N_FIELD_ID) ? NL_HEAD (el->u.ops) : NULL;
+              node_t fval = (fname != NULL) ? NL_NEXT (fname) : NULL;
+              node_t mem;
+              if (fname == NULL || fname->code != N_ID || fval == NULL) {
+                error (c2m_ctx, POS (el),
+                       "malformed object initializer for class '%s'", type_id->u.s.s);
+                continue;
+              }
+              check (c2m_ctx, fval, el);
+              mem = find_class_field_member (c2m_ctx, class_def, fname->u.s.s);
+              if (mem == NULL) {
+                error (c2m_ctx, POS (el),
+                       "class '%s' has no field '%s' to initialize",
+                       type_id->u.s.s, fname->u.s.s);
+              } else {
+                decl_t md = (decl_t) mem->attr;
+                if (md != NULL && md->decl_spec.type != NULL)
+                  check_assignment_types (c2m_ctx, md->decl_spec.type, NULL, fval->attr, el);
+              }
+            }
+            break;
+          }
           if (init_list != NULL) {
             node_t el, add_def;
 
@@ -24519,11 +24607,65 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       VARR_TRUNC (MIR_op_t, call_ops, ops_start);
     }
     /* Brace-init:  new T{e1, e2, ...} — emit one obj->Add(e) call per element
-       (resolved through the same protocol helper as check). */
+       (resolved through the same protocol helper as check).
+
+       Object-initializer:  new T(args) { .field = value, ... } — store each
+       value into the named member of the freshly-constructed object (after
+       the constructor ran), reusing the same field-store conventions as the
+       dict->class binder (value-semantic String ownership, scalar coercion,
+       by-value aggregate copy). */
     {
       node_t init_list = NL_NEXT (arg_list);
+      node_t first_init = (init_list != NULL) ? NL_HEAD (init_list->u.ops) : NULL;
 
-      if (init_list != NULL && NL_HEAD (init_list->u.ops) != NULL) {
+      if (first_init != NULL && first_init->code == N_FIELD_ID) {
+        op_t base = force_reg (c2m_ctx, obj, MIR_T_I64);
+        for (node_t el = NL_HEAD (init_list->u.ops); el != NULL; el = NL_NEXT (el)) {
+          node_t fname = NL_HEAD (el->u.ops);
+          node_t fval = (fname != NULL) ? NL_NEXT (fname) : NULL;
+          node_t mem = find_class_field_member (c2m_ctx, class_type->u.tag_type,
+                                                 fname->u.s.s);
+          decl_t md = (mem != NULL) ? (decl_t) mem->attr : NULL;
+          struct type *mtype;
+          mir_size_t moff;
+          if (md == NULL || fval == NULL) continue; /* validated during check */
+          mtype = md->decl_spec.type;
+          moff = md->offset;
+          if (mtype->mode == TM_STRUCT || mtype->mode == TM_CLASS
+              || mtype->mode == TM_UNION) {
+            /* By-value aggregate field: block-copy from the value's address. */
+            op_t src = gen (c2m_ctx, fval, NULL, NULL, FALSE, NULL, NULL);
+            MIR_op_t dst_mem = MIR_new_mem_op (ctx, MIR_T_I8, (MIR_disp_t) moff,
+                                               base.mir_op.u.reg, 0, 1);
+            block_move (c2m_ctx, new_op (NULL, dst_mem), src, type_size (c2m_ctx, mtype));
+          } else if (builtin_string_type_p (mtype)) {
+            /* Value-semantic String member: own a private heap copy (c2m_str_own)
+               so `delete obj` frees it, exactly like `obj->s = ...`. */
+            op_t v = val_gen (c2m_ctx, fval);
+            MIR_op_t own_arg;
+            op_t owned;
+            MIR_type_t mt = get_mir_type (c2m_ctx, mtype);
+            MIR_alias_t alias = get_type_alias (c2m_ctx, mtype);
+            string_ensure_imports (c2m_ctx);
+            own_arg = force_reg (c2m_ctx, v, MIR_T_I64).mir_op;
+            owned = gen_rt_call (c2m_ctx, str_own_proto, str_own_item, 1, &own_arg);
+            owned = force_reg (c2m_ctx, owned, MIR_T_I64);
+            emit2 (c2m_ctx, tp_mov (mt),
+                   MIR_new_alias_mem_op (ctx, mt, (MIR_disp_t) moff, base.mir_op.u.reg,
+                                         0, 1, alias, 0),
+                   owned.mir_op);
+          } else {
+            /* Scalar / pointer / char* field: coerce to the member type and store. */
+            op_t v = val_gen (c2m_ctx, fval);
+            MIR_type_t mt = get_mir_type (c2m_ctx, mtype);
+            MIR_op_t dst_mem = MIR_new_alias_mem_op (ctx, mt, (MIR_disp_t) moff,
+                                                     base.mir_op.u.reg, 0, 1,
+                                                     get_type_alias (c2m_ctx, mtype), 0);
+            v = cast (c2m_ctx, v, mt, FALSE);
+            emit_scalar_assign (c2m_ctx, new_op (md, dst_mem), &v, mt, FALSE);
+          }
+        }
+      } else if (init_list != NULL && NL_HEAD (init_list->u.ops) != NULL) {
         node_t add_def
           = find_class_protocol_method (c2m_ctx, class_type->u.tag_type, "Add", 1, POS (r));
 

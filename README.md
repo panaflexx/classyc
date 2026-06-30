@@ -423,6 +423,32 @@ defer delete p;                               // RAII-style cleanup for heap mem
 > name shadows the field (as in the `Point` constructor above). `this` as a
 > standalone pronoun (e.g. `return this;`) is unrelated and always available.
 
+#### Object initializers: `new T(args) { .field = value, ... }`
+A `new` expression can be followed by a C/C++23-style **object initializer** —
+a brace block of `.field = value` designators that run as post-construction
+stores on the freshly-allocated object. The constructor (if any) runs first;
+the designators then fill named fields, so you skip a wall of `p->field = ...`
+assignments:
+
+```c
+Patient* p = new Patient() {        // zero-arg ctor, then field stores
+    .firstName = "Ada",
+    .lastName  = "Lovelace",
+    .age       = 36,
+};
+
+Patient* q = new Patient(startId) { // ctor arg sets id, designators do the rest
+    .firstName = "Alan",
+    .home      = (Point){ .x = 3, .y = 4 },   // by-value aggregate field
+};
+```
+
+Each store reuses normal field-assignment semantics: value-semantic `String`
+ownership (the object frees them on `delete`), scalar coercion, and by-value
+aggregate copy. Unknown fields and type-incompatible values are compile errors.
+The leading `.` distinguishes this from the collection brace-init
+`new List<int>{1, 2, 3}` (which calls `Add` per element).
+
 ### `defer`, `delete`, and Scoped Resource Management
 `defer` runs a statement on scope exit (LIFO, Go-style) — perfect for closing
 files and freeing heap objects right where you acquire them.
@@ -782,6 +808,7 @@ Look in the `examples/` directory:
 | `test-array-to-list.cy`    | Array/slice `.ToList()`, `auto` deduction, `List(T*)` ctor |
 | `test-list-conversions.cy` | `List<T>` → array/`dict`: `ToArray`, `CopyTo`, `ToJsonArray`, `ToDictBy` |
 | `test-auto-conversions.cy` | Automagical round-trips: `List<T>.FromJson`/`ToJson`, `Map<String,V>.ToDict`/`ToJson`, `Map.Keys()`/`Values()` → `List<T>` |
+| `test-object-initializer.cy` | C/C++23-style object initializers: `new T(args) { .field = value, ... }` (String/scalar/aggregate fields) |
 | `test-typed-forin.cy`      | Typed for-in (`for (String s in arr)`, `for (int n in arr)`) |
 | `classy-sets.cy`           | Generic `Set<T>` hash set (content-aware `String` hashing) |
 | `classy-map.cy`            | Generic `Map<K,V>` hash map (`m[k]`, `for (auto k,v in m)`, string→object) |
