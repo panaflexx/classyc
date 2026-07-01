@@ -17070,16 +17070,25 @@ if (base != NULL && base->code == N_ID) {
           decl_spec.type = it;
         }
       } else {
-        check (c2m_ctx, initializer, r);
-        struct expr *ie = initializer->attr;
-        if (ie != NULL && ie->type != NULL && ie->type->mode != TM_UNDEF) {
-          struct type *it = create_type (c2m_ctx, ie->type);
-          it->pos_node = r;
-          if (it->mode == TM_ARR) it = adjust_type (c2m_ctx, it); /* decay */
-          set_type_layout (c2m_ctx, it);
-          decl_spec.type = it;
-        }
-      }
+              check (c2m_ctx, initializer, r);
+              struct expr *ie = initializer->attr;
+              if (ie != NULL && ie->type != NULL && ie->type->mode != TM_UNDEF) {
+                struct type *it = create_type (c2m_ctx, ie->type);
+                it->pos_node = r;
+                if (it->mode == TM_ARR) it = adjust_type (c2m_ctx, it); /* decay */
+                /* If declarator starts with a pointer (e.g., auto *p = expr;),
+                   strip one pointer level from the inferred type to match
+                   C++ auto semantics: auto *p = expr; where expr is T* -> p is T* */
+                node_t decl_list = NL_EL (declarator->u.ops, 1);
+                node_t first_decl = decl_list != NULL ? NL_HEAD (decl_list->u.ops) : NULL;
+                if (first_decl != NULL && first_decl->code == N_POINTER
+                    && it->mode == TM_PTR) {
+                  it = it->u.ptr_type;  /* strip one pointer level */
+                }
+                set_type_layout (c2m_ctx, it);
+                decl_spec.type = it;
+              }
+            }
     }
     /* classyc extension: minimal VLA support.
        Lower a local declaration `T name[expr];` whose size expression is
