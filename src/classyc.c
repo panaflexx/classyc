@@ -21572,6 +21572,16 @@ static op_t gen_dict_value_for_init (c2m_ctx_t c2m_ctx, node_t value) {
     /* runtime _Bool expression: wrap as JSON boolean */
     op_t v = val_gen (c2m_ctx, value);
     return gen_dict_create_bool (c2m_ctx, v.mir_op);
+  } else if (ve != NULL
+             && (builtin_string_type_p (ve->type)
+                 || (ve->type->mode == TM_PTR && ve->type->u.ptr_type != NULL
+                     && char_type_p (ve->type->u.ptr_type)))) {
+    /* runtime String / char* value (e.g. p.symptomDescription): store as a
+       JSON string.  dict_create_string copies the bytes, so the dict owns its
+       own copy.  Without this, a String would fall through to the int64 branch
+       below and the raw char* pointer would be stored as an integer. */
+    op_t v = val_gen (c2m_ctx, value);
+    return gen_dict_create_string (c2m_ctx, v.mir_op);
   } 
   /* Fallthrough - runtime expression: evaluate then wrap as int64 */
   op_t v = val_gen (c2m_ctx, value);
