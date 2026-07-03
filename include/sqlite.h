@@ -721,13 +721,16 @@ class Transaction {
          void   bindRow(dict r)             // copy a SELECT row into fields
    * Write side (used by save / update / delete):
          String tableName()
-         String insertColumns()             // "A,B,C"
-         String insertPlaceholders()        // "?,?,?"
-         String updateSet()                 // "A=?,B=?,C=?"
-         int    columnCount()               // number of ? in updateSet()
+         String insertColumns()             // "A,B,C" — the single source of truth
          void   bindInsertValues(Statement* stmt)
          void   bindUpdateValues(Statement* stmt)
          int    getId()                     // primary key for UPDATE/DELETE
+
+   The placeholder list ("?,?,?"), the UPDATE set ("A=?,B=?,C=?") and the
+   column count are all DERIVED from insertColumns() (see placeholdersFor /
+   updateSetFor / columnCountFor), so an entity never restates them.  UPDATE
+   therefore rewrites every insertable column; a table with insert-only
+   columns would need a bespoke path.
 
    Because ClassyC monomorphises every method of a generic class, EntityOps<T>
    only compiles the methods you actually instantiate for T.  QueryBuilder<T>
@@ -751,19 +754,51 @@ class Transaction {
        User* u = EntityOps<User>.fromRow(row);   // caller owns the pointer
    ------------------------------------------------------------------------- */
 class EntityOps<T> {
+    /* Derivations from a "A,B,C" column list — so entities declare columns once. */
+    static String placeholdersFor(String columns) {
+        List<String>* cols = columns.split(",");
+        defer delete cols;
+        String out = "";
+        for (int i = 0; i < cols->Count(); i++) {
+            if (i == 0) out = "?";
+            else        out = out + ",?";
+        }
+        return out;
+    }
+
+    static String updateSetFor(String columns) {
+        List<String>* cols = columns.split(",");
+        defer delete cols;
+        String out = "";
+        for (int i = 0; i < cols->Count(); i++) {
+            if (i == 0) out = cols->Get(i) + "=?";
+            else        out = out + "," + cols->Get(i) + "=?";
+        }
+        return out;
+    }
+
+    static int columnCountFor(String columns) {
+        List<String>* cols = columns.split(",");
+        int n = cols->Count();
+        delete cols;
+        return n;
+    }
+
     static void save(T* e, Sqlite* db) {
-        String sql = "INSERT INTO " + e->tableName() + " (" + e->insertColumns() +
-                     ") VALUES (" + e->insertPlaceholders() + ")";
+        String cols = e->insertColumns();
+        String sql = "INSERT INTO " + e->tableName() + " (" + cols +
+                     ") VALUES (" + placeholdersFor(cols) + ")";
         owned Statement* stmt = db->prepare(sql);
         e->bindInsertValues(stmt);
         stmt->execute();
     }
 
     static void update(T* e, Sqlite* db) {
-        String sql = "UPDATE " + e->tableName() + " SET " + e->updateSet() + " WHERE Id=?";
+        String cols = e->insertColumns();
+        String sql = "UPDATE " + e->tableName() + " SET " + updateSetFor(cols) + " WHERE Id=?";
         owned Statement* stmt = db->prepare(sql);
         e->bindUpdateValues(stmt);
-        stmt->bind(e->columnCount() + 1, e->getId());
+        stmt->bind(columnCountFor(cols) + 1, e->getId());
         stmt->execute();
     }
 
