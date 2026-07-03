@@ -8996,6 +8996,14 @@ struct check_ctx {
   node_t func_block_scope;
   unsigned curr_func_scope_num;
   unsigned char in_params_p, jump_ret_p;
+  /* Set TRUE while checking a function body that contains a `try` statement.
+     Consulted by process_func_decls_for_allocation to force scalar locals and
+     parameters of such functions into memory instead of MIR registers: values
+     held in callee-saved registers across the try's setjmp are reverted to
+     their setjmp-time values by longjmp, so a variable modified in the try
+     body and read in a catch handler would otherwise see a stale (or garbage)
+     value.  Memory-backing gives the intuitive, reliable behavior. */
+  int curr_func_has_try;
   node_t curr_unnamed_anon_struct_union_member;
   node_t curr_switch;
   VARR (decl_t) * func_decls_for_allocation;
@@ -9032,6 +9040,7 @@ struct check_ctx {
 #define curr_func_scope_num check_ctx->curr_func_scope_num
 #define in_params_p check_ctx->in_params_p
 #define jump_ret_p check_ctx->jump_ret_p
+#define curr_func_has_try check_ctx->curr_func_has_try
 #define curr_unnamed_anon_struct_union_member check_ctx->curr_unnamed_anon_struct_union_member
 #define curr_switch check_ctx->curr_switch
 #define func_decls_for_allocation check_ctx->func_decls_for_allocation
@@ -9412,12 +9421,31 @@ static struct type arithmetic_conversion (const struct type *type1, const struct
   return res;
 }
 
+/* Per-dereference-site guard classification produced by the ownership pass and
+   consumed by gen (see struct expr::own_deref_class). */
+enum deref_guard_class { DEREF_GUARD_DEFAULT = 0, DEREF_GUARD_SAFE = 1, DEREF_GUARD_CHECK = 2 };
+
 struct expr {
   unsigned int const_p : 1, const_addr_p : 1, builtin_call_p : 1;
   /* Dict-to-class bind cast flags (set on N_CAST nodes):
      bind_p     : 1 iff this is the (T)dict / (T?)dict synthesized binder.
      lenient_p  : 1 iff the `?` form (no throw on missing/mismatched fields). */
   unsigned int bind_p : 1, lenient_p : 1;
+  /* Ownership-directed dereference classification (set by the ownership pass on
+     N_DEREF / N_DEREF_FIELD / N_IND nodes).  Drives gen's per-site guard
+     decision.  Values (see enum deref_guard_class):
+       DEREF_GUARD_DEFAULT (0) — not classified: emit the usual null guard.
+       DEREF_GUARD_SAFE    (1) — receiver proven live and non-null (a currently
+                                 `OS_OWNED` binding acquired via `new`, whose
+                                 OOM check guarantees non-null): elide the guard.
+       DEREF_GUARD_CHECK   (2) — receiver is a heap object the pass could tag
+                                 but whose liveness is NOT statically proven
+                                 (join-widened to MaybeOwned): today it still
+                                 gets the null guard; this is the future home of
+                                 the object generation-tag use-after-free check.
+     Defaults 0, so any site the pass didn't classify (or when -fno-ownership is
+     set) keeps its guard. */
+  unsigned int own_deref_class : 2;
   union {
     node_t lvalue_node;       /* for id, str, field, deref field, ind, deref, compound literal */
     node_t label_addr_target; /* for label address */
@@ -13362,6 +13390,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       e->u.lvalue_node = NULL;
       e->const_p = e->const_addr_p = e->builtin_call_p = FALSE;
       e->bind_p = e->lenient_p = FALSE;
+      e->own_deref_class = DEREF_GUARD_DEFAULT;
       return e;
     }
 
@@ -13784,8 +13813,18 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         type = decl->decl_spec.type;
         ns = decl->scope->attr;
         if (scalar_type_p (type)) {
-          decl->reg_p = TRUE;
-          continue;
+          /* In a function containing a `try` (with exceptions enabled), keep
+             scalars in memory rather than MIR registers: longjmp reverts
+             callee-saved registers to their setjmp-time contents, so a
+             register-homed variable modified in the try body and read in a
+             catch handler would see a stale/garbage value.  Memory-backed
+             locals hold their last store and behave intuitively.  Only decls
+             already registered here get a frame offset, so this is safe. */
+          if (!(c2m_options->exceptions_p && curr_func_has_try)) {
+            decl->reg_p = TRUE;
+            continue;
+          }
+          decl->reg_p = FALSE;
         }
         VARR_SET (decl_t, func_decls_for_allocation, j, decl);
         j++;
@@ -17441,6 +17480,7 @@ if (base != NULL && base->code == N_ID) {
     func_block_scope = curr_scope;
     curr_func_def = r;
     jump_ret_p = FALSE;
+    curr_func_has_try = FALSE;
     curr_switch = curr_loop = curr_loop_switch = NULL;
     curr_call_arg_area_offset = 0;
     VARR_TRUNC(decl_t, func_decls_for_allocation, 0);
@@ -17867,6 +17907,7 @@ if (base != NULL && base->code == N_ID) {
         func_block_scope = block;
         curr_func_def = fdef;
         jump_ret_p = FALSE;
+        curr_func_has_try = FALSE;
         curr_switch = curr_loop = curr_loop_switch = NULL;
         curr_call_arg_area_offset = 0;
         VARR_TRUNC (decl_t, func_decls_for_allocation, 0);
@@ -18447,6 +18488,9 @@ if (base != NULL && base->code == N_ID) {
         node_t body       = NL_EL(r->u.ops, 1);
         node_t catch_list = NL_EL(r->u.ops, 2);
 
+        /* Force this function's scalar locals/params into memory (see
+           curr_func_has_try) so they survive the try's setjmp/longjmp. */
+        curr_func_has_try = TRUE;
         check(c2m_ctx, body, r);                    /* walk try body block     */
         for (node_t cat = NL_HEAD(catch_list->u.ops); cat != NULL; cat = NL_NEXT(cat)) {
           node_t class_sel = NL_EL(cat->u.ops, 0);  /* class selector | N_IGNORE */
@@ -18725,6 +18769,10 @@ struct gen_ctx {
   MIR_item_t cy_safe_alloc_proto, cy_safe_alloc_item;  /* void *cy_safe_alloc(size)           */
   MIR_item_t cy_safe_free_proto,  cy_safe_free_item;   /* void  cy_safe_free(ptr,line)        */
   MIR_item_t cy_safe_deref_proto, cy_safe_deref_item;  /* void  cy_safe_deref(ptr,line)       */
+  /* -fobject-guards side-table UAF/double-free runtime (cy_obj_*) */
+  MIR_item_t cy_obj_track_proto, cy_obj_track_item;         /* void cy_obj_track(ptr)          */
+  MIR_item_t cy_obj_note_free_proto, cy_obj_note_free_item; /* void cy_obj_note_free(ptr,line) */
+  MIR_item_t cy_obj_check_proto, cy_obj_check_item;         /* void cy_obj_check(ptr,line)     */
   int exc_depth;                                        /* try nesting depth (label uids) */
   VARR (MIR_op_t) * call_ops, *ret_ops, *switch_ops;
   VARR (case_t) * switch_cases;
@@ -18895,6 +18943,12 @@ struct gen_ctx {
 #define cy_safe_free_item gen_ctx->cy_safe_free_item
 #define cy_safe_deref_proto gen_ctx->cy_safe_deref_proto
 #define cy_safe_deref_item gen_ctx->cy_safe_deref_item
+#define cy_obj_track_proto gen_ctx->cy_obj_track_proto
+#define cy_obj_track_item gen_ctx->cy_obj_track_item
+#define cy_obj_note_free_proto gen_ctx->cy_obj_note_free_proto
+#define cy_obj_note_free_item gen_ctx->cy_obj_note_free_item
+#define cy_obj_check_proto gen_ctx->cy_obj_check_proto
+#define cy_obj_check_item gen_ctx->cy_obj_check_item
 #define exc_depth gen_ctx->exc_depth
 #define call_ops gen_ctx->call_ops
 #define ret_ops gen_ctx->ret_ops
@@ -20543,9 +20597,13 @@ static op_t gen_heap_alloc (c2m_ctx_t c2m_ctx, mir_size_t size) {
   MIR_context_t ctx = c2m_ctx->ctx;
   MIR_op_t size_op = MIR_new_uint_op (ctx, size);
 
-  /* In exceptions mode use the tagged allocator so that use-after-free and
-     double-free can be detected at runtime.  The 16-byte header is invisible
-     to callers (cy_safe_alloc returns payload; cy_safe_free strips the header). */
+  /* In exceptions mode route the allocation through cy_safe_alloc.  NOTE: this
+     is a plain malloc wrapper — there is NO object header (an earlier header-
+     prefix "tagged allocator" was abandoned because prepending a header changes
+     the pointer the program holds, which breaks every free path, external C
+     interop, and alignment).  Use-after-free / double-free detection instead
+     lives in the optional side-table object guards (`-fobject-guards`, see
+     object_guard_ensure_imports / cy_obj_*), which never alter pointer layout. */
   if (c2m_options->exceptions_p) {
     safety_ensure_imports (c2m_ctx);
     return gen_rt_call (c2m_ctx, cy_safe_alloc_proto, cy_safe_alloc_item, 1, &size_op);
@@ -20589,6 +20647,14 @@ static void gen_heap_free (c2m_ctx_t c2m_ctx, MIR_op_t ptr, long line) {
   gen_rt_call_void (c2m_ctx, free_proto, free_item, 1, &ptr);
 }
 
+/* Sentinel pushed on the defer stack when entering a `try` body: when unwound
+   by gen_run_defers it emits a cy_exc_pop() call instead of gen'ing an AST
+   node.  This makes a `return`/`break`/`continue` that leaves a try body pop
+   the exception frame it entered (LIFO with any real defers registered inside
+   the try), so a later `throw` never longjmps into a frame whose function has
+   already returned.  A low integer never collides with a real heap node_t. */
+#define CY_EXC_POP_MARKER ((node_t) (intptr_t) 2)
+
 /* Emit the deferred statements registered above stack depth `from`, in LIFO
    order, without popping them (the caller decides when to truncate the stack). */
 static void gen_run_defers (c2m_ctx_t c2m_ctx, size_t from) {
@@ -20596,8 +20662,13 @@ static void gen_run_defers (c2m_ctx_t c2m_ctx, size_t from) {
   size_t i = VARR_LENGTH (node_t, defer_stmts);
 
   while (i > from) {
+    node_t d;
     i--;
-    gen (c2m_ctx, VARR_GET (node_t, defer_stmts, i), NULL, NULL, FALSE, NULL, NULL);
+    d = VARR_GET (node_t, defer_stmts, i);
+    if (d == CY_EXC_POP_MARKER)
+      gen_rt_call_void (c2m_ctx, cy_exc_pop_proto, cy_exc_pop_item, 0, NULL);
+    else
+      gen (c2m_ctx, d, NULL, NULL, FALSE, NULL, NULL);
   }
 }
 
@@ -20941,6 +21012,30 @@ static void gen_div_zero_check (c2m_ctx_t c2m_ctx, op_t divisor_op, long line) {
   emit_label_insn_opt (c2m_ctx, ok_label);
 }
 
+/* Guard: signed INT_MIN / -1 (and % ) overflow, which raises SIGFPE on x86.
+   Traps reason 3 (arithmetic) when dividend == min_val AND divisor == -1.
+   Both ops must be I64 registers (values are sign-extended, so the 32-bit
+   INT32_MIN case is represented correctly as a negative I64). */
+static void gen_div_overflow_check (c2m_ctx_t c2m_ctx, op_t dividend_op, op_t divisor_op,
+                                    long long min_val, long line) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_label_t ok_label = MIR_new_label (ctx);
+  MIR_op_t trap_args[3];
+  safety_ensure_imports (c2m_ctx);
+  /* if divisor != -1 -> safe */
+  emit3 (c2m_ctx, MIR_BNE, MIR_new_label_op (ctx, ok_label),
+         divisor_op.mir_op, MIR_new_int_op (ctx, -1));
+  /* divisor == -1: if dividend != min_val -> safe */
+  emit3 (c2m_ctx, MIR_BNE, MIR_new_label_op (ctx, ok_label),
+         dividend_op.mir_op, MIR_new_int_op (ctx, min_val));
+  trap_args[0] = MIR_new_int_op (ctx, 3); /* reason: arithmetic */
+  trap_args[1] = zero_op.mir_op;
+  trap_args[2] = MIR_new_int_op (ctx, line);
+  gen_rt_call_void (c2m_ctx, safety_trap_proto, safety_trap_item, 3, trap_args);
+  emit_label_insn_opt (c2m_ctx, ok_label);
+}
+
 /* Guard: if (uint64_t)idx_op >= len_op, call _safety_trap(1, 0, line).
    Treats negative signed indices as out-of-bounds via unsigned comparison.
    idx_op must be an I64 register; len_op may be a register or immediate. */
@@ -20989,6 +21084,72 @@ static void gen_class_deref_check (c2m_ctx_t c2m_ctx, op_t ptr_op, long line) {
   args[0] = ptr_op.mir_op;
   args[1] = MIR_new_int_op (ctx, line);
   gen_rt_call_void (c2m_ctx, cy_safe_deref_proto, cy_safe_deref_item, 2, args);
+}
+
+/* ── -fobject-guards: side-table UAF/double-free runtime imports/emitters ──
+   Layout-preserving object guards (see cyexc.h).  Only emitted when
+   c2m_options->object_guards_p is set.  cy_obj_track registers a `new` object,
+   cy_obj_note_free marks it dead + quarantines (used in place of free), and
+   cy_obj_check verifies liveness before an ownership-CHECK dereference. */
+static void object_guard_ensure_imports (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_var_t vs[2];
+  if (cy_obj_check_item != NULL) return;
+  exception_ensure_imports (c2m_ctx); /* cy_obj_* may throw via cy_exc_throw */
+  MIR_module_t module = curr_func->module;
+
+  /* void cy_obj_track(void *ptr) */
+  vs[0].name = "ptr"; vs[0].type = MIR_T_I64;
+  cy_obj_track_proto = MIR_new_proto_arr (ctx, "__cy_obj_track_p", 0, NULL, 1, vs);
+  cy_obj_track_item  = MIR_new_import (ctx, "cy_obj_track");
+  move_item_to_module_start (module, cy_obj_track_proto);
+  move_item_to_module_start (module, cy_obj_track_item);
+
+  /* void cy_obj_note_free(void *ptr, long line) */
+  vs[0].name = "ptr";  vs[0].type = MIR_T_I64;
+  vs[1].name = "line"; vs[1].type = MIR_T_I64;
+  cy_obj_note_free_proto = MIR_new_proto_arr (ctx, "__cy_obj_note_free_p", 0, NULL, 2, vs);
+  cy_obj_note_free_item  = MIR_new_import (ctx, "cy_obj_note_free");
+  move_item_to_module_start (module, cy_obj_note_free_proto);
+  move_item_to_module_start (module, cy_obj_note_free_item);
+
+  /* void cy_obj_check(void *ptr, long line) */
+  vs[0].name = "ptr";  vs[0].type = MIR_T_I64;
+  vs[1].name = "line"; vs[1].type = MIR_T_I64;
+  cy_obj_check_proto = MIR_new_proto_arr (ctx, "__cy_obj_check_p", 0, NULL, 2, vs);
+  cy_obj_check_item  = MIR_new_import (ctx, "cy_obj_check");
+  move_item_to_module_start (module, cy_obj_check_proto);
+  move_item_to_module_start (module, cy_obj_check_item);
+}
+
+/* cy_obj_track(ptr) — register a freshly `new`-allocated object as live. */
+static void gen_obj_guard_track (c2m_ctx_t c2m_ctx, MIR_op_t ptr) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  object_guard_ensure_imports (c2m_ctx);
+  gen_rt_call_void (c2m_ctx, cy_obj_track_proto, cy_obj_track_item, 1, &ptr);
+}
+
+/* cy_obj_note_free(ptr, line) — mark dead + quarantine (replaces free). */
+static void gen_obj_guard_note_free (c2m_ctx_t c2m_ctx, MIR_op_t ptr, long line) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[2];
+  object_guard_ensure_imports (c2m_ctx);
+  args[0] = ptr;
+  args[1] = MIR_new_int_op (ctx, line);
+  gen_rt_call_void (c2m_ctx, cy_obj_note_free_proto, cy_obj_note_free_item, 2, args);
+}
+
+/* cy_obj_check(ptr, line) — throw use-after-free if ptr is a known-dead object. */
+static void gen_obj_guard_check (c2m_ctx_t c2m_ctx, op_t ptr_op, long line) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_op_t args[2];
+  object_guard_ensure_imports (c2m_ctx);
+  args[0] = ptr_op.mir_op;
+  args[1] = MIR_new_int_op (ctx, line);
+  gen_rt_call_void (c2m_ctx, cy_obj_check_proto, cy_obj_check_item, 2, args);
 }
 
 /* Emit: res = dict_create_object() */
@@ -23784,8 +23945,16 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     /* Integer division-by-zero guard — only for / and %, not &, |, <<, * etc. */
     if (c2m_options->exceptions_p && (r->code == N_DIV || r->code == N_MOD)
         && integer_type_p (((struct expr *) r->attr)->type)) {
+      struct type *rt = ((struct expr *) r->attr)->type;
       op_t div_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
       gen_div_zero_check (c2m_ctx, div_reg, (long) POS (r).lno);
+      /* Signed MIN / -1 overflow (SIGFPE) guard. */
+      if (signed_integer_type_p (rt)) {
+        mir_size_t sz = type_size (c2m_ctx, rt);
+        long long minv = sz >= 8 ? (-9223372036854775807LL - 1) : (long long) (-2147483647 - 1);
+        op_t dvd_reg = force_reg (c2m_ctx, op1, MIR_T_I64);
+        gen_div_overflow_check (c2m_ctx, dvd_reg, div_reg, minv, (long) POS (r).lno);
+      }
     }
     emit_bin_op (c2m_ctx, r, ((struct expr *) r->attr)->type, res, op1, op2);
     break;
@@ -23892,8 +24061,16 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     /* Integer division-by-zero guard for /= and %= (exceptions mode only). */
     if (c2m_options->exceptions_p && (r->code == N_DIV_ASSIGN || r->code == N_MOD_ASSIGN)
         && integer_type_p (((struct expr *) r->attr)->type2)) {
+      struct type *rt = ((struct expr *) r->attr)->type2;
       op_t div_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
       gen_div_zero_check (c2m_ctx, div_reg, (long) POS (r).lno);
+      /* Signed MIN / -1 overflow (SIGFPE) guard. */
+      if (signed_integer_type_p (rt)) {
+        mir_size_t sz = type_size (c2m_ctx, rt);
+        long long minv = sz >= 8 ? (-9223372036854775807LL - 1) : (long long) (-2147483647 - 1);
+        op_t dvd_reg = force_reg (c2m_ctx, val, MIR_T_I64);
+        gen_div_overflow_check (c2m_ctx, dvd_reg, div_reg, minv, (long) POS (r).lno);
+      }
     }
     emit_bin_op (c2m_ctx, r, ((struct expr *) r->attr)->type2, val, val, op2);
     t = get_op_type (c2m_ctx, var);
@@ -24035,7 +24212,16 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       op_t wrapped;
       if (rhs_expr != NULL && rhs_expr->type->mode == TM_DICT) {
         wrapped = gen_dict_value_copy (c2m_ctx, op2.mir_op);
-      } else if (rhs_node->code == N_STR || (rhs_expr != NULL && rhs_expr->type->mode == TM_PTR)) {
+      } else if (rhs_node->code == N_STR
+                 || (rhs_expr != NULL
+                     && (builtin_string_type_p (rhs_expr->type)
+                         || rhs_expr->type->mode == TM_PTR))) {
+        /* String / char* / literal: store via dict_create_string, which COPIES
+           the bytes so the dict owns its own buffer.  Without the
+           builtin_string_type_p check a ClassyC `String` (not TM_PTR) fell
+           through to the int64 branch below — the raw pointer was stored as a
+           number (garbage json) and dangled once its arena scope was released.
+           Mirrors gen_dict_value_for_init's runtime-String handling. */
         wrapped = gen_dict_create_string (c2m_ctx, op2.mir_op);
       } else if (rhs_expr != NULL && rhs_expr->const_p && floating_type_p (rhs_expr->type)) {
         wrapped = gen_dict_create_number (c2m_ctx, op2.mir_op);
@@ -24289,6 +24475,16 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     } else {
       op1 = force_reg (c2m_ctx, op1, MIR_T_I64);
       assert (op1.mir_op.mode == MIR_OP_REG);
+      /* Null guard when indexing a genuine pointer (not a decayed array whose
+         base is always a valid stack/global address): p[i] on a null p would
+         otherwise segfault. */
+      if (c2m_options->exceptions_p && arr_type->mode == TM_PTR && arr_type->arr_type == NULL
+          && ((struct expr *) r->attr)->own_deref_class != DEREF_GUARD_SAFE)
+        gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
+      /* -fobject-guards: liveness check at ownership-CHECK (MaybeOwned) sites. */
+      if (c2m_options->object_guards_p
+          && ((struct expr *) r->attr)->own_deref_class == DEREF_GUARD_CHECK)
+        gen_obj_guard_check (c2m_ctx, op1, (long) POS (r).lno);
     }
     res = op1;
     res.decl = NULL;
@@ -24394,9 +24590,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         && type->u.ptr_type->mode == TM_FUNC && type->func_type_before_adjustment_p) {
       res = op1;
     } else {
-      /* Null-pointer guard before data dereference (*ptr). */
-      if (c2m_options->exceptions_p)
+      /* Null-pointer guard before data dereference (*ptr).  Elided when the
+         ownership pass proved the receiver live and non-null (DEREF_GUARD_SAFE). */
+      if (c2m_options->exceptions_p
+          && ((struct expr *) r->attr)->own_deref_class != DEREF_GUARD_SAFE)
         gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
+      /* -fobject-guards: liveness check at ownership-CHECK (MaybeOwned) sites. */
+      if (c2m_options->object_guards_p
+          && ((struct expr *) r->attr)->own_deref_class == DEREF_GUARD_CHECK)
+        gen_obj_guard_check (c2m_ctx, op1, (long) POS (r).lno);
       struct expr *op_e = NL_HEAD (r->u.ops)->attr;
       t = get_mir_type (c2m_ctx, type);
       op1.mir_op = MIR_new_alias_mem_op (ctx, t, 0, op1.mir_op.u.reg, 0, 1,
@@ -24482,9 +24684,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       assert (left->type->mode == TM_PTR);
       op1 = force_reg (c2m_ctx, op1, MIR_T_I64);
       assert (op1.mir_op.mode == MIR_OP_REG);
-      /* Null-pointer guard before ptr->field access. */
-      if (c2m_options->exceptions_p)
+      /* Null-pointer guard before ptr->field access.  Elided when the
+         ownership pass proved the receiver live and non-null (DEREF_GUARD_SAFE). */
+      if (c2m_options->exceptions_p
+          && ((struct expr *) r->attr)->own_deref_class != DEREF_GUARD_SAFE)
         gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
+      /* -fobject-guards: liveness check at ownership-CHECK (MaybeOwned) sites. */
+      if (c2m_options->object_guards_p
+          && ((struct expr *) r->attr)->own_deref_class == DEREF_GUARD_CHECK)
+        gen_obj_guard_check (c2m_ctx, op1, (long) POS (r).lno);
       /* Note: use-after-free detection via cy_safe_deref is available in the
          runtime but not auto-emitted here.  Without intercepting ALL malloc calls
          (including runtime-internal ones) the per-deref check produces false
@@ -24845,6 +25053,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         }
       }
     }
+    /* -fobject-guards: register this `new` class object in the liveness side
+       table so use-after-free / double-free through it is detectable. */
+    if (c2m_options->object_guards_p)
+      gen_obj_guard_track (c2m_ctx, obj.mir_op);
     res = obj;
     break;
   }
@@ -26803,14 +27015,24 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
        members AFTER the user destructor ran (it may still read them) and
        BEFORE the heap is released.  No-op unless the deleted type is a class
        with String members. */
+    int del_is_class_obj = FALSE;
     {
       struct expr *del_e2 = (struct expr *) expr->attr;
       struct type *cls = (del_e2 != NULL && del_e2->type != NULL
                           && del_e2->type->mode == TM_PTR)
                            ? del_e2->type->u.ptr_type : NULL;
+      del_is_class_obj = (cls != NULL && cls->mode == TM_CLASS);
       gen_class_string_members_drop (c2m_ctx, op1.mir_op, cls);
     }
-    gen_heap_free (c2m_ctx, op1.mir_op, (long) POS (r).lno);
+    /* -fobject-guards: for `new` class objects, mark the address dead and
+       quarantine it (the runtime frees it later on ring eviction) instead of
+       returning it to malloc immediately — this both catches double-free and
+       keeps the address from being reused while still tracked (no false-positive
+       UAF).  Non-class heap frees keep the normal path. */
+    if (c2m_options->object_guards_p && del_is_class_obj)
+      gen_obj_guard_note_free (c2m_ctx, op1.mir_op, (long) POS (r).lno);
+    else
+      gen_heap_free (c2m_ctx, op1.mir_op, (long) POS (r).lno);
     emit_label_insn_opt (c2m_ctx, del_skip); /* null pointers land here (no-op) */
     /* Use-after-free mitigation: null out the deleted pointer's lvalue so that
        any subsequent access through the same variable hits the null guard. */
@@ -27013,10 +27235,29 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       op_t sj = gen_rt_call (c2m_ctx, cy_setjmp_proto, cy_setjmp_item, 1, &buf.mir_op);
       emit2 (c2m_ctx, MIR_BT, MIR_new_label_op (ctx, dispatch_label), sj.mir_op);
 
+      /* Register a frame-pop marker on the defer stack so a return/break/
+         continue leaving the body pops this exception frame (see
+         CY_EXC_POP_MARKER).  It unwinds LIFO with any real defers declared
+         inside the try body. */
+      size_t try_defer_mark = VARR_LENGTH (node_t, defer_stmts);
+      VARR_PUSH (node_t, defer_stmts, CY_EXC_POP_MARKER);
+
       /* --- normal path: run protected body, unwind frame, done --- */
       gen (c2m_ctx, body, NULL, NULL, FALSE, NULL, NULL);
-      gen_rt_call_void (c2m_ctx, cy_exc_pop_proto, cy_exc_pop_item, 0, NULL);
-      emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, after_try));
+      {
+        /* Only pop + jump on fall-through.  If the body ended in a terminator
+           (return/break/continue already ran the marker and jumped), emitting
+           another pop would be dead code and a double-pop. */
+        MIR_insn_t last = DLIST_TAIL (MIR_insn_t, curr_func->u.func->insns);
+        if (last == NULL
+            || (last->code != MIR_RET && last->code != MIR_JRET && last->code != MIR_JMP)) {
+          gen_run_defers (c2m_ctx, try_defer_mark); /* emits cy_exc_pop via marker */
+          emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, after_try));
+        }
+      }
+      /* Remove the marker from the compile-time defer stack; the exception
+         (dispatch) path below pops the frame explicitly at runtime. */
+      VARR_TRUNC (node_t, defer_stmts, try_defer_mark);
 
       /* --- exception path: pop our frame, then dispatch on the thrown id --- */
       emit_label_insn_opt (c2m_ctx, dispatch_label);

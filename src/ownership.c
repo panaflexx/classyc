@@ -1905,6 +1905,52 @@ static void analyze (flowctx_t *ctx, node_t n) {
     }
     return;
   }
+  case N_DEREF:
+  case N_DEREF_FIELD:
+  case N_IND: {
+    /* Ownership-directed dereference classification.  The gen phase emits a
+       null guard before *p / p->f / p[i] when -fexceptions is on.  We refine
+       that per site (see enum deref_guard_class):
+
+         SAFE  — receiver is a tracked binding in state OS_OWNED (never
+                 released/detached/moved and not widened to MaybeOwned at a
+                 join) AND acquired via `new` (whose OOM check guarantees
+                 non-null).  gen elides the redundant guard.
+         CHECK — receiver is a `new` heap binding that is live-but-uncertain
+                 (OS_MAYBE_OWNED: owned on some paths, gone on others).  It is
+                 the natural home for the future object generation-tag
+                 use-after-free check; for now gen still emits the null guard.
+
+       Only classify on the final diagnostic pass (authoritative, converged
+       state); silent inference passes never stamp. */
+    if (diag_active_p (ctx)) {
+      node_t recv   = NL_HEAD (n->u.ops);
+      node_t target = id_resolves_to_decl (recv);
+      int idx = cand_lookup (ctx, target);
+      if (idx >= 0 && n->attr != NULL) {
+        candidate_t *c = &VARR_ADDR (candidate_t, ctx->cands)[idx];
+        int new_binding
+          = c->managed_p
+            || (c->release_fn != NULL && strcmp (c->release_fn, "delete") == 0);
+        if (new_binding && c->state == OS_OWNED) {
+          ((struct expr *) n->attr)->own_deref_class = DEREF_GUARD_SAFE;
+        } else if (new_binding && c->state == OS_MAYBE_OWNED) {
+          ((struct expr *) n->attr)->own_deref_class = DEREF_GUARD_CHECK;
+          if (ctx->verbose_p) {
+            pos_t p = POS (n);
+            fprintf (stderr,
+                     "  [ownership] deref of `%s` needs liveness check "
+                     "(MaybeOwned) at %s:%d — future generation-tag site\n",
+                     c->name, p.fname != NULL ? p.fname : "?", p.lno);
+          }
+        }
+      }
+    }
+    /* Recurse for nested effects (the receiver's own N_ID UAF check, etc.). */
+    for (node_t ch = NL_HEAD (n->u.ops); ch != NULL; ch = NL_NEXT (ch))
+      analyze (ctx, ch);
+    return;
+  }
   case N_ID: {
     /* Bare use: check for use-after-release.  We don't fire on an N_ID
        directly inside an N_CALL arg list (transfer_call already fires);

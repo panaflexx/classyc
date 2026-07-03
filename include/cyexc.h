@@ -171,4 +171,119 @@ C2M_EXC_API void cy_safe_deref (void *ptr, long line) {
   (void) ptr; (void) line; /* no-op without a global malloc intercept */
 }
 
+/* ── Object guards: side-table + quarantine (opt-in via -fobject-guards) ──────
+ *
+ * A layout-preserving use-after-free / double-free detector for `new` class
+ * objects.  Unlike a header-prefix "tagged allocator" (which changes the
+ * pointer the program holds and breaks every free path / C interop), this
+ * keeps `new` a plain malloc and tracks liveness in a SIDE TABLE keyed by the
+ * object address.  The compiler emits, under -fobject-guards:
+ *
+ *     new C(...)        ->  ...malloc..., cy_obj_track(p)
+ *     delete p          ->  ...dtor..., cy_obj_note_free(p, line)   (no free!)
+ *     p->field  (CHECK) ->  cy_obj_check(p, line); ...access...
+ *
+ * where CHECK sites are exactly the derefs the ownership pass could not prove
+ * live (state MaybeOwned).  Proven-live (OWNED) derefs are never instrumented.
+ *
+ * Freed blocks are QUARANTINED, not returned to malloc, so their addresses are
+ * never reused while still tracked -- this is what makes the check free of the
+ * false positives the cy_safe_deref note above describes (a reused address can
+ * never masquerade as a live-then-dead tracked object).  When the quarantine
+ * ring is full the oldest block is really free()d AND its table entry removed,
+ * so a much-later deref of that stale pointer finds no entry and is treated
+ * leniently (no throw) rather than a false positive.
+ *
+ * Single-threaded (like the rest of cyexc); wrap the table in a mutex or make
+ * it _Thread_local before using guards in threaded code. */
+
+#ifndef CY_OBJ_TAB_BITS
+#define CY_OBJ_TAB_BITS 16               /* 65536 slots (open addressing) */
+#endif
+#define CY_OBJ_TAB_SIZE (1u << CY_OBJ_TAB_BITS)
+#define CY_OBJ_TAB_MASK (CY_OBJ_TAB_SIZE - 1u)
+
+#ifndef CY_OBJ_QUARANTINE
+#define CY_OBJ_QUARANTINE 4096           /* freed blocks held before real free() */
+#endif
+
+#define CY_OBJ_EMPTY 0                   /* slot unused                          */
+#define CY_OBJ_LIVE  1                   /* address currently owns a live object */
+#define CY_OBJ_DEAD  2                   /* address freed (quarantined)          */
+
+typedef struct { uintptr_t addr; unsigned char state; } cy_obj_slot_t;
+static cy_obj_slot_t cy__obj_tab[CY_OBJ_TAB_SIZE];
+static void         *cy__obj_quar[CY_OBJ_QUARANTINE];
+static size_t        cy__obj_quar_head = 0;
+static size_t        cy__obj_quar_count = 0;
+
+static size_t cy__obj_hash (uintptr_t a) {
+  /* Fibonacci hash of the address (drop the low zero bits from alignment). */
+  a >>= 4;
+  return (size_t) ((a * 11400714819323198485ull) >> (64 - CY_OBJ_TAB_BITS)) & CY_OBJ_TAB_MASK;
+}
+
+/* Find the slot for `a`: returns index of its entry or of the first EMPTY slot
+   on the probe chain (insertion point).  Table is sized generously and never
+   grows; if it fills, we degrade to lenient (treat as untracked). */
+static size_t cy__obj_find (uintptr_t a) {
+  size_t i = cy__obj_hash (a);
+  for (size_t n = 0; n < CY_OBJ_TAB_SIZE; n++) {
+    if (cy__obj_tab[i].state == CY_OBJ_EMPTY || cy__obj_tab[i].addr == a) return i;
+    i = (i + 1) & CY_OBJ_TAB_MASK;
+  }
+  return cy__obj_hash (a); /* full: caller overwrites, worst case a stale entry */
+}
+
+/* Register a freshly `new`-allocated object as live. */
+C2M_EXC_API void cy_obj_track (void *ptr) {
+  if (ptr == NULL) return;
+  uintptr_t a = (uintptr_t) ptr;
+  size_t i = cy__obj_find (a);
+  cy__obj_tab[i].addr = a;
+  cy__obj_tab[i].state = CY_OBJ_LIVE;
+}
+
+/* Record that `ptr` is being deleted.  Throws on double-free.  Does NOT free
+   the block: it is quarantined so its address can't be reused while tracked.
+   The oldest quarantined block is really free()d (and untracked) when the ring
+   overflows. */
+C2M_EXC_API void cy_obj_note_free (void *ptr, long line) {
+  if (ptr == NULL) return; /* delete of null is a no-op elsewhere */
+  uintptr_t a = (uintptr_t) ptr;
+  size_t i = cy__obj_find (a);
+  if (cy__obj_tab[i].state == CY_OBJ_DEAD && cy__obj_tab[i].addr == a) {
+    cy_exc_throw (CY_EXC_RUNTIME, "double free of object", NULL, (int) line);
+    return;
+  }
+  /* Mark dead (track it even if it wasn't seen at alloc: still catches a later
+     double free). */
+  cy__obj_tab[i].addr = a;
+  cy__obj_tab[i].state = CY_OBJ_DEAD;
+
+  /* Quarantine ring: evict + really free the oldest when full. */
+  if (cy__obj_quar_count == CY_OBJ_QUARANTINE) {
+    void *old = cy__obj_quar[cy__obj_quar_head];
+    size_t j = cy__obj_find ((uintptr_t) old);
+    if (cy__obj_tab[j].addr == (uintptr_t) old) cy__obj_tab[j].state = CY_OBJ_EMPTY;
+    free (old);
+    cy__obj_quar[cy__obj_quar_head] = ptr;
+    cy__obj_quar_head = (cy__obj_quar_head + 1) % CY_OBJ_QUARANTINE;
+  } else {
+    cy__obj_quar[(cy__obj_quar_head + cy__obj_quar_count) % CY_OBJ_QUARANTINE] = ptr;
+    cy__obj_quar_count++;
+  }
+}
+
+/* Liveness check before a dereference the compiler couldn't prove live.
+   Throws use-after-free if the address is a known-dead (quarantined) object.
+   A live or untracked address passes (untracked => lenient, no false positive). */
+C2M_EXC_API void cy_obj_check (void *ptr, long line) {
+  if (ptr == NULL) return; /* null is handled by the separate null guard */
+  uintptr_t a = (uintptr_t) ptr;
+  size_t i = cy__obj_find (a);
+  if (cy__obj_tab[i].state == CY_OBJ_DEAD && cy__obj_tab[i].addr == a)
+    cy_exc_throw (CY_EXC_RUNTIME, "use-after-free", NULL, (int) line);
+}
+
 #endif /* C2M_CYEXC_H */

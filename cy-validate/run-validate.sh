@@ -26,7 +26,10 @@ for f in "$DIR"/val-*.cy; do
     [ -f "$f" ] || continue
     name=$(basename "$f")
     banner "$name"
-    $CLASSYC -g $INCLUDE "$f" -eg
+    # A test may request extra compiler flags via a first-line marker:
+    #   /* REQUIRES: -fobject-guards */
+    extra=$(sed -n '1,5p' "$f" | sed -n 's|.*REQUIRES:\([^*]*\)\*/.*|\1|p')
+    $CLASSYC -g $INCLUDE $extra "$f" -eg
     status=$?
     if [ $status -eq 0 ]; then
         PASS=$((PASS + 1))
