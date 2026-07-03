@@ -27,9 +27,12 @@ static char stdarg_str[]
 #endif
     "#define va_arg(ap, type) __builtin_va_arg(ap, (type *) 0)\n"
     "#define va_end(ap) 0\n"
-#if defined(__APPLE__) || defined(__WIN32)
+#if defined(__WIN32)
+    /* Windows x64: va_list is `char *` (a scalar), so copy by value. */
     "#define va_copy(dest, src) ((dest) = (src))\n"
 #else
+    /* SysV x86-64 (Linux and macOS): va_list is `struct __va_list_tag[1]`,
+       an array type — assign the single element, never the array itself. */
     "#define va_copy(dest, src) ((dest)[0] = (src)[0])\n"
 #endif
     "\n"
