@@ -468,8 +468,68 @@ float __nan (void) {
 }
 #endif
 
+/* Forward decl: the JIT context (defined below) is scanned by the registry
+   resolver, which the linker invokes before that definition is reached. */
+static MIR_context_t main_ctx;
+
+/* ── [[registry("NAME")]] cross-module reflection (JIT linker set) ─────────
+   classyc lowers each [[registry("NAME")]] record to an exported ref_data
+   symbol `__cyreg_<NAME>__<var>` that points at the record.  Undefined anchors
+   `__start_cyreg_<NAME>` / `__stop_cyreg_<NAME>` are resolved here by gathering
+   every matching record's address into a contiguous void*[] and returning its
+   bounds — the JIT analogue of GNU ld's `__start_/__stop_` linker set used in
+   AOT, so the same source iterates the set identically in both modes. */
+typedef struct { char *name; void **arr; size_t n; } cyreg_set_t;
+static cyreg_set_t *cyreg_sets = NULL;
+static size_t cyreg_nsets = 0, cyreg_cap = 0;
+
+static cyreg_set_t *cyreg_get_set (const char *regname) {
+  for (size_t i = 0; i < cyreg_nsets; i++)
+    if (strcmp (cyreg_sets[i].name, regname) == 0) return &cyreg_sets[i];
+
+  char prefix[512];
+  int plen = snprintf (prefix, sizeof prefix, "__cyreg_%s__", regname);
+  void **arr = NULL;
+  size_t n = 0, cap = 0;
+  DLIST (MIR_module_t) *mlist = MIR_get_module_list (main_ctx);
+  for (MIR_module_t m = DLIST_HEAD (MIR_module_t, *mlist); m != NULL;
+       m = DLIST_NEXT (MIR_module_t, m)) {
+    for (MIR_item_t it = DLIST_HEAD (MIR_item_t, m->items); it != NULL;
+         it = DLIST_NEXT (MIR_item_t, it)) {
+      if (it->item_type != MIR_ref_data_item) continue;
+      const char *nm = it->u.ref_data->name;
+      if (nm == NULL || strncmp (nm, prefix, (size_t) plen) != 0) continue;
+      void *rec = it->u.ref_data->ref_item != NULL ? it->u.ref_data->ref_item->addr : NULL;
+      if (n >= cap) { cap = cap ? cap * 2 : 8; arr = realloc (arr, cap * sizeof (void *)); }
+      arr[n++] = rec;
+    }
+  }
+  /* Ensure a non-NULL, unique base even for an empty set (start==stop). */
+  if (arr == NULL) arr = calloc (1, sizeof (void *));
+  if (cyreg_nsets >= cyreg_cap) {
+    cyreg_cap = cyreg_cap ? cyreg_cap * 2 : 8;
+    cyreg_sets = realloc (cyreg_sets, cyreg_cap * sizeof (cyreg_set_t));
+  }
+  cyreg_sets[cyreg_nsets].name = strdup (regname);
+  cyreg_sets[cyreg_nsets].arr = arr;
+  cyreg_sets[cyreg_nsets].n = n;
+  return &cyreg_sets[cyreg_nsets++];
+}
+
+static void *cyreg_anchor (const char *sym) {
+  const char *reg;
+  int stop;
+  if (strncmp (sym, "__start_cyreg_", 14) == 0) { reg = sym + 14; stop = 0; }
+  else if (strncmp (sym, "__stop_cyreg_", 13) == 0) { reg = sym + 13; stop = 1; }
+  else return NULL;
+  cyreg_set_t *s = cyreg_get_set (reg);
+  return stop ? (void *) (s->arr + s->n) : (void *) s->arr;
+}
+
 static void *import_resolver (const char *name) {
   void *handler, *sym = NULL;
+
+  { void *a = cyreg_anchor (name); if (a != NULL) return a; }
 
   for (size_t i = 0; i < sizeof (std_libs) / sizeof (struct lib); i++)
     if ((handler = std_libs[i].handler) != NULL && (sym = dlsym (handler, name)) != NULL) break;

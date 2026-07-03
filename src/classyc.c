@@ -4618,6 +4618,10 @@ typedef node_t (*nonterm_arg_func_t) (c2m_ctx_t c2m_ctx, int, node_t);
    composes postfix operators via post_expr_part, which is defined later. */
 static node_t post_expr_part (c2m_ctx_t c2m_ctx, int no_err_p, node_t arg);
 
+/* Forward decl: C23 `[[...]]` attribute specifier, referenced by
+   try_attr_spec (defined earlier) but implemented alongside D(attr). */
+static node_t c23_attr_spec (c2m_ctx_t c2m_ctx, int no_err_p MIR_UNUSED);
+
 #define C(c) (curr_token->code == c)
 
 static int match (c2m_ctx_t c2m_ctx, int c, pos_t *pos, node_code_t *node_code, node_t *node) {
@@ -6123,6 +6127,7 @@ static node_t try_attr_spec (c2m_ctx_t c2m_ctx, pos_t pos, node_t *asm_part) {
       *asm_part = r;
     }
   }
+  if ((r = TRY (c23_attr_spec)) != err_node) return r; /* C23 [[...]] */
   if ((r = TRY (attr_spec)) != err_node) {
     if (c2m_options->pedantic_p)
       error (c2m_ctx, pos, "GCC attributes are not implemented");
@@ -6206,7 +6211,12 @@ D (declaration) {
     if (curr_scope == top_scope && c2m_options->pedantic_p)
       warning (c2m_ctx, pos, "extra ; outside of a function");
   } else {
-    try_attr_spec (c2m_ctx, curr_token->pos, NULL);
+    /* Leading attributes (C23 `[[...]]` or GCC `__attribute__`) appear BEFORE
+       the declaration specifiers, e.g. `[[registry("routes")]] static T x`.
+       Capture them so they can be merged onto each init-declarator's attrs
+       slot (previously the return value was discarded). */
+    node_t lead_attrs = try_attr_spec (c2m_ctx, curr_token->pos, NULL);
+    if (lead_attrs == err_node) lead_attrs = NULL;
     PA (declaration_specs, curr_scope == top_scope ? (node_t) 1 : NULL);
     spec = r;
     last_pos = POS (spec);
@@ -6299,7 +6309,22 @@ D (declaration) {
         op = NL_HEAD (decl->u.ops);
         tpname_add (c2m_ctx, op, curr_scope, typedef_p);
         attrs = try_attr_spec (c2m_ctx, last_pos, &asm_part);
-        if (attrs == err_node) attrs = new_node (c2m_ctx, N_IGNORE);
+        if (attrs == err_node) attrs = NULL;
+        /* Merge leading attrs (before the specs) with trailing attrs (after the
+           declarator).  Both are N_LIST(of N_ATTR); prepend the leading ones. */
+        if (lead_attrs != NULL) {
+          if (attrs == NULL) {
+            attrs = lead_attrs;
+          } else {
+            for (node_t a = NL_HEAD (lead_attrs->u.ops); a != NULL; ) {
+              node_t nexta = NL_NEXT (a);
+              NL_REMOVE (lead_attrs->u.ops, a);
+              op_append (c2m_ctx, attrs, a);
+              a = nexta;
+            }
+          }
+        }
+        if (attrs == NULL) attrs = new_node (c2m_ctx, N_IGNORE);
         if (asm_part == NULL) asm_part = new_node (c2m_ctx, N_IGNORE);
         if (M ('=')) {
           P (initializer);
@@ -6375,6 +6400,29 @@ D (attr_spec) {
   }
   PT (')');
   PT (')');
+  return list;
+}
+
+/* C23 attribute specifier: `[[ attr, attr(args), ... ]]`.  Reuses the D(attr)
+   parser (shared with __attribute__) so both spellings produce the same
+   N_ATTR(N_ID, N_LIST:(arg)*) node shape.  Wrapped in TRY by callers, so a
+   real leading subscript never mis-parses as an attribute. */
+D (c23_attr_spec) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  node_t list, r;
+
+  PT ('[');
+  PT ('[');   /* second '[' absent => not a C23 attribute; TRY rewinds */
+  list = new_node (c2m_ctx, N_LIST);
+  for (;;) {
+    if (C (']')) break;
+    P (attr);
+    op_append (c2m_ctx, list, r);
+    if (C (']')) break;
+    PT (',');
+  }
+  PT (']');
+  PT (']');
   return list;
 }
 
@@ -22838,6 +22886,25 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
   }
 }
 
+/* If `attrs` (a declaration's N_LIST of N_ATTR) carries `registry("NAME")`,
+   return NAME (the section/registry key); otherwise NULL.  Used to lower the
+   C23 `[[registry("...")]]` marker into a cross-module registry entry. */
+static const char *registry_attr_name (node_t attrs) {
+  if (attrs == NULL || attrs->code != N_LIST) return NULL;
+  for (node_t a = NL_HEAD (attrs->u.ops); a != NULL; a = NL_NEXT (a)) {
+    if (a->code != N_ATTR) continue;
+    node_t id = NL_HEAD (a->u.ops);
+    if (id == NULL || id->code != N_ID || strcmp (id->u.s.s, "registry") != 0) continue;
+    node_t arglist = NL_NEXT (id);
+    if (arglist == NULL || arglist->code != N_LIST) return NULL;
+    node_t arg = NL_HEAD (arglist->u.ops);
+    if (arg == NULL) return NULL;
+    if (arg->code == N_STR || arg->code == N_ID) return arg->u.s.s;
+    return NULL;
+  }
+  return NULL;
+}
+
 static MIR_item_t get_ref_item (c2m_ctx_t c2m_ctx, node_t def, const char *name) {
   MIR_context_t ctx = c2m_ctx->ctx;
   struct decl *decl = def->attr;
@@ -25598,6 +25665,29 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           MIR_item_t item = MIR_new_forward (ctx, name);
 
           move_item_forward (c2m_ctx, item);
+        }
+        /* [[registry("NAME")]] lowering: emit an exported pointer to this
+           top-level record under a discoverable, prefixed symbol
+           (__cyreg_<NAME>__<var>).  The JIT driver enumerates these across
+           modules to synthesize __start_cyreg_<NAME>/__stop_cyreg_<NAME>; in
+           AOT they land in an ELF/Mach-O section with the same anchors. */
+        if (decl->u.item != NULL && decl->scope == top_scope) {
+          const char *reg = registry_attr_name (attrs);
+          if (reg != NULL) {
+            /* Emit one exported-address entry per record: `__cyreg_<NAME>__...`
+               is a pointer to the record.  The JIT driver enumerates these by
+               scanning module items; b2obj/b2objmac place them into an ELF/
+               Mach-O section `cyreg_<NAME>` so the system linker provides the
+               `__start_/__stop_` anchors.  A process-global counter keeps the
+               names unique across modules within a single (JIT) invocation;
+               in AOT they are emitted as local symbols so per-object repeats
+               are harmless.  NAME must not contain `__` (it delimits the
+               registry key from the per-record suffix). */
+            static int cyreg_counter = 0;
+            char rn[512];
+            snprintf (rn, sizeof rn, "__cyreg_%s__%s_%d", reg, name, cyreg_counter++);
+            MIR_new_ref_data (ctx, rn, decl->u.item, 0);
+          }
         }
       }
     }

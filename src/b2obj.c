@@ -668,6 +668,71 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         }
     }
 
+    /* ----- [[registry("NAME")]] linker sets -----
+       classyc lowered each tagged record to a ref_data symbol
+       `__cyreg_<NAME>__*` pointing at the record.  Pull them OUT of .data into
+       one PROGBITS section `cyreg_<NAME>` per registry (holding the 8-byte
+       pointers, relocated to the records), so the system linker synthesises
+       `__start_cyreg_<NAME>` / `__stop_cyreg_<NAME>` bounding the set — the
+       AOT analogue of the JIT driver's module scan. */
+    typedef struct {
+        char name[128];
+        uint8_t *buf; size_t size, cap;
+        struct { size_t off; const char *sym; int64_t add; } *rel;
+        size_t nrel, caprel;
+        Elf64_Rela *rbuf;                /* resolved relocations (indices) */
+        size_t sec_idx, rela_sec_idx;    /* ELF section indices (assigned later) */
+        size_t nm, rela_nm;              /* .shstrtab name offsets */
+        size_t file_off, rela_file_off;  /* file offsets */
+    } cyreg_sec_t;
+    cyreg_sec_t *cyr = NULL; size_t n_cyr = 0, cap_cyr = 0;
+    struct { const char *name; size_t sec; size_t off; } *cyr_syms = NULL;
+    size_t n_cyr_syms = 0, cap_cyr_syms = 0;
+    {
+        size_t w = 0;
+        for (size_t i = 0; i < n_datas; i++) {
+            const char *nm = datas[i].name;
+            if (nm != NULL && datas[i].is_ref_data && strncmp(nm, "__cyreg_", 8) == 0) {
+                const char *p = nm + 8;
+                const char *e = strstr(p, "__");
+                size_t klen = e ? (size_t)(e - p) : strlen(p);
+                char key[128];
+                if (klen >= sizeof key) klen = sizeof key - 1;
+                memcpy(key, p, klen); key[klen] = 0;
+                cyreg_sec_t *s = NULL;
+                for (size_t k = 0; k < n_cyr; k++)
+                    if (strcmp(cyr[k].name, key) == 0) { s = &cyr[k]; break; }
+                if (s == NULL) {
+                    if (n_cyr >= cap_cyr) { cap_cyr = cap_cyr ? cap_cyr*2 : 4;
+                        cyr = realloc(cyr, cap_cyr * sizeof *cyr); }
+                    s = &cyr[n_cyr++]; memset(s, 0, sizeof *s);
+                    snprintf(s->name, sizeof s->name, "%s", key);
+                }
+                size_t off = s->size;             /* entries are 8 bytes, naturally aligned */
+                if (s->size + 8 > s->cap) { s->cap = s->cap ? s->cap*2 : 64;
+                    s->buf = realloc(s->buf, s->cap); }
+                memset(s->buf + off, 0, 8); s->size += 8;
+                const char *tgt = datas[i].ref_item ? map_symbol(MIR_item_name(ctx, datas[i].ref_item)) : NULL;
+                if (tgt != NULL) {
+                    if (s->nrel >= s->caprel) { s->caprel = s->caprel ? s->caprel*2 : 8;
+                        s->rel = realloc(s->rel, s->caprel * sizeof *s->rel); }
+                    s->rel[s->nrel].off = off; s->rel[s->nrel].sym = tgt;
+                    s->rel[s->nrel].add = datas[i].ref_disp; s->nrel++;
+                }
+                if (n_cyr_syms >= cap_cyr_syms) { cap_cyr_syms = cap_cyr_syms ? cap_cyr_syms*2 : 16;
+                    cyr_syms = realloc(cyr_syms, cap_cyr_syms * sizeof *cyr_syms); }
+                cyr_syms[n_cyr_syms].name = nm;
+                cyr_syms[n_cyr_syms].sec  = (size_t)(s - cyr);
+                cyr_syms[n_cyr_syms].off  = off;
+                n_cyr_syms++;
+                free(datas[i].bytes);             /* drop from .data */
+            } else {
+                datas[w++] = datas[i];
+            }
+        }
+        n_datas = w;
+    }
+
     /* ----- Phase 2: assign offsets within sections ----- */
     DBG("phase 1b done: %zu funcs, %zu datas, %zu bsses", n_funcs, n_datas, n_bsses);
     DBG("phase 2: assigning section offsets and building buffers");
@@ -822,6 +887,20 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t nm_rela_debug_info = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.debug_info");
     size_t nm_rela_debug_line = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.debug_line");
 
+    /* Dynamic [[registry]] sections follow the fixed set.  Each registry gets a
+       PROGBITS section `cyreg_<NAME>` (index NUM_SECTIONS+2k) and a matching
+       `.rela.cyreg_<NAME>` (index NUM_SECTIONS+2k+1). */
+    size_t total_sections = NUM_SECTIONS + 2 * n_cyr;
+    for (size_t k = 0; k < n_cyr; k++) {
+        char snm[160], rnm[168];
+        snprintf(snm, sizeof snm, "cyreg_%s", cyr[k].name);
+        snprintf(rnm, sizeof rnm, ".rela.cyreg_%s", cyr[k].name);
+        cyr[k].sec_idx      = NUM_SECTIONS + 2 * k;
+        cyr[k].rela_sec_idx = NUM_SECTIONS + 2 * k + 1;
+        cyr[k].nm      = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, snm);
+        cyr[k].rela_nm = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, rnm);
+    }
+
     /* Build .strtab + symtab entries */
     char  *strtab = NULL;
     size_t strtab_size = 0, strtab_cap = 0;
@@ -953,6 +1032,20 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         SYMTAB_PUSH(s);
     }
 
+    /* [[registry]] entry symbols: LOCAL STT_OBJECT pointers living in their
+       cyreg_<NAME> section.  Local binding lets several objects each define
+       their own entries without duplicate-symbol clashes; the linker still
+       merges the sections and provides the __start_/__stop_ anchors. */
+    for (size_t i = 0; i < n_cyr_syms; i++) {
+        Elf64_Sym s = {0};
+        s.st_name = strtab_add(&strtab, &strtab_size, &strtab_cap, cyr_syms[i].name);
+        s.st_info = ELF64_ST_INFO(STB_LOCAL, STT_OBJECT);
+        s.st_shndx = (uint16_t) cyr[cyr_syms[i].sec].sec_idx;
+        s.st_value = cyr_syms[i].off;
+        s.st_size = 8;
+        SYMTAB_PUSH(s);
+    }
+
     /* Imported / external undefined symbols.
      * Also add any reloc symbol not yet in sym_map. */
     for (size_t i = 0; i < imports.n; i++) {
@@ -1046,6 +1139,19 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
             rela_data[rd_idx++] = r;
         else
             rela_text[rt_idx++] = r;
+    }
+
+    /* Resolve [[registry]] section relocations (symtab indices are final). */
+    for (size_t k = 0; k < n_cyr; k++) {
+        cyr[k].rbuf = cyr[k].nrel ? calloc(cyr[k].nrel, sizeof(Elf64_Rela)) : NULL;
+        for (size_t r = 0; r < cyr[k].nrel; r++) {
+            size_t sym_idx = 0;
+            for (size_t j = 0; j < n_sym_map; j++)
+                if (strcmp(sym_map[j].name, cyr[k].rel[r].sym) == 0) { sym_idx = sym_map[j].idx; break; }
+            cyr[k].rbuf[r].r_offset = cyr[k].rel[r].off;
+            cyr[k].rbuf[r].r_info   = ELF64_R_INFO(sym_idx, R_X86_64_64);
+            cyr[k].rbuf[r].r_addend = cyr[k].rel[r].add;
+        }
     }
 
     DBG("phase 3 done: %zu symbols", n_syms);
@@ -1770,13 +1876,22 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t rela_dbline_size = n_rela_dbline * sizeof(Elf64_Rela);
     off += rela_dbline_size;
 
+    /* [[registry]] cyreg_<NAME> PROGBITS + .rela.cyreg_<NAME> sections */
+    for (size_t k = 0; k < n_cyr; k++) {
+        off = align8(off);
+        cyr[k].file_off = off;
+        off += cyr[k].size;
+        off = align8(off);
+        cyr[k].rela_file_off = off;
+        off += cyr[k].nrel * sizeof(Elf64_Rela);
+    }
+
     /* section headers */
     off = align8(off);
     size_t sh_off = off;
 
     /* ----- Build section headers ----- */
-    Elf64_Shdr shdrs[NUM_SECTIONS];
-    memset(shdrs, 0, sizeof(shdrs));
+    Elf64_Shdr *shdrs = calloc(total_sections, sizeof(Elf64_Shdr));
 
     /* 0: null */
     /* already zeroed */
@@ -1910,6 +2025,26 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     shdrs[SEC_RELA_DEBUG_LINE].sh_addralign = 8;
     shdrs[SEC_RELA_DEBUG_LINE].sh_entsize   = sizeof(Elf64_Rela);
 
+    /* [[registry]] cyreg_<NAME> (SHF_ALLOC|SHF_WRITE PROGBITS) + its .rela */
+    for (size_t k = 0; k < n_cyr; k++) {
+        Elf64_Shdr *ps = &shdrs[cyr[k].sec_idx];
+        ps->sh_name      = cyr[k].nm;
+        ps->sh_type      = SHT_PROGBITS;
+        ps->sh_flags     = SHF_ALLOC | SHF_WRITE;
+        ps->sh_offset    = cyr[k].file_off;
+        ps->sh_size      = cyr[k].size;
+        ps->sh_addralign = 8;
+        Elf64_Shdr *rs = &shdrs[cyr[k].rela_sec_idx];
+        rs->sh_name      = cyr[k].rela_nm;
+        rs->sh_type      = SHT_RELA;
+        rs->sh_offset    = cyr[k].rela_file_off;
+        rs->sh_size      = cyr[k].nrel * sizeof(Elf64_Rela);
+        rs->sh_link      = SEC_SYMTAB;
+        rs->sh_info      = cyr[k].sec_idx;
+        rs->sh_addralign = 8;
+        rs->sh_entsize   = sizeof(Elf64_Rela);
+    }
+
     /* ----- ELF header ----- */
     Elf64_Ehdr ehdr;
     memset(&ehdr, 0, sizeof(ehdr));
@@ -1923,7 +2058,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     ehdr.e_version   = EV_CURRENT;
     ehdr.e_ehsize    = sizeof(Elf64_Ehdr);
     ehdr.e_shentsize = sizeof(Elf64_Shdr);
-    ehdr.e_shnum     = NUM_SECTIONS;
+    ehdr.e_shnum     = (uint16_t) total_sections;
     ehdr.e_shoff     = sh_off;
     ehdr.e_shstrndx  = SEC_SHSTRTAB;
 
@@ -2011,15 +2146,24 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         write(fd, rela_dbline, rela_dbline_size);
     }
 
-    /* padding to sh_off */
+    /* [[registry]] cyreg sections: PROGBITS pointer array + its relocations */
     { size_t cur = (rela_dbline_size > 0 ? rela_dbline_off + rela_dbline_size
                   : rela_dbinfo_size > 0 ? rela_dbinfo_off + rela_dbinfo_size
                   : debug_str_size > 0   ? debug_str_off + debug_str_size
                   : shstrtab_off + shstrtab_size);
+      for (size_t k = 0; k < n_cyr; k++) {
+          if (cyr[k].file_off > cur) write_padding(fd, cyr[k].file_off - cur);
+          if (cyr[k].size) write(fd, cyr[k].buf, cyr[k].size);
+          cur = cyr[k].file_off + cyr[k].size;
+          if (cyr[k].rela_file_off > cur) write_padding(fd, cyr[k].rela_file_off - cur);
+          if (cyr[k].nrel) write(fd, cyr[k].rbuf, cyr[k].nrel * sizeof(Elf64_Rela));
+          cur = cyr[k].rela_file_off + cyr[k].nrel * sizeof(Elf64_Rela);
+      }
+      /* padding to sh_off */
       if (sh_off > cur) write_padding(fd, sh_off - cur); }
 
     /* section headers */
-    write(fd, shdrs, sizeof(shdrs));
+    write(fd, shdrs, total_sections * sizeof(Elf64_Shdr));
 
     close(fd);
 
@@ -2039,6 +2183,10 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     free(symtab);
     free(strtab);
     free(shstrtab);
+    free(shdrs);
+    for (size_t k = 0; k < n_cyr; k++) { free(cyr[k].buf); free(cyr[k].rel); free(cyr[k].rbuf); }
+    free(cyr);
+    free(cyr_syms);
     free(sym_map);
     for (size_t i = 0; i < n_funcs; i++) free(funcs[i].code);
     free(funcs);
