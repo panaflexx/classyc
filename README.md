@@ -283,6 +283,43 @@ The template itself is skipped during checking and codegen (only its
 monomorphized specializations are real functions), mirroring how generic *class*
 templates work.
 
+#### Nested generics: `List<T*>` inside another generic
+
+A generic class body may instantiate another generic with its *own* type
+parameter — including a **pointer** to it, like `List<T*>`. The reference is
+deferred as a placeholder while the outer template is parsed and only
+materialized (with the pointer level preserved) once the outer class is
+specialized with a concrete type:
+
+```c
+#include "list.h"
+
+class Repository<T> {
+    List<T*>* items;
+
+    Repository() {
+        // `T*` flows through to List's element type: Repository<User>
+        // materializes an owning List<User*>.
+        this->items = new List<T*>().owns();
+    }
+    ~Repository() { delete items; }        // frees the list AND every T
+
+    void add(T* e) { this->items->Add(e); }
+    T*   get(int i) { return this->items->Get(i); }
+    int  count()   { return this->items->Count(); }
+};
+
+auto users = new Repository<User>();
+defer delete users;                        // frees the repo, its list, and users
+users->add(new User("Ada"));
+printf("%s\n", (char*)users->get(0)->name);
+```
+
+This is exactly what powers the SQLite `QueryBuilder<T>` (see
+`examples/classy-querybuilder.cy`), whose `ToList()` returns an owning
+`List<T*>` of typed entities. Multi-level (`T**`) and multi-parameter
+(`Map<K, V*>`) forms work the same way.
+
 ### Arrays & Slices → `List<T>` (lengths flow into generics)
 A C array or a filter/map slice converts to a heap `List<T>` with `.ToList()`,
 or straight through the constructor. The compiler threads the source's length
@@ -826,6 +863,7 @@ Look in the `examples/` directory:
 | `classy-fetch.cy`          | HTTP/HTTPS client (`include/httpclient.h`): calls the PokéAPI over TLS, headers as a `dict`, `List<String>` |
 | `classy-customers.cy`      | End-to-end typed JSON ingest: `(Customer)? rec` binds each record from `customers.json` into a `Map<int, Customer*>`, then runs 6 database-style queries (lookup, filter, group-by, aggregate, top-K) |
 | `classy-restful.cy`        | SQLite-backed REST controller (`include/sqlite.h`): bound queries, `(User) row` binding, `List<dict>` → `ToDict()` JSON responses, transactions (`-l sqlite3`) |
+| `classy-querybuilder.cy`   | LINQ-style `QueryBuilder<T>` (`include/sqlite.h`): fluent `Where`/`OrderBy`/`Take`/`Skip`/`Select`, materialising typed entities into an owning `List<T*>` (`-l sqlite3`) |
 | `test-customexception.cy`  | User-defined exceptions via `enum { MyErr = 100 }` |
 
 Run them all with:

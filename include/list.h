@@ -467,7 +467,7 @@ class List<T> {
         return arr;
     }
 
-    /* Generic projection to a DICT_ARRAY: apply `项` to every element and
+    /* Generic projection to a DICT_ARRAY: apply `fn` to every element and
      * append the resulting DictValue* to the array. This is the
      * Select(x => ...).ToArray() of JSON building — StringsToJsonArray() and
      * IntsToJsonArray() are just the common specializations:

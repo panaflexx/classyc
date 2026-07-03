@@ -4816,12 +4816,24 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
           while (*_cur != '\0' && _ok) {
             const char *_us = strchr (_cur, '_');
             size_t _len = _us != NULL ? (size_t) (_us - _cur) : strlen (_cur);
+            /* A segment is a type-param name optionally followed by one "P"
+               per pointer level (T* -> "TP", T** -> "TPP").  Peel the trailing
+               'P's to recover the base param name and the pointer depth, then
+               re-wrap the resolved concrete arg in that many N_POINTERs so the
+               downstream re-mangle produces e.g. __generic_List_UserP.
+               (Assumes type-param names contain no '_' and do not end in 'P'.) */
+            size_t _base_len = _len;
+            int _depth = 0;
+            while (_base_len > 0 && _cur[_base_len - 1] == 'P') { _depth++; _base_len--; }
             int _pi = -1;
             for (int _i = 0; _i < n_params; _i++)
-              if (params[_i] != NULL && strlen (params[_i]) == _len
-                  && strncmp (_cur, params[_i], _len) == 0) { _pi = _i; break; }
+              if (params[_i] != NULL && strlen (params[_i]) == _base_len
+                  && strncmp (_cur, params[_i], _base_len) == 0) { _pi = _i; break; }
             if (_pi < 0 || _nr >= 4) { _ok = 0; break; }
-            _resolved[_nr++] = args[_pi];
+            node_t _res = args[_pi];
+            for (int _d = 0; _d < _depth; _d++)
+              _res = new_pos_node1 (c2m_ctx, N_POINTER, POS (n), _res);
+            _resolved[_nr++] = _res;
             _cur = _us != NULL ? _us + 1 : _cur + _len;
           }
           if (_ok && _nr > 0) {
@@ -5072,13 +5084,19 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
       }
     }
     if (curr_cls_name != NULL && curr_n_params > 0) {
-      /* Check that every supplied type arg is one of the current class's params. */
+      /* Check that every supplied type arg is one of the current class's
+         params, allowing a pointer-to-param (e.g. `List<T*>` inside a generic
+         QueryBuilder<T>).  Pointer wrappers are peeled to reach the base N_ID;
+         mangle_generic_name re-encodes the depth as a "P" suffix (T* -> "TP"),
+         and specialize_node's placeholder resolver re-applies it. */
       int _all_params = (n_args > 0);
       for (int _j = 0; _j < n_args && _all_params; _j++) {
-        if (args[_j]->code != N_ID) { _all_params = 0; break; }
+        node_t _pa = args[_j];
+        while (_pa->code == N_POINTER) _pa = NL_HEAD (_pa->u.ops);
+        if (_pa->code != N_ID) { _all_params = 0; break; }
         int _found = 0;
         for (int _k = 0; _k < curr_n_params; _k++)
-          if (curr_params[_k] && strcmp (args[_j]->u.s.s, curr_params[_k]) == 0)
+          if (curr_params[_k] && strcmp (_pa->u.s.s, curr_params[_k]) == 0)
             { _found = 1; break; }
         if (!_found) _all_params = 0;
       }
@@ -21281,6 +21299,18 @@ static op_t gen_dict_bind_collection_field (c2m_ctx_t c2m_ctx, struct type *cls_
       MIR_op_t own_arg = force_reg (c2m_ctx, unwrapped, MIR_T_I64).mir_op;
       el_arg = gen_rt_call (c2m_ctx, str_own_proto, str_own_item, 1, &own_arg);
       el_arg = force_reg (c2m_ctx, el_arg, MIR_T_I64);
+    } else if (floating_type_p (el_type)) {
+      /* Floating-point element (e.g. List<double>): the union payload at offset
+         8 holds the value's raw bits (dict_create_number stores a `double`), so
+         read it back with the element's float type directly rather than loading
+         an I64 and emitting an invalid DMOV from an integer register. */
+      op_t elp = force_reg (c2m_ctx, el_dv, MIR_T_I64);
+      MIR_type_t el_mir_t = get_mir_type (c2m_ctx, el_type);
+      MIR_type_t load_t = el_mir_t == MIR_T_LD ? MIR_T_D : el_mir_t;
+      op_t fval = get_new_temp (c2m_ctx, load_t);
+      emit2 (c2m_ctx, tp_mov (load_t), fval.mir_op,
+             MIR_new_mem_op (ctx, load_t, 8, elp.mir_op.u.reg, 0, 1));
+      el_arg = (el_mir_t == MIR_T_LD) ? cast (c2m_ctx, fval, el_mir_t, TRUE) : fval;
     } else if (scalar_type_p (el_type) || string_type_p (el_type)) {
       /* Scalar / pointer element: unwrap the union payload. */
       op_t unwrapped = gen_dict_unwrap (c2m_ctx, el_dv);
@@ -21446,6 +21476,23 @@ static void gen_dict_bind_into (c2m_ctx_t c2m_ctx, struct type *cls_type,
       emit2 (c2m_ctx, tp_mov (mir_t),
              MIR_new_alias_mem_op (ctx, mir_t, 0, field_addr.mir_op.u.reg, 0, 1, alias, 0),
              coll.mir_op);
+    } else if (floating_type_p (mtype)) {
+      /* Floating-point leaf (float/double/long double).  The union payload at
+         offset 8 holds the value's raw bits (dict_create_number stores a
+         `double` there), so read it back with the field's own float type
+         instead of loading an I64 and emitting an invalid DMOV from an integer
+         register.  A narrower `float` field reads the low 4 bytes; long double
+         is stored as a double and widened on load. */
+      MIR_type_t mir_t = get_mir_type (c2m_ctx, mtype);
+      MIR_type_t load_t = mir_t == MIR_T_LD ? MIR_T_D : mir_t;
+      MIR_alias_t alias = get_type_alias (c2m_ctx, mtype);
+      op_t fval = get_new_temp (c2m_ctx, load_t);
+      emit2 (c2m_ctx, tp_mov (load_t), fval.mir_op,
+             MIR_new_mem_op (ctx, load_t, 8, val_dv.mir_op.u.reg, 0, 1));
+      if (mir_t == MIR_T_LD) fval = cast (c2m_ctx, fval, mir_t, TRUE);
+      emit2 (c2m_ctx, tp_mov (mir_t),
+             MIR_new_alias_mem_op (ctx, mir_t, 0, field_addr.mir_op.u.reg, 0, 1, alias, 0),
+             fval.mir_op);
     } else if (scalar_type_p (mtype) || string_type_p (mtype)) {
       /* Unwrap the union payload (offset 8 of DictValue) and store into the
          slot.  Same path as `(T)d.x` would take for a scalar leaf.  Struct
@@ -21673,8 +21720,18 @@ static op_t gen_dict_unwrap (c2m_ctx_t c2m_ctx, op_t dop) {
   MIR_context_t ctx = c2m_ctx->ctx;
   op_t ptr = force_reg (c2m_ctx, dop, MIR_T_I64);
   op_t res = get_new_temp (c2m_ctx, MIR_T_I64);
+  /* NULL-guard: a missing dict key (dict_object_get -> NULL) or an explicit
+     JSON null must not fault when its payload is read.  Yield 0 for a NULL
+     DictValue* so `(int)d.absent` / `(long)d.absent` degrade to 0 rather than
+     dereferencing offset 8 of NULL (SIGSEGV).  This is the lenient default the
+     rest of the dict path already assumes (zero-fill on missing bind fields). */
+  MIR_label_t done_label = MIR_new_label (ctx);
+  emit2 (c2m_ctx, MIR_MOV, res.mir_op, MIR_new_int_op (ctx, 0));
+  emit3 (c2m_ctx, MIR_BEQ, MIR_new_label_op (ctx, done_label), ptr.mir_op,
+         MIR_new_int_op (ctx, 0));
   emit2 (c2m_ctx, MIR_MOV, res.mir_op,
          MIR_new_mem_op (ctx, MIR_T_I64, 8, ptr.mir_op.u.reg, 0, 1));
+  emit_label_insn_opt (c2m_ctx, done_label);
   return res;
 }
 
@@ -24490,15 +24547,37 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       /* If source is a DictValue* (TM_DICT), unwrap the union payload first.
          This extracts int64_value for integer targets, string_value for pointer
          targets.  Offset 8 in DictValue is the start of the value union. */
+      t = get_mir_type (c2m_ctx, type);
       {
         node_t src_node = NL_EL (r->u.ops, 1);
         struct expr *src_e = src_node ? (struct expr *) src_node->attr : NULL;
         if (src_e && src_e->type && src_e->type->mode == TM_DICT
             && type->mode != TM_DICT) {
+          if (floating_type_p (type)) {
+            /* Floating target (e.g. `(double)d.price`): the union payload holds
+               the value's raw bits (dict_create_number stores a `double`), so
+               read offset 8 with the float type directly rather than unwrapping
+               an I64 and doing a bogus int->float numeric conversion. */
+            MIR_type_t load_t = (t == MIR_T_LD) ? MIR_T_D : t;
+            op_t dvp = force_reg (c2m_ctx, op1, MIR_T_I64);
+            op_t fval = get_new_temp (c2m_ctx, load_t);
+            /* NULL-guard (missing key / JSON null): yield 0.0 instead of
+               dereferencing offset 8 of NULL, mirroring gen_dict_unwrap. */
+            MIR_label_t fdone = MIR_new_label (ctx);
+            emit2 (c2m_ctx, tp_mov (load_t), fval.mir_op,
+                   load_t == MIR_T_F ? MIR_new_float_op (ctx, 0.0f)
+                                     : MIR_new_double_op (ctx, 0.0));
+            emit3 (c2m_ctx, MIR_BEQ, MIR_new_label_op (ctx, fdone), dvp.mir_op,
+                   MIR_new_int_op (ctx, 0));
+            emit2 (c2m_ctx, tp_mov (load_t), fval.mir_op,
+                   MIR_new_mem_op (ctx, load_t, 8, dvp.mir_op.u.reg, 0, 1));
+            emit_label_insn_opt (c2m_ctx, fdone);
+            res = (t == MIR_T_LD) ? cast (c2m_ctx, fval, t, TRUE) : fval;
+            break;
+          }
           op1 = gen_dict_unwrap (c2m_ctx, op1);
         }
       }
-      t = get_mir_type (c2m_ctx, type);
       res = cast (c2m_ctx, op1, t, TRUE);
     }
     break;

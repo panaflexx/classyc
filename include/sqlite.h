@@ -63,6 +63,16 @@
            ->rollback()                     // safe after commit (no-op)
            ~Transaction()                    // ROLLBACK if commit() never ran
 
+       QueryBuilder<T>   LINQ-style fluent SELECT builder -> typed entities
+           new QueryBuilder<T>(db, table)
+           .Where(col, op, value).OrderBy(col).OrderByDesc(col)
+           .Take(n).Skip(n).Select(cols)
+           .BuildSelectSql()   -> String
+           .ToList()           -> List<T*>*   // owning; `defer delete`
+           .FirstOrDefault()   -> T*          // heap entity or NULL
+           .Count() / .Any()   -> int
+       // T must provide: T() and void bindRow(dict). See EntityOps<T>.
+
    ── Format string for execute(sql, fmt, ...) / query(sql, fmt, ...) ──────
 
        i   int      -> sqlite3_bind_int
@@ -695,6 +705,267 @@ class Transaction {
             this->db->execute("ROLLBACK");
             this->active = 0;
         }
+    }
+};
+
+/* -------------------------------------------------------------------------
+   EntityOps<T> – schema-driven, generic active-record helper.  It generates
+   INSERT / UPDATE / DELETE SQL from an entity's own metadata methods and
+   materialises entities back from result-row dicts, so a class describes its
+   table shape once and gets full persistence for free.
+
+   Entity contract
+   ───────────────
+   * Read side (used by fromRow and by QueryBuilder<T>):
+         T()                                // no-argument constructor
+         void   bindRow(dict r)             // copy a SELECT row into fields
+   * Write side (used by save / update / delete):
+         String tableName()
+         String insertColumns()             // "A,B,C"
+         String insertPlaceholders()        // "?,?,?"
+         String updateSet()                 // "A=?,B=?,C=?"
+         int    columnCount()               // number of ? in updateSet()
+         void   bindInsertValues(Statement* stmt)
+         void   bindUpdateValues(Statement* stmt)
+         int    getId()                     // primary key for UPDATE/DELETE
+
+   Because ClassyC monomorphises every method of a generic class, EntityOps<T>
+   only compiles the methods you actually instantiate for T.  QueryBuilder<T>
+   deliberately does NOT go through EntityOps, so read-only entities that
+   implement just T()/bindRow() work with QueryBuilder without providing the
+   write-side metadata.
+
+   Example:
+
+       class User {
+           int    id;
+           String name;
+           User() {}
+           void bindRow(dict r) {
+               this->id   = (int)(long) r.id;  // missing key -> 0 (lenient)
+               this->name = r.name;            // String field owns a copy
+           }
+           // ...write-side metadata omitted; needed only for save/update/delete
+       };
+
+       User* u = EntityOps<User>.fromRow(row);   // caller owns the pointer
+   ------------------------------------------------------------------------- */
+class EntityOps<T> {
+    static void save(T* e, Sqlite* db) {
+        String sql = "INSERT INTO " + e->tableName() + " (" + e->insertColumns() +
+                     ") VALUES (" + e->insertPlaceholders() + ")";
+        owned Statement* stmt = db->prepare(sql);
+        e->bindInsertValues(stmt);
+        stmt->execute();
+    }
+
+    static void update(T* e, Sqlite* db) {
+        String sql = "UPDATE " + e->tableName() + " SET " + e->updateSet() + " WHERE Id=?";
+        owned Statement* stmt = db->prepare(sql);
+        e->bindUpdateValues(stmt);
+        stmt->bind(e->columnCount() + 1, e->getId());
+        stmt->execute();
+    }
+
+    static void delete(T* e, Sqlite* db) {
+        String sql = "DELETE FROM " + e->tableName() + " WHERE Id=?";
+        owned Statement* stmt = db->prepare(sql);
+        stmt->bind(1, e->getId());
+        stmt->execute();
+    }
+
+    /* Inverse of save: materialise a fresh heap T from a SELECT-row dict.
+       T must provide bindRow(dict) mapping its SQL columns to fields — the
+       single place that mapping is written.  Because String fields bind with
+       value semantics, the returned object owns private copies of its strings
+       and is safe to keep after the source row dict is freed.  Caller owns the
+       result (`delete` / `move`). */
+    static T* fromRow(dict r) {
+        T* e = new T();
+        e->bindRow(r);
+        return e;
+    }
+};
+
+/* -------------------------------------------------------------------------
+   QueryBuilder<T> – a small, LINQ-style fluent builder that composes a
+   SELECT and materialises typed entities.
+
+   ── Quick start ──────────────────────────────────────────────────────────
+
+       // T must satisfy the EntityOps<T> contract (default ctor + bindRow).
+       owned auto adults = new QueryBuilder<User>(db, "Users")
+           .Where("age", ">", "18")
+           .OrderBy("name")
+           .Take(10)
+           .ToList();                // -> List<User*>* (owns its User*)
+       defer delete adults;          // frees the list AND every User
+
+       for (auto u in adults)
+           printf("%s (%d)\n", (char*)u->name, u->age);
+
+       User* first = new QueryBuilder<User>(db, "Users")
+           .Where("age", ">", "18").OrderBy("age").FirstOrDefault();
+       defer delete first;           // may be NULL; delete NULL is a no-op
+
+       int n = new QueryBuilder<User>(db, "Users")
+           .Where("active", "=", "1").Count();
+
+   ── API ──────────────────────────────────────────────────────────────────
+
+       new QueryBuilder<T>(db, tableName)
+       .Where(col, op, value)   // ANDs successive calls; value is quoted
+       .OrderBy(col)            // ASC; repeatable (comma-joined)
+       .OrderByDesc(col)        // DESC
+       .Take(n)                 // LIMIT n
+       .Skip(n)                 // OFFSET n
+       .Select(cols)            // projection (default "*")
+       .BuildSelectSql()        -> String   // the composed SQL
+       .ToList()                -> List<T*>* // owning; caller deletes
+       .FirstOrDefault()        -> T*        // heap entity or NULL
+       .Count()                 -> int       // SELECT COUNT(*) with WHERE
+       .Any()                   -> int       // Count() > 0
+
+   Notes:
+   * Where() interpolates `value` into a single-quoted literal.  It performs
+     no escaping, so it is intended for trusted/programmatic values — use a
+     prepared Statement for untrusted input.
+   * ToList() returns an *owning* List<T*>: `delete list` frees the list and
+     every entity in it.  FirstOrDefault() returns a standalone heap entity
+     the caller owns.
+   ------------------------------------------------------------------------- */
+class QueryBuilder<T> {
+    Sqlite* db;
+    String  tableName;
+    String  whereClause;
+    String  orderByClause;
+    int     limitCount;
+    int     offsetCount;
+    String  selectCols;
+    int     hasWhere;
+    int     hasOrderBy;
+
+    QueryBuilder(Sqlite* db, String tableName) {
+        this->db = db;
+        this->tableName = tableName;
+        this->whereClause = "";
+        this->orderByClause = "";
+        this->limitCount = -1;
+        this->offsetCount = 0;
+        this->selectCols = "*";
+        this->hasWhere = 0;
+        this->hasOrderBy = 0;
+    }
+
+    QueryBuilder<T>* Where(String column, String op, String value) {
+        String condition = column + " " + op + " '" + value + "'";
+        if (this->hasWhere) {
+            this->whereClause = this->whereClause + " AND " + condition;
+        } else {
+            this->whereClause = condition;
+            this->hasWhere = 1;
+        }
+        return this;
+    }
+
+    QueryBuilder<T>* OrderBy(String column) {
+        if (this->hasOrderBy) {
+            this->orderByClause = this->orderByClause + ", ";
+        }
+        this->orderByClause = this->orderByClause + column + " ASC";
+        this->hasOrderBy = 1;
+        return this;
+    }
+
+    QueryBuilder<T>* OrderByDesc(String column) {
+        if (this->hasOrderBy) {
+            this->orderByClause = this->orderByClause + ", ";
+        }
+        this->orderByClause = this->orderByClause + column + " DESC";
+        this->hasOrderBy = 1;
+        return this;
+    }
+
+    QueryBuilder<T>* Take(int count) {
+        this->limitCount = count;
+        return this;
+    }
+
+    QueryBuilder<T>* Skip(int count) {
+        this->offsetCount = count;
+        return this;
+    }
+
+    QueryBuilder<T>* Select(String columns) {
+        this->selectCols = columns;
+        return this;
+    }
+
+    String BuildSelectSql() {
+        String sql = "SELECT " + this->selectCols + " FROM " + this->tableName;
+        if (this->hasWhere) {
+            sql = sql + " WHERE " + this->whereClause;
+        }
+        if (this->hasOrderBy) {
+            sql = sql + " ORDER BY " + this->orderByClause;
+        }
+        if (this->limitCount >= 0) {
+            sql = sql + " LIMIT " + this->limitCount;
+        }
+        if (this->offsetCount > 0) {
+            sql = sql + " OFFSET " + this->offsetCount;
+        }
+        return sql;
+    }
+
+    /* Execute the composed SELECT and materialise an owning List<T*>.
+       Each row becomes a heap T (default ctor + bindRow); the returned list
+       `.owns()` them, so `delete list` frees the list and every T.  We build
+       the entity inline rather than via EntityOps<T> so that read-only
+       entities need only implement T() and bindRow(dict) — not the full
+       write-side (save/update/delete) metadata contract. */
+    List<T*>* ToList() {
+        String sql = this->BuildSelectSql();
+        List<dict>* rows = this->db->query(sql);
+        List<T*>* result = new List<T*>().owns();
+        if (!rows) return result;
+        defer delete rows;
+        for (int i = 0; i < rows->Count(); i++) {
+            T* e = new T();
+            e->bindRow(rows->Get(i));
+            result->Add(e);
+        }
+        return result;
+    }
+
+    /* Execute and return the first entity as a standalone heap T* (caller
+       owns it, `defer delete`), or NULL when there are no rows. */
+    T* FirstOrDefault() {
+        this->Take(1);
+        String sql = this->BuildSelectSql();
+        List<dict>* rows = this->db->query(sql);
+        if (!rows) return NULL;
+        defer delete rows;
+        if (rows->Count() == 0) return NULL;
+        T* e = new T();
+        e->bindRow(rows->Get(0));
+        return e;
+    }
+
+    /* SELECT COUNT(*) honouring the current WHERE clause. */
+    int Count() {
+        String sql = "SELECT COUNT(*) FROM " + this->tableName;
+        if (this->hasWhere) {
+            sql = sql + " WHERE " + this->whereClause;
+        }
+        dict row = this->db->query_one(sql);
+        if (!row) return 0;
+        return (int)(long)row["COUNT(*)"];
+    }
+
+    /* True iff at least one row matches the current WHERE clause. */
+    int Any() {
+        return this->Count() > 0;
     }
 };
 
