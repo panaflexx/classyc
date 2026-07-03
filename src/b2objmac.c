@@ -373,6 +373,23 @@ static const char *map_symbol (const char *name) {
 static const char *macho_mangle (const char *name) {
   if (name == NULL) return name;
   if (name[0] == '.') return name;
+  /* [[registry]] anchors: the consumer references __start_cyreg_<NAME> /
+     __stop_cyreg_<NAME>; Apple's linker synthesises section bounds under the
+     magic names `section$start$<SEG>$<SECT>` / `section$end$...` (no leading
+     underscore).  Rewrite so both the relocation and the undefined symbol use
+     that spelling and ld resolves them to the merged cyreg_<NAME> section. */
+  if (strncmp (name, "__start_cyreg_", 14) == 0) {
+    const char *reg = name + 14;
+    char *m = malloc (32 + strlen (reg));
+    sprintf (m, "section$start$__DATA$cyreg_%s", reg);
+    return m;
+  }
+  if (strncmp (name, "__stop_cyreg_", 13) == 0) {
+    const char *reg = name + 13;
+    char *m = malloc (32 + strlen (reg));
+    sprintf (m, "section$end$__DATA$cyreg_%s", reg);
+    return m;
+  }
   size_t len = strlen (name);
   char *mangled = malloc (len + 2);
   mangled[0] = '_';
@@ -558,6 +575,71 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     text_size += funcs[i].code_len;
   }
 
+  /* ----- [[registry("NAME")]] linker sets (Mach-O) -----
+     Pull __cyreg_<NAME>__* ref_data out of __data into one
+     (__DATA,cyreg_<NAME>) section per registry, holding the 8-byte pointers
+     (relocated to the records).  The Apple linker then provides the magic
+     `section$start$__DATA$cyreg_<NAME>` / `section$end$...` symbols; we rename
+     the consumer's __start_/__stop_ references to those (see macho_mangle). */
+  typedef struct {
+    char name[128];
+    uint8_t *buf; size_t size, cap;
+    struct { size_t off; const char *sym; int64_t add; } *rel;
+    size_t nrel, caprel;
+    struct relocation_info *rbuf;   /* resolved relocation entries */
+    size_t n_sect;        /* 1-based Mach-O section number */
+    uint64_t addr;        /* vmaddr within the segment */
+    size_t file_off, reloc_file_off;
+  } cyreg_sec_t;
+  cyreg_sec_t *cyr = NULL; size_t n_cyr = 0, cap_cyr = 0;
+  struct { const char *name; size_t sec; size_t off; } *cyr_syms = NULL;
+  size_t n_cyr_syms = 0, cap_cyr_syms = 0;
+  {
+    size_t w = 0;
+    for (size_t i = 0; i < n_datas; i++) {
+      const char *nm = datas[i].name;
+      if (nm != NULL && datas[i].is_ref_data && strncmp (nm, "__cyreg_", 8) == 0) {
+        const char *p = nm + 8;
+        const char *e = strstr (p, "__");
+        size_t klen = e ? (size_t)(e - p) : strlen (p);
+        char key[128];
+        if (klen >= sizeof key) klen = sizeof key - 1;
+        memcpy (key, p, klen); key[klen] = 0;
+        cyreg_sec_t *s = NULL;
+        for (size_t k = 0; k < n_cyr; k++)
+          if (strcmp (cyr[k].name, key) == 0) { s = &cyr[k]; break; }
+        if (s == NULL) {
+          if (n_cyr >= cap_cyr) { cap_cyr = cap_cyr ? cap_cyr*2 : 4;
+            cyr = realloc (cyr, cap_cyr * sizeof *cyr); }
+          s = &cyr[n_cyr++]; memset (s, 0, sizeof *s);
+          snprintf (s->name, sizeof s->name, "%s", key);
+        }
+        size_t off = s->size;
+        if (s->size + 8 > s->cap) { s->cap = s->cap ? s->cap*2 : 64;
+          s->buf = realloc (s->buf, s->cap); }
+        memset (s->buf + off, 0, 8); s->size += 8;
+        const char *tgt = datas[i].ref_item
+            ? macho_mangle (map_symbol (MIR_item_name (ctx, datas[i].ref_item))) : NULL;
+        if (tgt != NULL) {
+          if (s->nrel >= s->caprel) { s->caprel = s->caprel ? s->caprel*2 : 8;
+            s->rel = realloc (s->rel, s->caprel * sizeof *s->rel); }
+          s->rel[s->nrel].off = off; s->rel[s->nrel].sym = tgt;
+          s->rel[s->nrel].add = datas[i].ref_disp; s->nrel++;
+        }
+        if (n_cyr_syms >= cap_cyr_syms) { cap_cyr_syms = cap_cyr_syms ? cap_cyr_syms*2 : 16;
+          cyr_syms = realloc (cyr_syms, cap_cyr_syms * sizeof *cyr_syms); }
+        cyr_syms[n_cyr_syms].name = nm;
+        cyr_syms[n_cyr_syms].sec  = (size_t)(s - cyr);
+        cyr_syms[n_cyr_syms].off  = off;
+        n_cyr_syms++;
+        free (datas[i].bytes);
+      } else {
+        datas[w++] = datas[i];
+      }
+    }
+    n_datas = w;
+  }
+
   /* __data: concatenate all data items (8-byte aligned) */
   size_t data_size = 0;
   for (size_t i = 0; i < n_datas; i++) {
@@ -566,6 +648,14 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     data_size += datas[i].size;
   }
 
+  /* cyreg sections live in the segment right after __data (addresses ascend;
+     __bss zerofill stays last).  Section numbers are known now; the vmaddrs
+     depend on the FINAL text_size (Phase 2c may add branch stubs), so they are
+     computed later (see "finalize cyreg/bss addresses").  n_cyr==0 leaves
+     everything exactly as before. */
+  for (size_t k = 0; k < n_cyr; k++) cyr[k].n_sect = 3 + k; /* __text=1,__data=2 */
+  size_t bss_sect = 3 + n_cyr;        /* __bss is the last section */
+
   /* __bss: just total size (8-byte aligned per item) */
   size_t bss_size = 0;
   for (size_t i = 0; i < n_bsses; i++) {
@@ -573,6 +663,8 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     bsses[i].bss_offset = bss_size;
     bss_size += bsses[i].len;
   }
+  size_t cyreg_total = 0;
+  uint64_t bss_addr = 0;   /* both set after text_size is final */
 
 
   /* ----- Phase 2b: collect relocations from the code generator ----- */
@@ -861,6 +953,18 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     MACH_SECT_BSS  = 3,
   };
 
+  /* Finalize cyreg/bss addresses now that text_size is final (post-stubs). */
+  {
+    uint64_t a = text_size + data_size;
+    for (size_t k = 0; k < n_cyr; k++) {
+      a = align_up (a, 8);
+      cyr[k].addr = a;
+      a += cyr[k].size;
+    }
+    cyreg_total = a - (text_size + data_size);
+    bss_addr = align_up (text_size + data_size + cyreg_total, 8);
+  }
+
   size_t n_local_syms = n_syms;
 
   for (size_t i = 0; i < n_funcs; i++) {
@@ -870,9 +974,20 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     struct nlist_64 s = {0};
     const char *mname = macho_mangle (fname);
     s.n_un.n_strx = STRTAB_ADD (mname);
-    s.n_type = N_SECT | (is_exported ? N_EXT : 0);
+    /* ClassyC lowers class methods/ctors/dtors to free functions with mangled
+       names containing `__`.  A class defined in a shared header is emitted by
+       every TU that includes it, so the same symbol appears in several objects.
+       Mark such definitions as `.weak_def_can_be_hidden` (N_WEAK_DEF + private
+       extern): the linker coalesces the identical copies at LINK time (C++-
+       inline / ODR) and demotes the survivor to a local symbol.  Crucially
+       this avoids a runtime *weak bind* — a plain N_WEAK_DEF would make dyld try
+       to bind the coalesced address into the function's __TEXT location, which
+       is read-only ("BIND targets __TEXT which is not writable").  This is the
+       Mach-O mirror of b2obj's STB_WEAK trick and the JIT's func-redef. */
+    int weak_coal = (is_exported && strstr (fname, "__") != NULL);
+    s.n_type = N_SECT | (is_exported ? N_EXT : 0) | (weak_coal ? N_PEXT : 0);
     s.n_sect = MACH_SECT_TEXT;
-    s.n_desc = 0;
+    s.n_desc = weak_coal ? N_WEAK_DEF : 0;
     s.n_value = funcs[i].text_offset;
     SYM_MAP_ADD (mname, n_syms);
     SYMTAB_PUSH (s);
@@ -911,10 +1026,22 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     const char *mname = macho_mangle (bsses[i].name);
     s.n_un.n_strx = STRTAB_ADD (mname);
     s.n_type = N_SECT | (is_exported ? N_EXT : 0);
-    s.n_sect = MACH_SECT_BSS;
+    s.n_sect = (uint8_t) bss_sect;
     s.n_desc = 0;
-    s.n_value = text_size + data_size + bsses[i].bss_offset;
+    s.n_value = bss_addr + bsses[i].bss_offset;
     SYM_MAP_ADD (mname, n_syms);
+    SYMTAB_PUSH (s);
+  }
+
+  /* --- [[registry]] entry symbols: LOCAL pointers in their cyreg section --- */
+  for (size_t i = 0; i < n_cyr_syms; i++) {
+    struct nlist_64 s = {0};
+    const char *mname = macho_mangle (cyr_syms[i].name);
+    s.n_un.n_strx = STRTAB_ADD (mname);
+    s.n_type = N_SECT;                 /* local (no N_EXT) */
+    s.n_sect = (uint8_t) cyr[cyr_syms[i].sec].n_sect;
+    s.n_desc = 0;
+    s.n_value = cyr[cyr_syms[i].sec].addr + cyr_syms[i].off;
     SYMTAB_PUSH (s);
   }
 
@@ -1075,6 +1202,25 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       reloc_text[rt_idx++] = ri;
   }
 
+  /* Resolve [[registry]] cyreg-section relocations (absolute 64-bit to each
+     referenced record; r_extern=1 like the other data relocs). */
+  for (size_t k = 0; k < n_cyr; k++) {
+    cyr[k].rbuf = cyr[k].nrel ? calloc (cyr[k].nrel, sizeof (struct relocation_info)) : NULL;
+    for (size_t r = 0; r < cyr[k].nrel; r++) {
+      size_t sym_idx = 0;
+      for (size_t j = 0; j < n_sym_map; j++)
+        if (strcmp (sym_map[j].name, cyr[k].rel[r].sym) == 0) { sym_idx = sym_map[j].idx; break; }
+      struct relocation_info ri; memset (&ri, 0, sizeof ri);
+      ri.r_address = (int32_t) cyr[k].rel[r].off;
+      ri.r_symbolnum = sym_idx;
+      ri.r_extern = 1;
+      ri.r_type = X86_64_RELOC_UNSIGNED;
+      ri.r_length = 3;
+      ri.r_pcrel = 0;
+      cyr[k].rbuf[r] = ri;
+    }
+  }
+
   DBG ("  __text relocs: %zu, __data relocs: %zu", n_reloc_text, n_reloc_data);
 
   /* ----- Phase 5: compute file layout and write Mach-O ----- */
@@ -1097,7 +1243,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   /* Count load commands */
   uint32_t ncmds = 4; /* LC_SEGMENT_64, LC_SYMTAB, LC_DYSYMTAB, LC_VERSION_MIN_MACOSX */
   size_t sizeofcmds = sizeof (struct segment_command_64)
-                     + sizeof (struct section_64) * 3  /* __text, __data, __bss */
+                     + sizeof (struct section_64) * (3 + n_cyr)  /* __text,__data,cyreg*,__bss */
                      + sizeof (struct symtab_command)
                      + sizeof (struct dysymtab_command)
                      + sizeof (struct version_min_command);
@@ -1110,12 +1256,28 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   size_t data_file_off = text_file_off + text_size;
   if (data_size > 0) data_file_off = align_up (data_file_off, 8);
 
+  /* cyreg section data follows __data (8-aligned each). */
+  size_t cyreg_run = data_file_off + data_size;
+  for (size_t k = 0; k < n_cyr; k++) {
+    cyreg_run = align_up (cyreg_run, 8);
+    cyr[k].file_off = cyreg_run;
+    cyreg_run += cyr[k].size;
+  }
+  size_t cyreg_file_end = cyreg_run;
+
   /* Relocation entries follow section data */
-  size_t reloc_text_off = data_file_off + data_size;
+  size_t reloc_text_off = cyreg_file_end;
   size_t reloc_data_off = reloc_text_off + n_reloc_text * sizeof (struct relocation_info);
 
+  /* cyreg relocations follow the __data relocations. */
+  size_t cyreg_reloc_run = reloc_data_off + n_reloc_data * sizeof (struct relocation_info);
+  for (size_t k = 0; k < n_cyr; k++) {
+    cyr[k].reloc_file_off = cyreg_reloc_run;
+    cyreg_reloc_run += cyr[k].nrel * sizeof (struct relocation_info);
+  }
+
   /* Symbol table */
-  size_t symtab_off = reloc_data_off + n_reloc_data * sizeof (struct relocation_info);
+  size_t symtab_off = cyreg_reloc_run;
   symtab_off = align_up (symtab_off, 8);
 
   /* String table */
@@ -1130,15 +1292,15 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   struct segment_command_64 seg_cmd;
   memset (&seg_cmd, 0, sizeof (seg_cmd));
   seg_cmd.cmd = LC_SEGMENT_64;
-  seg_cmd.cmdsize = sizeof (struct segment_command_64) + 3 * sizeof (struct section_64);
+  seg_cmd.cmdsize = sizeof (struct segment_command_64) + (3 + n_cyr) * sizeof (struct section_64);
   strncpy (seg_cmd.segname, "__TEXT", 16);
   seg_cmd.vmaddr = 0;
-  seg_cmd.vmsize = text_size + data_size + bss_size;
+  seg_cmd.vmsize = n_cyr ? (bss_addr + bss_size) : (text_size + data_size + bss_size);
   seg_cmd.fileoff = text_file_off;
-  seg_cmd.filesize = text_size + data_size;
+  seg_cmd.filesize = n_cyr ? (cyreg_file_end - text_file_off) : (text_size + data_size);
   seg_cmd.maxprot = 7;  /* rwx */
   seg_cmd.initprot = 7; /* rwx */
-  seg_cmd.nsects = 3;
+  seg_cmd.nsects = (uint32_t)(3 + n_cyr);
   seg_cmd.flags = 0;
 
   /* Section 1: __TEXT,__text */
@@ -1178,7 +1340,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   memset (&sec_bss, 0, sizeof (sec_bss));
   strncpy (sec_bss.sectname, "__bss", 16);
   strncpy (sec_bss.segname, "__DATA", 16);
-  sec_bss.addr = text_size + data_size;
+  sec_bss.addr = n_cyr ? bss_addr : (text_size + data_size);
   sec_bss.size = bss_size;
   sec_bss.offset = 0; /* S_NO_DATA */
   sec_bss.align = 3;  /* 2^3 = 8-byte alignment */
@@ -1240,10 +1402,28 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   /* Header */
   write (fd, &mhdr, sizeof (mhdr));
 
+  /* Build cyreg section headers (between __data and __bss). */
+  struct section_64 *cyreg_secs = n_cyr ? calloc (n_cyr, sizeof (struct section_64)) : NULL;
+  for (size_t k = 0; k < n_cyr; k++) {
+    struct section_64 *sc = &cyreg_secs[k];
+    char sn[16]; memset (sn, 0, sizeof sn);
+    snprintf (sn, sizeof sn, "cyreg_%s", cyr[k].name); /* Mach-O sectname: 16 bytes, not NUL-required */
+    memcpy (sc->sectname, sn, 16 < strlen(sn) ? 16 : strlen(sn));
+    strncpy (sc->segname, "__DATA", 16);
+    sc->addr = cyr[k].addr;
+    sc->size = cyr[k].size;
+    sc->offset = (uint32_t) cyr[k].file_off;
+    sc->align = 3; /* 8 bytes */
+    sc->reloff = (uint32_t)(cyr[k].nrel ? cyr[k].reloc_file_off : 0);
+    sc->nreloc = (uint32_t) cyr[k].nrel;
+    sc->flags = S_REGULAR;
+  }
+
   /* Load commands */
   write (fd, &seg_cmd, sizeof (seg_cmd));
   write (fd, &sec_text, sizeof (sec_text));
   write (fd, &sec_data, sizeof (sec_data));
+  for (size_t k = 0; k < n_cyr; k++) write (fd, &cyreg_secs[k], sizeof (struct section_64));
   write (fd, &sec_bss, sizeof (sec_bss));
   write (fd, &sym_cmd, sizeof (sym_cmd));
   write (fd, &dysym_cmd, sizeof (dysym_cmd));
@@ -1263,6 +1443,16 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     write (fd, data_buf, data_size);
   }
 
+  /* cyreg section data (pointer arrays) */
+  {
+    size_t cur = data_file_off + data_size;
+    for (size_t k = 0; k < n_cyr; k++) {
+      if (cyr[k].file_off > cur) write_padding (fd, cyr[k].file_off - cur);
+      if (cyr[k].size) write (fd, cyr[k].buf, cyr[k].size);
+      cur = cyr[k].file_off + cyr[k].size;
+    }
+  }
+
   /* __text relocation entries */
   if (n_reloc_text)
     write (fd, reloc_text, n_reloc_text * sizeof (struct relocation_info));
@@ -1271,9 +1461,13 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   if (n_reloc_data)
     write (fd, reloc_data, n_reloc_data * sizeof (struct relocation_info));
 
+  /* cyreg section relocation entries */
+  for (size_t k = 0; k < n_cyr; k++)
+    if (cyr[k].nrel) write (fd, cyr[k].rbuf, cyr[k].nrel * sizeof (struct relocation_info));
+
   /* Padding to symbol table */
   {
-    size_t cur = reloc_data_off + n_reloc_data * sizeof (struct relocation_info);
+    size_t cur = cyreg_reloc_run;
     if (symtab_off > cur) write_padding (fd, symtab_off - cur);
   }
 
@@ -1302,6 +1496,10 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   free (symtab);
   free (strtab);
   free (sym_map);
+  for (size_t k = 0; k < n_cyr; k++) { free (cyr[k].buf); free (cyr[k].rel); free (cyr[k].rbuf); }
+  free (cyr);
+  free (cyr_syms);
+  free (cyreg_secs);
   for (size_t i = 0; i < n_funcs; i++) free (funcs[i].code);
   free (funcs);
   for (size_t i = 0; i < n_datas; i++) free (datas[i].bytes);

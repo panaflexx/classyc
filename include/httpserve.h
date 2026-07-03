@@ -141,4 +141,50 @@ extern Response* app_handle(Request* req);
    and never returns under normal operation.  The application's main() calls it. */
 extern int serve(int port);
 
+/* ═══════════════════════════════════════════════════════════════════════
+   Attribute-based routing (ASP.NET-style auto-discovery)
+   ═══════════════════════════════════════════════════════════════════════
+
+   A controller registers a route by dropping a `RouteReg` into the "routes"
+   registry with the C23 `[[registry("routes")]]` attribute — no central table,
+   no manual wiring.  The compiler + linker gather every such record across all
+   translation units (JIT: driver module scan; AOT: ELF/Mach-O linker set), and
+   `route_dispatch` matches an incoming request against them.
+
+   In a controller:
+
+       static Response* addpatient_post(Request* req) { ... }
+       ROUTE("POST", "/api/addpatient", addpatient_post);
+
+   In the application entry point:
+
+       Response* app_handle(Request* req) { return route_dispatch(req); }
+       int main() { return serve(8080); }
+*/
+typedef struct {
+    const char* method;   /* "GET" / "POST" / ...            */
+    const char* path;     /* exact request path to match     */
+    Response* (*handler)(Request*);
+} RouteReg;
+
+/* The linker set: an array of RouteReg* gathered from every module. */
+extern RouteReg* __start_cyreg_routes[];
+extern RouteReg* __stop_cyreg_routes[];
+
+/* Register `fn` for (method, path).  `fn` must be a unique identifier token. */
+#define ROUTE(method, path, fn) \
+    [[registry("routes")]] static RouteReg __cy_route_##fn = { (method), (path), (fn) }
+
+/* Match a request against every registered route; 404 if none match.
+   `static` so each TU gets its own copy (only the app entry point uses it). */
+static Response* route_dispatch(Request* req) {
+    for (RouteReg** p = __start_cyreg_routes; p < __stop_cyreg_routes; p++) {
+        RouteReg* r = *p;
+        if (strcmp((char*)req->path, r->path) == 0
+            && strcmp((char*)req->method, r->method) == 0)
+            return r->handler(req);
+    }
+    return resp_not_found(req->path);
+}
+
 #endif /* CLASSYC_HTTPSERVE_H */
