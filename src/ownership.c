@@ -3003,6 +3003,35 @@ static void emit_ownership_report (flowctx_t *ctx, node_t func_def,
   }
 }
 
+/* Cheap predicate used by the pre-filter below.
+ * Returns TRUE if the function body (or its single return) contains an
+ * obvious acquire form that would set returns_owned_inline_p even when
+ * there are no tracked candidates.  We only need a shallow scan; we stop
+ * as soon as we see a return whose peeled expression is N_NEW, N_DETACH
+ * or an N_CALL.  This is O(1) in practice for the common case.
+ */
+static int func_might_return_owned_inline (node_t func_def) {
+  if (func_def == NULL || func_def->code != N_FUNC_DEF) return 0;
+  node_t block = FUNC_DEF_BLOCK (func_def);
+  if (block == NULL || block->code != N_BLOCK) return 0;
+  /* Walk the top-level statements only (no deep recursion). */
+  for (node_t s = NL_HEAD (block->u.ops); s != NULL; s = NL_NEXT (s)) {
+    if (s->code != N_RETURN) continue;
+    node_t expr = NL_EL (s->u.ops, 0);
+    if (expr == NULL) return 0; /* void return */
+    expr = peel_casts (expr);
+    if (expr->code == N_NEW || expr->code == N_DETACH) return 1;
+    if (expr->code == N_CALL) return 1;
+    /* Common wrapper shape: return detach <call or new> */
+    if (expr->code == N_CAST) {
+      node_t inner = peel_casts (NL_EL (expr->u.ops, 1));
+      if (inner && (inner->code == N_NEW || inner->code == N_DETACH || inner->code == N_CALL))
+        return 1;
+    }
+  }
+  return 0;
+}
+
 /* Per-function entry point.  Collects candidates, builds the CFG, runs the
  * worklist to fixpoint, then a single diagnostic pass that emits the real
  * warnings and errors. */
@@ -3020,11 +3049,24 @@ static void analyze_function (c2m_ctx_t c2m_ctx, node_t func_def) {
   /* Seed param candidates so interprocedural summary inference can fire. */
   collect_param_candidates (c2m_ctx, func_def, cands);
 
+  /* Cheap pre-filter: if no candidates at all and the function cannot
+     possibly set returns_owned_inline_p via a direct return-acquire shape,
+     install a trivial summary (returns_owned_p=0) and skip the expensive
+     CFG build + dataflow.  This preserves correctness for wrappers because
+     we still let the inline detection run when it might fire. */
+  if (VARR_LENGTH (candidate_t, cands) == 0 &&
+      !func_might_return_owned_inline (func_def)) {
+    /* No ownership state to track and no inline acquire return → trivial summary. */
+    summary_install (c2m_ctx, func_def, 0, NULL, 0, NULL);
+    VARR_DESTROY (candidate_t, cands);
+    return;
+  }
+
   /* Note: we used to early-exit when cands was empty, but the
      interprocedural summary pass needs to run on every function so that
      wrappers with no candidates (e.g. `Box* spawn(int v) { return new
-     Box(v); }`) still get returns_owned_p recorded.  cfg_emit_diagnostics
-     handles empty cands gracefully. */
+     Box(v); }`) still get returns_owned_p recorded.  The pre-filter above
+     restores most of that saving while still handling the wrapper case. */
 
   if (verbose_p) {
     pos_t fp = POS (func_def);
