@@ -20,7 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include "include/list.h"
+#include "list.h"
 
 /* ───────────────────────────── Model classes ───────────────────────────── */
 
@@ -65,6 +65,7 @@ class Hit {
 
 /* Allocate a lowercased, NUL-terminated copy of [s, s+len). */
 String intern_word(const char* s, int len) {
+	char ww[len+1];
     char* w = (char*) malloc(len + 1);
     for (int i = 0; i < len; i++) w[i] = (char) tolower((unsigned char) s[i]);
     w[len] = 0;

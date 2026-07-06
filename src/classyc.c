@@ -1578,46 +1578,50 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
         }
         cs->pos.ln_pos = 0;
         break;
-      case '/':
-        if (comment_char >= 0) break;
-        curr_c = cs_get (c2m_ctx);
-        if (curr_c == '/' || curr_c == '*') {
-          VARR_PUSH (char, symbol_text, '/');
-          comment_char = curr_c;
-          break;
-        }
-        cs_unget (c2m_ctx, curr_c);
-        curr_c = '/';
-        goto end_ws;
-      case '*':
-        if (comment_char < 0) goto end_ws;
-        if (comment_char != '*') break;
-        curr_c = cs_get (c2m_ctx);
-        if (curr_c == '/') {
-          comment_char = -1;
-          VARR_PUSH (char, symbol_text, '*');
-        } else {
-          cs_unget (c2m_ctx, curr_c);
-          curr_c = '*';
-        }
-        break;
-      default:
-        if (comment_char < 0) goto end_ws;
-        if (curr_c == EOF) {
-          error_func (c2m_ctx, C_unfinished_comment, "unfinished comment");
-          goto end_ws;
-        }
-        break;
-      }
-      VARR_PUSH (char, symbol_text, curr_c);
-    }
-  end_ws:
-    if (VARR_LENGTH (char, symbol_text) != 0) {
-      cs_unget (c2m_ctx, curr_c);
-      VARR_PUSH (char, symbol_text, '\0');
-      return new_token_wo_uniq_repr (c2m_ctx, nl_p ? pos : cs->pos, VARR_ADDR (char, symbol_text),
-                                     nl_p ? '\n' : ' ', N_IGNORE);
-    }
+	      case '/':
+	        if (comment_char >= 0) break;
+	        curr_c = cs_get (c2m_ctx);
+	        if (curr_c == '/' || curr_c == '*') {
+	          VARR_PUSH (char, symbol_text, '/');
+	          comment_char = curr_c;
+	          break;
+	        }
+	        cs_unget (c2m_ctx, curr_c);
+	        curr_c = '/';
+	        goto end_ws;
+	      case '*':
+	        if (comment_char < 0) goto end_ws;
+	        if (comment_char != '*') break;
+	        curr_c = cs_get (c2m_ctx);
+	        if (curr_c == '/') {
+	          comment_char = -1;
+	          VARR_PUSH (char, symbol_text, '*');
+	        } else {
+	          cs_unget (c2m_ctx, curr_c);
+	          curr_c = '*';
+	        }
+	        break;
+	      default:
+	        if (comment_char < 0) goto end_ws;
+	        if (curr_c == EOF) {
+	          error_func (c2m_ctx, C_unfinished_comment, "unfinished comment");
+	          goto end_ws;
+	        }
+	        break;
+	      }
+	      VARR_PUSH (char, symbol_text, curr_c);
+	    }
+	  end_ws:
+	    if (VARR_LENGTH (char, symbol_text) != 0) {
+	      cs_unget (c2m_ctx, curr_c);
+	      /* Optimization: whitespace/comment runs are discarded by pptoken2token anyway.
+	         Avoid expensive uniq_cstr + reg_malloc + hash lookup for the full sequence.
+	         Use a static short sentinel; the actual text is irrelevant. */
+	      static const char ws_space[] = " ";
+	      static const char ws_nl[] = "\n";
+	      const char *ws = nl_p ? ws_nl : ws_space;
+	      return new_token (c2m_ctx, nl_p ? pos : cs->pos, ws, nl_p ? '\n' : ' ', N_IGNORE);
+	    }
     if (header_p && (curr_c == '<' || curr_c == '\"')) {
       int stop;
 
