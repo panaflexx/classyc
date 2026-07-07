@@ -259,21 +259,40 @@ class Map<K, V> {
 
     int Contains(K key) const { return this->find_index(key) >= 0 ? 1 : 0; }
 
-    /* Value for `key`, or a zero-initialized V if absent (subscript read). */
-    V Get(K key) const {
-        int idx = this->find_index(key);
-        if (idx >= 0) return this->vals[idx];
-        V zero;
-        memset((void*)&zero, 0, sizeof(V));
-        return zero;
-    }
+	/* Value for `key`.
+	 * throws KeyException if the key is absent.
+	 * Callers that want silent fallback should use GetOr() or TryGet(). */
 
-    /* Value for `key`, or `fallback` if absent. */
-    V GetOr(K key, V fallback) const {
-        int idx = this->find_index(key);
-        if (idx >= 0) return this->vals[idx];
-        return fallback;
-    }
+	V Get(K key) const {
+		int idx = this->find_index(key);
+		if (idx >= 0) return this->vals[idx];
+		// Throw KeyException (value 8) — reuse the same path dict uses 
+		throw(KeyException, "missing key in Map");
+		// Unreachable
+		V zero;
+		memset((void*)&zero, 0, sizeof(V));
+		return zero;
+	}
+
+	/* Value for `key`, or `fallback` if absent. */
+	V GetOr(K key, V fallback) const {
+		int idx = this->find_index(key);
+		if (idx >= 0) return this->vals[idx];
+		return fallback;
+	}
+
+	/* Fast C++-style lookup
+	 * Returns true and writes the value via out-parameter if present;
+	 * returns false (and leaves *out untouched) if absent.  No exception. */
+	bool TryGet(K key, V* out) const {
+		if (out == NULL) return false;
+		int idx = this->find_index(key);
+		if (idx >= 0) {
+			*out = this->vals[idx];
+			return true;
+		}
+		return false;
+	}
 
     /* Insertion-ordered indexed access (powers for-in and KeyAt/ValAt loops).
      * Caller must ensure 0 <= index < Count(). */

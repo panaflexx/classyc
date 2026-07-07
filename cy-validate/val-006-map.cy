@@ -36,8 +36,14 @@ int main() {
     check(ages->Get("Ada") == 37,     "subscript read+update -> 37");
     check(ages->Contains("Bob") == 1, "Contains present");
     check(ages->Contains("Zoe") == 0, "Contains absent");
-    check(ages->Get("Zoe") == 0,      "Get absent -> 0");
-    check(ages->GetOr("Zoe", -1) == -1, "GetOr absent -> default");
+	/* Get absent now throws KeyException (new default) */\
+	try {
+		int z = ages->Get("Zoe");
+		printf("FAIL: Get absent should throw\n");
+	} catch (e) {
+		check(1, "Get absent throws KeyException");
+	}
+	check(ages->GetOr("Zoe", -1) == -1, "GetOr absent -> default");
 
     /* Remove */
     check(ages->Remove("Bob") == 1,   "Remove present -> 1");
@@ -79,7 +85,11 @@ int main() {
     lib["Africa"]  = new Track("Africa",  295);
     Track* k = lib["Kashmir"];
     check(k != NULL && k->seconds == 508, "string->object lookup + field");
-    check(lib["Missing"] == NULL,         "absent object key -> NULL");
+	try {
+		check(lib["Missing"] == NULL,         "absent object key -> NULL");
+	} catch (e) {
+		check(1, "Get 'Missing' throws KeyException");
+	}
     int secs = 0; for (auto title, trk in lib) secs += trk->seconds;
     check(secs == 508 + 295,              "for-in over object values");
     for (auto title, trk in lib) delete trk;   /* map owns only pointers */

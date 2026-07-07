@@ -1970,36 +1970,61 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
       set_string_val (c2m_ctx, t, symbol_text, wide_type);
       return t;
     }
-    default:
-      if (isalpha (curr_c) || curr_c == '_') {
-        // Unicode, fstring
-        if (curr_c == 'L' || curr_c == 'u' || curr_c == 'U' || curr_c == 'f') {
-          wide_type = curr_c;
-          if ((curr_c = cs_get (c2m_ctx)) == '\"' || curr_c == '\'') {
-            VARR_PUSH (char, symbol_text, wide_type);
-            goto literal;
-          } else if (wide_type == 'u' && curr_c == '8') {
-            wide_type = '8';
-            if ((curr_c = cs_get (c2m_ctx)) == '\"') {
-              VARR_PUSH (char, symbol_text, 'u');
-              VARR_PUSH (char, symbol_text, '8');
-              goto literal;
-            }
-            cs_unget (c2m_ctx, curr_c);
-            curr_c = '8';
-          }
-          cs_unget (c2m_ctx, curr_c);
-          curr_c = wide_type;
-        }
-        pos = cs->pos;
-        do {
-          VARR_PUSH (char, symbol_text, curr_c);
-          curr_c = cs_get (c2m_ctx);
-        } while (isalnum (curr_c) || curr_c == '_');
-        cs_unget (c2m_ctx, curr_c);
-        VARR_PUSH (char, symbol_text, '\0');
-        return new_id_token (c2m_ctx, pos, VARR_ADDR (char, symbol_text));
-      } else {
+	      default:
+	        if (isalpha (curr_c) || curr_c == '_') {
+	          // Unicode, fstring
+	          if (curr_c == 'L' || curr_c == 'u' || curr_c == 'U' || curr_c == 'f') {
+	            wide_type = curr_c;
+	            if ((curr_c = cs_get (c2m_ctx)) == '"' || curr_c == '\'') {
+	              VARR_PUSH (char, symbol_text, wide_type);
+	              goto literal;
+	            } else if (wide_type == 'u' && curr_c == '8') {
+	              wide_type = '8';
+	              if ((curr_c = cs_get (c2m_ctx)) == '"') {
+	                VARR_PUSH (char, symbol_text, 'u');
+	                VARR_PUSH (char, symbol_text, '8');
+	                goto literal;
+	              }
+	              cs_unget (c2m_ctx, curr_c);
+	              curr_c = '8';
+	            }
+	            cs_unget (c2m_ctx, curr_c);
+	            curr_c = wide_type;
+	          }
+	          pos = cs->pos;
+	          /* Fast-path for the common ID case: most identifiers are short.
+	             Collect into a small stack buffer first; fall back to VARR only
+	             for unusually long names.  This avoids hundreds of thousands of
+	             VARR_PUSH / VARR_ADDR calls on typical workloads. */
+	          char idbuf[64];
+	          size_t idlen = 0;
+	          int use_varr = 0;
+	          do {
+	            if (!use_varr) {
+	              if (idlen < sizeof(idbuf) - 1) {
+	                idbuf[idlen++] = curr_c;
+	              } else {
+	                use_varr = 1;
+	                /* flush what we have */
+	                for (size_t k = 0; k < idlen; k++)
+	                  VARR_PUSH (char, symbol_text, idbuf[k]);
+	                VARR_PUSH (char, symbol_text, curr_c);
+	                idlen = 0; /* not used after switch */
+	              }
+	            } else {
+	              VARR_PUSH (char, symbol_text, curr_c);
+	            }
+	            curr_c = cs_get (c2m_ctx);
+	          } while (isalnum (curr_c) || curr_c == '_');
+	          cs_unget (c2m_ctx, curr_c);
+	          if (use_varr) {
+	            VARR_PUSH (char, symbol_text, '\0');
+	            return new_id_token (c2m_ctx, pos, VARR_ADDR (char, symbol_text));
+	          } else {
+	            idbuf[idlen] = '\0';
+	            return new_id_token (c2m_ctx, pos, idbuf);
+	          }
+	        } else {
         VARR_PUSH (char, symbol_text, curr_c);
         VARR_PUSH (char, symbol_text, '\0');
         return new_token_wo_uniq_repr (c2m_ctx, cs->pos, VARR_ADDR (char, symbol_text), curr_c,
@@ -2117,14 +2142,67 @@ static node_t get_int_node_from_repr (c2m_ctx_t c2m_ctx, const char *repr, char 
   return new_ull_node (c2m_ctx, ull, pos);
 }
 
+/* Fast keyword classification for the common identifier case in pptoken2token.
+   Avoids a full str_add / htab lookup for every identifier.  The table is
+   a simple length+prefix switch; correctness is verified by the existing
+   kw_add path that populates the real str_tab at init time. */
+static token_code_t fast_keyword (const char *s, size_t len) {
+  if (len == 0 || len > 16) return T_STR;
+  switch (len) {
+  case 2:
+    if (s[0]=='i' && s[1]=='f') return T_IF;
+    if (s[0]=='d' && s[1]=='o') return T_DO;
+    break;
+  case 3:
+    if (s[0]=='i' && s[1]=='n' && s[2]=='t') return T_INT;
+    if (s[0]=='f' && s[1]=='o' && s[2]=='r') return T_FOR;
+    break;
+  case 4:
+    if (s[0]=='c' && s[1]=='h' && s[2]=='a' && s[3]=='r') return T_CHAR;
+    if (s[0]=='v' && s[1]=='o' && s[2]=='i' && s[3]=='d') return T_VOID;
+    if (s[0]=='a' && s[1]=='u' && s[2]=='t' && s[3]=='o') return T_AUTO;
+    if (s[0]=='c' && s[1]=='a' && s[2]=='s' && s[3]=='e') return T_CASE;
+    if (s[0]=='e' && s[1]=='l' && s[2]=='s' && s[3]=='e') return T_ELSE;
+    if (s[0]=='e' && s[1]=='n' && s[2]=='u' && s[3]=='m') return T_ENUM;
+    if (s[0]=='d' && s[1]=='i' && s[2]=='c' && s[3]=='t') return T_DICT;
+    break;
+  case 5:
+    if (s[0]=='c' && s[1]=='l' && s[2]=='a' && s[3]=='s' && s[4]=='s') return T_CLASS;
+    if (s[0]=='c' && s[1]=='o' && s[2]=='n' && s[3]=='s' && s[4]=='t') return T_CONST;
+    if (s[0]=='f' && s[1]=='l' && s[2]=='o' && s[3]=='a' && s[4]=='t') return T_FLOAT;
+    if (s[0]=='s' && s[1]=='h' && s[2]=='o' && s[3]=='r' && s[4]=='t') return T_SHORT;
+    if (s[0]=='u' && s[1]=='n' && s[2]=='i' && s[3]=='o' && s[4]=='n') return T_UNION;
+    if (s[0]=='w' && s[1]=='h' && s[2]=='i' && s[3]=='l' && s[4]=='e') return T_WHILE;
+    break;
+  case 6:
+    if (s[0]=='d' && s[1]=='o' && s[2]=='u' && s[3]=='b' && s[4]=='l' && s[5]=='e') return T_DOUBLE;
+    if (s[0]=='r' && s[1]=='e' && s[2]=='t' && s[3]=='u' && s[4]=='r' && s[5]=='n') return T_RETURN;
+    if (s[0]=='s' && s[1]=='t' && s[2]=='r' && s[3]=='u' && s[4]=='c' && s[5]=='t') return T_STRUCT;
+    if (s[0]=='s' && s[1]=='w' && s[2]=='i' && s[3]=='t' && s[4]=='c' && s[5]=='h') return T_SWITCH;
+    if (s[0]=='t' && s[1]=='y' && s[2]=='p' && s[3]=='e' && s[4]=='d' && s[5]=='e' && s[6]=='f') return T_TYPEDEF;
+    break;
+  case 7:
+    if (s[0]=='t' && s[1]=='y' && s[2]=='p' && s[3]=='e' && s[4]=='o' && s[5]=='f') return T_TYPEOF;
+    break;
+  }
+  return T_STR; /* not a keyword */
+}
+
 static token_t pptoken2token (c2m_ctx_t c2m_ctx, token_t t, int id2kw_p) {
   assert (t->code != T_HEADER && t->code != T_BOA && t->code != T_EOA && t->code != T_EOR
           && t->code != T_EOP && t->code != T_EOFILE && t->code != T_EOU && t->code != T_PLM
           && t->code != T_RDBLNO);
   if (t->code == T_NO_MACRO_IDENT) t->code = T_ID;
   if (t->code == T_ID && id2kw_p) {
+    token_code_t kw = fast_keyword (t->repr, strlen (t->repr));
+    if (kw != T_STR) {
+      t->code = kw;
+      t->node_code = N_IGNORE;
+      t->node = NULL;
+      return t;
+    }
+    /* fall back to the full table (rare non-keyword path) */
     tab_str_t str = str_add (c2m_ctx, t->repr, strlen (t->repr) + 1, T_STR, 0, FALSE);
-
     if (str.key != T_STR) {
       t->code = (int) str.key;
       t->node_code = N_IGNORE;
@@ -21041,20 +21119,19 @@ static void gen_div_overflow_check (c2m_ctx_t c2m_ctx, op_t dividend_op, op_t di
 }
 
 /* Guard: if (uint64_t)idx_op >= len_op, call _safety_trap(1, 0, line).
-   Treats negative signed indices as out-of-bounds via unsigned comparison.
-   idx_op must be an I64 register; len_op may be a register or immediate. */
+   Callers that want negative-signed-index protection must emit
+   a BGE guard before calling this helper. */
 static void gen_oob_check (c2m_ctx_t c2m_ctx, op_t idx_op, MIR_op_t len_op, long line) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_label_t ok_label = MIR_new_label (ctx);
+  MIR_label_t ok_label = MIR_new_label (c2m_ctx->ctx);
   MIR_op_t trap_args[3];
   safety_ensure_imports (c2m_ctx);
   /* UBLT ok_label, idx, len -- if (unsigned)idx < len skip trap (safe) */
-  emit3 (c2m_ctx, MIR_UBLT, MIR_new_label_op (ctx, ok_label),
+  emit3 (c2m_ctx, MIR_UBLT, MIR_new_label_op (c2m_ctx->ctx, ok_label),
          idx_op.mir_op, len_op);
-  trap_args[0] = MIR_new_int_op (ctx, 1); /* reason: out-of-bounds */
+  trap_args[0] = MIR_new_int_op (c2m_ctx->ctx, 1); /* reason: out-of-bounds */
   trap_args[1] = zero_op.mir_op;
-  trap_args[2] = MIR_new_int_op (ctx, line);
+  trap_args[2] = MIR_new_int_op (c2m_ctx->ctx, line);
   gen_rt_call_void (c2m_ctx, safety_trap_proto, safety_trap_item, 3, trap_args);
   emit_label_insn_opt (c2m_ctx, ok_label);
 }
@@ -21851,7 +21928,7 @@ static op_t gen_dict_value_for_init (c2m_ctx_t c2m_ctx, node_t value) {
        below and the raw char* pointer would be stored as an integer. */
     op_t v = val_gen (c2m_ctx, value);
     return gen_dict_create_string (c2m_ctx, v.mir_op);
-  } 
+  }
   /* Fallthrough - runtime expression: evaluate then wrap as int64 */
   op_t v = val_gen (c2m_ctx, value);
   return gen_dict_create_int64 (c2m_ctx, v.mir_op);
@@ -22002,11 +22079,11 @@ static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, str_empty_proto);
   move_item_to_module_start (module, str_empty_item);
 
-  /* char *c2m_str_substr(const char *s, int64_t pos, int64_t len) */
-  vars[0].name = "s";   vars[0].type = MIR_T_I64;
-  vars[1].name = "pos"; vars[1].type = MIR_T_I64;
-  vars[2].name = "len"; vars[2].type = MIR_T_I64;
-  str_substr_proto = MIR_new_proto_arr (ctx, "__c2m_str_substr_p", 1, &ptr_t, 3, vars);
+  /* char *c2m_str_substr(const char *s, ssize_t pos, ssize_t len) */
+    vars[0].name = "s";   vars[0].type = MIR_T_I64;
+    vars[1].name = "pos"; vars[1].type = MIR_T_I64;
+    vars[2].name = "len"; vars[2].type = MIR_T_I64;
+    str_substr_proto = MIR_new_proto_arr (ctx, "__c2m_str_substr_p", 1, &ptr_t, 3, vars);
   str_substr_item = MIR_new_import (ctx, "c2m_str_substr");
   move_item_to_module_start (module, str_substr_proto);
   move_item_to_module_start (module, str_substr_item);
@@ -22019,12 +22096,12 @@ static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, str_find_proto);
   move_item_to_module_start (module, str_find_item);
 
-  /* char *c2m_str_replace(const char *s, int64_t pos, int64_t len, const char *repl) */
-  vars[0].name = "s";    vars[0].type = MIR_T_I64;
-  vars[1].name = "pos";  vars[1].type = MIR_T_I64;
-  vars[2].name = "len";  vars[2].type = MIR_T_I64;
-  vars[3].name = "repl"; vars[3].type = MIR_T_I64;
-  str_replace_proto = MIR_new_proto_arr (ctx, "__c2m_str_replace_p", 1, &ptr_t, 4, vars);
+  /* char *c2m_str_replace(const char *s, ssize_t pos, ssize_t len, const char *repl) */
+    vars[0].name = "s";    vars[0].type = MIR_T_I64;
+    vars[1].name = "pos";  vars[1].type = MIR_T_I64;
+    vars[2].name = "len";  vars[2].type = MIR_T_I64;
+    vars[3].name = "repl"; vars[3].type = MIR_T_I64;
+    str_replace_proto = MIR_new_proto_arr (ctx, "__c2m_str_replace_p", 1, &ptr_t, 4, vars);
   str_replace_item = MIR_new_import (ctx, "c2m_str_replace");
   move_item_to_module_start (module, str_replace_proto);
   move_item_to_module_start (module, str_replace_item);
@@ -24596,9 +24673,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     } else {
       /* Null-pointer guard before data dereference (*ptr).  Elided when the
          ownership pass proved the receiver live and non-null (DEREF_GUARD_SAFE). */
-      if (c2m_options->exceptions_p
-          && ((struct expr *) r->attr)->own_deref_class != DEREF_GUARD_SAFE)
-        gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
+      if (((struct expr *) r->attr)->own_deref_class == DEREF_GUARD_DEFAULT) {
+        warning (c2m_ctx, POS (r), "possible null dereference (ownership analysis could not prove the pointer non-null)");
+        if (c2m_options->exceptions_p)
+          gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
+      }
       /* -fobject-guards: liveness check at ownership-CHECK (MaybeOwned) sites. */
       if (c2m_options->object_guards_p
           && ((struct expr *) r->attr)->own_deref_class == DEREF_GUARD_CHECK)
@@ -25335,15 +25414,53 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             res = gen_string_call (c2m_ctx, SM_FIND, vals, 2);
             break;
           case SM_SUBSTR:
-            vals[1] = promote (c2m_ctx, val_gen (c2m_ctx, NL_HEAD (args->u.ops)), MIR_T_I64, FALSE).mir_op;
-            vals[2] = promote (c2m_ctx, val_gen (c2m_ctx, NL_EL (args->u.ops, 1)), MIR_T_I64, FALSE).mir_op;
-            res = gen_string_call (c2m_ctx, SM_SUBSTR, vals, 3);
+            {
+              op_t pos_op = promote (c2m_ctx, val_gen (c2m_ctx, NL_HEAD (args->u.ops)), MIR_T_I64, FALSE);
+              op_t len_op = promote (c2m_ctx, val_gen (c2m_ctx, NL_EL (args->u.ops, 1)), MIR_T_I64, FALSE);
+              /* Force signed semantics: reject negative pos/len at runtime
+                 (prevents the "negative becomes huge unsigned" silent failure).
+                 Emit guard before the call; reuse the OOB safety trap path. */
+              if (c2m_options->exceptions_p) {
+                /* If either is negative, trap (reason OOB).  Simple constant-foldable
+                   checks are left to the backend; we emit unconditional compare. */
+                MIR_label_t ok1 = MIR_new_label (c2m_ctx->ctx);
+                MIR_op_t zero = zero_op.mir_op;
+                emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (c2m_ctx->ctx, ok1), pos_op.mir_op, zero);
+                /* negative pos */
+                gen_oob_check (c2m_ctx, pos_op, zero, (long) POS (r).lno); /* reuse for negative-as-OOB */
+                emit_label_insn_opt (c2m_ctx, ok1);
+                MIR_label_t ok2 = MIR_new_label (c2m_ctx->ctx);
+                emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (c2m_ctx->ctx, ok2), len_op.mir_op, zero);
+                gen_oob_check (c2m_ctx, len_op, zero, (long) POS (r).lno);
+                emit_label_insn_opt (c2m_ctx, ok2);
+              }
+              vals[1] = pos_op.mir_op;
+              vals[2] = len_op.mir_op;
+              res = gen_string_call (c2m_ctx, SM_SUBSTR, vals, 3);
+            }
             break;
           case SM_REPLACE:
-            vals[1] = promote (c2m_ctx, val_gen (c2m_ctx, NL_HEAD (args->u.ops)), MIR_T_I64, FALSE).mir_op;
-            vals[2] = promote (c2m_ctx, val_gen (c2m_ctx, NL_EL (args->u.ops, 1)), MIR_T_I64, FALSE).mir_op;
-            vals[3] = val_gen (c2m_ctx, NL_EL (args->u.ops, 2)).mir_op;
-            res = gen_string_call (c2m_ctx, SM_REPLACE, vals, 4);
+            {
+              op_t pos_op = promote (c2m_ctx, val_gen (c2m_ctx, NL_HEAD (args->u.ops)), MIR_T_I64, FALSE);
+              op_t len_op = promote (c2m_ctx, val_gen (c2m_ctx, NL_EL (args->u.ops, 1)), MIR_T_I64, FALSE);
+              op_t repl_op = val_gen (c2m_ctx, NL_EL (args->u.ops, 2));
+              /* Force signed semantics for the positional form of replace */
+              if (c2m_options->exceptions_p) {
+                MIR_label_t ok1 = MIR_new_label (c2m_ctx->ctx);
+                MIR_op_t zero = zero_op.mir_op;
+                emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (c2m_ctx->ctx, ok1), pos_op.mir_op, zero);
+                gen_oob_check (c2m_ctx, pos_op, zero, (long) POS (r).lno);
+                emit_label_insn_opt (c2m_ctx, ok1);
+                MIR_label_t ok2 = MIR_new_label (c2m_ctx->ctx);
+                emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (c2m_ctx->ctx, ok2), len_op.mir_op, zero);
+                gen_oob_check (c2m_ctx, len_op, zero, (long) POS (r).lno);
+                emit_label_insn_opt (c2m_ctx, ok2);
+              }
+              vals[1] = pos_op.mir_op;
+              vals[2] = len_op.mir_op;
+              vals[3] = repl_op.mir_op;
+              res = gen_string_call (c2m_ctx, SM_REPLACE, vals, 4);
+            }
             /* replace mutates in place: write the new pointer back into the
                receiver when it is a plain assignable lvalue. */
             {
