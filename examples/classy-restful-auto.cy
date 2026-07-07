@@ -111,7 +111,8 @@ class Request {
 
     /* O(1) lookup via Map (best practice over repeated string scans) */
     String QueryParam(String k) {
-        if (this->queryParams) return this->queryParams->Get(k);
+        if (this->queryParams && (k in this->queryParams))
+            return this->queryParams->Get(k);
         return (String)0;
     }
 
@@ -204,7 +205,9 @@ class UsersController {
                 "SELECT COUNT(*) AS n FROM users");
         }
         if (!rows) return resp_bad("query failed");
-        int total = (cnt != 0 && cnt.n != 0) ? (int)(long)cnt.n : 0;
+        int total = 0;
+        if (cnt != 0 && "n" in cnt)
+            total = (int)(long)cnt.n;
 
         /* Pythonic: Filter lambda selects active rows in-memory after SQL pagination.
            GAP: dict int fields still need the (int)(long) double-cast in the lambda.

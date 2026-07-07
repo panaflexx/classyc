@@ -170,7 +170,7 @@ class List<T> {
     void owns(bool owns) { this->_owns_ptrs = owns; }
 
     /* Ensure capacity >= min. Doubles until satisfied; preserves elements. */
-    void EnsureCapacity(int min) {
+    void EnsureCapacity(int min) __attribute__((da_ignore)) {
         if (min <= this->capacity) return;
         int newCap = this->capacity;
         while (newCap < min) newCap = newCap * 2;
@@ -182,7 +182,7 @@ class List<T> {
     }
 
     /* Shrink backing array to Count() (minimum 1). Releases wasted memory. */
-    void TrimExcess() {
+    void TrimExcess() __attribute__((da_ignore)) {
         int target = this->length > 0 ? this->length : 1;
         if (target == this->capacity) return;
         T* newData = (T*) malloc(sizeof(T) * target);
@@ -195,14 +195,14 @@ class List<T> {
     /* ═════════════════════════ Search ══════════════════════════════════ */
 
     /* Index of first element equal to item via ==, or -1. */
-    int IndexOf(T item) {
+    int IndexOf(T item) __attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++)
             if (this->data[i] == item) return i;
         return -1;
     }
 
     /* Index of last element equal to item via ==, or -1. */
-    int LastIndexOf(T item) {
+    int LastIndexOf(T item) __attribute__((da_ignore)) {
         int i = this->length - 1;
         while (i >= 0) {
             if (this->data[i] == item) return i;
@@ -266,7 +266,7 @@ class List<T> {
     /* ═════════════════════════ Transformations ═════════════════════════ */
 
     /* Reverse elements in place. O(n). */
-    void Reverse() {
+    void Reverse() __attribute__((da_ignore)) {
         int lo = 0, hi = this->length - 1;
         while (lo < hi) {
             T tmp = this->data[lo];
@@ -279,7 +279,7 @@ class List<T> {
 
     /* Sort in place using Shell sort (O(n log² n) average).
      * cmp(a, b) returns <0 if a<b, 0 if equal, >0 if a>b. */
-    void Sort(int(*cmp)(T, T)) {
+    void Sort(int(*cmp)(T, T)) __attribute__((da_ignore)) {
         int gap = this->length / 2;
         while (gap > 0) {
             for (int i = gap; i < this->length; i++) {
@@ -303,7 +303,7 @@ class List<T> {
 
     /* Return new heap list with [start, start+count). Clamps to valid range.
      * Caller must `delete` the result. */
-    List<T>* Slice(int start, int count) {
+    List<T>* Slice(int start, int count) __attribute__((da_ignore)) {
         if (start < 0)                   start = 0;
         if (start >= this->length)       count = 0;
         if (count < 0)                   count = 0;
@@ -314,7 +314,7 @@ class List<T> {
     }
 
     /* Return shallow copy. Caller must `delete`. */
-    List<T>* Copy() {
+    List<T>* Copy() __attribute__((da_ignore)) {
         List<T>* c = new List<T>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++)
             c->Add(this->data[i]);
@@ -341,13 +341,13 @@ class List<T> {
     /* Bulk-copy the live elements into a caller-provided buffer starting at
      * index 0.  Mirrors C#'s `List<T>.CopyTo(T[] array)`.  The destination
      * must have room for at least Count() elements. */
-    void CopyTo(T* destination) {
+    void CopyTo(T* destination) __attribute__((da_ignore)) {
         if (this->length > 0)
             memcpy((void*) destination, (void*) this->data, sizeof(T) * this->length);
     }
 
     /* Structural equality: same count + pairwise ==. Returns 1 or 0. */
-    int Equals(List<T>* other) {
+    int Equals(List<T>* other) __attribute__((da_ignore)) {
         if (other == NULL || other->Count() != this->length) return 0;
         for (int i = 0; i < this->length; i++)
             if (this->data[i] != other->Get(i)) return 0;
@@ -357,14 +357,14 @@ class List<T> {
     /* ═════════════════════════ Higher-order ═══════════════════════════ */
 
     /* Call action(item) for each element in order. */
-    void ForEach(void(*action)(T)) {
+    void ForEach(void(*action)(T)) __attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++)
             action(this->data[i]);
     }
 
     /* Return new heap list containing elements where pred(item) != 0.
      * Caller must `delete`. */
-    List<T>* Filter(int(*pred)(T)) {
+    List<T>* Filter(int(*pred)(T)) __attribute__((da_ignore)) {
         List<T>* result = new List<T>();
         for (int i = 0; i < this->length; i++)
             if (pred(this->data[i])) result->Add(this->data[i]);
@@ -372,9 +372,9 @@ class List<T> {
     }
 
 	    /* Return new heap list with fn(item) applied to every element.
-     * Same-type transform (T -> T), so it chains with Filter:
-     *   nums->Filter(p)->Map(f).  Caller must `delete` the result. */
-	    List<T>* Map(T(*fn)(T)) {
+	     * Same-type transform (T -> T), so it chains with Filter:
+	     *   nums->Filter(p)->Map(f).  Caller must `delete` the result. */
+	    List<T>* Map(T(*fn)(T)) __attribute__((da_ignore)) {
         List<T>* result = new List<T>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++)
             result->Add(fn(this->data[i]));
@@ -384,7 +384,7 @@ class List<T> {
     /* Convert List<dict> to DICT_ARRAY. Casts the backing store to dict* so the
      * generic body type-checks for every element specialization (the method is
      * only meaningful for List<dict>). */
-    dict ToDict() {
+    dict ToDict() __attribute__((da_ignore)) {
         dict arr = dict_create_array();
         dict* d = (dict*)this->data;
         for (int i = 0; i < this->length; i++) {
@@ -408,7 +408,7 @@ class List<T> {
      * for *every* element specialization (a bare `(char*)elem` cast is rejected
      * for floating-point T like List<double>), while reading the real value
      * when the list actually holds Strings. */
-    dict StringsToJsonArray() {
+    dict StringsToJsonArray() __attribute__((da_ignore)) {
         dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
             dict_array_append(arr, dict_create_string(*(char**)&this->data[i]));
@@ -419,7 +419,7 @@ class List<T> {
     /* Convert List<int> to a DICT_ARRAY of DICT_INT64 values. The integer
      * sibling of StringsToJsonArray(); reads via `*(int*)&elem` so the body
      * type-checks for all T and round-trips the value for List<int>. */
-    dict IntsToJsonArray() {
+    dict IntsToJsonArray() __attribute__((da_ignore)) {
         dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
             dict_array_append(arr, dict_create_int64((long)*(int*)&this->data[i]));
@@ -439,7 +439,7 @@ class List<T> {
      * `*(double*)&elem`, `*(char**)&elem`): those casts are pointer-to-pointer
      * (always valid for any T), and only the nameof-selected branch runs, so
      * the body both type-checks for every specialization and reads correctly. */
-    dict ToJsonArray() {
+    dict ToJsonArray() __attribute__((da_ignore)) {
         dict arr = dict_create_array();
         const char* tn = nameof<T>();
         for (int i = 0; i < this->length; i++) {
@@ -476,7 +476,7 @@ class List<T> {
      *   dict out = { "items": nums->ToJsonArrayBy(asNum) };
      *
      * `fn(item)` is responsible for producing each element value. */
-    dict ToJsonArrayBy(dict(*fn)(T)) {
+    dict ToJsonArrayBy(dict(*fn)(T)) __attribute__((da_ignore)) {
         dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
             dict_array_append(arr, fn(this->data[i]));
@@ -495,7 +495,7 @@ class List<T> {
      * the same key overwrites the earlier value (last-one-wins, as in C#'s
      * indexer-based fill).  The returned dict is owned by whatever dict
      * references it. */
-    dict ToDictBy(const char*(*keyFn)(T), dict(*valFn)(T)) {
+    dict ToDictBy(const char*(*keyFn)(T), dict(*valFn)(T)) __attribute__((da_ignore)) {
         dict obj = dict_create_object();
         for (int i = 0; i < this->length; i++) {
             dict_object_set(obj, (char*)keyFn(this->data[i]), valFn(this->data[i]));
@@ -517,7 +517,7 @@ class List<T> {
      *
      * `array` should be a JSON array; a scalar/object dict yields a length of 0
      * (or 1) per the dict length() rules. */
-    static List<T>* FromJson(dict array) {
+    static List<T>* FromJson(dict array) __attribute__((da_ignore)) {
         List<T>* r = new List<T>();
         int n = (int)array.length();
         for (int i = 0; i < n; i++) {
@@ -535,7 +535,7 @@ class List<T> {
      * Intended for scalar element lists (int/double/String); for a List<dict>
      * use ToDict() and serialize the owning dict yourself (ToJson() would free
      * the referenced element dicts). */
-    String ToJson() {
+    String ToJson() __attribute__((da_ignore)) {
         dict arr = this->ToJsonArray();
         String j = arr.json;
         dict_destroy(arr);

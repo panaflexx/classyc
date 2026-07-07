@@ -416,6 +416,14 @@ typedef enum {
                             pointer was nulled; the new owner holds the value. */
 } owstate_t;
 
+/* Definite-assignment lattice (added for compile-time uninit-read detection).
+   Orthogonal to the ownership lattice; tracked only for scalar/pointer locals. */
+typedef enum {
+  DA_UNINIT = 0,   /* no write on any path reaching this point */
+  DA_INIT,         /* definitely written on every path */
+  DA_MAYBE         /* written on some paths, not others (join) */
+} da_state_t;
+
 static const char *owstate_name (owstate_t s) {
   switch (s) {
   case OS_UNOWNED:     return "Unowned";
@@ -458,6 +466,11 @@ static owstate_t state_meet (owstate_t a, owstate_t b) {
       return OS_DETACHED;
   }
   return OS_MAYBE_OWNED;
+}
+
+static da_state_t da_meet (da_state_t a, da_state_t b) {
+  if (a == b) return a;
+  return DA_MAYBE;   /* INIT ⊓ UNINIT = MAYBE */
 }
 
 /* A tracked binding being analysed.  One slot per candidate per function. */
@@ -530,6 +543,18 @@ typedef struct candidate {
      which lets conditionally-moved owned locals still get cleaned up on the
      paths where they were NOT moved out. */
   int         unsafe_escape_p;
+  /* Definite-assignment state (new).  Only meaningful for scalar/pointer
+     locals.  DA_UNINIT means the binding is read before any write on every
+     path; DA_MAYBE means some paths write, others do not.  Emitted as a
+     compile-time error (UNINIT) or warning (MAYBE) at the read site. */
+  da_state_t  da_state;
+  /* If set, the definite-assignment diagnostic is suppressed for this
+     candidate.  Set by the `__attribute__((classyc_da_ignore))` (or the
+     shorter `__attribute__((da_ignore))`) on the declaration.
+     Used by the collection headers (list.h, set.h, map.h) to silence
+     the check for their internal temporaries without disabling it
+     globally. */
+  int         da_ignore_p;
 } candidate_t;
 
 DEF_VARR (candidate_t);
@@ -714,22 +739,27 @@ static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) 
         c.managed_p    = (d != NULL && d->owned_p) ? 1 : 0;
         c.moved_p      = 0;
         c.unsafe_escape_p = 0;
-        /* Honour __attribute__((cleanup(fn))) — the GCC RAII attribute that
-           tells the compiler to call `fn(&var)` at scope exit.  If the user
-           has wired up explicit cleanup that way, suppress our leak warning
-           and pretend the binding is permanently disposed-of for diagnostic
-           purposes (it'll still get its scope-bound state transitions). */
+        c.da_state     = (init != NULL ? DA_INIT : DA_UNINIT);
+        /* Honour __attribute__((cleanup(fn))) and the new
+           __attribute__((da_ignore)) (or classyc_da_ignore) that tells the
+           definite-assignment pass to stay silent for this declaration.
+           Used by the collection headers to silence noise on their internal
+           temporaries without disabling the check for user code. */
         c.has_cleanup_p = 0;
+        c.da_ignore_p   = 0;
         {
           node_t attrs = SPEC_DECL_ATTRS (n);
           if (attrs != NULL && attrs->code == N_LIST) {
             for (node_t aa = NL_HEAD (attrs->u.ops); aa != NULL; aa = NL_NEXT (aa)) {
               if (aa->code != N_ATTR) continue;
               node_t aname = NL_HEAD (aa->u.ops);
-              if (aname != NULL && aname->code == N_ID && aname->u.s.s != NULL
-                  && strcmp (aname->u.s.s, "cleanup") == 0) {
-                c.has_cleanup_p = 1;
-                break;
+              if (aname != NULL && aname->code == N_ID && aname->u.s.s != NULL) {
+                if (strcmp(aname->u.s.s, "cleanup") == 0) {
+                  c.has_cleanup_p = 1;
+                } else if (strcmp(aname->u.s.s, "da_ignore") == 0 ||
+                           strcmp(aname->u.s.s, "classyc_da_ignore") == 0) {
+                  c.da_ignore_p = 1;
+                }
               }
             }
           }
@@ -788,6 +818,7 @@ static void collect_param_candidates (c2m_ctx_t c2m_ctx, node_t func_def,
     c.state        = OS_OWNED; /* assume caller passed ownership */
     c.param_p      = 1;
     c.param_pos    = pos;
+    c.da_state     = DA_INIT; /* parameters are inputs, considered defined */
     VARR_PUSH (candidate_t, out, c);
   }
 }
@@ -1205,13 +1236,17 @@ static void transfer_assign (flowctx_t *ctx, node_t assign) {
     const char *acq = acquire_fn_name_of_init (rhs);
     if (acq != NULL && release_fn_for_acquire (acq) != NULL) {
       a[lhs_idx].state = OS_OWNED;
+      a[lhs_idx].da_state = DA_INIT; /* writing a freshly acquired value */
       return;
     }
     /* IP path: x = make_buf(...) where make_buf has summary.returns_owned_p. */
     if (summary_release_for_init (rhs) != NULL) {
       a[lhs_idx].state = OS_OWNED;
+      a[lhs_idx].da_state = DA_INIT;
       return;
     }
+    /* Any other write to a tracked binding establishes definite assignment. */
+    a[lhs_idx].da_state = DA_INIT;
   }
 
   /* --- Case B: Both sides are tracked candidates and RHS is a direct
@@ -1723,8 +1758,10 @@ static void analyze (flowctx_t *ctx, node_t n) {
     /* Recurse into all operands so nested expressions (initializer) fire. */
     for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
       analyze (ctx, c);
-    if (idx >= 0)
+    if (idx >= 0) {
       VARR_ADDR (candidate_t, ctx->cands)[idx].state = OS_OWNED;
+      VARR_ADDR (candidate_t, ctx->cands)[idx].da_state = DA_INIT;
+    }
     return;
   }
   case N_BLOCK: {
@@ -1972,6 +2009,26 @@ static void analyze (flowctx_t *ctx, node_t n) {
                "and is dead; use the new owner instead", c->name);
         diag_mark_warned (ctx, c);
       }
+      /* Definite-assignment (da) checks: UNINIT -> error, MAYBE -> warning.
+         Only emit on the final diagnostic pass (diag_active_p).
+         We keep the check for any tracked owned heap resource (`new` or
+         `malloc`), but we deliberately suppress it for candidates whose
+         declaration lives inside a system/header file (list.h, set.h,
+         map.h …).  That removes the noise from internal temporaries while
+         still catching uninitialized user-owned objects. */
+      const char *fname = c->acquire_pos.fname;
+      int is_header = (fname && strstr(fname, ".h") != NULL);
+      int is_tracked_heap = (c->release_fn != NULL &&
+                             (strcmp(c->release_fn, "delete") == 0 ||
+                              strcmp(c->release_fn, "free") == 0));
+      if (!is_header && is_tracked_heap && c->da_state == DA_UNINIT && !c->warned_p && diag_active_p (ctx)) {
+        error (ctx->c2m_ctx, POS (n),
+               "use of uninitialized value `%s`", c->name);
+        diag_mark_warned (ctx, c);
+      } else if (!is_header && is_tracked_heap && c->da_state == DA_MAYBE && !c->warned_p && diag_active_p (ctx)) {
+        warning (ctx->c2m_ctx, POS (n),
+                 "possible use of uninitialized value `%s`", c->name);
+      }
     }
     return;
   }
@@ -2053,6 +2110,9 @@ typedef struct basic_block {
      the dataflow runner once it knows ncands; freed in cfg_destroy. */
   owstate_t          *state_in;
   owstate_t          *state_out;
+  /* Definite-assignment (da) state — parallel arrays to the owstate ones. */
+  da_state_t         *da_state_in;
+  da_state_t         *da_state_out;
 } basic_block_t;
 DEF_VARR (basic_block_t);
 
@@ -2412,6 +2472,7 @@ static void cfg_apply_block (flowctx_t *ctx, basic_block_t *bb) {
   size_t ncands = VARR_LENGTH (candidate_t, ctx->cands);
   /* Load in_state into the candidate scratch slots. */
   for (size_t k = 0; k < ncands; k++) cands[k].state = bb->state_in[k];
+  for (size_t k = 0; k < ncands; k++) cands[k].da_state = bb->da_state_in[k];
   ctx->dead_p = 0;
   /* Run each effect's transfer.  The existing `analyze` dispatcher does the
      per-AST-node transitions; control-flow nodes never appear inside a
@@ -2424,6 +2485,7 @@ static void cfg_apply_block (flowctx_t *ctx, basic_block_t *bb) {
   }
   /* Snapshot out_state for propagation to successors. */
   for (size_t k = 0; k < ncands; k++) bb->state_out[k] = cands[k].state;
+  for (size_t k = 0; k < ncands; k++) bb->da_state_out[k] = cands[k].da_state;
 }
 
 static void cfg_dataflow (flowctx_t *ctx, cfg_t *cfg) {
@@ -2435,6 +2497,8 @@ static void cfg_dataflow (flowctx_t *ctx, cfg_t *cfg) {
   for (size_t i = 0; i < nblocks; i++) {
     bbs[i].state_in  = (owstate_t *) calloc (ncands, sizeof (owstate_t));
     bbs[i].state_out = (owstate_t *) calloc (ncands, sizeof (owstate_t));
+    bbs[i].da_state_in  = (da_state_t *) calloc (ncands, sizeof (da_state_t));
+    bbs[i].da_state_out = (da_state_t *) calloc (ncands, sizeof (da_state_t));
   }
 
   ctx->quiet_p = 1;
@@ -2466,6 +2530,25 @@ static void cfg_dataflow (flowctx_t *ctx, cfg_t *cfg) {
         int entry_p = (i == (size_t) cfg->entry_bb);
         for (size_t k = 0; k < ncands; k++)
           in_buf[k] = (entry_p && ca[k].param_p) ? OS_OWNED : OS_UNOWNED;
+      }
+      /* Definite-assignment in-state: locals start UNINIT; entry params
+         start INIT (caller is responsible for providing a defined value). */
+      da_state_t da_new_in[64];
+      da_state_t *da_in_buf = da_new_in;
+      da_state_t *heap_da_in = NULL;
+      if (ncands > 64) {
+        heap_da_in = (da_state_t *) calloc (ncands, sizeof (da_state_t));
+        da_in_buf = heap_da_in;
+      }
+      {
+        candidate_t *ca = VARR_ADDR (candidate_t, ctx->cands);
+        int entry_p = (i == (size_t) cfg->entry_bb);
+        for (size_t k = 0; k < ncands; k++) {
+          if (entry_p)
+            da_in_buf[k] = ca[k].da_state;   /* already set correctly at candidate creation */
+          else
+            da_in_buf[k] = DA_UNINIT;
+        }
       }
       size_t npreds = VARR_LENGTH (int, bb->preds);
       if (npreds > 0) {
@@ -2511,6 +2594,44 @@ static void cfg_dataflow (flowctx_t *ctx, cfg_t *cfg) {
         if (in_buf[k] != bb->state_in[k]) { in_diff = 1; break; }
       if (in_diff) memcpy (bb->state_in, in_buf, ncands * sizeof (owstate_t));
       if (heap_in != NULL) free (heap_in);
+
+      /* --- Definite-assignment (DA) propagation & store --- */
+      if (npreds > 0) {
+        int *preds = VARR_ADDR (int, bb->preds);
+        da_state_t da_refined[64];
+        da_state_t *da_r_buf = da_refined;
+        da_state_t *heap_da_r = NULL;
+        if (ncands > 64) {
+          heap_da_r = (da_state_t *) calloc (ncands, sizeof (da_state_t));
+          da_r_buf = heap_da_r;
+        }
+        for (size_t pi = 0; pi < npreds; pi++) {
+          basic_block_t *pred = &bbs[preds[pi]];
+          da_state_t *po = pred->da_state_out;
+          if (pi == 0) memcpy (da_in_buf, po, ncands * sizeof (da_state_t));
+          else
+            for (size_t k = 0; k < ncands; k++)
+              da_in_buf[k] = da_meet (da_in_buf[k], po[k]);
+        }
+        if (heap_da_r) free (heap_da_r);
+      }
+      int da_in_diff = 0;
+      for (size_t k = 0; k < ncands; k++)
+        if (da_in_buf[k] != bb->da_state_in[k]) { da_in_diff = 1; break; }
+      if (da_in_diff) memcpy (bb->da_state_in, da_in_buf, ncands * sizeof (da_state_t));
+      if (heap_da_in) free (heap_da_in);
+
+      /* Post-fixed-point guarantee: any candidate declared with a non-null
+         initializer (new / malloc) must be considered DA_INIT from the
+         first use onward.  This overrides any conservative MAYBE that the
+         data-flow lattice produced at a merge (e.g. loop header). */
+      {
+        candidate_t *ca = VARR_ADDR (candidate_t, ctx->cands);
+        for (size_t k = 0; k < ncands; k++) {
+          if (SPEC_DECL_INIT(ca[k].decl) != NULL)
+            bb->da_state_in[k] = DA_INIT;
+        }
+      }
 
       /* Apply transfers to compute new out_state. */
       owstate_t prev_out[64];
@@ -2821,6 +2942,8 @@ static void cfg_destroy (cfg_t *cfg) {
   for (size_t i = 0; i < nblocks; i++) {
     if (bbs[i].state_in  != NULL) free (bbs[i].state_in);
     if (bbs[i].state_out != NULL) free (bbs[i].state_out);
+    if (bbs[i].da_state_in  != NULL) free (bbs[i].da_state_in);
+    if (bbs[i].da_state_out != NULL) free (bbs[i].da_state_out);
     VARR_DESTROY (node_t, bbs[i].effects);
     VARR_DESTROY (cfg_edge_t, bbs[i].succs);
     VARR_DESTROY (int, bbs[i].preds);
