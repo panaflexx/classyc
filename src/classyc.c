@@ -7881,6 +7881,13 @@ D (stmt) {
 
     M_SOFT("throw");
     pos_t tpos = curr_token->pos;
+
+    if (!C('(')) {
+        error(c2m_ctx, tpos,
+              "throw must be written as throw(id, msg);");
+        record_stop(c2m_ctx, mark, TRUE);
+        return err_node;
+    }
     /* Use assign_expr (not expr) so the top-level ',' separates the two
        arguments rather than being parsed as a comma-operator expression. */
     PT('('); P(assign_expr); op1 = r;          /* id expr  */
@@ -24674,7 +24681,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       /* Null-pointer guard before data dereference (*ptr).  Elided when the
          ownership pass proved the receiver live and non-null (DEREF_GUARD_SAFE). */
       if (((struct expr *) r->attr)->own_deref_class == DEREF_GUARD_DEFAULT) {
-        warning (c2m_ctx, POS (r), "possible null dereference (ownership analysis could not prove the pointer non-null)");
+        //FIXME: This fires on a lot of perfectly fine code
+        if (c2m_options->verbose_p)
+          warning (c2m_ctx, POS (r), "possible null dereference (ownership analysis could not prove the pointer non-null)");
         if (c2m_options->exceptions_p)
           gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
       }
