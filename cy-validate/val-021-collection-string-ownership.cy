@@ -40,7 +40,7 @@ int main(void) {
     defer delete names;
     for (int i = 0; i < 1000; i++) {
         String s = label(i);   /* tracked by the per-iter arena */
-        names->Add(s);         /* move-on-store: list takes ownership */
+        names->Add(detach s);         /* move-on-store: list takes ownership */
     }
     check(names->Count() == 1000, "(1) list holds all 1000 entries");
     check(strcmp(names->Get(0),   "item#0")   == 0, "(1) first entry intact after loop");
