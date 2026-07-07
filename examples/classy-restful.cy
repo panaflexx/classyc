@@ -112,8 +112,12 @@ class Request {
 
     /* O(1) lookup via Map (best practice over repeated string scans) */
     String QueryParam(String k) {
-        if (this->queryParams) return this->queryParams->Get(k);
-        return (String)0;
+		try {
+	        if (this->queryParams)
+				return this->queryParams->Get(k);
+		} catch(e) {
+	        return (String)0;
+		}
     }
 
     /* expose the whole collection if a handler wants to iterate or pass it on */

@@ -26,7 +26,7 @@
  *       examples/classh-restful.cy -eg
  */
 
-#include "sketch/sqlite-classyc.h"
+#include "sqlite.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -111,9 +111,12 @@ class Request {
 
     /* O(1) lookup via Map (best practice over repeated string scans) */
     String QueryParam(String k) {
-        if (this->queryParams && (k in this->queryParams))
+        if (!this->queryParams) return (String)0;
+        try {
             return this->queryParams->Get(k);
-        return (String)0;
+        } catch (e) {
+            return (String)0;
+        }
     }
 
     /* expose the whole collection if a handler wants to iterate or pass it on */
