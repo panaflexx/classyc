@@ -21130,6 +21130,7 @@ static void gen_div_overflow_check (c2m_ctx_t c2m_ctx, op_t dividend_op, op_t di
    a BGE guard before calling this helper. */
 static void gen_oob_check (c2m_ctx_t c2m_ctx, op_t idx_op, MIR_op_t len_op, long line) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
   MIR_label_t ok_label = MIR_new_label (c2m_ctx->ctx);
   MIR_op_t trap_args[3];
   safety_ensure_imports (c2m_ctx);
@@ -21139,6 +21140,30 @@ static void gen_oob_check (c2m_ctx_t c2m_ctx, op_t idx_op, MIR_op_t len_op, long
   trap_args[0] = MIR_new_int_op (c2m_ctx->ctx, 1); /* reason: out-of-bounds */
   trap_args[1] = zero_op.mir_op;
   trap_args[2] = MIR_new_int_op (c2m_ctx->ctx, line);
+  gen_rt_call_void (c2m_ctx, safety_trap_proto, safety_trap_item, 3, trap_args);
+  emit_label_insn_opt (c2m_ctx, ok_label);
+}
+
+/* Guard: if size_op <= 0, call _safety_trap(3, 0, line) (arithmetic).
+   Prevents negative/zero VLA sizes from reaching alloca (UB per C99/C11).
+   size_op must be an I64 register.  Emitted only under -fexceptions. */
+static void gen_vla_size_check (c2m_ctx_t c2m_ctx, op_t size_op, long line) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_label_t ok_label = MIR_new_label (ctx);
+  MIR_op_t trap_args[3];
+  /* Always force to a fresh I64 reg so the subsequent BGT uses signed comparison
+     semantics even if the alloca size came from a size_t (U64) multiply.  Negative
+     VLA dim produces negative bits that we must detect as <=0. */
+  op_t sz = get_new_temp (c2m_ctx, MIR_T_I64);
+  emit2 (c2m_ctx, MIR_MOV, sz.mir_op, size_op.mir_op);
+  safety_ensure_imports (c2m_ctx);
+  /* BGT ok_label, size, 0  -- skip trap if size > 0 */
+  emit3 (c2m_ctx, MIR_BGT, MIR_new_label_op (ctx, ok_label),
+         sz.mir_op, zero_op.mir_op);
+  trap_args[0] = MIR_new_int_op (ctx, 3); /* reason: arithmetic */
+  trap_args[1] = zero_op.mir_op;
+  trap_args[2] = MIR_new_int_op (ctx, line);
   gen_rt_call_void (c2m_ctx, safety_trap_proto, safety_trap_item, 3, trap_args);
   emit_label_insn_opt (c2m_ctx, ok_label);
 }
@@ -25647,11 +25672,22 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           op1 = mem_to_address (c2m_ctx, op1, FALSE);
       }
       MIR_append_insn (ctx, curr_func, MIR_new_insn (ctx, MIR_VA_START, op1.mir_op));
-    } else if (alloca_p) {
-      res = get_new_temp (c2m_ctx, t);
-      op1 = val_gen (c2m_ctx, NL_HEAD (args->u.ops));
-      MIR_append_insn (ctx, curr_func, MIR_new_insn (ctx, MIR_ALLOCA, res.mir_op, op1.mir_op));
-    } else {
+	    } else if (alloca_p) {
+	      res = get_new_temp (c2m_ctx, t);
+	      node_t size_arg = NL_HEAD (args->u.ops);
+	      /* Guard on the original dimension (signed) if the alloca arg is a sizeof*dim mul.
+	         This preserves negative values that would be lost after unsigned promotion in the byte-size. */
+	      if (c2m_options->exceptions_p && size_arg && size_arg->code == N_MUL) {
+	        node_t dim_node = NL_EL (size_arg->u.ops, 1);  /* second operand of mul */
+	        if (dim_node) {
+	          op_t dim_op = val_gen (c2m_ctx, dim_node);
+	          op_t dim64 = force_reg (c2m_ctx, dim_op, MIR_T_I64);
+	          gen_vla_size_check (c2m_ctx, dim64, (long) POS (r).lno);
+	        }
+	      }
+	      op1 = val_gen (c2m_ctx, size_arg);
+	      MIR_append_insn (ctx, curr_func, MIR_new_insn (ctx, MIR_ALLOCA, res.mir_op, op1.mir_op));
+	    } else {
       param_list = func_type->u.func_type->param_list;
       param = NL_HEAD (param_list->u.ops);
       int arg_num = 0;
