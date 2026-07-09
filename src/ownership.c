@@ -555,6 +555,12 @@ typedef struct candidate {
      the check for their internal temporaries without disabling it
      globally. */
   int         da_ignore_p;
+  /* Pure definite-assignment candidate: a local pointer (or other
+     tracked-for-DA binding) that is NOT an ownership / auto-defer
+     candidate.  Leak diagnostics, auto-release synthesis, and ownership
+     state transitions must leave these alone — they only participate in
+     the DA lattice and the uninit-use warning. */
+  int         da_only_p;
 } candidate_t;
 
 DEF_VARR (candidate_t);
@@ -657,6 +663,33 @@ static void state_widen_owned_to_maybe (flowctx_t *ctx) {
  * Candidate collection: discover tracked bindings before analysis runs.
  * ──────────────────────────────────────────────────────────────────────── */
 
+/* True when a SPEC_DECL initializer is a real rvalue (not missing / N_IGNORE).
+   The parse always materialises a placeholder N_IGNORE for "no initializer",
+   so a bare non-NULL test would treat every local as definitely assigned. */
+static int decl_has_real_init_p (node_t init) {
+  return init != NULL && init->code != N_IGNORE;
+}
+
+/* Scan declaration attributes for cleanup / da_ignore markers. */
+static void candidate_scan_attrs (node_t n, int *has_cleanup_p, int *da_ignore_p) {
+  *has_cleanup_p = 0;
+  *da_ignore_p = 0;
+  node_t attrs = SPEC_DECL_ATTRS (n);
+  if (attrs == NULL || attrs->code != N_LIST) return;
+  for (node_t aa = NL_HEAD (attrs->u.ops); aa != NULL; aa = NL_NEXT (aa)) {
+    if (aa->code != N_ATTR) continue;
+    node_t aname = NL_HEAD (aa->u.ops);
+    if (aname != NULL && aname->code == N_ID && aname->u.s.s != NULL) {
+      if (strcmp (aname->u.s.s, "cleanup") == 0) {
+        *has_cleanup_p = 1;
+      } else if (strcmp (aname->u.s.s, "da_ignore") == 0
+                 || strcmp (aname->u.s.s, "classyc_da_ignore") == 0) {
+        *da_ignore_p = 1;
+      }
+    }
+  }
+}
+
 static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) *out) {
   /* c2m_ctx parameter present only so POS() macro expands correctly here. */
   (void) c2m_ctx;
@@ -691,6 +724,7 @@ static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) 
         && !d->decl_spec.thread_local_p) {
       ip_release_fn = summary_release_for_init (SPEC_DECL_INIT (n));
     }
+    int collected = 0;
     if (auto_defer_path || ip_release_fn != NULL || owned_managed) {
       node_t init = SPEC_DECL_INIT (n);
       const char *acquire, *release, *name;
@@ -722,48 +756,51 @@ static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) 
       name = ownership_spec_decl_name (n);
       if (acquire != NULL && release != NULL && name != NULL) {
         candidate_t c;
+        memset (&c, 0, sizeof (c));
         c.decl         = n;
         c.name         = name;
         c.acquire_fn   = acquire;
         c.release_fn   = release;
         c.acquire_pos  = POS (n);
         c.state        = OS_UNOWNED; /* becomes OS_OWNED when its decl is hit */
-        c.warned_p     = 0;
-        c.escapes_p    = 0;
-        c.returned_p   = 0;
-        c.released_p   = 0;
-        c.release_kind = NULL;
-        memset (&c.release_pos, 0, sizeof (c.release_pos));
-        c.param_p      = 0;
-        c.param_pos    = 0;
         c.managed_p    = (d != NULL && d->owned_p) ? 1 : 0;
-        c.moved_p      = 0;
-        c.unsafe_escape_p = 0;
-        c.da_state     = (init != NULL ? DA_INIT : DA_UNINIT);
-        /* Honour __attribute__((cleanup(fn))) and the new
-           __attribute__((da_ignore)) (or classyc_da_ignore) that tells the
-           definite-assignment pass to stay silent for this declaration.
-           Used by the collection headers to silence noise on their internal
-           temporaries without disabling the check for user code. */
-        c.has_cleanup_p = 0;
-        c.da_ignore_p   = 0;
-        {
-          node_t attrs = SPEC_DECL_ATTRS (n);
-          if (attrs != NULL && attrs->code == N_LIST) {
-            for (node_t aa = NL_HEAD (attrs->u.ops); aa != NULL; aa = NL_NEXT (aa)) {
-              if (aa->code != N_ATTR) continue;
-              node_t aname = NL_HEAD (aa->u.ops);
-              if (aname != NULL && aname->code == N_ID && aname->u.s.s != NULL) {
-                if (strcmp(aname->u.s.s, "cleanup") == 0) {
-                  c.has_cleanup_p = 1;
-                } else if (strcmp(aname->u.s.s, "da_ignore") == 0 ||
-                           strcmp(aname->u.s.s, "classyc_da_ignore") == 0) {
-                  c.da_ignore_p = 1;
-                }
-              }
-            }
-          }
-        }
+        /* Real initializer => DA_INIT; bare `T *p;` stays DA_UNINIT. */
+        c.da_state     = decl_has_real_init_p (init) ? DA_INIT : DA_UNINIT;
+        c.da_only_p    = 0;
+        candidate_scan_attrs (n, &c.has_cleanup_p, &c.da_ignore_p);
+        VARR_PUSH (candidate_t, out, c);
+        collected = 1;
+      }
+    }
+    /* Definite-assignment path: track local pointer bindings that are not
+       already ownership candidates.  This is how `int *p;` without an
+       initializer is recognised so a later `*p` can warn (and gen can
+       zero-init so the null guard traps the wild read at runtime). */
+    if (!collected && d != NULL && !d->unowned_p
+        && d->scope != NULL && d->scope != top_scope
+        && d->scope->code == N_BLOCK
+        && d->decl_spec.type != NULL && d->decl_spec.type->mode == TM_PTR
+        && !d->decl_spec.typedef_p && !d->decl_spec.extern_p
+        && !d->decl_spec.static_p && !d->decl_spec.thread_local_p) {
+      const char *name = ownership_spec_decl_name (n);
+      node_t init = SPEC_DECL_INIT (n);
+      /* Skip the synthesized method receiver: create_decl stores `this` as a
+         block-scoped pointer SPEC_DECL without an initializer, so without this
+         gate it would look like an uninitialized local and later gen could
+         interfere.  Real parameters live on the N_FUNC param list; we only
+         walk the function body for DA candidates (see analyze_function). */
+      if (name != NULL && strcmp (name, "this") != 0) {
+        candidate_t c;
+        memset (&c, 0, sizeof (c));
+        c.decl         = n;
+        c.name         = name;
+        c.acquire_fn   = "<da>";
+        c.release_fn   = NULL; /* no ownership / release semantics */
+        c.acquire_pos  = POS (n);
+        c.state        = OS_UNOWNED;
+        c.da_state     = decl_has_real_init_p (init) ? DA_INIT : DA_UNINIT;
+        c.da_only_p    = 1;
+        candidate_scan_attrs (n, &c.has_cleanup_p, &c.da_ignore_p);
         VARR_PUSH (candidate_t, out, c);
       }
     }
@@ -819,6 +856,7 @@ static void collect_param_candidates (c2m_ctx_t c2m_ctx, node_t func_def,
     c.param_p      = 1;
     c.param_pos    = pos;
     c.da_state     = DA_INIT; /* parameters are inputs, considered defined */
+    c.da_only_p    = 0;
     VARR_PUSH (candidate_t, out, c);
   }
 }
@@ -848,6 +886,8 @@ static void check_exit_state (flowctx_t *ctx, pos_t exit_pos, const char *exit_k
     /* Parameters are tracked only to infer summaries; the caller still
        owns them, so it's not a leak if they stay Owned at function exit. */
     if (c->param_p) continue;
+    /* Pure DA candidates have no ownership / release responsibility. */
+    if (c->da_only_p || c->release_fn == NULL) continue;
     /* Managed (`owned` / `move`) bindings never leak: the compiler
        guarantees a scope-exit release (synthesized in cfg_emit_diagnostics)
        unless ownership was moved out (escapes_p).  Suppress all leak
@@ -1382,6 +1422,7 @@ static void transfer_call (flowctx_t *ctx, node_t call) {
          Authoritative path for release / double-free / direct UAF. */
       candidate_t *c = &a[direct_idx];
       int is_release_call = (callee_name != NULL
+                             && c->release_fn != NULL
                              && strcmp (callee_name, c->release_fn) == 0)
                             || pa == PA_RELEASES;
 
@@ -1751,16 +1792,28 @@ static void analyze (flowctx_t *ctx, node_t n) {
 
   switch (n->code) {
   case N_SPEC_DECL: {
-    /* If this binding is a tracked candidate, the moment of declaration is
-       when its state becomes Owned.  We still recurse into the initializer
-       so any nested effects fire. */
+    /* Ownership candidates become Owned at the declaration if they have a
+       real initializer (or are managed/auto-defer acquires).  Definite
+       assignment only flips to INIT when there is a real initializer;
+       bare `T *p;` stays DA_UNINIT until a later write. */
     int idx = cand_lookup (ctx, n);
     /* Recurse into all operands so nested expressions (initializer) fire. */
     for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
       analyze (ctx, c);
     if (idx >= 0) {
-      VARR_ADDR (candidate_t, ctx->cands)[idx].state = OS_OWNED;
-      VARR_ADDR (candidate_t, ctx->cands)[idx].da_state = DA_INIT;
+      candidate_t *c = &VARR_ADDR (candidate_t, ctx->cands)[idx];
+      int has_init = decl_has_real_init_p (SPEC_DECL_INIT (n));
+      if (!c->da_only_p) {
+        /* Ownership tracking: declaration-with-init (or managed empty slot
+           later assigned via move/acquire) is treated as Owned once the
+           declarator is reached.  Bare `owned T *p;` stays UNOWNED until a
+           real write — the `has_init` gate keeps uninit from looking live. */
+        if (has_init || c->managed_p)
+          c->state = OS_OWNED;
+      }
+      if (has_init) c->da_state = DA_INIT;
+      /* else leave c->da_state as seeded at candidate creation (typically
+         DA_UNINIT for bare declarators). */
     }
     return;
   }
@@ -1937,6 +1990,30 @@ static void analyze (flowctx_t *ctx, node_t n) {
     node_t args   = callee != NULL ? NL_NEXT (callee) : NULL;
     if (callee != NULL) analyze (ctx, callee);
     if (args != NULL && args->code == N_LIST) {
+      /* Stamp the prepended instance-method receiver (`this` arg) so gen can
+         elide the single call-site null check when the receiver is a proven
+         live `new` binding.  The arg node shares its expr attr with the
+         original ID; reusing own_deref_class as a non-null proof is fine
+         because bare-ID reads never consult that field. */
+      if (diag_active_p (ctx)) {
+        node_t first = NL_HEAD (args->u.ops);
+        node_t peel = first;
+        if (peel != NULL && peel->code == N_ADDR) peel = NL_HEAD (peel->u.ops);
+        node_t target = id_resolves_to_decl (peel);
+        int idx = cand_lookup (ctx, target);
+        if (first != NULL && first->attr != NULL) {
+          if (first->code == N_ADDR) {
+            ((struct expr *) first->attr)->own_deref_class = DEREF_GUARD_SAFE;
+          } else if (idx >= 0) {
+            candidate_t *c = &VARR_ADDR (candidate_t, ctx->cands)[idx];
+            int new_binding
+              = c->managed_p
+                || (c->release_fn != NULL && strcmp (c->release_fn, "delete") == 0);
+            if (new_binding && c->state == OS_OWNED)
+              ((struct expr *) first->attr)->own_deref_class = DEREF_GUARD_SAFE;
+          }
+        }
+      }
       for (node_t a = NL_HEAD (args->u.ops); a != NULL; a = NL_NEXT (a))
         if (id_resolves_to_decl (a) == NULL) analyze (ctx, a);
     }
@@ -1960,11 +2037,18 @@ static void analyze (flowctx_t *ctx, node_t n) {
 
        Only classify on the final diagnostic pass (authoritative, converged
        state); silent inference passes never stamp. */
-    if (diag_active_p (ctx)) {
+    if (diag_active_p (ctx) && n->attr != NULL) {
       node_t recv   = NL_HEAD (n->u.ops);
       node_t target = id_resolves_to_decl (recv);
       int idx = cand_lookup (ctx, target);
-      if (idx >= 0 && n->attr != NULL) {
+      /* Method / constructor / destructor bodies: the language always passes a
+         non-null receiver into `this` (call sites emit one null trap before the
+         call under -fexceptions).  Classify every `this->f` / `*this` / `this[i]`
+         as SAFE so gen does not re-emit per-field traps inside the body. */
+      if (recv != NULL && recv->code == N_ID && recv->u.s.s != NULL
+          && strcmp (recv->u.s.s, "this") == 0) {
+        ((struct expr *) n->attr)->own_deref_class = DEREF_GUARD_SAFE;
+      } else if (idx >= 0) {
         candidate_t *c = &VARR_ADDR (candidate_t, ctx->cands)[idx];
         int new_binding
           = c->managed_p
@@ -2009,25 +2093,32 @@ static void analyze (flowctx_t *ctx, node_t n) {
                "and is dead; use the new owner instead", c->name);
         diag_mark_warned (ctx, c);
       }
-      /* Definite-assignment (da) checks: UNINIT -> error, MAYBE -> warning.
+      /* Definite-assignment (da) checks: UNINIT / MAYBE -> warning.
          Only emit on the final diagnostic pass (diag_active_p).
-         We keep the check for any tracked owned heap resource (`new` or
-         `malloc`), but we deliberately suppress it for candidates whose
-         declaration lives inside a system/header file (list.h, set.h,
-         map.h …).  That removes the noise from internal temporaries while
-         still catching uninitialized user-owned objects. */
-      const char *fname = c->acquire_pos.fname;
-      int is_header = (fname && strstr(fname, ".h") != NULL);
-      int is_tracked_heap = (c->release_fn != NULL &&
-                             (strcmp(c->release_fn, "delete") == 0 ||
-                              strcmp(c->release_fn, "free") == 0));
-      if (!is_header && is_tracked_heap && c->da_state == DA_UNINIT && !c->warned_p && diag_active_p (ctx)) {
-        error (ctx->c2m_ctx, POS (n),
-               "use of uninitialized value `%s`", c->name);
-        diag_mark_warned (ctx, c);
-      } else if (!is_header && is_tracked_heap && c->da_state == DA_MAYBE && !c->warned_p && diag_active_p (ctx)) {
-        warning (ctx->c2m_ctx, POS (n),
-                 "possible use of uninitialized value `%s`", c->name);
+         Covers both ownership-tracked heap bindings (`new`/`malloc`) and
+         pure-DA local pointers (`int *p;`).  Header files and
+         `__attribute__((da_ignore))` bindings are suppressed so list/set/map
+         internals stay quiet while user code still gets the diagnostic.
+         Softened to warning (not error) so runtime safety guards can still
+         catch the wild use under -fexceptions (bugs/010-uninit-read.cy). */
+      if (!c->da_ignore_p && !c->param_p && diag_active_p (ctx)) {
+        const char *fname = c->acquire_pos.fname;
+        int is_header = (fname && strstr (fname, ".h") != NULL);
+        if (!is_header && !c->warned_p) {
+          if (c->da_state == DA_UNINIT) {
+            warning (ctx->c2m_ctx, POS (n),
+                     "use of uninitialized value `%s`",
+                     c->name);
+            /* Do not mark warned_p for DA: a later ownership diagnostic
+               (UAF/leak) can still fire.  Suppress only re-emitting the
+               same uninit note by reusing warned for da_only. */
+            if (c->da_only_p) diag_mark_warned (ctx, c);
+          } else if (c->da_state == DA_MAYBE) {
+            warning (ctx->c2m_ctx, POS (n),
+                     "possible use of uninitialized value `%s`",
+                     c->name);
+          }
+        }
       }
     }
     return;
@@ -2621,14 +2712,18 @@ static void cfg_dataflow (flowctx_t *ctx, cfg_t *cfg) {
       if (da_in_diff) memcpy (bb->da_state_in, da_in_buf, ncands * sizeof (da_state_t));
       if (heap_da_in) free (heap_da_in);
 
-      /* Post-fixed-point guarantee: any candidate declared with a non-null
-         initializer (new / malloc) must be considered DA_INIT from the
-         first use onward.  This overrides any conservative MAYBE that the
-         data-flow lattice produced at a merge (e.g. loop header). */
+      /* Post-fixed-point guarantee: any candidate declared with a *real*
+         initializer (new / malloc / ... — not the placeholder N_IGNORE)
+         must be considered DA_INIT from the first use onward.  This
+         overrides any conservative MAYBE that the data-flow lattice
+         produced at a merge (e.g. loop header).  Using `!= NULL` would
+         treat every bare `T *p;` as INIT, because the parser always
+         materialises N_IGNORE for a missing initializer. */
       {
         candidate_t *ca = VARR_ADDR (candidate_t, ctx->cands);
         for (size_t k = 0; k < ncands; k++) {
-          if (SPEC_DECL_INIT(ca[k].decl) != NULL)
+          if (ca[k].decl != NULL && ca[k].decl->code == N_SPEC_DECL
+              && decl_has_real_init_p (SPEC_DECL_INIT (ca[k].decl)))
             bb->da_state_in[k] = DA_INIT;
         }
       }
@@ -2818,6 +2913,7 @@ static void cfg_emit_diagnostics (flowctx_t *ctx, cfg_t *cfg) {
       if (c->warned_p) continue;
       if (c->has_cleanup_p) continue;
       if (c->param_p) continue;  /* never synthesize free on incoming params */
+      if (c->da_only_p || c->release_fn == NULL) continue;
       /* Escape gate.  A binding that escaped UNSAFELY (returned, stored into a
          non-tracked location, handed to an unknown/owning call, aliased by a
          plain `=`, detached, or already covered by a user `defer`) must not
@@ -3168,7 +3264,12 @@ static void analyze_function (c2m_ctx_t c2m_ctx, node_t func_def) {
   int verbose_p = c2m_options != NULL && c2m_options->verbose_p;
 
   VARR_CREATE (candidate_t, cands, alloc, 8);
-  collect_candidates (c2m_ctx, func_def, cands);
+  /* Ownership acquire/IP candidates: walk the whole function def so a
+     top-level `auto x = new T();` style binding is found.  Pure DA
+     candidates (uninitialized local pointers) only come from the body
+     block — that avoids treating parameter SPEC_DECLs / the synthetic
+     `this` receiver as uninitialized locals. */
+  collect_candidates (c2m_ctx, FUNC_DEF_BLOCK (func_def), cands);
   /* Seed param candidates so interprocedural summary inference can fire. */
   collect_param_candidates (c2m_ctx, func_def, cands);
 

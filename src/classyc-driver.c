@@ -323,6 +323,8 @@ static void init_options (int argc, char *argv[]) {
       options.prepro_only_p = TRUE;
     } else if (strcmp (argv[i], "-fsyntax-only") == 0) {
       options.syntax_only_p = TRUE;
+    } else if (strcmp (argv[i], "-fpedantic") == 0) {
+      options.pedantic_p = TRUE;
     } else if (strcmp (argv[i], "-fpreprocessed") == 0) {
       options.no_prepro_p = TRUE;
     } else if (strcmp (argv[i], "-fexceptions") == 0) {

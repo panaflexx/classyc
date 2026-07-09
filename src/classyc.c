@@ -782,6 +782,7 @@ static node_t add_pos (c2m_ctx_t c2m_ctx, node_t n, pos_t p) {
 }
 
 static node_t op_append (c2m_ctx_t c2m_ctx, node_t n, node_t op) {
+  if (op == NULL) return n;  /* guard against NULL ops in error-recovery paths */
   NL_APPEND (n->u.ops, op);
   return add_pos (c2m_ctx, n, POS (op));
 }
@@ -23618,6 +23619,12 @@ static op_t gen_class_method_call_dest (c2m_ctx_t c2m_ctx, node_t func_def,
   op_t all_args[GEN_METHOD_MAX_ARGS + 1];
 
   assert (n_args <= GEN_METHOD_MAX_ARGS);
+  /* One null check on the receiver at the call site.  Method bodies treat
+     `this` as DEREF_GUARD_SAFE so they do not re-check on every field access. */
+  if (c2m_options->exceptions_p) {
+    this_op = force_reg (c2m_ctx, this_op, MIR_T_I64);
+    gen_null_check (c2m_ctx, this_op, (long) POS (func_def).lno);
+  }
   all_args[0] = this_op; /* 'this' is the first parameter of the method */
   for (int i = 0; i < n_args; i++) all_args[i + 1] = args[i];
   return gen_funcptr_call (c2m_ctx, proto, ft, MIR_new_ref_op (ctx, mdecl->u.item), all_args,
@@ -24695,34 +24702,48 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     }
     break;
   }
-  case N_DEREF:
-    op1 = val_gen (c2m_ctx, NL_HEAD (r->u.ops));
-    op1 = force_reg (c2m_ctx, op1, MIR_T_I64);
-    assert (op1.mir_op.mode == MIR_OP_REG);
-    if ((type = ((struct expr *) r->attr)->type)->mode == TM_PTR
-        && type->u.ptr_type->mode == TM_FUNC && type->func_type_before_adjustment_p) {
-      res = op1;
-    } else {
-      /* Null-pointer guard before data dereference (*ptr).  Elided when the
-         ownership pass proved the receiver live and non-null (DEREF_GUARD_SAFE). */
-      if (((struct expr *) r->attr)->own_deref_class == DEREF_GUARD_DEFAULT) {
-        //FIXME: This fires on a lot of perfectly fine code
-        if (c2m_options->verbose_p)
-          warning (c2m_ctx, POS (r), "possible null dereference (ownership analysis could not prove the pointer non-null)");
-        if (c2m_options->exceptions_p)
-          gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
-      }
-      /* -fobject-guards: liveness check at ownership-CHECK (MaybeOwned) sites. */
-      if (c2m_options->object_guards_p
-          && ((struct expr *) r->attr)->own_deref_class == DEREF_GUARD_CHECK)
-        gen_obj_guard_check (c2m_ctx, op1, (long) POS (r).lno);
-      struct expr *op_e = NL_HEAD (r->u.ops)->attr;
-      t = get_mir_type (c2m_ctx, type);
-      op1.mir_op = MIR_new_alias_mem_op (ctx, t, 0, op1.mir_op.u.reg, 0, 1,
-                                         get_type_alias (c2m_ctx, type), op_e->type->antialias);
-      res = new_op (NULL, op1.mir_op);
-    }
-    break;
+	case N_DEREF:
+		    op1 = val_gen (c2m_ctx, NL_HEAD (r->u.ops));
+		    op1 = force_reg (c2m_ctx, op1, MIR_T_I64);
+		    assert (op1.mir_op.mode == MIR_OP_REG);
+		    if (r->attr != NULL) {
+		      struct expr *e = (struct expr *) r->attr;
+		      type = e->type;
+		      if (type != NULL && type->mode == TM_PTR
+		          && type->u.ptr_type != NULL && type->u.ptr_type->mode == TM_FUNC && type->func_type_before_adjustment_p) {
+		        res = op1;
+		      } else {
+		        /* Match N_DEREF_FIELD / N_IND: only elide the null guard when ownership
+		           proved the receiver live and non-null (DEREF_GUARD_SAFE), or when the
+		           receiver is the method/ctor parameter `this` (call sites emit the
+		           single null trap).  CHECK/DEFAULT still trap. */
+		        node_t drecv = NL_HEAD (r->u.ops);
+		        int this_recv_p = (drecv != NULL && drecv->code == N_ID && drecv->u.s.s != NULL
+		                           && strcmp (drecv->u.s.s, "this") == 0);
+		        if (e->own_deref_class != DEREF_GUARD_SAFE && !this_recv_p) {
+		          if (c2m_options->verbose_p && e->own_deref_class == DEREF_GUARD_DEFAULT)
+		            warning (c2m_ctx, POS (r), "possible null dereference (ownership analysis could not prove the pointer non-null)");
+		          if (c2m_options->exceptions_p)
+		            gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
+		        }
+		        if (c2m_options->object_guards_p && e->own_deref_class == DEREF_GUARD_CHECK)
+		          gen_obj_guard_check (c2m_ctx, op1, (long) POS (r).lno);
+		        struct expr *op_e = NL_HEAD (r->u.ops)->attr;
+		        t = get_mir_type (c2m_ctx, type);
+		        op1.mir_op = MIR_new_alias_mem_op (ctx, t, 0, op1.mir_op.u.reg, 0, 1,
+		                                           get_type_alias (c2m_ctx, type), op_e ? op_e->type->antialias : 0);
+		        res = new_op (NULL, op1.mir_op);
+		      }
+		    } else {
+		      /* No expr attr (syntax-only or early error path) – emit plain deref without ownership guards */
+		      struct expr *op_e = NL_HEAD (r->u.ops)->attr;
+		      struct type *t2 = op_e ? op_e->type : NULL;
+		      t = get_mir_type (c2m_ctx, t2);
+		      op1.mir_op = MIR_new_alias_mem_op (ctx, t, 0, op1.mir_op.u.reg, 0, 1,
+		                                         get_type_alias (c2m_ctx, t2), op_e ? op_e->type->antialias : 0);
+		      res = new_op (NULL, op1.mir_op);
+		    }
+		    break;
   case N_FIELD:
   case N_DEREF_FIELD: {
     node_t def_node;
@@ -24801,11 +24822,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       assert (left->type->mode == TM_PTR);
       op1 = force_reg (c2m_ctx, op1, MIR_T_I64);
       assert (op1.mir_op.mode == MIR_OP_REG);
-      /* Null-pointer guard before ptr->field access.  Elided when the
-         ownership pass proved the receiver live and non-null (DEREF_GUARD_SAFE). */
-      if (c2m_options->exceptions_p
-          && ((struct expr *) r->attr)->own_deref_class != DEREF_GUARD_SAFE)
-        gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
+      /* Null-pointer guard before ptr->field access.  Elided when ownership
+         proved the receiver live (DEREF_GUARD_SAFE) or the receiver is the
+         method/ctor `this` parameter (call site emits the single null trap). */
+      {
+        node_t frecv = NL_HEAD (r->u.ops);
+        int this_recv_p = (frecv != NULL && frecv->code == N_ID && frecv->u.s.s != NULL
+                           && strcmp (frecv->u.s.s, "this") == 0);
+        if (c2m_options->exceptions_p
+            && ((struct expr *) r->attr)->own_deref_class != DEREF_GUARD_SAFE
+            && !this_recv_p)
+          gen_null_check (c2m_ctx, op1, (long) POS (r).lno);
+      }
       /* -fobject-guards: liveness check at ownership-CHECK (MaybeOwned) sites. */
       if (c2m_options->object_guards_p
           && ((struct expr *) r->attr)->own_deref_class == DEREF_GUARD_CHECK)
@@ -25691,12 +25719,33 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       param_list = func_type->u.func_type->param_list;
       param = NL_HEAD (param_list->u.ops);
       int arg_num = 0;
+      /* Instance method: param list starts with the synthetic `this` pointer.
+         Null-check that receiver once at the call site (body treats `this` as
+         DEREF_GUARD_SAFE).  Elide when ownership stamped SAFE on the receiver
+         expr, or when the receiver is `&obj` (always non-null address). */
+      int method_this_null_check_p = FALSE;
+      if (c2m_options->exceptions_p && param != NULL && param->code == N_SPEC_DECL) {
+        node_t this_declr = SPEC_DECL_DECL (param);
+        node_t this_id = (this_declr != NULL && this_declr->code == N_DECL)
+                           ? DECL_ID (this_declr) : NULL;
+        if (this_id != NULL && this_id->code == N_ID && this_id->u.s.s != NULL
+            && strcmp (this_id->u.s.s, "this") == 0)
+          method_this_null_check_p = TRUE;
+      }
       for (node_t arg = first_arg; arg != NULL; arg = NL_NEXT (arg)) {
         struct type *arg_type;
         arg_num++;
         e = arg->attr;
         struct_p = e->type->mode == TM_STRUCT || e->type->mode == TM_UNION || e->type->mode == TM_CLASS;
         op2 = gen (c2m_ctx, arg, NULL, NULL, !struct_p, NULL, NULL);
+        if (method_this_null_check_p && arg_num == 1 && !struct_p) {
+          int elide = (arg->code == N_ADDR)
+                      || (e != NULL && e->own_deref_class == DEREF_GUARD_SAFE);
+          if (!elide) {
+            op2 = force_reg (c2m_ctx, op2, MIR_T_I64);
+            gen_null_check (c2m_ctx, op2, (long) POS (r).lno);
+          }
+        }
         assert (param != NULL || NL_HEAD (param_list->u.ops) == NULL
                 || func_type->u.func_type->dots_p);
         arg_type = e->type;
@@ -25906,6 +25955,34 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
              x.empty() is safe). */
           if (decl->scope != top_scope && !decl->decl_spec.static_p
               && builtin_string_type_p (decl->decl_spec.type)) {
+            if (id->attr == NULL) {
+              node_t saved_scope = curr_scope;
+              curr_scope = decl->scope;
+              check (c2m_ctx, id, NULL);
+              curr_scope = saved_scope;
+            }
+            var = gen (c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
+            if (var.mir_op.mode == MIR_OP_REG
+                || (var.mir_op.mode == MIR_OP_MEM && var.mir_op.u.mem.index == 0))
+              emit2 (c2m_ctx, MIR_MOV, var.mir_op, MIR_new_int_op (ctx, 0));
+          }
+          /* Null-initialize uninitialized local pointer variables so that a
+             later dereference is a well-defined null-pointer access instead of
+             a wild read of stack garbage.  Combined with the -fexceptions null
+             guard this turns `int *p; *p;` into a catchable safety trap (see
+             bugs/010-uninit-read.cy).  Ownership's definite-assignment pass
+             additionally warns at the read site.  Never touch the synthesized
+             method receiver `this` (create_decl stores it as a block-scoped
+             pointer SPEC_DECL without an initializer). */
+          if (decl->scope != top_scope && decl->scope != NULL
+              && decl->scope->code == N_BLOCK
+              && !decl->decl_spec.static_p
+              && !decl->decl_spec.extern_p
+              && decl->decl_spec.type != NULL
+              && decl->decl_spec.type->mode == TM_PTR
+              && !builtin_string_type_p (decl->decl_spec.type)
+              && id != NULL && id->code == N_ID
+              && id->u.s.s != NULL && strcmp (id->u.s.s, "this") != 0) {
             if (id->attr == NULL) {
               node_t saved_scope = curr_scope;
               curr_scope = decl->scope;
