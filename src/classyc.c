@@ -7200,18 +7200,40 @@ D (class_member_declaration) {
   if ((r = TRY(declarator)) != err_node) {
     decl = r;
 
-    // Accept and ignore trailing cv-qualifiers on a method definition:
-    //   RetType name(params) const { ... }
-    // ClassyC does not yet enforce const-correctness, so the qualifier is
-    // consumed purely so the method body parses.  Only commit to swallowing the
-    // qualifier(s) when they are immediately followed by a method body '{';
-    // otherwise rewind so a (malformed) data member is still handled below.
-    if (C(T_CONST) || C(T_VOLATILE)) {
-      size_t cv_mark = record_start(c2m_ctx);
-      while (C(T_CONST) || C(T_VOLATILE)) {
-        if (!M(T_CONST)) M(T_VOLATILE);
+    /* Accept trailing cv-qualifiers and/or GCC/C23 attributes on a method
+       definition: `Ret name() const __attribute__((...)) {}` or the
+       `__attribute__((da_ignore))` used in list.h for the definitely-assigned
+       analysis.  Attributes are parsed via try_attr_spec which handles both
+       `__attribute__((...))` and C23 `[[...]]` plus optional `__asm`.  Only
+       commit when ultimately followed by '{' so a malformed data member is
+       still diagnosed below. */
+    {
+      size_t tail_mark = record_start(c2m_ctx);
+      int saw_tail = 0;
+      for (;;) {
+        if (C(T_CONST) || C(T_VOLATILE)) {
+          while (C(T_CONST) || C(T_VOLATILE)) {
+            if (!M(T_CONST)) M(T_VOLATILE);
+          }
+          saw_tail = 1;
+          continue;
+        }
+        /* consume one GCC attribute / C23 attribute / asm-spec if present */
+        {
+          node_t asmp = NULL;
+          node_t ar = try_attr_spec(c2m_ctx, curr_token->pos, &asmp);
+          if (ar != err_node && (ar != NULL || asmp != NULL)) {
+            saw_tail = 1;
+            continue;
+          }
+        }
+        break;
       }
-      record_stop(c2m_ctx, cv_mark, !C('{')); /* commit if a body follows, else rewind */
+      if (saw_tail) {
+        record_stop(c2m_ctx, tail_mark, !C('{'));
+      } else {
+        record_stop(c2m_ctx, tail_mark, TRUE);
+      }
     }
 
     // Check if this is a function definition (has a compound statement)
@@ -9266,6 +9288,16 @@ D (transl_unit) {
       dl = new_node (c2m_ctx, N_LIST);
       d->attr = curr_scope;
       curr_scope = d;
+      /* Trailing GCC/C23 attributes or __asm may appear between the declarator
+         and the function body: `void foo() __attribute__((...)) {}`.  Consume
+         them here (loop, since several may appear) before entering the K&R
+         declaration-list loop.  They are ignored for codegen. */
+      for (;;) {
+        node_t asmp = NULL;
+        node_t ar = try_attr_spec (c2m_ctx, curr_token->pos, &asmp);
+        if (ar != err_node && (ar != NULL || asmp != NULL)) continue;
+        break;
+      }
       while (!C ('{')) { /* declaration-list */
         PE (declaration, decl_err);
         op_flat_append (c2m_ctx, dl, r);
