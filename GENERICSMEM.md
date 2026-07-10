@@ -225,17 +225,28 @@ names contain no `_`, which holds for `T`, `K`, `V`, `Key`, `Value`, ….) This
 is the *only* compiler change required to let a two-parameter generic refer to
 itself, so `Copy()`/`Merge()`/internal `new Map<K,V>()` all work.
 
-### Still unsupported: cross-generic references with an *unresolved* parameter
+### Nested generics with unresolved (and concrete) parameters — supported
 
-A generic body that instantiates a **different** generic with one of its own
-(still-abstract) parameters — e.g. `List<K>` inside `Map<K, V>` (think a
-hypothetical `Keys() -> List<K>*`) — does **not** work: `List<K>` tries to
-materialise `__generic_List_K` immediately, with `K` an unresolved identifier,
-yielding `unknown type K`. `map.h` therefore avoids it: instead of returning a
-`List<K>`/`List<V>`, the map exposes its own `Count()` / `KeyAt(int)` /
-`ValAt(int)` traversal (which also powers keyed for-in), plus `ForEach`.
-Closing this gap (deferred specialisation of nested generics) would let keyed
-collections hand back `List<K>` of their keys directly.
+A generic body may instantiate **another** generic with one of its own still-
+abstract parameters — e.g. `List<K>` / `List<V>` inside `Map<K, V>`, or
+`List<T*>` inside a user `Repository<T>`.  Parsing does **not** materialise the
+nested specialisation while the outer template is still abstract: the reference
+is stored as a mangled placeholder (`__generic_List_K`, `__generic_List_TP`,
+…).  When the outer template is specialised (`Map<String, int>`),
+`specialize_node` rewrites the placeholder to the concrete name and queues the
+nested specialisation on `generic_crossrefs` for deferred materialisation.
+
+Fully concrete nested types inside a generic body — e.g. `List<String>` inside
+`List<T>.SelectString` — are also deferred during body parse (the outer
+`class_node` may still be NULL) and materialised once the outer template is
+back-filled.
+
+This is what powers:
+
+* `Map<K,V>::Keys()` / `Values()` → `List<K>*` / `List<V>*`
+* `List<T>::SelectString` → `List<String>*`
+* README nested example `class Repository<T> { List<T*>* items; ... }`
+* `As<T>` calling `Is<T>.Of(...)` (cross-generic, same param)
 
 ### `Map<K, V>` hashing
 

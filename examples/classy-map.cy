@@ -54,15 +54,31 @@ int main() {
     check(ages->Set("Ada", 37) == 0,  "1c  Set existing key returns 0");
     check(ages->Get("Ada") == 37,     "1d  value updated in place");
     check(ages->Count() == 3,         "1e  Count unchanged after update");
-    check(ages->Contains("Bob") == 1, "1f  Contains present key");
-    check(ages->Contains("Zoe") == 0, "1g  !Contains absent key");
+    check(ages->Contains("Bob"),      "1f  Contains present key");
+    check(!ages->Contains("Zoe"),     "1g  !Contains absent key");
+    check(ages->ContainsKey("Bob"),   "1h  ContainsKey alias");
+    check(ages->TryAdd("Ada", 99) == false, "1i  TryAdd existing -> false");
+    check(ages->Get("Ada") == 37,     "1j  TryAdd did not overwrite");
+    check(ages->TryAdd("Eve", 25) == true,  "1k  TryAdd new -> true");
+    check(ages->Get("Eve") == 25,     "1l  TryAdd inserted");
+    check(ages->Remove("Eve") == 1,   "1m  cleanup Eve");
 
-    /* ── 2. Missing keys: Get vs GetOr ──────────────────────────────── */
+    /* ── 2. Missing keys: Get throws; use GetOr / TryGet ─────────────── */
     printf("\n-- 2. Missing keys --\n");
 
-    check(ages->Get("Zoe") == 0,        "2a  Get(absent) -> 0");
+    {
+        int threw = 0;
+        try { int z = ages->Get("Zoe"); (void)z; }
+        catch (e) { threw = 1; }
+        check(threw == 1,                 "2a  Get(absent) throws KeyException");
+    }
     check(ages->GetOr("Zoe", -1) == -1, "2b  GetOr(absent, -1)");
     check(ages->GetOr("Ada", -1) == 37, "2c  GetOr(present) -> value");
+    {
+        int v = 0;
+        check(ages->TryGet("Ada", &v) && v == 37, "2d  TryGet present");
+        check(!ages->TryGet("Zoe", &v),           "2e  TryGet absent");
+    }
 
     /* ── 3. Subscript sugar: map[k] = v / v = map[k] ────────────────── */
     printf("\n-- 3. Subscript --\n");
@@ -72,7 +88,8 @@ int main() {
     check(ages->Count() == 4,         "3a  subscript insert grew count");
     check(ages["Dot"] == 99,          "3b  subscript read inserted");
     check(ages["Bob"] == 41,          "3c  subscript read updated");
-    check(ages["Nope"] == 0,          "3d  subscript read absent -> 0");
+    /* Absent subscript read uses Get and throws — prefer GetOr. */
+    check(ages->GetOr("Nope", 0) == 0, "3d  GetOr absent -> 0 (not silent Get)");
 
     /* ── 4. Remove, Clear ───────────────────────────────────────────── */
     printf("\n-- 4. Remove, Clear --\n");
@@ -155,7 +172,7 @@ int main() {
 
     Track* k = library["Kashmir"];
     check(k != NULL && k->seconds == 508,    "9a  object lookup + field access");
-    check(library["Missing"] == NULL,        "9b  absent object key -> NULL");
+    check(library->GetOr("Missing", NULL) == NULL, "9b  absent object key GetOr -> NULL");
 
     int total_secs = 0;
     for (auto title, trk in library) total_secs += trk->seconds;

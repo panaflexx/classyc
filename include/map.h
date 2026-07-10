@@ -257,72 +257,80 @@ class Map<K, V> {
         return this;
     }
 
-    int Contains(K key) const { return this->find_index(key) >= 0 ? 1 : 0; }
+    /* True if `key` is present.  C# Dictionary vocabulary. */
+    bool Contains(K key) const { return this->find_index(key) >= 0; }
 
-	/* Value for `key`.
-	 * throws KeyException if the key is absent.
-	 * Callers that want silent fallback should use GetOr() or TryGet(). */
+    /* Alias for Contains — same as C# ContainsKey. */
+    bool ContainsKey(K key) const { return this->Contains(key); }
 
-	V Get(K key) const {
-		int idx = this->find_index(key);
-		if (idx >= 0) return this->vals[idx];
-		// Throw KeyException (value 8) — reuse the same path dict uses 
-		throw(KeyException, "missing key in Map");
-		// Unreachable
-		V zero;
-		memset((void*)&zero, 0, sizeof(V));
-		return zero;
-	}
+    /* Value for `key`.
+     * throws KeyException if the key is absent.
+     * Callers that want silent fallback should use GetOr() or TryGet(). */
+    V Get(K key) const {
+        int idx = this->find_index(key);
+        if (idx >= 0) return this->vals[idx];
+        throw(KeyException, "missing key in Map");
+        V zero;
+        memset((void*)&zero, 0, sizeof(V));
+        return zero;
+    }
 
-	/* Value for `key`, or `fallback` if absent. */
-	V GetOr(K key, V fallback) const {
-		int idx = this->find_index(key);
-		if (idx >= 0) return this->vals[idx];
-		return fallback;
-	}
+    /* Value for `key`, or `fallback` if absent. */
+    V GetOr(K key, V fallback) const {
+        int idx = this->find_index(key);
+        if (idx >= 0) return this->vals[idx];
+        return fallback;
+    }
 
-	/* Fast C++-style lookup
-	 * Returns true and writes the value via out-parameter if present;
-	 * returns false (and leaves *out untouched) if absent.  No exception. */
-	bool TryGet(K key, V* out) const {
-		if (out == NULL) return false;
-		int idx = this->find_index(key);
-		if (idx >= 0) {
-			*out = this->vals[idx];
-			return true;
-		}
-		return false;
-	}
+    /* Fast C++-style lookup.  Returns true and writes *out if present;
+     * returns false (leaves *out untouched) if absent.  No exception. */
+    bool TryGet(K key, V* out) const {
+        if (out == NULL) return false;
+        int idx = this->find_index(key);
+        if (idx >= 0) {
+            *out = this->vals[idx];
+            return true;
+        }
+        return false;
+    }
 
     /* Insertion-ordered indexed access (powers for-in and KeyAt/ValAt loops).
-     * Caller must ensure 0 <= index < Count(). */
-    K KeyAt(int index) const { return this->keys[index]; }
-    V ValAt(int index) const { return this->vals[index]; }
+     * Throws OutOfBoundsException if index is not in [0, Count()). */
+    K KeyAt(int index) const {
+        if (index < 0 || index >= this->count)
+            throw(OutOfBoundsException, "Map.KeyAt oob");
+        return this->keys[index];
+    }
+    V ValAt(int index) const {
+        if (index < 0 || index >= this->count)
+            throw(OutOfBoundsException, "Map.ValAt oob");
+        return this->vals[index];
+    }
 
-    /* Human-readable JSON-ish representation (best for Map<String, String>).
-     * Example: {"page":"2","limit":"10"} */
-    String to_string() const {
-        if (this->count == 0) return "{}";
-        String s = "{";
-        int first = 1;
-        for (int i = 0; i < this->count; i++) {
-            if (!first) s = s + ",";
-            s = s + "\"" + (char*)this->keys[i] + "\":\"" + (char*)this->vals[i] + "\"";
-            first = 0;
-        }
-        return s + "}";
+    /* Destroy one key slot (by-value dtor or owned pointer delete). */
+    void destroy_key_at(int i) {
+        if (this->_owns_keys && is_pointer<K>()) delete this->keys[i];
+        else                                     __destroy(this->keys[i]);
+    }
+
+    /* Destroy one value slot. */
+    void destroy_val_at(int i) {
+        if (this->_owns_vals && is_pointer<V>()) delete this->vals[i];
+        else                                     __destroy(this->vals[i]);
     }
 
     /* ───────────────────── Mutation ───────────────────── */
 
     /* Insert or update `key` -> `val`.  Returns 1 if a new key was inserted,
-     * 0 if an existing key's value was overwritten.  (Subscript write.) */
+     * 0 if an existing key's value was overwritten.  On overwrite the old
+     * value is destroyed (by-value dtor or owned pointer delete). */
     int Set(K key, V val) {
         this->ensure_table();
 
         int slot = this->find_slot(key);
         int idx  = this->table[slot];
         if (idx >= 0) {                 /* existing key: overwrite value */
+            this->destroy_val_at(idx);
             this->vals[idx] = val;
             return 0;
         }
@@ -342,12 +350,24 @@ class Map<K, V> {
         return 1;
     }
 
-    /* Remove `key`.  Returns 1 if removed, 0 if not present. */
+    /* Insert only if `key` is absent.  Returns true if inserted, false if the
+     * key was already present (existing value left unchanged). */
+    bool TryAdd(K key, V val) {
+        if (this->Contains(key)) return false;
+        this->Set(key, val);
+        return true;
+    }
+
+    /* Remove `key`.  Returns 1 if removed, 0 if not present.  Destroys the
+     * removed key and value (by-value / .ownsKeys/.ownsValues). */
     int Remove(K key) {
         if (this->table_cap == 0) return 0;
         int slot = this->find_slot(key);
         int idx  = this->table[slot];
         if (idx < 0) return 0;
+
+        this->destroy_key_at(idx);
+        this->destroy_val_at(idx);
 
         /* Swap-remove from the dense arrays and repoint the moved entry's slot. */
         int last = this->count - 1;
@@ -363,7 +383,12 @@ class Map<K, V> {
         return 1;
     }
 
+    /* Drop all entries, destroying keys/values first. */
     void Clear() {
+        for (int i = 0; i < this->count; i++) {
+            this->destroy_key_at(i);
+            this->destroy_val_at(i);
+        }
         this->count = 0;
         this->used  = 0;
         for (int i = 0; i < this->table_cap; i++) this->table[i] = -1;
@@ -421,6 +446,14 @@ class Map<K, V> {
      */
     dict ToDict() const {
         dict obj = dict_create_object();
+        /* JSON objects only accept string keys.  nameof<K>() is compile-time;
+         * non-String maps must not cast keys to char* (was a hard segfault). */
+        const char* kt = nameof<K>();
+        int k_is_str = (strcmp(kt, "String") == 0 || strcmp(kt, "char") == 0);
+        if (!k_is_str) {
+            /* Empty object: safer than UB. Prefer Keys()/Values() for non-String K. */
+            return obj;
+        }
         const char* vt = nameof<V>();
         for (int i = 0; i < this->count; i++) {
             V* p = &this->vals[i];
@@ -442,8 +475,6 @@ class Map<K, V> {
                 dv = *(dict*)p;
             else
                 dv = dict_create_null();
-            /* Read the key as String via address so the body type-checks for
-             * every K; correct for Map<String, V>. */
             dict_object_set(obj, *(char**)&this->keys[i], dv);
         }
         return obj;
@@ -459,6 +490,11 @@ class Map<K, V> {
         dict_destroy(obj);
         return j;
     }
+
+    /* C# / f-string friendly aliases.  Must sit after ToJson() so the body can
+     * call it (method order matters in ClassyC generics). */
+    String ToString() const { return this->ToJson(); }
+    String to_string() const { return this->ToJson(); }
 
 };
 

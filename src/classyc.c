@@ -79,6 +79,8 @@ static const pos_t no_pos = {NULL, -1, -1};
 
 typedef struct c2m_ctx *c2m_ctx_t;
 
+int c2m_pending_extra_gt = 0;
+
 typedef struct stream {
   FILE *f;                        /* the current file, NULL for top-level or string stream */
   const char *fname;              /* NULL only for preprocessor string stream */
@@ -4705,6 +4707,12 @@ static node_t post_expr_part (c2m_ctx_t c2m_ctx, int no_err_p, node_t arg);
    try_attr_spec (defined earlier) but implemented alongside D(attr). */
 static node_t c23_attr_spec (c2m_ctx_t c2m_ctx, int no_err_p MIR_UNUSED);
 
+/* Built-in method registry (header-extensible via [[builtin_method(...)]]).
+   Defined with get_string_method; used from declaration parsing + parse_init. */
+static void builtin_methods_init (MIR_alloc_t alloc);
+static void builtin_methods_finish (void);
+static void register_builtin_methods_from_attrs (c2m_ctx_t c2m_ctx, node_t attrs);
+
 #define C(c) (curr_token->code == c)
 
 static int match (c2m_ctx_t c2m_ctx, int c, pos_t *pos, node_code_t *node_code, node_t *node) {
@@ -5091,6 +5099,8 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
   return cp;
 }
 
+static node_t parse_generic_instantiation (c2m_ctx_t c2m_ctx, const char *base_name, pos_t pos);
+
 /* Parse one generic type argument after '<': a primitive keyword or an N_ID class name. */
 static node_t parse_generic_type_arg (c2m_ctx_t c2m_ctx) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
@@ -5110,16 +5120,15 @@ static node_t parse_generic_type_arg (c2m_ctx_t c2m_ctx) {
   else if (MP (T_DICT,     pos)) base = new_pos_node (c2m_ctx, N_DICT,   pos);
   else if (MP (T_BOOL,     pos)) base = new_pos_node (c2m_ctx, N_BOOL,   pos);
   else if (MN (T_ID, r)) {
-    /* Any<I> as a type argument (e.g. List<Any<View>*>): synthesize the erased
-       handle class and use its mangled name (a plain N_ID) as the argument, so
-       the outer generic instantiation mangles with no special-casing. */
-    if (strcmp (r->u.s.s, "Any") == 0 && C (T_CMP) && curr_token->node_code == N_LT)
+    if (strcmp (r->u.s.s, "Any") == 0 && C (T_CMP) && curr_token->node_code == N_LT) {
       base = parse_any_instantiation (c2m_ctx, POS (r));
-    else
-      base = r;   /* user class name */
+    } else if (C (T_CMP) && curr_token->node_code == N_LT && is_generic_class_p(c2m_ctx, r->u.s.s)) {
+      base = parse_generic_instantiation(c2m_ctx, r->u.s.s, POS(r));
+    } else {
+      base = r;
+    }
   }
   if (base == NULL) return NULL;
-  /* Check for trailing '*' — pointer type argument (e.g. int*, Point*) */
   while (MP ('*', pos)) {
     base = new_pos_node1 (c2m_ctx, N_POINTER, pos, base);
   }
@@ -5135,22 +5144,28 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
                                              pos_t pos) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
 
-  /* Self-reference or cross-reference inside a generic class body: if we are
-     currently parsing a generic class body (curr_class != NULL) AND every type
-     arg is one of the CURRENT class's type parameters, return the mangled
-     placeholder name without creating a real specialisation.  The placeholder
-     looks like "__generic_List_T" (self-ref) or "__generic_Is_T" (cross-ref
-     to Is from within As<T>'s body) and is resolved to the concrete name
-     ("__generic_List_String" / "__generic_Is_Circle") by specialize_node when
-     the template is later instantiated with a real type argument.
+  /* Nested / self / cross references while parsing a generic class body.
 
-     This covers two cases:
-       1. Self-reference:  List<T> inside List<T>'s body (base_name == curr class)
-       2. Cross-reference: Is<T>  inside As<T>'s body  (base_name != curr class)
-     Both produce a placeholder that specialize_node resolves at instantiation
-     time; cross-refs are also recorded in generic_crossrefs for deferred
-     materialization of the referenced specialization. */
-  if (parse_ctx != NULL && parse_ctx->curr_class != NULL) {
+     While curr_class is a generic being defined, type arguments may still be
+     that class's type parameters (T, K, V, T*, ...).  Materialising those as
+     real specialisations would leave unresolved type names (unknown type K)
+     and corrupt later codegen.  Instead:
+
+       1. Param-based args (self or cross):
+            List<T> / List<T*> inside List, Is<T> inside As, List<K> inside Map
+          -> return mangled placeholder ("__generic_List_T", "__generic_List_K",
+             "__generic_List_TP", ...).  specialize_node rewrites the placeholder
+             to the concrete name when the OUTER template is instantiated, and
+             records cross-generic materialisations in generic_crossrefs.
+
+       2. Fully concrete args (no outer type params):
+            List<String> inside List<T>'s SelectString, etc.
+          -> also return the mangled name as a type-name placeholder, and queue
+             the concrete specialisation on generic_crossrefs.  The caller drains
+             that queue once the outer template's class_node is back-filled (the
+             self-template's body is still NULL mid-parse, so materialisation has
+             to wait). */
+  if (parse_ctx != NULL && parse_ctx->curr_class != NULL && n_args > 0) {
     /* Find the current class's template entry to get its type params.  During
        body parsing the template's class_node may still be NULL (pre-registered),
        so match by name from the curr_class node's id. */
@@ -5171,26 +5186,38 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
       }
     }
     if (curr_cls_name != NULL && curr_n_params > 0) {
-      /* Check that every supplied type arg is one of the current class's
-         params, allowing a pointer-to-param (e.g. `List<T*>` inside a generic
-         QueryBuilder<T>).  Pointer wrappers are peeled to reach the base N_ID;
-         mangle_generic_name re-encodes the depth as a "P" suffix (T* -> "TP"),
-         and specialize_node's placeholder resolver re-applies it. */
-      int _all_params = (n_args > 0);
-      for (int _j = 0; _j < n_args && _all_params; _j++) {
+      int _any_curr_param = 0;
+      for (int _j = 0; _j < n_args; _j++) {
         node_t _pa = args[_j];
-        while (_pa->code == N_POINTER) _pa = NL_HEAD (_pa->u.ops);
-        if (_pa->code != N_ID) { _all_params = 0; break; }
-        int _found = 0;
-        for (int _k = 0; _k < curr_n_params; _k++)
-          if (curr_params[_k] && strcmp (_pa->u.s.s, curr_params[_k]) == 0)
-            { _found = 1; break; }
-        if (!_found) _all_params = 0;
+        while (_pa != NULL && _pa->code == N_POINTER) _pa = NL_HEAD (_pa->u.ops);
+        if (_pa == NULL || _pa->code != N_ID) continue;
+        for (int _k = 0; _k < curr_n_params; _k++) {
+          if (curr_params[_k] != NULL && strcmp (_pa->u.s.s, curr_params[_k]) == 0) {
+            _any_curr_param = 1;
+            break;
+          }
+        }
+        if (_any_curr_param) break;
       }
-      if (_all_params) {
-        /* Return a placeholder N_ID; specialize_node will substitute it. */
+      if (_any_curr_param) {
+        /* Self-ref or cross-ref with unresolved outer type params — placeholder only. */
         const char *mangled = mangle_generic_name (c2m_ctx, base_name, n_args, args);
         return build_id (c2m_ctx, mangled, pos);
+      }
+      /* Fully concrete nested instantiation while inside a generic body
+         (e.g. List<String> inside List<T>).  Defer real specialisation until
+         the outer template body is complete. */
+      {
+        const char *mangled = mangle_generic_name (c2m_ctx, base_name, n_args, args);
+        node_t ph_id = build_id (c2m_ctx, mangled, pos);
+        tpname_add (c2m_ctx, ph_id, top_scope != NULL ? top_scope : curr_scope, TRUE);
+        generic_crossref_t cr;
+        cr.ref_name = base_name;
+        cr.n_args = n_args;
+        for (int _ci = 0; _ci < n_args && _ci < 4; _ci++) cr.args[_ci] = args[_ci];
+        cr.pos = pos;
+        VARR_PUSH (generic_crossref_t, generic_crossrefs, cr);
+        return ph_id;
       }
     }
   }
@@ -5277,9 +5304,20 @@ static node_t parse_generic_instantiation (c2m_ctx_t c2m_ctx,
   } while (M (','));
 
   if (C (T_CMP) && curr_token->node_code == N_GT) {
-    M (T_CMP); /* consume '>' */
+    M (T_CMP);
+  } else if (C (T_SH) && (curr_token->node_code == N_RSH || curr_token->node_code == N_RSH_ASSIGN)) {
+    extern int c2m_pending_extra_gt;
+    c2m_pending_extra_gt = 1;
+    M (T_SH);
+  } else if (C (T_CMP) && curr_token->node_code == N_GE) {
+    M (T_CMP);
   } else {
-    error (c2m_ctx, pos, "expected '>' to close generic type argument list");
+    extern int c2m_pending_extra_gt;
+    if (c2m_pending_extra_gt) {
+      c2m_pending_extra_gt = 0;
+    } else {
+      error (c2m_ctx, pos, "expected '>' to close generic type argument list");
+    }
   }
 
   return get_or_create_specialization (c2m_ctx, base_name, n_args, type_args, pos);
@@ -6408,6 +6446,9 @@ D (declaration) {
           }
         }
         if (attrs == NULL) attrs = new_node (c2m_ctx, N_IGNORE);
+        /* Header-extensible builtins: [[builtin_method("String", "m", "rt", n, "ret")]] */
+        if (attrs != NULL && attrs->code == N_LIST)
+          register_builtin_methods_from_attrs (c2m_ctx, attrs);
         if (asm_part == NULL) asm_part = new_node (c2m_ctx, N_IGNORE);
         if (M ('=')) {
           P (initializer);
@@ -6834,6 +6875,10 @@ DA (type_spec) {
     /* Index into generic_templates for the pre-registration done before body parsing.
        (size_t)-1 means no pre-registration was done. */
     size_t generic_tmpl_preidx = (size_t)-1;
+    /* Mark into generic_crossrefs when starting a generic class body: concrete
+       nested specialisations (List<String> inside List<T>) push here, and are
+       drained once class_node is back-filled. */
+    size_t generic_body_xref_mark = 0;
     /* Optional structural-conformance clause (Phase 1): class C impl A, B { ... }.
        Collected as an N_LIST of interface-name N_IDs and attached as the third
        child of the N_CLASS node; conformance is verified structurally in check.
@@ -6889,6 +6934,7 @@ DA (type_spec) {
             for (int _i = 0; _i < 4; _i++) pre.type_params[_i] = type_params[_i];
             VARR_PUSH (generic_tmpl_t, generic_templates, pre);
             generic_tmpl_preidx = VARR_LENGTH (generic_tmpl_t, generic_templates) - 1;
+            generic_body_xref_mark = VARR_LENGTH (generic_crossref_t, generic_crossrefs);
           }
           P (class_member_list);
           parse_ctx->curr_class = last_class;
@@ -6930,6 +6976,21 @@ DA (type_spec) {
           tmpl.n_type_params = n_type_params;
           for (int _i = 0; _i < 4; _i++) tmpl.type_params[_i] = type_params[_i];
           VARR_PUSH (generic_tmpl_t, generic_templates, tmpl);
+        }
+        /* Materialise concrete nested specialisations deferred during the body
+           (e.g. List<String> referenced from List<T>.SelectString).  class_node
+           is now set, so self- and cross-materialisation can deep-copy the
+           finished templates.  curr_class must stay cleared so we take the
+           normal specialisation path rather than re-queuing placeholders. */
+        if (generic_tmpl_preidx != (size_t)-1) {
+          node_t _saved_cls = parse_ctx->curr_class;
+          parse_ctx->curr_class = NULL;
+          while (VARR_LENGTH (generic_crossref_t, generic_crossrefs) > generic_body_xref_mark) {
+            generic_crossref_t _cr = VARR_POP (generic_crossref_t, generic_crossrefs);
+            (void) get_or_create_specialization (c2m_ctx, _cr.ref_name, _cr.n_args,
+                                                 _cr.args, _cr.pos);
+          }
+          parse_ctx->curr_class = _saved_cls;
         }
         /* Mark the N_CLASS as a template so check/gen can skip it */
         r->attr = (void *)((intptr_t)-1); /* sentinel: template, not a real class */
@@ -8843,6 +8904,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (iface_t, interfaces, alloc, 4);
   VARR_CREATE (generic_fn_tmpl_t, generic_fn_templates, alloc, 4);
   VARR_CREATE (generic_fn_spec_t, generic_fn_specs, alloc, 8);
+  builtin_methods_init (alloc);
 }
 
 /* ClassyC exception prelude — injected into every translation unit so that
@@ -8869,6 +8931,10 @@ static void add_standard_includes (c2m_ctx_t c2m_ctx) {
     add_string_stream (c2m_ctx, "<environment>", str);
   }
   add_string_stream (c2m_ctx, "<exception-prelude>", exception_prelude);
+  /* Header-extensible String builtin table (re-registers stock methods + documents
+     the [[builtin_method]] form).  Requires -I include so the file resolves. */
+  add_string_stream (c2m_ctx, "<string-builtins>",
+                     "#include \"string_builtins.h\"\n");
 }
 
 /* Pre-scan the post-preprocessor token stream and register every `class NAME`
@@ -9006,6 +9072,7 @@ static void parse_finish (c2m_ctx_t c2m_ctx) {
     if (generic_fn_specs != NULL)
       VARR_DESTROY (generic_fn_spec_t, generic_fn_specs);
   }
+  builtin_methods_finish ();
   finish_streams (c2m_ctx);
   reg_free (c2m_ctx, c2m_ctx->parse_ctx);
 }
@@ -9366,59 +9433,274 @@ static int str_concat_string_operand_p (const struct type *type, node_t op) {
   return 0;
 }
 
-/* Built-in String methods recognized as `s.method(...)` call syntax. */
-	enum str_method {
-	  SM_NONE = 0,
-	  SM_LENGTH,  /* s.length()                       -> size_t          */
-	  SM_EMPTY,   /* s.empty()                        -> int  (0/1)      */
-	  SM_SUBSTR,  /* s.substr(pos, len)               -> String          */
-	  SM_FIND,    /* s.find(needle)                   -> size_t          */
-	  SM_REPLACE, /* s.replace(pos, len, replacement) -> String (in-place) */
-	  SM_REPLACE_ALL, /* s.replace(needle, replacement) -> String (search-replace) */
-	  SM_UPPER,   /* s.upper()                        -> String          */
-	  SM_LOWER,   /* s.lower()                        -> String          */
-	  SM_COPY,       /* String.copy(p, len)                -> String          */
-	  SM_DETACH,     /* s.detach()                         -> char * (untracked) */
-	  SM_ATTACH,     /* String.attach(p)                   -> String (tracked)  */
-	  SM_STARTS_WITH, /* s.starts_with(prefix)             -> int (0/1)         */
-	  SM_ENDS_WITH,   /* s.ends_with(suffix)               -> int (0/1)         */
-	  SM_CONTAINS,    /* s.contains(needle)                -> int (0/1)         */
-	  SM_TRIM,        /* s.trim()                          -> String            */
-	  SM_SPLIT,       /* s.split(delim)                    -> List<String>*     */
-	  SM_JOIN,        /* list.join(delim) (on List<String>)-> String            */
-	  SM_EQUALS,      /* s.equals(other)                   -> int (0/1)         */
-	};
+/* Built-in method registry — String / ListString (and extensible types).
 
-/* Map a method name to its enum, the exact argument count it expects, and the
-   runtime helper symbol name.  Returns SM_NONE for unknown names. */
+   Methods are *data* in a process-global table, not a giant if/else in the
+   checker.  The table is seeded with the stock String methods at parse_init,
+   and headers can add (or re-register) entries with C23 attributes:
+
+     [[builtin_method("String", "titlecase", "c2m_str_titlecase", 0, "String")]]
+     static int __bm_titlecase;   // dummy declarator so attrs attach
+
+   Args: (type, method, runtime_symbol, nargs, retkind [, "static"]).
+   retkind is one of: String, size_t, int, char*, ListString.
+   type is "String" (instance), "StringStatic" (String.copy), or
+   "ListString" (List<String> join).
+
+   Known SM_* ids keep existing gen special cases (substr bounds, in-place
+   replace, split→List).  Newly registered methods use SM_EXT and lower to a
+   plain runtime call. */
+enum str_method {
+  SM_NONE = 0,
+  SM_LENGTH,
+  SM_EMPTY,
+  SM_SUBSTR,
+  SM_FIND,
+  SM_REPLACE,
+  SM_REPLACE_ALL,
+  SM_UPPER,
+  SM_LOWER,
+  SM_COPY,
+  SM_DETACH,
+  SM_ATTACH,
+  SM_STARTS_WITH,
+  SM_ENDS_WITH,
+  SM_CONTAINS,
+  SM_TRIM,
+  SM_SPLIT,
+  SM_JOIN,
+  SM_EQUALS,
+  SM_EXT, /* header-registered, no special codegen */
+};
+
+enum builtin_ret_kind {
+  BMR_NONE = 0,
+  BMR_STRING,
+  BMR_SIZE,
+  BMR_INT,
+  BMR_CHAR_PTR,
+  BMR_LIST_STRING,
+};
+
+typedef struct {
+  const char *type_name;  /* "String" | "StringStatic" | "ListString" */
+  const char *method;     /* "trim" */
+  const char *rt_name;    /* "c2m_str_trim" */
+  int nargs;              /* user arg count (not including receiver) */
+  int static_p;           /* 1 = type-name receiver (String.copy) */
+  enum str_method sm;     /* SM_* for specials; SM_EXT for generic */
+  enum builtin_ret_kind ret;
+} builtin_method_t;
+
+DEF_VARR (builtin_method_t);
+
+/* Process-global so get_string_method() stays signature-stable (no c2m_ctx).
+   Reset/seeded at the start of every parse. */
+static VARR (builtin_method_t) *g_builtin_methods = NULL;
+
+static enum builtin_ret_kind builtin_ret_from_name (const char *s) {
+  if (s == NULL) return BMR_NONE;
+  if (strcmp (s, "String") == 0) return BMR_STRING;
+  if (strcmp (s, "size_t") == 0) return BMR_SIZE;
+  if (strcmp (s, "int") == 0 || strcmp (s, "bool") == 0) return BMR_INT;
+  if (strcmp (s, "char*") == 0 || strcmp (s, "charP") == 0) return BMR_CHAR_PTR;
+  if (strcmp (s, "ListString") == 0 || strcmp (s, "List<String>") == 0
+      || strcmp (s, "List_String") == 0)
+    return BMR_LIST_STRING;
+  return BMR_NONE;
+}
+
+/* Register one builtin method.  Idempotent on (type, method, nargs). */
+static void register_builtin_method (const builtin_method_t *bm) {
+  if (g_builtin_methods == NULL || bm == NULL || bm->method == NULL) return;
+  for (size_t i = 0; i < VARR_LENGTH (builtin_method_t, g_builtin_methods); i++) {
+    builtin_method_t *e = &VARR_ADDR (builtin_method_t, g_builtin_methods)[i];
+    if (e->nargs == bm->nargs && e->method != NULL && strcmp (e->method, bm->method) == 0
+        && e->type_name != NULL && bm->type_name != NULL
+        && strcmp (e->type_name, bm->type_name) == 0)
+      return; /* already present */
+  }
+  VARR_PUSH (builtin_method_t, g_builtin_methods, *bm);
+}
+
+static void seed_default_string_methods (void) {
+  /* Stock String methods — same set previously hard-coded in get_string_method.
+     Headers can re-declare these with [[builtin_method]] (no-ops due to
+     idempotent register) or add new SM_EXT entries. */
+  static const builtin_method_t defaults[] = {
+    { "String", "length",       "c2m_str_length",       0, 0, SM_LENGTH,      BMR_SIZE },
+    { "String", "empty",        "c2m_str_empty",        0, 0, SM_EMPTY,       BMR_INT },
+    { "String", "substr",       "c2m_str_substr",       2, 0, SM_SUBSTR,      BMR_STRING },
+    { "String", "find",         "c2m_str_find",         1, 0, SM_FIND,        BMR_SIZE },
+    { "String", "replace",      "c2m_str_replace",      3, 0, SM_REPLACE,     BMR_STRING },
+    { "String", "replace",      "c2m_str_replace_all",  2, 0, SM_REPLACE_ALL, BMR_STRING },
+    { "String", "upper",        "c2m_str_upper",        0, 0, SM_UPPER,       BMR_STRING },
+    { "String", "lower",        "c2m_str_lower",        0, 0, SM_LOWER,       BMR_STRING },
+    { "String", "detach",       "c2m_str_detach",       0, 0, SM_DETACH,      BMR_CHAR_PTR },
+    { "String", "starts_with",  "c2m_str_starts_with",  1, 0, SM_STARTS_WITH, BMR_INT },
+    { "String", "ends_with",    "c2m_str_ends_with",    1, 0, SM_ENDS_WITH,   BMR_INT },
+    { "String", "contains",     "c2m_str_contains",     1, 0, SM_CONTAINS,    BMR_INT },
+    { "String", "trim",         "c2m_str_trim",         0, 0, SM_TRIM,        BMR_STRING },
+    { "String", "split",        "c2m_str_split",        1, 0, SM_SPLIT,       BMR_LIST_STRING },
+    { "String", "equals",       "c2m_str_equals",       1, 0, SM_EQUALS,      BMR_INT },
+    { "StringStatic", "copy",   "c2m_str_copy",         2, 1, SM_COPY,        BMR_STRING },
+    { "StringStatic", "attach", "c2m_str_attach",       1, 1, SM_ATTACH,      BMR_STRING },
+    { "ListString", "join",     "c2m_str_join",         1, 0, SM_JOIN,        BMR_STRING },
+  };
+  for (size_t i = 0; i < sizeof (defaults) / sizeof (defaults[0]); i++)
+    register_builtin_method (&defaults[i]);
+}
+
+static void builtin_methods_init (MIR_alloc_t alloc) {
+  if (g_builtin_methods == NULL)
+    VARR_CREATE (builtin_method_t, g_builtin_methods, alloc, 32);
+  else
+    VARR_TRUNC (builtin_method_t, g_builtin_methods, 0);
+  seed_default_string_methods ();
+}
+
+static void builtin_methods_finish (void) {
+  if (g_builtin_methods != NULL) {
+    VARR_DESTROY (builtin_method_t, g_builtin_methods);
+    g_builtin_methods = NULL;
+  }
+}
+
+/* Find a registered method.  If want_nargs >= 0, require that arity; else the
+   first entry with that method name.  type_name NULL matches any type that
+   uses the legacy String-instance table (type "String"). */
+static const builtin_method_t *find_builtin_method (const char *type_name,
+                                                     const char *method,
+                                                     int want_nargs) {
+  if (g_builtin_methods == NULL || method == NULL) return NULL;
+  for (size_t i = 0; i < VARR_LENGTH (builtin_method_t, g_builtin_methods); i++) {
+    const builtin_method_t *e = &VARR_ADDR (builtin_method_t, g_builtin_methods)[i];
+    if (e->method == NULL || strcmp (e->method, method) != 0) continue;
+    if (type_name != NULL) {
+      if (e->type_name == NULL || strcmp (e->type_name, type_name) != 0) continue;
+    } else {
+      if (e->type_name == NULL || strcmp (e->type_name, "String") != 0) continue;
+    }
+    if (want_nargs >= 0 && e->nargs != want_nargs) continue;
+    return e;
+  }
+  return NULL;
+}
+
+/* Legacy API: map a method name (String instance/static shared names) to SM_*.
+   Prefers the primary arity entry.  replace defaults to 3-arg form; callers
+   re-resolve SM_REPLACE_ALL when actual arity is 2. */
 static enum str_method get_string_method (const char *name, int *nargs,
                                           const char **rt_name) {
-  int n;
-  const char *rt;
-  enum str_method m;
+  const builtin_method_t *e;
 
-  if (strcmp (name, "length") == 0)       { m = SM_LENGTH;  n = 0; rt = "c2m_str_length"; }
-  else if (strcmp (name, "empty") == 0)   { m = SM_EMPTY;   n = 0; rt = "c2m_str_empty"; }
-  else if (strcmp (name, "substr") == 0)  { m = SM_SUBSTR;  n = 2; rt = "c2m_str_substr"; }
-  else if (strcmp (name, "find") == 0)    { m = SM_FIND;    n = 1; rt = "c2m_str_find"; }
-  else if (strcmp (name, "replace") == 0) { m = SM_REPLACE; n = 3; rt = "c2m_str_replace"; }
-  else if (strcmp (name, "upper") == 0)   { m = SM_UPPER;   n = 0; rt = "c2m_str_upper"; }
-  else if (strcmp (name, "lower") == 0)   { m = SM_LOWER;   n = 0; rt = "c2m_str_lower"; }
-  else if (strcmp (name, "copy") == 0)     { m = SM_COPY;    n = 2; rt = "c2m_str_copy"; }
-  else if (strcmp (name, "detach") == 0)  { m = SM_DETACH;  n = 0; rt = "c2m_str_detach"; }
-  else if (strcmp (name, "attach") == 0)      { m = SM_ATTACH;      n = 1; rt = "c2m_str_attach"; }
-  else if (strcmp (name, "starts_with") == 0) { m = SM_STARTS_WITH; n = 1; rt = "c2m_str_starts_with"; }
-  else if (strcmp (name, "ends_with") == 0)   { m = SM_ENDS_WITH;   n = 1; rt = "c2m_str_ends_with"; }
-  else if (strcmp (name, "contains") == 0)    { m = SM_CONTAINS;    n = 1; rt = "c2m_str_contains"; }
-  else if (strcmp (name, "trim") == 0)        { m = SM_TRIM;        n = 0; rt = "c2m_str_trim"; }
-  else if (strcmp (name, "split") == 0)       { m = SM_SPLIT;       n = 1; rt = "c2m_str_split"; }
-  else if (strcmp (name, "join") == 0)        { m = SM_JOIN;        n = 1; rt = "c2m_str_join"; }
-  else if (strcmp (name, "equals") == 0)      { m = SM_EQUALS;      n = 1; rt = "c2m_str_equals"; }
-  else                                        { m = SM_NONE;        n = 0; rt = NULL; }
+  if (name == NULL) {
+    if (nargs) *nargs = 0;
+    if (rt_name) *rt_name = NULL;
+    return SM_NONE;
+  }
+  /* Prefer instance methods; static names also live under StringStatic. */
+  e = find_builtin_method ("String", name, -1);
+  if (e == NULL) e = find_builtin_method ("StringStatic", name, -1);
+  if (e == NULL) e = find_builtin_method ("ListString", name, -1);
+  if (e == NULL) {
+    if (nargs) *nargs = 0;
+    if (rt_name) *rt_name = NULL;
+    return SM_NONE;
+  }
+  if (nargs) *nargs = e->nargs;
+  if (rt_name) *rt_name = e->rt_name;
+  return e->sm;
+}
 
-  if (nargs != NULL) *nargs = n;
-  if (rt_name != NULL) *rt_name = rt;
-  return m;
+/* Scan a declaration's attribute list for [[builtin_method(...)]]. */
+static void register_builtin_methods_from_attrs (c2m_ctx_t c2m_ctx, node_t attrs) {
+  if (attrs == NULL || attrs->code != N_LIST) return;
+  for (node_t a = NL_HEAD (attrs->u.ops); a != NULL; a = NL_NEXT (a)) {
+    node_t id, arglist, args[8];
+    int n = 0;
+    builtin_method_t bm;
+
+    if (a->code != N_ATTR) continue;
+    id = NL_HEAD (a->u.ops);
+    if (id == NULL || id->code != N_ID || strcmp (id->u.s.s, "builtin_method") != 0)
+      continue;
+    arglist = NL_NEXT (id);
+    if (arglist == NULL || arglist->code != N_LIST) {
+      error (c2m_ctx, POS (a), "builtin_method expects (type, method, rt, nargs, ret[, \"static\"])");
+      continue;
+    }
+    for (node_t arg = NL_HEAD (arglist->u.ops); arg != NULL && n < 8; arg = NL_NEXT (arg))
+      args[n++] = arg;
+    if (n < 5) {
+      error (c2m_ctx, POS (a),
+             "builtin_method needs at least 5 args: type, method, runtime, nargs, retkind");
+      continue;
+    }
+    memset (&bm, 0, sizeof (bm));
+    /* Arg 0: type name */
+    if (args[0]->code == N_STR || args[0]->code == N_ID)
+      bm.type_name = args[0]->u.s.s;
+    else {
+      error (c2m_ctx, POS (a), "builtin_method type must be a string or identifier");
+      continue;
+    }
+    /* Arg 1: method name */
+    if (args[1]->code == N_STR || args[1]->code == N_ID)
+      bm.method = args[1]->u.s.s;
+    else {
+      error (c2m_ctx, POS (a), "builtin_method name must be a string or identifier");
+      continue;
+    }
+    /* Arg 2: runtime symbol */
+    if (args[2]->code == N_STR || args[2]->code == N_ID)
+      bm.rt_name = args[2]->u.s.s;
+    else {
+      error (c2m_ctx, POS (a), "builtin_method runtime symbol must be a string or identifier");
+      continue;
+    }
+    /* Arg 3: nargs (integer literal) */
+    if (args[3]->code == N_I || args[3]->code == N_L || args[3]->code == N_LL)
+      bm.nargs = (int) args[3]->u.l;
+    else if (args[3]->code == N_U || args[3]->code == N_UL || args[3]->code == N_ULL)
+      bm.nargs = (int) args[3]->u.ul;
+    else {
+      error (c2m_ctx, POS (a), "builtin_method nargs must be an integer constant");
+      continue;
+    }
+    /* Arg 4: return kind */
+    if (args[4]->code == N_STR || args[4]->code == N_ID)
+      bm.ret = builtin_ret_from_name (args[4]->u.s.s);
+    else {
+      error (c2m_ctx, POS (a), "builtin_method retkind must be a string or identifier");
+      continue;
+    }
+    if (bm.ret == BMR_NONE) {
+      error (c2m_ctx, POS (a),
+             "unknown builtin_method retkind (use String, size_t, int, char*, ListString)");
+      continue;
+    }
+    /* Optional arg 5: "static" */
+    if (n >= 6 && (args[5]->code == N_STR || args[5]->code == N_ID)
+        && strcmp (args[5]->u.s.s, "static") == 0)
+      bm.static_p = 1;
+    if (bm.static_p && strcmp (bm.type_name, "String") == 0)
+      bm.type_name = "StringStatic";
+    /* Re-map well-known methods to SM_* so existing gen special cases fire;
+       everything else is SM_EXT (plain rt call). */
+    {
+      const builtin_method_t *known = find_builtin_method (bm.type_name, bm.method, bm.nargs);
+      if (known != NULL && known->sm != SM_EXT && known->sm != SM_NONE)
+        bm.sm = known->sm;
+      else
+        bm.sm = SM_EXT;
+    }
+    /* Intern strings so they outlive the AST (stream buffers). */
+    bm.type_name = uniq_cstr (c2m_ctx, bm.type_name).s;
+    bm.method = uniq_cstr (c2m_ctx, bm.method).s;
+    bm.rt_name = uniq_cstr (c2m_ctx, bm.rt_name).s;
+    register_builtin_method (&bm);
+  }
 }
 
 static int scalar_type_p (const struct type *type) {
@@ -17008,6 +17290,58 @@ if (base != NULL && base->code == N_ID) {
 	                  error(c2m_ctx, POS(r),
 	                        "'join' is a List<String> method; call it on a List<String>");
 	                  break;
+	                case SM_EXT: {
+	                  /* Header-registered method: return type from the registry. */
+	                  const builtin_method_t *bm
+	                    = find_builtin_method ("String", method_id->u.s.s,
+	                                           (int) NL_LENGTH (arg_list->u.ops));
+	                  if (bm == NULL)
+	                    bm = find_builtin_method ("String", method_id->u.s.s, -1);
+	                  if (bm == NULL) { error (c2m_ctx, POS (r), "unknown String method"); break; }
+	                  switch (bm->ret) {
+	                  case BMR_SIZE:
+	                    res_type.u.basic_type = get_uint_basic_type (sizeof (mir_size_t));
+	                    set_type_layout (c2m_ctx, &res_type);
+	                    break;
+	                  case BMR_INT:
+	                    res_type.u.basic_type = TP_INT;
+	                    set_type_layout (c2m_ctx, &res_type);
+	                    break;
+	                  case BMR_STRING:
+	                    res_type.u.basic_type = TP_STRING;
+	                    res_type.type_qual.const_p = 1;
+	                    res_type.raw_size = 8;
+	                    res_type.align = 8;
+	                    break;
+	                  case BMR_CHAR_PTR: {
+	                    struct type *pt = create_type (c2m_ctx, NULL);
+	                    pt->mode = TM_BASIC;
+	                    pt->u.basic_type = TP_CHAR;
+	                    set_type_layout (c2m_ctx, pt);
+	                    init_type (&res_type);
+	                    res_type.mode = TM_PTR;
+	                    res_type.u.ptr_type = pt;
+	                    res_type.raw_size = 8;
+	                    res_type.align = 8;
+	                    break;
+	                  }
+	                  case BMR_LIST_STRING: {
+	                    struct type str_el;
+	                    struct type *lp;
+	                    init_type (&str_el);
+	                    str_el.mode = TM_BASIC;
+	                    str_el.u.basic_type = TP_STRING;
+	                    str_el.type_qual.const_p = 1;
+	                    str_el.raw_size = 8;
+	                    str_el.align = 8;
+	                    if ((lp = make_list_ptr_type (c2m_ctx, &str_el, POS (r))) == NULL) break;
+	                    res_type = *lp;
+	                    break;
+	                  }
+	                  default: break;
+	                  }
+	                  break;
+	                }
 	                default: break;
 	                }
 	                ret_type = &res_type;
@@ -22359,11 +22693,43 @@ static op_t gen_string_concat_operand (c2m_ctx_t c2m_ctx, node_t op) {
   return gen_str_from_call (c2m_ctx, str_from_i64_proto, str_from_int_item, v.mir_op);
 }
 
+/* Lazy import of a pure I64->I64 string runtime helper by name (for SM_EXT
+   methods registered via [[builtin_method]] without a dedicated gen_ctx slot). */
+static op_t gen_string_call_by_rt_name (c2m_ctx_t c2m_ctx, const char *rt_name,
+                                        MIR_op_t *vals, int n) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_module_t module = curr_func->module;
+  MIR_type_t res_t = MIR_T_I64;
+  MIR_var_t vars[5];
+  char pname[128];
+  MIR_item_t proto, item;
+  int i;
+
+  assert (rt_name != NULL && n >= 0 && n <= 5);
+  for (i = 0; i < n; i++) {
+    vars[i].name = "a";
+    vars[i].type = MIR_T_I64;
+  }
+  snprintf (pname, sizeof (pname), "__bm_%s_p", rt_name);
+  proto = MIR_new_proto_arr (ctx, pname, 1, &res_t, (size_t) n, vars);
+  item = MIR_new_import (ctx, rt_name);
+  move_item_to_module_start (module, proto);
+  move_item_to_module_start (module, item);
+  return gen_rt_call (c2m_ctx, proto, item, (size_t) n, vals);
+}
+
 /* Emit a call to the String runtime helper for method `sm` with `n` value
-   operands, returning the I64 result register. */
-static op_t gen_string_call (c2m_ctx_t c2m_ctx, enum str_method sm, MIR_op_t *vals, int n) {
+   operands.  ext_rt_name is required when sm == SM_EXT (header-registered). */
+static op_t gen_string_call_named (c2m_ctx_t c2m_ctx, enum str_method sm,
+                                   const char *ext_rt_name, MIR_op_t *vals, int n) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_item_t proto = NULL, item = NULL;
+
+  if (sm == SM_EXT) {
+    assert (ext_rt_name != NULL);
+    return gen_string_call_by_rt_name (c2m_ctx, ext_rt_name, vals, n);
+  }
 
   string_ensure_imports (c2m_ctx); /* must run before reading the proto/item refs */
   switch (sm) {
@@ -22388,6 +22754,10 @@ static op_t gen_string_call (c2m_ctx_t c2m_ctx, enum str_method sm, MIR_op_t *va
   default:             assert (0);                                                 break;
   }
   return gen_rt_call (c2m_ctx, proto, item, (size_t) n, vals);
+}
+
+static op_t gen_string_call (c2m_ctx_t c2m_ctx, enum str_method sm, MIR_op_t *vals, int n) {
+  return gen_string_call_named (c2m_ctx, sm, NULL, vals, n);
 }
 
 /* ── Value-semantic String fields (Option D) ──────────────────────────────
@@ -25571,6 +25941,20 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             vals[1] = val_gen (c2m_ctx, NL_HEAD (args->u.ops)).mir_op;
             res = gen_string_call (c2m_ctx, SM_SPLIT, vals, 2);
             break;
+          case SM_EXT: {
+            /* Header-registered method: receiver + N args as I64, call rt by name. */
+            int ui = 1;
+            const builtin_method_t *bm;
+            int an = args != NULL ? (int) NL_LENGTH (args->u.ops) : 0;
+            bm = find_builtin_method ("String", method_id->u.s.s, an);
+            if (bm == NULL) bm = find_builtin_method ("String", method_id->u.s.s, -1);
+            assert (bm != NULL && bm->rt_name != NULL);
+            for (node_t arg = args ? NL_HEAD (args->u.ops) : NULL; arg != NULL && ui < 4;
+                 arg = NL_NEXT (arg))
+              vals[ui++] = val_gen (c2m_ctx, arg).mir_op;
+            res = gen_string_call_named (c2m_ctx, SM_EXT, bm->rt_name, vals, ui);
+            break;
+          }
           default: break;
           }
           goto finish;

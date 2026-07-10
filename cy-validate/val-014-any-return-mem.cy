@@ -65,10 +65,13 @@ int main() {
     double total = 0; for (auto s in shapes) total += s->area();
     check(approx(total, 3.14159 * (1 + 4 + 9 + 16)), "collection of returned handles intact");
 
-    /* 6. alloc loop: many returned handles, last one still correct (leak sanity) */
+    /* 6. alloc loop: many returned handles, last one still correct (leak sanity).
+       `unowned` keeps the ownership analyzer from treating the loop-carried
+       `delete h` as poisoning `h` on the next iteration (false UAF on the
+       back-edge).  Runtime ownership is still explicit via delete. */
     int ok = 1;
     for (int i = 0; i < 20000; i++) {
-        Any<Shape>* h = make_circle(2.0);
+        unowned Any<Shape>* h = make_circle(2.0);
         if (i == 19999 && !approx(h->area(), 12.56636)) ok = 0;
         delete h;   /* caller owns the returned handle now */
     }

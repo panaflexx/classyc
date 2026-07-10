@@ -34,16 +34,23 @@ int main() {
     ages["Ada"] = ages["Ada"] + 1;    /* subscript read+write */
     check(ages->Count() == 2,         "Count after inserts");
     check(ages->Get("Ada") == 37,     "subscript read+update -> 37");
-    check(ages->Contains("Bob") == 1, "Contains present");
-    check(ages->Contains("Zoe") == 0, "Contains absent");
-	/* Get absent now throws KeyException (new default) */\
-	try {
-		int z = ages->Get("Zoe");
-		printf("FAIL: Get absent should throw\n");
-	} catch (e) {
-		check(1, "Get absent throws KeyException");
-	}
-	check(ages->GetOr("Zoe", -1) == -1, "GetOr absent -> default");
+    check(ages->Contains("Bob"),      "Contains present");
+    check(!ages->Contains("Zoe"),     "Contains absent");
+    check(ages->ContainsKey("Bob"),   "ContainsKey alias");
+    check(ages->TryAdd("Ada", 0) == false, "TryAdd existing is false");
+    check(ages->TryAdd("Zoe", 9) == true,  "TryAdd new is true");
+    check(ages->Get("Zoe") == 9,      "TryAdd inserted value");
+    check(ages->Remove("Zoe") == 1,   "Remove TryAdd key");
+    /* Get absent throws KeyException */
+    try {
+        int z = ages->Get("Zoe");
+        (void)z;
+        printf("FAIL: Get absent should throw\n");
+        failed++;
+    } catch (e) {
+        check(1, "Get absent throws KeyException");
+    }
+    check(ages->GetOr("Zoe", -1) == -1, "GetOr absent -> default");
 
     /* Remove */
     check(ages->Remove("Bob") == 1,   "Remove present -> 1");

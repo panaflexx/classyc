@@ -158,16 +158,18 @@ class List<T> {
         return this;
     }
 
-    /* Indexed access. Caller must ensure 0 <= index < Count(). */
-    T Get(int index) { return this->data[index]; }
+    T Get(int index) { if (index < 0 || index >= this->length) throw(OutOfBoundsException, "List.Get oob"); return this->data[index]; }
 
-    /* Convenience: first/last element. Undefined behavior on empty list. */
-    T First() { return this->data[0]; }
-    T Last()  { return this->data[this->length - 1]; }
+    T First() { if (this->length == 0) throw(OutOfBoundsException, "First empty"); return this->data[0]; }
+    T Last() { if (this->length == 0) throw(OutOfBoundsException, "Last empty"); return this->data[this->length - 1]; }
+    T GetOr(int index, T fb){ if(index<0||index>=length) return fb; return data[index]; }
+    bool TryGet(int index, T* out){ if(!out) return false; if(index<0||index>=length) return false; *out=data[index]; return true; }
+    T FirstOr(T fb){ if(length==0) return fb; return data[0]; }
+    T LastOr(T fb){ if(length==0) return fb; return data[length-1]; }
 
     /* ═════════════════════════ Capacity management ══════════════════════ */
 
-    void owns(bool owns) { this->_owns_ptrs = owns; }
+    List<T>* owns(int v) { this->_owns_ptrs = v ? 1 : 0; return this; }
 
     /* Ensure capacity >= min. Doubles until satisfied; preserves elements. */
     void EnsureCapacity(int min) __attribute__((da_ignore)) {
@@ -211,15 +213,12 @@ class List<T> {
         return -1;
     }
 
-    /* Returns 1 if any element equals item via ==, 0 otherwise. */
     int Contains(T item) { return this->IndexOf(item) >= 0; }
+    int FindIndex(int(*pred)(T)) __attribute__((da_ignore)) { for(int i=0;i<length;i++) if(pred(data[i])) return i; return -1; }
 
     /* ═══════════════════════════ Mutation ═════════════════════════====== */
 
-    /* Replace element at index. No-op if out of range. */
-    void Set(int index, T item) {
-        if (index >= 0 && index < this->length) this->data[index] = item;
-    }
+    void Set(int index, T item) { if(index<0||index>=length) throw(OutOfBoundsException, "Set oob"); if(_owns_ptrs && is_pointer<T>()) delete data[index]; else __destroy(data[index]); data[index]=item; }
 
     /* Append to end. Grows capacity as needed. */
     void Add(T item) {
@@ -238,19 +237,9 @@ class List<T> {
         this->length++;
     }
 
-    /* Remove and return last element. Undefined on empty list. */
-    T Pop() {
-        this->length--;
-        return this->data[this->length];
-    }
+    T Pop() { if(length==0) throw(OutOfBoundsException, "Pop empty"); length--; return data[length]; }
 
-    /* Remove by index, shift left. No-op if out of range. */
-    void RemoveAt(int index) {
-        if (index < 0 || index >= this->length) return;
-        for (int i = index; i < this->length - 1; i++)
-            this->data[i] = this->data[i + 1];
-        this->length--;
-    }
+    void RemoveAt(int index) { if(index<0||index>=length) throw(OutOfBoundsException, "RemoveAt oob"); if(_owns_ptrs && is_pointer<T>()) delete data[index]; else __destroy(data[index]); for(int i=index;i<length-1;i++) data[i]=data[i+1]; length--; }
 
     /* Remove first occurrence of item via ==. Returns 1 on success, 0 if absent. */
     int Remove(T item) {
@@ -260,8 +249,7 @@ class List<T> {
         return 1;
     }
 
-    /* Clear all elements. Retains backing capacity for reuse. */
-    void Clear() { this->length = 0; }
+    void Clear() { for(int i=0;i<length;i++){ if(_owns_ptrs && is_pointer<T>()) delete data[i]; else __destroy(data[i]); } length=0; }
 
     /* ═════════════════════════ Transformations ═════════════════════════ */
 
@@ -295,11 +283,10 @@ class List<T> {
         }
     }
 
-    /* Append all elements of `other` to this list. Returns this for chaining. */
-    List<T>* Concat(List<T>* other) {
-        for (auto item in other) this->Add(item);
-        return this;
-    }
+    List<T>* Concat(List<T>* other) { if(other){ int oc=other->Count(); EnsureCapacity(length+oc); for(int i=0;i<oc;i++) Add(other->Get(i)); } return this; }
+
+    void AddRange(List<T>* other) { if(!other) return; int oc=other->Count(); EnsureCapacity(length+oc); for(int i=0;i<oc;i++) Add(other->Get(i)); }
+    void InsertRange(int index, List<T>* other) { if(!other||other->Count()==0) return; if(index<0) index=0; if(index>length) index=length; int oc=other->Count(); EnsureCapacity(length+oc); for(int i=length-1;i>=index;i--) data[i+oc]=data[i]; for(int i=0;i<oc;i++) data[index+i]=other->Get(i); length+=oc; }
 
     /* Return new heap list with [start, start+count). Clamps to valid range.
      * Caller must `delete` the result. */
@@ -323,36 +310,10 @@ class List<T> {
 
     /* ═════════════════════════ Array conversions ═══════════════════════ */
 
-    /* Bulk-copy the live elements into a fresh heap T[] and return it.
-     * Mirrors C#'s `T[] List<T>.ToArray()`: the result is an independent
-     * copy (mutating it does not touch the list).  The element count is the
-     * list's Count() — a bare T* carries no length of its own, so keep
-     * Count() around if you need the bound.  Caller owns the result and must
-     * `free()` it.  Empty lists return a 1-slot buffer (never NULL), matching
-     * the never-null spirit of Array.Empty<T>(). */
-    T* ToArray() {
-        int n = this->length > 0 ? this->length : 1;
-        T* array = (T*) malloc(sizeof(T) * n);
-        if (this->length > 0)
-            memcpy((void*) array, (void*) this->data, sizeof(T) * this->length);
-        return array;
-    }
-
-    /* Bulk-copy the live elements into a caller-provided buffer starting at
-     * index 0.  Mirrors C#'s `List<T>.CopyTo(T[] array)`.  The destination
-     * must have room for at least Count() elements. */
-    void CopyTo(T* destination) __attribute__((da_ignore)) {
-        if (this->length > 0)
-            memcpy((void*) destination, (void*) this->data, sizeof(T) * this->length);
-    }
-
-    /* Structural equality: same count + pairwise ==. Returns 1 or 0. */
-    int Equals(List<T>* other) __attribute__((da_ignore)) {
-        if (other == NULL || other->Count() != this->length) return 0;
-        for (int i = 0; i < this->length; i++)
-            if (this->data[i] != other->Get(i)) return 0;
-        return 1;
-    }
+    T* ToArray() { int n=length>0?length:1; T* array=(T*)malloc(sizeof(T)*n); for(int i=0;i<length;i++) array[i]=data[i]; return array; }
+    void CopyTo(T* destination) __attribute__((da_ignore)) { for(int i=0;i<length;i++) destination[i]=data[i]; }
+    int Equals(List<T>* other) __attribute__((da_ignore)) { if(!other||other->Count()!=length) return 0; for(int i=0;i<length;i++) if(data[i]!=other->Get(i)) return 0; return 1; }
+    List<T>* Distinct() __attribute__((da_ignore)) { List<T>* r=new List<T>(length>0?length:4); for(int i=0;i<length;i++) if(r->IndexOf(data[i])<0) r->Add(data[i]); return r; }
 
     /* ═════════════════════════ Higher-order ═══════════════════════════ */
 
@@ -379,6 +340,69 @@ class List<T> {
         for (int i = 0; i < this->length; i++)
             result->Add(fn(this->data[i]));
         return result;
+    }
+
+    List<T>* Where(int(*pred)(T)) __attribute__((da_ignore)) {
+        List<T>* result = new List<T>();
+        for (int i = 0; i < this->length; i++)
+            if (pred(this->data[i])) result->Add(this->data[i]);
+        return result;
+    }
+
+    List<T>* Select(T(*fn)(T)) __attribute__((da_ignore)) {
+        List<T>* result = new List<T>(this->length > 0 ? this->length : 1);
+        for (int i = 0; i < this->length; i++)
+            result->Add(fn(this->data[i]));
+        return result;
+    }
+
+    List<String>* SelectString(String(*fn)(T)) __attribute__((da_ignore)) {
+        List<String>* result = new List<String>(this->length > 0 ? this->length : 4);
+        for (int i = 0; i < this->length; i++)
+            result->Add(fn(this->data[i]));
+        return result;
+    }
+
+
+
+    int Any(int(*pred)(T)) __attribute__((da_ignore)) {
+        for (int i = 0; i < this->length; i++)
+            if (pred(this->data[i])) return 1;
+        return 0;
+    }
+
+    int All(int(*pred)(T)) __attribute__((da_ignore)) {
+        for (int i = 0; i < this->length; i++)
+            if (!pred(this->data[i])) return 0;
+        return 1;
+    }
+
+    T Find(int(*pred)(T)) __attribute__((da_ignore)) {
+        for (int i = 0; i < this->length; i++)
+            if (pred(this->data[i])) return this->data[i];
+        T z;
+        memset((void*)&z, 0, sizeof(T));
+        return z;
+    }
+
+    T FindOr(T fb, int(*pred)(T)) __attribute__((da_ignore)) {
+        for (int i = 0; i < this->length; i++)
+            if (pred(this->data[i])) return this->data[i];
+        return fb;
+    }
+
+    static List<T>* Repeat(T item, int count) __attribute__((da_ignore)) {
+        if (count < 0) count = 0;
+        List<T>* r = new List<T>(count > 0 ? count : 4);
+        for (int i = 0; i < count; i++) r->Add(item);
+        return r;
+    }
+
+    dict ToArrayDict() __attribute__((da_ignore)) {
+        dict arr = dict_create_array();
+        dict* d = (dict*)this->data;
+        for (int i = 0; i < this->length; i++) dict_array_append(arr, d[i]);
+        return arr;
     }
 
     /* Convert List<dict> to DICT_ARRAY. Casts the backing store to dict* so the
@@ -542,7 +566,15 @@ class List<T> {
         return j;
     }
 
+    String ToString() __attribute__((da_ignore)) {
+        return this->ToJson();
+    }
+
+    String to_string() __attribute__((da_ignore)) {
+        return this->ToJson();
+    }
 
 };
+
 
 #endif /* CLASSYC_LIST_H */
