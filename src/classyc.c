@@ -4383,10 +4383,14 @@ typedef struct {
 
 DEF_VARR (generic_tmpl_t);
 
-/* Specialization cache: tracks which List<String>, List<int>, etc. have been created */
+/* Specialization cache: tracks which List<String>, List<int>, etc. have been created.
+   n_args/args retain the concrete type arguments so method specialization can
+   re-bind class type params (T) from a receiver like `__generic_List_int`. */
 typedef struct {
   const char *orig_name;  /* "List" */
   const char *spec_name;  /* "__generic_List_String" */
+  int n_args;
+  node_t args[4];
 } generic_spec_t;
 
 DEF_VARR (generic_spec_t);
@@ -4442,6 +4446,30 @@ typedef struct {
 
 DEF_VARR (generic_fn_spec_t);
 
+/* Generic *method* templates: class methods with their own type parameters,
+   e.g. `List<U>* Select<U>(U(*fn)(T))` on `class List<T>`.  The method lives
+   in the class template AST (T open, U open).  At a call site on a specialized
+   receiver (`List<int>* xs`) we monomorphize both the class type args and the
+   method type args into a free function with an explicit `this` parameter:
+     `__genmeth_List_int_Select_String(__generic_List_int *this, String(*fn)(int))`
+   Call sites rewrite to that free function (see N_CALL method path). */
+typedef struct {
+  const char *class_name;      /* base template class name, e.g. "List" */
+  const char *method_name;     /* "Select" */
+  node_t func_node;            /* N_FUNC_DEF template from the class body */
+  int n_type_params;           /* method type params only (U, not class T) */
+  const char *type_params[4];
+  int is_static;               /* 1 = no implicit this */
+} generic_method_tmpl_t;
+
+DEF_VARR (generic_method_tmpl_t);
+
+typedef struct {
+  const char *spec_name;       /* "__genmeth_List_int_Select_String" */
+} generic_method_spec_t;
+
+DEF_VARR (generic_method_spec_t);
+
 /* Interface registry (Phase 1): a named, STRUCTURAL method-set contract.
    Recording the signatures by name lets later phases ask "does class C satisfy
    interface I?" structurally — the same duck-typing the compiler already does
@@ -4468,6 +4496,12 @@ struct parse_ctx {
   VARR (iface_t) * interfaces;               /* registered interface contracts */
   VARR (generic_fn_tmpl_t) * generic_fn_templates; /* registered generic function templates */
   VARR (generic_fn_spec_t) * generic_fn_specs;     /* generic function specialization cache */
+  VARR (generic_method_tmpl_t) * generic_method_templates;
+  VARR (generic_method_spec_t) * generic_method_specs;
+  /* Method type params currently being parsed (Select<U>): treated like outer
+     class type params for nested-specialization placeholder purposes. */
+  int n_method_type_params;
+  const char *method_type_params[4];
 };
 
 #define record_level parse_ctx->record_level
@@ -4483,6 +4517,10 @@ struct parse_ctx {
 #define interfaces parse_ctx->interfaces
 #define generic_fn_templates parse_ctx->generic_fn_templates
 #define generic_fn_specs parse_ctx->generic_fn_specs
+#define generic_method_templates parse_ctx->generic_method_templates
+#define generic_method_specs parse_ctx->generic_method_specs
+#define n_method_type_params parse_ctx->n_method_type_params
+#define method_type_params parse_ctx->method_type_params
 
 static struct node err_struct;
 static const node_t err_node = &err_struct;
@@ -5286,7 +5324,10 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
         break;
       }
     }
-    if (curr_cls_name != NULL && curr_n_params > 0) {
+    /* Abstract type args: class type params and/or currently open method type
+       params (Select<U> body with List<U>). */
+    if ((curr_cls_name != NULL && curr_n_params > 0)
+        || n_method_type_params > 0) {
       int _any_curr_param = 0;
       for (int _j = 0; _j < n_args; _j++) {
         node_t _pa = args[_j];
@@ -5296,6 +5337,17 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
           if (curr_params[_k] != NULL && strcmp (_pa->u.s.s, curr_params[_k]) == 0) {
             _any_curr_param = 1;
             break;
+          }
+        }
+        /* Also treat open method type params (U in Select<U>) as abstract so
+           List<U> inside a method template does not materialize a real class. */
+        if (!_any_curr_param && n_method_type_params > 0) {
+          for (int _k = 0; _k < n_method_type_params; _k++) {
+            if (method_type_params[_k] != NULL
+                && strcmp (_pa->u.s.s, method_type_params[_k]) == 0) {
+              _any_curr_param = 1;
+              break;
+            }
           }
         }
         if (_any_curr_param) break;
@@ -5320,6 +5372,34 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
         VARR_PUSH (generic_crossref_t, generic_crossrefs, cr);
         return ph_id;
       }
+    }
+  }
+
+  /* Guard: single-letter uppercase type-arg IDs (T, U, K, V, ...) that are not
+     registered generic class templates are open type parameters — e.g. List<U>
+     in the return type of Select<U>(...) before method type params are opened.
+     Never materialize List_U as a real class. */
+  {
+    int _any_open = 0;
+    for (int _j = 0; _j < n_args; _j++) {
+      node_t _pa = args[_j];
+      while (_pa != NULL && _pa->code == N_POINTER) _pa = NL_HEAD (_pa->u.ops);
+      if (_pa == NULL || _pa->code != N_ID) continue;
+      const char *nm = _pa->u.s.s;
+      if (nm == NULL || nm[0] == '\0') continue;
+      if (strncmp (nm, "__generic_", 10) == 0) continue;
+      if (is_generic_class_p (c2m_ctx, nm)) continue;
+      /* Active method type param? */
+      for (int _k = 0; _k < n_method_type_params; _k++)
+        if (method_type_params[_k] && strcmp (nm, method_type_params[_k]) == 0)
+          { _any_open = 1; break; }
+      if (_any_open) break;
+      /* Single uppercase letter type-param convention (T, U, K, V, ...). */
+      if (nm[0] >= 'A' && nm[0] <= 'Z' && nm[1] == '\0') { _any_open = 1; break; }
+    }
+    if (_any_open) {
+      const char *mangled = mangle_generic_name (c2m_ctx, base_name, n_args, args);
+      return build_id (c2m_ctx, mangled, pos);
     }
   }
 
@@ -5376,11 +5456,37 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
   node_t spec_id_node = build_id (c2m_ctx, spec_name, pos);
   tpname_add (c2m_ctx, spec_id_node, curr_scope, TRUE);
 
-  /* Record in specialization cache */
+  /* Record in specialization cache (keep type args for method generics). */
   generic_spec_t gs;
   gs.orig_name = base_name;
   gs.spec_name = spec_name;
+  gs.n_args = n_args;
+  for (int _ai = 0; _ai < 4; _ai++) gs.args[_ai] = (_ai < n_args) ? args[_ai] : NULL;
   VARR_PUSH (generic_spec_t, generic_specs, gs);
+
+  /* Generic methods (Select<U> etc.) stay open over method type params after
+     class specialisation.  Mark their copies on the specialized class with the
+     template sentinel so check skips them; call sites monomorphize instead. */
+  if (spec_class->code == N_CLASS && generic_method_templates != NULL) {
+    node_t mlist = TAG_MEMBER_LIST (spec_class);
+    if (mlist != NULL && mlist->code == N_LIST) {
+      for (node_t mem = NL_HEAD (mlist->u.ops); mem != NULL; mem = NL_NEXT (mem)) {
+        if (mem->code != N_FUNC_DEF) continue;
+        node_t mid = DECL_ID (FUNC_DEF_DECL (mem));
+        if (mid == NULL || mid->code != N_ID) continue;
+        for (size_t mi = 0; mi < VARR_LENGTH (generic_method_tmpl_t, generic_method_templates);
+             mi++) {
+          generic_method_tmpl_t *mt
+            = &VARR_ADDR (generic_method_tmpl_t, generic_method_templates)[mi];
+          if (strcmp (mt->class_name, base_name) == 0
+              && strcmp (mt->method_name, mid->u.s.s) == 0) {
+            mem->attr = (void *)((intptr_t)-1);
+            break;
+          }
+        }
+      }
+    }
+  }
 
   /* Inject before the containing top-level item */
   VARR_PUSH (node_t, pending_lambdas, spec_class);
@@ -5552,6 +5658,201 @@ static node_t get_or_create_generic_fn_specialization (c2m_ctx_t c2m_ctx,
   VARR_PUSH (node_t, pending_lambdas, spec_fn);
 
   return build_id (c2m_ctx, spec_name, pos);
+}
+
+/* Look up a registered generic method template for class.method. */
+static generic_method_tmpl_t *get_generic_method_template (c2m_ctx_t c2m_ctx,
+                                                           const char *class_name,
+                                                           const char *method_name) {
+  parse_ctx_t parse_ctx;
+  if (c2m_ctx->parse_ctx == NULL || class_name == NULL || method_name == NULL) return NULL;
+  parse_ctx = c2m_ctx->parse_ctx;
+  if (generic_method_templates == NULL) return NULL;
+  for (size_t i = 0; i < VARR_LENGTH (generic_method_tmpl_t, generic_method_templates); i++) {
+    generic_method_tmpl_t *t = &VARR_ADDR (generic_method_tmpl_t, generic_method_templates)[i];
+    if (strcmp (t->class_name, class_name) == 0 && strcmp (t->method_name, method_name) == 0)
+      return t;
+  }
+  return NULL;
+}
+
+/* Find specialization cache entry by mangled class name. */
+static generic_spec_t *find_generic_spec_by_name (c2m_ctx_t c2m_ctx, const char *spec_name) {
+  parse_ctx_t parse_ctx;
+  if (c2m_ctx->parse_ctx == NULL || spec_name == NULL) return NULL;
+  parse_ctx = c2m_ctx->parse_ctx;
+  if (generic_specs == NULL) return NULL;
+  for (size_t i = 0; i < VARR_LENGTH (generic_spec_t, generic_specs); i++) {
+    generic_spec_t *s = &VARR_ADDR (generic_spec_t, generic_specs)[i];
+    if (strcmp (s->spec_name, spec_name) == 0) return s;
+  }
+  return NULL;
+}
+
+/* Mangle: List + [int] + Select + [String] -> __genmeth_List_int_Select_String */
+static const char *mangle_generic_method_name (c2m_ctx_t c2m_ctx,
+                                               const char *class_name, int n_cargs,
+                                               node_t *cargs,
+                                               const char *method_name, int n_margs,
+                                               node_t *margs) {
+  VARR_TRUNC (char, temp_string, 0);
+  add_to_temp_string (c2m_ctx, "__genmeth_");
+  add_to_temp_string (c2m_ctx, class_name);
+  for (int i = 0; i < n_cargs; i++) {
+    add_to_temp_string (c2m_ctx, "_");
+    node_t a = cargs[i];
+    int ptr_depth = 0;
+    while (a != NULL && a->code == N_POINTER) { ptr_depth++; a = NL_HEAD (a->u.ops); }
+    const char *an = "T";
+    if (a != NULL) {
+      switch (a->code) {
+      case N_STRING: an = "String"; break;
+      case N_INT: an = "int"; break;
+      case N_DOUBLE: an = "double"; break;
+      case N_FLOAT: an = "float"; break;
+      case N_CHAR: an = "char"; break;
+      case N_LONG: an = "long"; break;
+      case N_SHORT: an = "short"; break;
+      case N_UNSIGNED: an = "unsigned"; break;
+      case N_VOID: an = "void"; break;
+      case N_DICT: an = "dict"; break;
+      case N_BOOL: an = "bool"; break;
+      case N_ID: an = a->u.s.s; break;
+      default: break;
+      }
+    }
+    add_to_temp_string (c2m_ctx, an);
+    for (int p = 0; p < ptr_depth; p++) add_to_temp_string (c2m_ctx, "P");
+  }
+  add_to_temp_string (c2m_ctx, "_");
+  add_to_temp_string (c2m_ctx, method_name);
+  for (int i = 0; i < n_margs; i++) {
+    add_to_temp_string (c2m_ctx, "_");
+    node_t a = margs[i];
+    int ptr_depth = 0;
+    while (a != NULL && a->code == N_POINTER) { ptr_depth++; a = NL_HEAD (a->u.ops); }
+    const char *an = "T";
+    if (a != NULL) {
+      switch (a->code) {
+      case N_STRING: an = "String"; break;
+      case N_INT: an = "int"; break;
+      case N_DOUBLE: an = "double"; break;
+      case N_FLOAT: an = "float"; break;
+      case N_CHAR: an = "char"; break;
+      case N_LONG: an = "long"; break;
+      case N_SHORT: an = "short"; break;
+      case N_UNSIGNED: an = "unsigned"; break;
+      case N_VOID: an = "void"; break;
+      case N_DICT: an = "dict"; break;
+      case N_BOOL: an = "bool"; break;
+      case N_ID: an = a->u.s.s; break;
+      default: break;
+      }
+    }
+    add_to_temp_string (c2m_ctx, an);
+    for (int p = 0; p < ptr_depth; p++) add_to_temp_string (c2m_ctx, "P");
+  }
+  return uniq_cstr (c2m_ctx, VARR_ADDR (char, temp_string)).s;
+}
+
+/* Prepend `ClassSpec *this` to a specialized method free-function's param list. */
+static void prepend_this_param_to_func (c2m_ctx_t c2m_ctx, node_t func_def,
+                                        const char *class_spec_name, pos_t pos) {
+  node_t declarator, decl_list, func, param_list;
+  node_t class_id, specs, ptr_node, this_id, this_declr, this_param;
+
+  if (func_def == NULL || class_spec_name == NULL) return;
+  declarator = FUNC_DEF_DECL (func_def);
+  if (declarator == NULL) return;
+  decl_list = DECL_LIST (declarator);
+  if (decl_list == NULL) return;
+  func = NL_HEAD (decl_list->u.ops);
+  while (func != NULL && func->code != N_FUNC) func = NL_NEXT (func);
+  if (func == NULL) return;
+  param_list = NL_HEAD (func->u.ops);
+  if (param_list == NULL || param_list->code != N_LIST) return;
+
+  class_id = build_id (c2m_ctx, class_spec_name, pos);
+  specs = new_node1 (c2m_ctx, N_LIST, class_id);
+  ptr_node = new_pos_node1 (c2m_ctx, N_POINTER, pos, new_node (c2m_ctx, N_LIST));
+  this_id = build_id (c2m_ctx, "this", pos);
+  this_declr = new_pos_node2 (c2m_ctx, N_DECL, pos, this_id,
+                              new_node1 (c2m_ctx, N_LIST, ptr_node));
+  this_param = build_spec_decl (c2m_ctx, pos, specs, this_declr, NULL, NULL, NULL);
+  NL_PREPEND (param_list->u.ops, this_param);
+}
+
+/* Materialize a generic method as a free function with explicit this.
+   Returns N_ID of the mangled specialization name. */
+static node_t get_or_create_generic_method_specialization (
+    c2m_ctx_t c2m_ctx, const char *class_name, const char *class_spec_name,
+    int n_cargs, node_t *cargs, generic_method_tmpl_t *mt,
+    int n_margs, node_t *margs, pos_t pos) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  const char *spec_name;
+  node_t all_params_nodes[8];
+  const char *all_param_names[8];
+  int n_all, i;
+  generic_tmpl_t *ctmpl;
+
+  if (mt == NULL || mt->func_node == NULL) return NULL;
+  ctmpl = get_generic_template (c2m_ctx, class_name);
+  if (ctmpl == NULL) return NULL;
+
+  spec_name = mangle_generic_method_name (c2m_ctx, class_name, n_cargs, cargs,
+                                          mt->method_name, n_margs, margs);
+
+  if (generic_method_specs != NULL) {
+    for (size_t si = 0; si < VARR_LENGTH (generic_method_spec_t, generic_method_specs); si++) {
+      if (strcmp (VARR_GET (generic_method_spec_t, generic_method_specs, si).spec_name,
+                  spec_name)
+          == 0)
+        return build_id (c2m_ctx, spec_name, pos);
+    }
+  }
+
+  /* Combine class type params + method type params for substitution. */
+  n_all = 0;
+  for (i = 0; i < ctmpl->n_type_params && n_all < 8; i++) {
+    all_param_names[n_all] = ctmpl->type_params[i];
+    all_params_nodes[n_all] = (i < n_cargs) ? cargs[i] : new_pos_node (c2m_ctx, N_INT, pos);
+    n_all++;
+  }
+  for (i = 0; i < mt->n_type_params && n_all < 8; i++) {
+    all_param_names[n_all] = mt->type_params[i];
+    all_params_nodes[n_all] = (i < n_margs) ? margs[i] : new_pos_node (c2m_ctx, N_INT, pos);
+    n_all++;
+  }
+
+  {
+    size_t _xref_mark = VARR_LENGTH (generic_crossref_t, generic_crossrefs);
+    node_t spec_fn = specialize_node (c2m_ctx, mt->func_node, mt->method_name, spec_name,
+                                      n_all, all_param_names, all_params_nodes);
+    if (spec_fn == NULL) {
+      error (c2m_ctx, pos, "cannot instantiate generic method '%s.%s'",
+             class_name, mt->method_name);
+      return NULL;
+    }
+    /* Clear template sentinel from the specialized copy. */
+    spec_fn->attr = NULL;
+    if (!mt->is_static)
+      prepend_this_param_to_func (c2m_ctx, spec_fn, class_spec_name, pos);
+
+    /* Materialize any nested concrete specializations produced in the body. */
+    while (VARR_LENGTH (generic_crossref_t, generic_crossrefs) > _xref_mark) {
+      generic_crossref_t _cr = VARR_POP (generic_crossref_t, generic_crossrefs);
+      (void) get_or_create_specialization (c2m_ctx, _cr.ref_name, _cr.n_args, _cr.args,
+                                           _cr.pos);
+    }
+
+    {
+      generic_method_spec_t ms;
+      ms.spec_name = spec_name;
+      VARR_PUSH (generic_method_spec_t, generic_method_specs, ms);
+    }
+    VARR_PUSH (node_t, pending_lambdas, spec_fn);
+    return build_id (c2m_ctx, spec_name, pos);
+  }
 }
 
 /* ─────────────────────────── Generics helpers end ─────────────────────── */
@@ -5897,6 +6198,32 @@ DA (post_expr_part) {
       // will be handled by the call branch, making N_CALL( N_FIELD(base, id), arglist )
       n = new_pos_node1 (c2m_ctx, code, pos, op);
       if (r != NULL) op_append (c2m_ctx, n, r);
+      /* Method type args: obj.Select<String>(fn).  Speculative parse of
+         `<TypeArg,...>` immediately after the method id; only commit when a
+         following '(' confirms a call.  Stored as a third N_FIELD child
+         (N_LIST of type args) so check can read them without changing N_CALL. */
+      if (C (T_CMP) && curr_token->node_code == N_LT) {
+        size_t mta_mark = record_start (c2m_ctx);
+        node_t targs = new_node (c2m_ctx, N_LIST);
+        int ok = 1;
+        M (T_CMP); /* '<' */
+        do {
+          node_t ta = parse_generic_type_arg (c2m_ctx);
+          if (ta == NULL) { ok = 0; break; }
+          op_append (c2m_ctx, targs, ta);
+        } while (M (','));
+        if (ok && C (T_CMP) && curr_token->node_code == N_GT) {
+          M (T_CMP); /* '>' */
+          if (C ('(')) {
+            record_stop (c2m_ctx, mta_mark, FALSE);
+            op_append (c2m_ctx, n, targs);
+          } else {
+            record_stop (c2m_ctx, mta_mark, TRUE);
+          }
+        } else {
+          record_stop (c2m_ctx, mta_mark, TRUE);
+        }
+      }
       r = n;
       continue;
     } else if (MC ('[', pos, code)) {
@@ -6889,10 +7216,50 @@ D (class_member_declaration) {
 
     // Check if this is a function definition (has a compound statement)
     if (C('{')) {
-      // This is a method definition - treat as regular function
+      /* Recover method-level type params (Select<U>) stashed on the declarator
+         by direct_declarator.  Set parse_ctx so nested List<U> stays a placeholder
+         while the body is parsed. */
+      int meth_n_tp = 0;
+      const char *meth_tps[4] = {NULL, NULL, NULL, NULL};
+      if (decl->attr != NULL) {
+        int *carrier = (int *) decl->attr;
+        meth_n_tp = carrier[0];
+        const char **carr_tps = (const char **) (carrier + 1);
+        for (int i = 0; i < 4; i++) meth_tps[i] = carr_tps[i];
+        decl->attr = NULL;
+      }
+      int saved_mtp = n_method_type_params;
+      const char *saved_mtps[4];
+      for (int i = 0; i < 4; i++) saved_mtps[i] = method_type_params[i];
+      if (meth_n_tp > 0) {
+        n_method_type_params = meth_n_tp;
+        for (int i = 0; i < 4; i++) method_type_params[i] = meth_tps[i];
+      }
       P(compound_stmt);
+      node_t body = r;
+      n_method_type_params = saved_mtp;
+      for (int i = 0; i < 4; i++) method_type_params[i] = saved_mtps[i];
 
-      return build_func_def(c2m_ctx, POS(decl), spec, decl, new_node(c2m_ctx, N_LIST), r);
+      node_t fdef = build_func_def(c2m_ctx, POS(decl), spec, decl,
+                                    new_node(c2m_ctx, N_LIST), body);
+      /* Register as a generic method template.  Marked with sentinel so class
+         check skips the unsubstitued U body; call sites monomorphize. */
+      if (meth_n_tp > 0 && parse_ctx->curr_class != NULL
+          && parse_ctx->curr_class->code == N_ID) {
+        node_t mid = DECL_ID (decl);
+        if (mid != NULL && mid->code == N_ID) {
+          generic_method_tmpl_t mt;
+          mt.class_name = parse_ctx->curr_class->u.s.s;
+          mt.method_name = mid->u.s.s;
+          mt.func_node = fdef;
+          mt.n_type_params = meth_n_tp;
+          for (int i = 0; i < 4; i++) mt.type_params[i] = meth_tps[i];
+          mt.is_static = is_static_method;
+          VARR_PUSH (generic_method_tmpl_t, generic_method_templates, mt);
+          fdef->attr = (void *)((intptr_t)-1); /* template: skip check/gen */
+        }
+      }
+      return fdef;
     } else {
       // One or more data members sharing `spec`, comma-separated:
       //   type d1 [= init], d2 [= init], ... ;
@@ -8543,6 +8910,8 @@ static node_t synthesize_any_class (c2m_ctx_t c2m_ctx, const char *iface_name, p
     generic_spec_t gs;
     gs.orig_name = "Any";
     gs.spec_name = struct_name_u;
+    gs.n_args = 0;
+    for (int _ai = 0; _ai < 4; _ai++) gs.args[_ai] = NULL;
     VARR_PUSH (generic_spec_t, generic_specs, gs);
   }
   for (node_t it = NL_HEAD (cls->u.ops); it != NULL;) {
@@ -8629,6 +8998,8 @@ static int any_thunk_register_p (c2m_ctx_t c2m_ctx, const char *thunk_name) {
   generic_spec_t gs;
   gs.orig_name = "__thunk";
   gs.spec_name = uniq_cstr (c2m_ctx, thunk_name).s;
+  gs.n_args = 0;
+  for (int _ai = 0; _ai < 4; _ai++) gs.args[_ai] = NULL;
   VARR_PUSH (generic_spec_t, generic_specs, gs);
   return TRUE;
 }
@@ -8826,6 +9197,8 @@ static node_t synthesize_any_thunks (c2m_ctx_t c2m_ctx, const char *iface_name,
     generic_spec_t gs;
     gs.orig_name = iface_name;
     gs.spec_name = factory_name;
+    gs.n_args = 0;
+    for (int _ai = 0; _ai < 4; _ai++) gs.args[_ai] = NULL;
     VARR_PUSH (generic_spec_t, generic_specs, gs);
   }
   return items;
@@ -9039,6 +9412,10 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (iface_t, interfaces, alloc, 4);
   VARR_CREATE (generic_fn_tmpl_t, generic_fn_templates, alloc, 4);
   VARR_CREATE (generic_fn_spec_t, generic_fn_specs, alloc, 8);
+  VARR_CREATE (generic_method_tmpl_t, generic_method_templates, alloc, 4);
+  VARR_CREATE (generic_method_spec_t, generic_method_specs, alloc, 8);
+  n_method_type_params = 0;
+  for (int i = 0; i < 4; i++) method_type_params[i] = NULL;
   builtin_methods_init (alloc);
 }
 
@@ -9206,6 +9583,10 @@ static void parse_finish (c2m_ctx_t c2m_ctx) {
       VARR_DESTROY (generic_fn_tmpl_t, generic_fn_templates);
     if (generic_fn_specs != NULL)
       VARR_DESTROY (generic_fn_spec_t, generic_fn_specs);
+    if (generic_method_templates != NULL)
+      VARR_DESTROY (generic_method_tmpl_t, generic_method_templates);
+    if (generic_method_specs != NULL)
+      VARR_DESTROY (generic_method_spec_t, generic_method_specs);
   }
   builtin_methods_finish ();
   finish_streams (c2m_ctx);
@@ -16249,6 +16630,23 @@ if (base != NULL && base->code == N_ID) {
           e->u.lvalue_node = NULL;
           break;
         }
+        /* Generic method access (Select<U>): placeholder; N_CALL monomorphizes. */
+        if (op2 != NULL && op2->code == N_ID && t1->mode == TM_CLASS
+            && t1->u.tag_type != NULL) {
+          node_t tid = TAG_ID (t1->u.tag_type);
+          const char *cn = (tid != NULL && tid->code == N_ID) ? tid->u.s.s : NULL;
+          const char *base = NULL;
+          generic_spec_t *gsp = (cn != NULL) ? find_generic_spec_by_name (c2m_ctx, cn) : NULL;
+          if (gsp != NULL) base = gsp->orig_name;
+          else if (cn != NULL) base = cn;
+          if (base != NULL
+              && get_generic_method_template (c2m_ctx, base, op2->u.s.s) != NULL) {
+            e->type->mode = TM_BASIC;
+            e->type->u.basic_type = TP_VOID;
+            e->u.lvalue_node = NULL;
+            break;
+          }
+        }
         if (t1->mode != TM_STRUCT && t1->mode != TM_UNION && t1->mode != TM_CLASS && t1->mode != TM_DICT) {
           error (c2m_ctx, POS (r), "request for member %s in something not a structure, union, class or dict",
                  op2->u.s.s);
@@ -17379,6 +17777,158 @@ if (base != NULL && base->code == N_ID) {
 	              // Only proceed with method call logic if the object is a class (TM_CLASS)
 	              if (obj_type->mode == TM_CLASS) {
 		                node_t method_id = NL_NEXT(obj);  // Method name (N_ID)
+
+		                /* Generic method monomorphization: xs->Select<String>(fn)
+		                   or xs->Select(fn) with U inferred from fn's return type. */
+		                if (method_id != NULL && method_id->code == N_ID) {
+		                  node_t tag = obj_type->u.tag_type;
+		                  node_t tid = (tag != NULL) ? TAG_ID (tag) : NULL;
+		                  const char *cn = (tid != NULL && tid->code == N_ID) ? tid->u.s.s : NULL;
+		                  generic_spec_t *gsp
+		                    = (cn != NULL) ? find_generic_spec_by_name (c2m_ctx, cn) : NULL;
+		                  const char *base = (gsp != NULL) ? gsp->orig_name : cn;
+		                  generic_method_tmpl_t *mt
+		                    = (base != NULL)
+		                        ? get_generic_method_template (c2m_ctx, base, method_id->u.s.s)
+		                        : NULL;
+		                  if (mt != NULL && gsp != NULL) {
+		                    node_t explicit_targs = NL_NEXT (method_id); /* third FIELD child */
+		                    node_t margs[4] = {NULL, NULL, NULL, NULL};
+		                    int n_margs = 0;
+		                    int infer_ok = 1;
+
+		                    /* Pre-check user args for inference. */
+		                    for (node_t ua = NL_HEAD (arg_list->u.ops); ua != NULL;
+		                         ua = NL_NEXT (ua))
+		                      if (ua->attr == NULL) check (c2m_ctx, ua, r);
+
+		                    if (explicit_targs != NULL && explicit_targs->code == N_LIST) {
+		                      for (node_t ta = NL_HEAD (explicit_targs->u.ops);
+		                           ta != NULL && n_margs < 4; ta = NL_NEXT (ta))
+		                        margs[n_margs++] = ta;
+		                    } else {
+		                      /* Infer U from the first user arg that is a function
+		                         pointer: U(*fn)(T) -> return type is U. */
+		                      node_t first = NL_HEAD (arg_list->u.ops);
+		                      if (first != NULL && first->attr != NULL) {
+		                        struct expr *fe = first->attr;
+		                        struct type *ft = fe->type;
+		                        if (ft != NULL && ft->mode == TM_PTR && ft->u.ptr_type
+		                            && ft->u.ptr_type->mode == TM_FUNC) {
+		                          struct type *rt = ft->u.ptr_type->u.func_type->ret_type;
+		                          node_t ta = build_seq_type_arg (c2m_ctx, rt, POS (r));
+		                          if (ta != NULL) margs[n_margs++] = ta;
+		                          else infer_ok = 0;
+		                        } else {
+		                          infer_ok = 0;
+		                        }
+		                      } else {
+		                        infer_ok = 0;
+		                      }
+		                      /* Pad remaining method type params with int fallback. */
+		                      while (n_margs < mt->n_type_params)
+		                        margs[n_margs++]
+		                          = new_pos_node (c2m_ctx, N_INT, POS (r));
+		                    }
+		                    if (n_margs < mt->n_type_params) {
+		                      error (c2m_ctx, POS (r),
+		                             "cannot infer type arguments for generic method '%s'",
+		                             method_id->u.s.s);
+		                      break;
+		                    }
+		                    if (!infer_ok && (explicit_targs == NULL
+		                                   || explicit_targs->code != N_LIST)) {
+		                      error (c2m_ctx, POS (r),
+		                             "cannot infer type arguments for generic method '%s' "
+		                             "(use explicit <Type> or pass a function pointer)",
+		                             method_id->u.s.s);
+		                      break;
+		                    }
+		                    {
+		                                      parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+		                                      size_t pend_mark = VARR_LENGTH (node_t, pending_lambdas);
+		                                      node_t spec_id = get_or_create_generic_method_specialization (
+		                        c2m_ctx, base, cn, gsp->n_args, gsp->args, mt, n_margs, margs,
+		                        POS (r));
+		                      materialize_pending_specs (c2m_ctx, pend_mark);
+		                      if (spec_id == NULL || spec_id->code != N_ID) {
+		                        error (c2m_ctx, POS (r),
+		                               "failed to specialize generic method '%s'",
+		                               method_id->u.s.s);
+		                        break;
+		                      }
+		                      /* Rewrite callee to free function; prepend this. */
+		                      {
+		                        node_t new_callee = build_id (c2m_ctx, spec_id->u.s.s, POS (r));
+		                        /* Replace N_FIELD callee with N_ID. */
+		                        NL_REMOVE (r->u.ops, op1);
+		                        NL_PREPEND (r->u.ops, new_callee);
+		                        op1 = new_callee;
+		                        if (!mt->is_static && r->attr == NULL) {
+		                          node_t this_arg = copy_node (c2m_ctx, obj);
+		                          this_arg->attr = obj->attr;
+		                          if (op1 /* keep */ && (NL_HEAD (r->u.ops))) {
+		                            /* was DEREF_FIELD or FIELD before rewrite */
+		                          }
+		                          /* obj is already a pointer for -> form; for . form
+		                             need address — obj_type is class value type only if
+		                             not from DEREF_FIELD.  For method calls via
+		                             pointer (List*), receiver is pointer. */
+		                          struct expr *oex = obj->attr;
+		                          if (oex != NULL && oex->type != NULL
+		                              && oex->type->mode == TM_CLASS) {
+		                            node_t addr = new_node1 (c2m_ctx, N_ADDR, this_arg);
+		                            struct expr *ae = create_expr (c2m_ctx, addr);
+		                            ae->type->mode = TM_PTR;
+		                            ae->type->u.ptr_type = oex->type;
+		                            set_type_layout (c2m_ctx, ae->type);
+		                            this_arg = addr;
+		                          }
+		                          NL_PREPEND (arg_list->u.ops, this_arg);
+		                        }
+		                        /* Fall through to regular function call path. */
+		                        check (c2m_ctx, op1, r);
+		                        e1 = op1->attr;
+		                        t1 = e1 != NULL ? e1->type : NULL;
+		                        if (t1 == NULL || t1->mode != TM_PTR
+		                            || t1->u.ptr_type == NULL
+		                            || t1->u.ptr_type->mode != TM_FUNC) {
+		                          error (c2m_ctx, POS (r),
+		                                 "specialized generic method is not a function");
+		                          break;
+		                        }
+		                        func_type = t1->u.ptr_type->u.func_type;
+		                        ret_type = func_type->ret_type;
+		                        /* Check args including this. */
+		                        param_list = func_type->param_list;
+		                        param = NL_HEAD (param_list->u.ops);
+		                        for (arg = NL_HEAD (arg_list->u.ops); arg != NULL;) {
+		                          node_t arg_next = NL_NEXT (arg);
+		                          if (!arg->attr) check (c2m_ctx, arg, r);
+		                          e2 = arg->attr;
+		                          if (param == NULL) {
+		                            if (!func_type->dots_p)
+		                              error (c2m_ctx, POS (arg),
+		                                     "too many arguments in generic method call");
+		                            arg = arg_next;
+		                            continue;
+		                          }
+		                          {
+		                            struct decl_spec *ds = get_param_decl_spec (param);
+		                            check_assignment_types (c2m_ctx, ds->type, NULL, e2, r);
+		                          }
+		                          param = NL_NEXT (param);
+		                          arg = arg_next;
+		                        }
+		                        if (param != NULL)
+		                          error (c2m_ctx, POS (r),
+		                                 "too few arguments in generic method call");
+		                        method_call_p = TRUE;
+		                        goto seq_method_done;
+		                      }
+		                    }
+		                  }
+		                }
 
 		                // Built-in List<String>::join(delim) -> String.  List<String>
 		                // defines no user `join`, so intercept it here (before the

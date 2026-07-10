@@ -40,7 +40,7 @@ These still fail or are incomplete — not the common `List`/`Map` path:
 
 | Gap | Why |
 |-----|-----|
-| **Generic method type params** (`Select<U>(U(*fn)(T))`) | No per-method type params / return substitution yet |
+| ~~**Generic method type params** (`Select<U>(U(*fn)(T))`)~~ | ✅ **landed** — see roadmap “Done (method generics)” |
 | **`if constexpr` / `is_int<T>`** | Generic body typechecks for *all* `T`; blocks `List.Range` |
 | **Generic call inference for classes** | Works for free funcs; some method sites still need explicit `<T>` |
 | **Nested generic of nested generic** depth edge cases | Not exhaustively stressed beyond `List`/`Map`/`Repository` |
@@ -66,8 +66,9 @@ Concrete primitives, pointers, by-value classes, and nested collection specialis
     * **FIXED** — `Clear`/`RemoveAt`/`Set` destroy via `is_pointer` + `__destroy`. `val-028` 3a-3f.
 
 6.  **Missing C# / Python essentials:**
-    * **FIXED partially:** `Where`/`Select` (`T→T`), `Any`/`All`/`Find*`/`AddRange`/`InsertRange`/`Distinct`/`Repeat`.
-    * **NOT FIXED:** generic `Select<U>`, `GroupBy`, slice `list[1..3]`, `operator+`, `Range` factory (needs `is_int<T>`).
+    * **FIXED partially:** `Where`/`Select`/`SelectString`, `Any`/`All`/`Find*`/`AddRange`/`InsertRange`/`Distinct`/`Repeat`.
+    * **FIXED:** generic `Select<U>` — `xs->Select<String>(fn)` / inferred `xs->Select(fn)`. `val-031`.
+    * **NOT FIXED:** `GroupBy`, slice `list[1..3]`, `operator+`, `Range` factory (needs `is_int<T>`).
 
 7.  **Constructor confusion:** capacity vs singleton for `int`.
     * **NOT FIXED — intentional** C# semantics: `new List<int>(4)` capacity, `new List<int>{4}` singleton.
@@ -126,13 +127,17 @@ Generic free-function inference (`Max(3,5)`): **works** (`val-023`). Mark langua
 * Simple `__generic_List_String` pretty-print in typeof/nameof for specialization IDs.
 * Validated by `cy-validate/val-030-nameof-typeof.cy` (20 tests); full suite 32/32.
 
-**In progress (method generics):** parse + specialise class methods with their own type params
-  so `List<U>* Select<U>(U(*fn)(T))` and call sites `xs->Select<String>(fn)` / inferred `U` work.
-  Target: replace `SelectString` with one real `Select<U>`; unlock `GroupBy<K>` later on the same machinery.
+**Done (method generics):**
+* Parse method type params: `List<U>* Select<U>(U(*fn)(T))` (declarator carrier + method template registry).
+* Open type params (T/U/K/V, active method params) never materialise fake classes (`List_U`).
+* Call site monomorphization: explicit `xs->Select<String>(fn)` or infer `U` from fn return type.
+* Specializations are free functions with explicit `this` (`__genmeth_List_int_Select_String`).
+* `list.h`: real `Select<U>`; `SelectString` kept as open-coded compat.
+* Validated by `cy-validate/val-031-generic-methods.cy` (8 tests).
 
-**Next (after method generics):** UFCS; expand `builtin_method` to dict/seq tables; `?.` `??` `..`; `owned auto` docs.
+**Next:** UFCS; `GroupBy<K>` on the new machinery; expand `builtin_method` to dict/seq; `?.` `??` `..`; `owned auto` docs.
 
-**Later:** Spread dict, `GroupBy`, properties, list `[]` literals, `is_int<T>` / `Range`.
+**Later:** Spread dict, properties, list `[]` literals, `is_int<T>` / `Range`.
 
 ### Notes from implementation
 

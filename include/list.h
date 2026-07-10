@@ -349,13 +349,21 @@ class List<T> {
         return result;
     }
 
-    List<T>* Select(T(*fn)(T)) __attribute__((da_ignore)) {
-        List<T>* result = new List<T>(this->length > 0 ? this->length : 1);
+    /* LINQ-style projection: T → U.  U is a method type parameter (specialized
+     * at the call site): xs->Select<String>(toName) or xs->Select(fn) with U
+     * inferred from fn's return type.  Caller must delete/own the result. */
+    List<U>* Select<U>(U(*fn)(T)) __attribute__((da_ignore)) {
+        List<U>* result = new List<U>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++)
             result->Add(fn(this->data[i]));
         return result;
     }
 
+    /* Same-type Select / Map (T → T) — kept as Map() for chains that stay on T. */
+
+    /* Compat: T → String projection. Prefer Select<String>(fn).  Body is open-coded
+     * (not delegated to Select) so List specializations type-check without nesting
+     * another generic-method monomorphization during method-body check. */
     List<String>* SelectString(String(*fn)(T)) __attribute__((da_ignore)) {
         List<String>* result = new List<String>(this->length > 0 ? this->length : 4);
         for (int i = 0; i < this->length; i++)

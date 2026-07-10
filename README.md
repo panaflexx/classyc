@@ -350,6 +350,26 @@ printf("%s\n", nameof(banana));        // "banana"
 `List.ToJsonArray` / `Map.ToDict` use `nameof<T>()` / `nameof<V>()` for their
 type-dispatch branches. See `cy-validate/val-030-nameof-typeof.cy`.
 
+#### Generic methods: `Select<U>`
+
+Class methods may declare their own type parameters (in addition to the class's).
+`List<T>.Select` projects into a different element type:
+
+```c
+int times2(int x) { return x * 2; }
+String nameOf(User* u) { return u->name; }
+
+List<int>* xs = new List<int>{1, 2, 3};
+List<int>* d = xs->Select<int>(times2);     // explicit U
+List<int>* e = xs->Select(times2);          // U inferred from fn return type
+
+List<User*>* users = ...;
+List<String>* names = users->Select<String>(nameOf);  // T* → String
+```
+
+See `cy-validate/val-031-generic-methods.cy`. The same machinery will host
+`GroupBy<K>` and friends later.
+
 ### Arrays & Slices → `List<T>` (lengths flow into generics)
 A C array or a filter/map slice converts to a heap `List<T>` with `.ToList()`,
 or straight through the constructor. The compiler threads the source's length
