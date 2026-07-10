@@ -4804,6 +4804,124 @@ static node_t synthesize_any_class (c2m_ctx_t c2m_ctx, const char *iface_name, p
 static node_t parse_any_instantiation (c2m_ctx_t c2m_ctx, pos_t pos);
 static node_t parse_synth_func_def (c2m_ctx_t c2m_ctx);
 
+/* Pretty-print a mangled specialization id when it is a simple
+   `__generic_Base_Arg0[_ArgN]*` form (no nested mangled args).  e.g.
+   __generic_List_String -> List<String>, __generic_List_intP -> List<int*>.
+   Complex / nested mangled names fall through unchanged. */
+static const char *pretty_generic_type_name (c2m_ctx_t c2m_ctx, const char *s) {
+  char base[128];
+  char args[8][96];
+  int n_args = 0, i;
+  const char *p, *us;
+  size_t blen;
+
+  if (s == NULL || strncmp (s, "__generic_", 10) != 0) return s;
+  p = s + 10;
+  us = strchr (p, '_');
+  if (us == NULL || us == p) return s;
+  blen = (size_t) (us - p);
+  if (blen == 0 || blen >= sizeof (base)) return s;
+  memcpy (base, p, blen);
+  base[blen] = '\0';
+  p = us + 1;
+  while (*p != '\0' && n_args < 8) {
+    size_t alen, baselen, k;
+    int ptr_depth = 0;
+    us = strchr (p, '_');
+    alen = us != NULL ? (size_t) (us - p) : strlen (p);
+    if (alen == 0 || alen >= sizeof (args[0])) return s;
+    /* Nested mangle embedded as an arg starts with "_generic" after the join
+       underscore — reject and keep the raw name. */
+    if (alen >= 9 && strncmp (p, "_generic", 8) == 0) return s;
+    baselen = alen;
+    while (baselen > 0 && p[baselen - 1] == 'P') {
+      ptr_depth++;
+      baselen--;
+    }
+    if (baselen == 0) return s;
+    memcpy (args[n_args], p, baselen);
+    args[n_args][baselen] = '\0';
+    for (k = 0; k < (size_t) ptr_depth && baselen + k + 1 < sizeof (args[0]); k++)
+      args[n_args][baselen + k] = '*';
+    args[n_args][baselen + ptr_depth] = '\0';
+    n_args++;
+    if (us == NULL) break;
+    p = us + 1;
+  }
+  if (n_args == 0) return s;
+  VARR_TRUNC (char, temp_string, 0);
+  add_to_temp_string (c2m_ctx, base);
+  add_to_temp_string (c2m_ctx, "<");
+  for (i = 0; i < n_args; i++) {
+    if (i > 0) add_to_temp_string (c2m_ctx, ",");
+    add_to_temp_string (c2m_ctx, args[i]);
+  }
+  add_to_temp_string (c2m_ctx, ">");
+  return uniq_cstr (c2m_ctx, VARR_ADDR (char, temp_string)).s;
+}
+
+/* Convert a parse-time type-argument AST node into a nameof/typeof string.
+   keep_ptr_p=0 (nameof): strip pointer wrappers — nameof<int*>() == "int".
+   keep_ptr_p=1 (typeof): keep stars — typeof<int*>() == "int*".
+   ID nodes that are generic specializations are pretty-printed when simple. */
+static const char *type_arg_reflection_name (c2m_ctx_t c2m_ctx, node_t a, int keep_ptr_p) {
+  int ptr_depth = 0;
+  const char *nm = NULL;
+
+  if (a == NULL) return "?";
+  while (a != NULL && a->code == N_POINTER) {
+    ptr_depth++;
+    a = NL_HEAD (a->u.ops);
+  }
+  if (a == NULL) return "?";
+  switch (a->code) {
+  case N_STRING:   nm = "String"; break;
+  case N_INT:      nm = "int"; break;
+  case N_DOUBLE:   nm = "double"; break;
+  case N_FLOAT:    nm = "float"; break;
+  case N_CHAR:     nm = "char"; break;
+  case N_LONG:     nm = "long"; break;
+  case N_SHORT:    nm = "short"; break;
+  case N_UNSIGNED: nm = "unsigned"; break;
+  case N_VOID:     nm = "void"; break;
+  case N_DICT:     nm = "dict"; break;
+  case N_BOOL:     nm = "bool"; break;
+  case N_ID:       nm = pretty_generic_type_name (c2m_ctx, a->u.s.s); break;
+  case N_ENUM: {
+    node_t id = TAG_ID (a);
+    nm = (id != NULL && id->code == N_ID) ? id->u.s.s : "enum";
+    break;
+  }
+  case N_STRUCT: {
+    node_t id = TAG_ID (a);
+    nm = (id != NULL && id->code == N_ID) ? id->u.s.s : "struct";
+    break;
+  }
+  case N_CLASS: {
+    node_t id = TAG_ID (a);
+    nm = (id != NULL && id->code == N_ID)
+           ? pretty_generic_type_name (c2m_ctx, id->u.s.s) : "class";
+    break;
+  }
+  case N_UNION: {
+    node_t id = TAG_ID (a);
+    nm = (id != NULL && id->code == N_ID) ? id->u.s.s : "union";
+    break;
+  }
+  default:         nm = "?"; break;
+  }
+  if (!keep_ptr_p || ptr_depth == 0) return nm;
+  {
+    size_t nlen = strlen (nm);
+    char buf[256];
+    if (nlen + (size_t) ptr_depth + 1 >= sizeof (buf)) return nm;
+    memcpy (buf, nm, nlen);
+    for (int i = 0; i < ptr_depth; i++) buf[nlen + (size_t) i] = '*';
+    buf[nlen + (size_t) ptr_depth] = '\0';
+    return uniq_cstr (c2m_ctx, buf).s;
+  }
+}
+
 /* Build a mangled specialization name, e.g. List + String -> __generic_List_String */
 static const char *mangle_generic_name (c2m_ctx_t c2m_ctx,
                                          const char *base_name,
@@ -4991,37 +5109,20 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
         }
       }
     }
-    /* nameof<T>() intrinsic: substitute the whole call with an N_STR whose
-       value is the concrete type-arg's name.  This is the compile-time
-       reflection primitive that lets a generic class body stringify T (e.g.
-       for RTTI comparisons in Is<T>/As<T>).  Pointer wrapping is stripped:
-       nameof<int*>() returns "int" (the base type name), matching how the
-       declarator substitution unwraps N_POINTER. */
+    /* nameof<T>() / typeof<T>() intrinsics: substitute the whole call with an
+       N_STR of the concrete type-arg name.  nameof strips pointer wrappers
+       (nameof<int*>() == "int"); typeof keeps them (typeof<int*>() == "int*").
+       Used for RTTI (Is<T>/As<T>) and JSON type-dispatch in List/Map. */
     if (callee != NULL && callee->code == N_ID && callee->u.s.s != NULL
-        && strcmp (callee->u.s.s, "nameof") == 0) {
+        && (strcmp (callee->u.s.s, "nameof") == 0
+            || strcmp (callee->u.s.s, "typeof") == 0)) {
+      int keep_ptr = (strcmp (callee->u.s.s, "typeof") == 0);
       node_t tlist = NL_NEXT (callee);
       node_t targ = (tlist != NULL) ? NL_HEAD (tlist->u.ops) : NULL;
       if (targ != NULL && targ->code == N_ID) {
         for (int i = 0; i < n_params; i++) {
           if (params[i] != NULL && strcmp (targ->u.s.s, params[i]) == 0) {
-            node_t a = args[i];
-            while (a->code == N_POINTER) a = NL_HEAD (a->u.ops);
-            const char *nm = NULL;
-            switch (a->code) {
-            case N_STRING:   nm = "String"; break;
-            case N_INT:      nm = "int"; break;
-            case N_DOUBLE:   nm = "double"; break;
-            case N_FLOAT:    nm = "float"; break;
-            case N_CHAR:     nm = "char"; break;
-            case N_LONG:     nm = "long"; break;
-            case N_SHORT:    nm = "short"; break;
-            case N_UNSIGNED: nm = "unsigned"; break;
-            case N_VOID:     nm = "void"; break;
-            case N_DICT:     nm = "dict"; break;
-            case N_BOOL:     nm = "bool"; break;
-            case N_ID:       nm = a->u.s.s; break;
-            default:         nm = "T"; break;
-            }
+            const char *nm = type_arg_reflection_name (c2m_ctx, args[i], keep_ptr);
             return new_str_node (c2m_ctx, N_STR, uniq_cstr (c2m_ctx, nm), POS (n));
           }
         }
@@ -5651,6 +5752,30 @@ D (primary_expr) {
     record_stop (c2m_ctx, nm_mark, TRUE); /* not nameof<T>(): rewind */
   }
 
+  /* typeof<T>(): companion to nameof<T>().  Same parse shape; check()/specialize
+     keep pointer depth so typeof<int*>() == "int*".  typeof is a keyword
+     (T_TYPEOF), so match the keyword rather than a bare identifier. */
+  if (C (T_TYPEOF)) {
+    size_t ty_mark = record_start (c2m_ctx);
+    pos_t ty_pos = curr_token->pos;
+    M (T_TYPEOF);
+    if (C (T_CMP) && curr_token->node_code == N_LT) {
+      M (T_CMP); /* consume '<' */
+      node_t targ = parse_generic_type_arg (c2m_ctx);
+      if (targ != NULL && C (T_CMP) && curr_token->node_code == N_GT) {
+        M (T_CMP); /* consume '>' */
+        if (M ('(') && M (')')) {
+          record_stop (c2m_ctx, ty_mark, FALSE); /* commit */
+          node_t ty_id = build_id (c2m_ctx, "typeof", ty_pos);
+          node_t tlist = new_node1 (c2m_ctx, N_LIST, targ);
+          node_t alist = new_node (c2m_ctx, N_LIST);
+          return new_pos_node3 (c2m_ctx, N_CALL, ty_pos, ty_id, tlist, alist);
+        }
+      }
+    }
+    record_stop (c2m_ctx, ty_mark, TRUE); /* not typeof<T>(): rewind */
+  }
+
   /* Shorthand untyped lambda:  x => body  (single parameter, no parens).
      The parameter type is inferred at the call site during check. */
   if (C (T_ID)) {
@@ -5757,7 +5882,17 @@ DA (post_expr_part) {
       r = NULL;
     } else if (MC ('.', pos, code) || MC (T_ARROW, pos, code)) {
       op = r;
-      if (!MN (T_ID, r)) return err_node;
+      /* Accept identifier method/field names, plus keywords that double as
+         reflection methods (typeof is a token keyword; nameof is a plain id). */
+      if (MN (T_ID, r)) {
+        /* normal */
+      } else if (C (T_TYPEOF)) {
+        pos_t idpos = curr_token->pos;
+        M (T_TYPEOF);
+        r = build_id (c2m_ctx, "typeof", idpos);
+      } else {
+        return err_node;
+      }
       // Build the N_FIELD now, then continue the loop so that a following '('
       // will be handled by the call branch, making N_CALL( N_FIELD(base, id), arglist )
       n = new_pos_node1 (c2m_ctx, code, pos, op);
@@ -10714,6 +10849,144 @@ static node_t skip_struct_scopes (node_t scope) {
 }
 
 static void check (c2m_ctx_t c2m_ctx, node_t node, node_t context);
+
+/* ── nameof / typeof reflection (check-time) ───────────────────────────── */
+
+static const char *basic_type_reflection_name (enum basic_type bt) {
+  switch (bt) {
+  case TP_VOID: return "void";
+  case TP_BOOL: return "bool";
+  case TP_CHAR:
+  case TP_SCHAR:
+  case TP_UCHAR: return "char";
+  case TP_SHORT:
+  case TP_USHORT: return "short";
+  case TP_INT:
+  case TP_UINT: return "int";
+  case TP_LONG:
+  case TP_ULONG: return "long";
+  case TP_LLONG:
+  case TP_ULLONG: return "long";
+  case TP_FLOAT: return "float";
+  case TP_DOUBLE: return "double";
+  case TP_LDOUBLE: return "double";
+  case TP_STRING: return "String";
+  default: return "?";
+  }
+}
+
+static const char *type_reflection_name (c2m_ctx_t c2m_ctx, const struct type *t,
+                                         int keep_ptr_p) {
+  int ptr_depth = 0;
+  const char *base = "?";
+  char buf[256];
+
+  if (t == NULL) return "?";
+  while (t != NULL && t->mode == TM_PTR) {
+    ptr_depth++;
+    t = t->u.ptr_type;
+  }
+  if (t == NULL) return "?";
+  switch (t->mode) {
+  case TM_BASIC: base = basic_type_reflection_name (t->u.basic_type); break;
+  case TM_ENUM: {
+    node_t id = (t->u.tag_type != NULL) ? TAG_ID (t->u.tag_type) : NULL;
+    base = (id != NULL && id->code == N_ID) ? id->u.s.s : "enum";
+    break;
+  }
+  case TM_CLASS: {
+    node_t id = (t->u.tag_type != NULL) ? TAG_ID (t->u.tag_type) : NULL;
+    base = (id != NULL && id->code == N_ID)
+             ? pretty_generic_type_name (c2m_ctx, id->u.s.s) : "class";
+    break;
+  }
+  case TM_STRUCT: {
+    node_t id = (t->u.tag_type != NULL) ? TAG_ID (t->u.tag_type) : NULL;
+    base = (id != NULL && id->code == N_ID) ? id->u.s.s : "struct";
+    break;
+  }
+  case TM_UNION: {
+    node_t id = (t->u.tag_type != NULL) ? TAG_ID (t->u.tag_type) : NULL;
+    base = (id != NULL && id->code == N_ID) ? id->u.s.s : "union";
+    break;
+  }
+  case TM_DICT: base = "dict"; break;
+  case TM_ARR: base = "array"; break;
+  case TM_FUNC: base = "func"; break;
+  case TM_SLICE: base = "slice"; break;
+  default: base = "?"; break;
+  }
+  if (!keep_ptr_p || ptr_depth == 0) return base;
+  {
+    size_t nlen = strlen (base);
+    if (nlen + (size_t) ptr_depth + 1 >= sizeof (buf)) return base;
+    memcpy (buf, base, nlen);
+    for (int i = 0; i < ptr_depth; i++) buf[nlen + (size_t) i] = '*';
+    buf[nlen + (size_t) ptr_depth] = '\0';
+    return uniq_cstr (c2m_ctx, buf).s;
+  }
+}
+
+static const char *enum_const_name_for_value (node_t enum_node, mir_llong val) {
+  node_t elist;
+  if (enum_node == NULL || enum_node->code != N_ENUM) return NULL;
+  elist = TAG_MEMBER_LIST (enum_node);
+  if (elist == NULL || elist->code != N_LIST) return NULL;
+  for (node_t en = NL_HEAD (elist->u.ops); en != NULL; en = NL_NEXT (en)) {
+    struct enum_value *ev;
+    node_t id;
+    if (en->code != N_ENUM_CONST || en->attr == NULL) continue;
+    ev = (struct enum_value *) en->attr;
+    if (ev->u.i_val != val) continue;
+    id = NL_HEAD (en->u.ops);
+    if (id != NULL && id->code == N_ID) return id->u.s.s;
+  }
+  return NULL;
+}
+
+static node_t build_enum_nameof_expr (c2m_ctx_t c2m_ctx, node_t val_expr,
+                                      node_t enum_node, pos_t pos) {
+  node_t elist, result, en;
+  node_t names[64];
+  mir_llong vals[64];
+  int n = 0, i;
+
+  result = new_str_node (c2m_ctx, N_STR, uniq_cstr (c2m_ctx, "?"), pos);
+  if (enum_node == NULL || enum_node->code != N_ENUM) return result;
+  elist = TAG_MEMBER_LIST (enum_node);
+  if (elist == NULL || elist->code != N_LIST) return result;
+  for (en = NL_HEAD (elist->u.ops); en != NULL && n < 64; en = NL_NEXT (en)) {
+    struct enum_value *ev;
+    node_t id;
+    if (en->code != N_ENUM_CONST || en->attr == NULL) continue;
+    ev = (struct enum_value *) en->attr;
+    id = NL_HEAD (en->u.ops);
+    if (id == NULL || id->code != N_ID) continue;
+    names[n] = id;
+    vals[n] = ev->u.i_val;
+    n++;
+  }
+  for (i = n - 1; i >= 0; i--) {
+    node_t val_copy = copy_node (c2m_ctx, val_expr);
+    node_t lit = new_i_node (c2m_ctx, (long) vals[i], pos);
+    node_t eq = new_pos_node2 (c2m_ctx, N_EQ, pos, val_copy, lit);
+    node_t then_s = new_str_node (c2m_ctx, N_STR,
+                                  uniq_cstr (c2m_ctx, names[i]->u.s.s), pos);
+    result = new_pos_node3 (c2m_ctx, N_COND, pos, eq, then_s, result);
+  }
+  return result;
+}
+
+static void rewrite_node_to_str (c2m_ctx_t c2m_ctx, node_t r, const char *nm) {
+  node_t str_node;
+  DLIST_LINK (node_t) saved_link;
+  if (nm == NULL) nm = "?";
+  str_node = new_str_node (c2m_ctx, N_STR, uniq_cstr (c2m_ctx, nm), POS (r));
+  check (c2m_ctx, str_node, NULL);
+  saved_link = r->op_link;
+  *r = *str_node;
+  r->op_link = saved_link;
+}
 
 static void set_class_layout (c2m_ctx_t c2m_ctx, node_t decl_node, struct type *type) {
     if (c2m_options->debug_p) printf("set_class_layout decl_node=%s\n", decl_node->u.s.s );
@@ -15967,6 +16240,15 @@ if (base != NULL && base->code == N_ID) {
           e->u.lvalue_node = NULL;
           break;
         }
+        /* nameof/typeof pseudo-methods: works on any receiver type (enum, scalar,
+           pointer, class...).  Placeholder void type; N_CALL does the real rewrite. */
+        if (op2 != NULL && op2->code == N_ID
+            && (strcmp (op2->u.s.s, "nameof") == 0 || strcmp (op2->u.s.s, "typeof") == 0)) {
+          e->type->mode = TM_BASIC;
+          e->type->u.basic_type = TP_VOID;
+          e->u.lvalue_node = NULL;
+          break;
+        }
         if (t1->mode != TM_STRUCT && t1->mode != TM_UNION && t1->mode != TM_CLASS && t1->mode != TM_DICT) {
           error (c2m_ctx, POS (r), "request for member %s in something not a structure, union, class or dict",
                  op2->u.s.s);
@@ -16458,47 +16740,122 @@ if (base != NULL && base->code == N_ID) {
           }
           /* Malformed is_pointer<...>(...); fall through to error */
         }
-        /* nameof<T>(): compile-time reflection intrinsic.  Returns the C-level
-           name of T as a string literal (char[N]).  Inside a generic body,
-           specialize_node already substituted this to an N_STR, so this path
-           only fires for nameof<ConcreteType>() used directly (e.g.
-           nameof<Circle>()).  Resolves T to its class/interface name string. */
-        if (op1->code == N_ID && strcmp (op1->u.s.s, "nameof") == 0) {
+        /* nameof<T>() / typeof<T>(): type-level reflection to a string literal.
+           nameof strips pointers (nameof<int*>() == "int"); typeof keeps them
+           (typeof<int*>() == "int*").  Also:
+             nameof(id)  — C#-style identifier name as a string
+           specialize_node already folds these inside generic bodies. */
+        if (op1->code == N_ID
+            && (strcmp (op1->u.s.s, "nameof") == 0
+                || strcmp (op1->u.s.s, "typeof") == 0)) {
+          int is_typeof = (strcmp (op1->u.s.s, "typeof") == 0);
           node_t type_args = NL_NEXT (op1);
           if (type_args != NULL && type_args->code == N_LIST) {
             node_t type_arg = NL_HEAD (type_args->u.ops);
             node_t call_args = NL_NEXT (type_args);
+            /* nameof<T>() / typeof<T>(): three children [id, tlist, empty-args] */
             if (type_arg != NULL && NL_NEXT (type_arg) == NULL
                 && call_args != NULL && NL_HEAD (call_args->u.ops) == NULL) {
-              const char *nm = NULL;
-              node_t a = type_arg;
-              while (a->code == N_POINTER) a = NL_HEAD (a->u.ops);
-              switch (a->code) {
-              case N_STRING:   nm = "String"; break;
-              case N_INT:      nm = "int"; break;
-              case N_DOUBLE:   nm = "double"; break;
-              case N_FLOAT:    nm = "float"; break;
-              case N_CHAR:     nm = "char"; break;
-              case N_LONG:     nm = "long"; break;
-              case N_SHORT:    nm = "short"; break;
-              case N_UNSIGNED: nm = "unsigned"; break;
-              case N_VOID:     nm = "void"; break;
-              case N_DICT:     nm = "dict"; break;
-              case N_BOOL:     nm = "bool"; break;
-              case N_ID:       nm = a->u.s.s; break;
-              default:         nm = "?"; break;
-              }
-              node_t str_node = new_str_node (c2m_ctx, N_STR,
-                                             uniq_cstr (c2m_ctx, nm), POS (r));
-              check (c2m_ctx, str_node, NULL);
-              DLIST_LINK (node_t) saved_link = r->op_link;
-              *r = *str_node;
-              r->op_link = saved_link;
+              const char *nm
+                = type_arg_reflection_name (c2m_ctx, type_arg, is_typeof);
+              rewrite_node_to_str (c2m_ctx, r, nm);
               e = r->attr;
               break;
             }
+            /* nameof(id): two children [id, arglist] — C# nameof on an identifier */
+            if (!is_typeof && call_args == NULL && type_arg != NULL
+                && NL_NEXT (type_arg) == NULL) {
+              if (type_arg->code == N_ID) {
+                rewrite_node_to_str (c2m_ctx, r, type_arg->u.s.s);
+                e = r->attr;
+                break;
+              }
+              /* nameof(expr): if const enum, reverse-lookup the enumerator */
+              check (c2m_ctx, type_arg, r);
+              {
+                struct expr *ae = type_arg->attr;
+                const char *nm = NULL;
+                if (ae != NULL && ae->type != NULL && ae->type->mode == TM_ENUM
+                    && ae->const_p)
+                  nm = enum_const_name_for_value (ae->type->u.tag_type, ae->c.i_val);
+                if (nm != NULL) {
+                  rewrite_node_to_str (c2m_ctx, r, nm);
+                  e = r->attr;
+                  break;
+                }
+              }
+            }
           }
-          /* Malformed nameof<...>(...); fall through to error */
+          /* Malformed nameof/typeof(...); fall through to error */
+        }
+        /* expr.nameof() / expr.typeof() — rewrite before call_nodes is populated
+           so gen_mir_protos does not see a non-call node. */
+        if (op1->code == N_FIELD || op1->code == N_DEREF_FIELD) {
+          node_t obj = NL_HEAD (op1->u.ops);
+          node_t mid = (obj != NULL) ? NL_NEXT (obj) : NULL;
+          if (mid != NULL && mid->code == N_ID
+              && (strcmp (mid->u.s.s, "nameof") == 0
+                  || strcmp (mid->u.s.s, "typeof") == 0)) {
+            int want_typeof = (strcmp (mid->u.s.s, "typeof") == 0);
+            node_t arg_list_early = NL_NEXT (op1);
+            struct expr *oe;
+            const char *nm = NULL;
+
+            if (arg_list_early == NULL || arg_list_early->code != N_LIST
+                || NL_HEAD (arg_list_early->u.ops) != NULL) {
+              error (c2m_ctx, POS (r), "%s() takes no arguments", mid->u.s.s);
+              break;
+            }
+            if (obj->attr == NULL) check (c2m_ctx, obj, r);
+            oe = obj->attr;
+            if (want_typeof) {
+              nm = (oe != NULL && oe->type != NULL)
+                     ? type_reflection_name (c2m_ctx, oe->type, 1) : "?";
+              rewrite_node_to_str (c2m_ctx, r, nm);
+              e = r->attr;
+              break;
+            }
+            /* nameof: enum const ID -> spelling; enum-typed value -> reverse map;
+               other identifiers -> spelling (C# nameof). */
+            if (obj->code == N_ID) {
+              node_t def = (oe != NULL) ? oe->def_node : NULL;
+              if (def == NULL)
+                def = find_def (c2m_ctx, S_REGULAR, obj, curr_scope, NULL);
+              if (def != NULL && def->code == N_ENUM_CONST) {
+                rewrite_node_to_str (c2m_ctx, r, obj->u.s.s);
+                e = r->attr;
+                break;
+              }
+              if (oe == NULL || oe->type == NULL || oe->type->mode != TM_ENUM) {
+                rewrite_node_to_str (c2m_ctx, r, obj->u.s.s);
+                e = r->attr;
+                break;
+              }
+              /* Fall through to enum reverse-map with this ID as the value. */
+            }
+            if (oe != NULL && oe->type != NULL && oe->type->mode == TM_ENUM) {
+              if (oe->const_p) {
+                nm = enum_const_name_for_value (oe->type->u.tag_type, oe->c.i_val);
+                if (nm == NULL) nm = "?";
+                rewrite_node_to_str (c2m_ctx, r, nm);
+                e = r->attr;
+                break;
+              }
+              {
+                node_t sw = build_enum_nameof_expr (c2m_ctx, obj, oe->type->u.tag_type,
+                                                    POS (r));
+                DLIST_LINK (node_t) saved_link = r->op_link;
+                check (c2m_ctx, sw, NULL);
+                *r = *sw;
+                r->op_link = saved_link;
+                e = r->attr;
+                break;
+              }
+            }
+            error (c2m_ctx, POS (r),
+                   "nameof() on this expression is not supported (use an identifier or enum value)");
+            break;
+          }
         }
         /* __destroy(x): compiler intrinsic used by generic collection templates to
            run an element's destructor before the backing buffer is freed.  It is

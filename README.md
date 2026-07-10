@@ -320,6 +320,36 @@ This is exactly what powers the SQLite `QueryBuilder<T>` (see
 `List<T*>` of typed entities. Multi-level (`T**`) and multi-parameter
 (`Map<K, V*>`) forms work the same way.
 
+#### Compile-time reflection: `nameof` / `typeof`
+
+Generic bodies (and free code) can stringify types and values:
+
+```c
+enum Fruit { apple = 1, banana = 2, cherry = 3 };
+
+// Type-level (specializes inside generics; nameof strips *, typeof keeps them):
+const char* a = nameof<int*>();     // "int"
+const char* b = typeof<int*>();     // "int*"
+const char* c = nameof<Fruit>();    // "Fruit"
+
+// Value-level method forms:
+printf("enum=%s\n", apple.nameof());   // "apple"
+printf("type=%s\n", apple.typeof());   // "Fruit"
+
+enum Fruit f = cherry;
+printf("%s\n", f.nameof());            // "cherry" (runtime reverse map)
+
+int x = 42;
+printf("%s\n", x.nameof());            // "x"  (C#-style identifier spelling)
+printf("%s\n", x.typeof());            // "int"
+
+// Free form for identifiers:
+printf("%s\n", nameof(banana));        // "banana"
+```
+
+`List.ToJsonArray` / `Map.ToDict` use `nameof<T>()` / `nameof<V>()` for their
+type-dispatch branches. See `cy-validate/val-030-nameof-typeof.cy`.
+
 ### Arrays & Slices → `List<T>` (lengths flow into generics)
 A C array or a filter/map slice converts to a heap `List<T>` with `.ToList()`,
 or straight through the constructor. The compiler threads the source's length
