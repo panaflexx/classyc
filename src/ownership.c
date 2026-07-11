@@ -1019,14 +1019,129 @@ static VARR (func_summary_t) *func_summaries = NULL;
 static int   summaries_dirty_p   = 0;   /* set when any summary changed this pass */
 static int   summaries_pass_idx  = 0;   /* current iteration (0 = first pass) */
 
-/* Find a summary by function-def identity.  Returns NULL if not yet computed. */
+/* ──────────────────────────────────────────────────────────────────────
+ * Call-graph worklist registry.
+ *
+ * One record per function definition (plus records for any prototype whose
+ * summary was queried).  While `analyze_function` runs for a function F,
+ * `ow_curr_idx` points at F's record and every interprocedural summary
+ * query records a dependency edge "F reads G's summary".  summary_lookup
+ * is the single funnel for those queries (summary_param_attr,
+ * return_expr_is_acquire_p and summary_release_for_init all go through
+ * it), so the recorded edges are exactly the dynamic dependency frontier.
+ *
+ * When G's summary later changes, precisely the recorded dependents are
+ * pushed on a worklist and re-analyzed — replacing the old fixed-count
+ * whole-module re-walks with a classic fixpoint iteration.  The registry
+ * also caches each function's "trivial" verdict (the no-candidate early
+ * exit in analyze_function) so the final diagnostics pass can skip
+ * functions that provably emit nothing.
+ * ────────────────────────────────────────────────────────────────────── */
+typedef struct ow_funcinfo {
+  node_t func_def;        /* key: N_FUNC_DEF (or a queried N_SPEC_DECL proto) */
+  VARR (int) *dependents; /* ow_funcs indices of funcs that queried our summary */
+  size_t summary_idx_p1;  /* 1-based index into func_summaries; 0 = none yet */
+  unsigned char on_worklist_p;
+  unsigned char trivial_p; /* last analysis took the no-candidate early exit */
+  unsigned char analyzed_p;
+} ow_funcinfo_t;
+DEF_VARR (ow_funcinfo_t);
+
+typedef struct ow_fidx {
+  node_t def;
+  size_t idx;
+} ow_fidx_t;
+DEF_HTAB (ow_fidx_t);
+
+static VARR (ow_funcinfo_t) *ow_funcs = NULL;
+static VARR (int) *ow_worklist = NULL;
+static HTAB (ow_fidx_t) *ow_fidx_tab = NULL;
+static MIR_alloc_t ow_alloc;               /* captured by ownership_run */
+static size_t ow_curr_idx = (size_t) -1;   /* record of the func being analyzed */
+static int ow_inference_p = 0;             /* 1 = silent inference (track + enqueue) */
+static int ow_last_install_changed_p = 0;  /* summary changed during curr analysis */
+static int ow_last_trivial_p = 0;          /* curr analysis took the trivial exit */
+
+static htab_hash_t ow_fidx_hash (ow_fidx_t e, void *arg MIR_UNUSED) {
+  return (htab_hash_t) mir_hash_finish (mir_hash_step (mir_hash_init (0x51), (uint64_t) e.def));
+}
+static int ow_fidx_eq (ow_fidx_t e1, ow_fidx_t e2, void *arg MIR_UNUSED) {
+  return e1.def == e2.def;
+}
+
+/* Get-or-create the registry record for DEF; returns its ow_funcs index. */
+static size_t ow_func_idx (node_t def) {
+  ow_fidx_t el, key;
+
+  key.def = def;
+  if (HTAB_DO (ow_fidx_t, ow_fidx_tab, key, HTAB_FIND, el)) return el.idx;
+  {
+    ow_funcinfo_t fi;
+
+    memset (&fi, 0, sizeof (fi));
+    fi.func_def = def;
+    VARR_CREATE (int, fi.dependents, ow_alloc, 4);
+    key.idx = VARR_LENGTH (ow_funcinfo_t, ow_funcs);
+    VARR_PUSH (ow_funcinfo_t, ow_funcs, fi);
+    HTAB_DO (ow_fidx_t, ow_fidx_tab, key, HTAB_INSERT, el);
+    return key.idx;
+  }
+}
+
+/* Record "the function currently being analyzed reads DEF_IDX's summary".
+   Deduped linearly — dependent lists are short in practice. */
+static void ow_record_dep (size_t def_idx) {
+  ow_funcinfo_t *fi;
+  int me;
+
+  if (ow_curr_idx == (size_t) -1) return;
+  fi = &VARR_ADDR (ow_funcinfo_t, ow_funcs)[def_idx];
+  me = (int) ow_curr_idx;
+  for (size_t i = VARR_LENGTH (int, fi->dependents); i-- > 0;)
+    if (VARR_GET (int, fi->dependents, i) == me) return;
+  VARR_PUSH (int, fi->dependents, me);
+}
+
+/* IDX's summary changed: queue every already-analyzed dependent for
+   re-analysis (unanalyzed ones will be reached by the ongoing walk). */
+static void ow_enqueue_dependents (size_t idx) {
+  VARR (int) *deps = VARR_ADDR (ow_funcinfo_t, ow_funcs)[idx].dependents;
+
+  for (size_t i = 0; i < VARR_LENGTH (int, deps); i++) {
+    int d = VARR_GET (int, deps, i);
+    ow_funcinfo_t *dep = &VARR_ADDR (ow_funcinfo_t, ow_funcs)[d];
+
+    if (dep->on_worklist_p || !dep->analyzed_p) continue;
+    if (dep->func_def == NULL || dep->func_def->code != N_FUNC_DEF) continue;
+    dep->on_worklist_p = 1;
+    VARR_PUSH (int, ow_worklist, d);
+  }
+}
+
+/* Find a summary by function-def identity (O(1) via the registry).
+   Returns NULL if not yet computed.  No dependency recording — used by
+   summary_install itself; analysis-side queries go through summary_lookup
+   below. */
+static func_summary_t *summary_lookup_raw (node_t func_def) {
+  ow_fidx_t el, key;
+  size_t sidx;
+
+  if (func_summaries == NULL || func_def == NULL || ow_fidx_tab == NULL) return NULL;
+  key.def = func_def;
+  if (!HTAB_DO (ow_fidx_t, ow_fidx_tab, key, HTAB_FIND, el)) return NULL;
+  sidx = VARR_GET (ow_funcinfo_t, ow_funcs, el.idx).summary_idx_p1;
+  if (sidx == 0) return NULL;
+  return &VARR_ADDR (func_summary_t, func_summaries)[sidx - 1];
+}
+
+/* Analysis-side summary query: also records the call-graph dependency so a
+   later change to FUNC_DEF's summary re-queues exactly the affected
+   callers (including queries that return NULL now but gain a summary
+   later, and self-queries of recursive functions). */
 static func_summary_t *summary_lookup (node_t func_def) {
-  if (func_summaries == NULL || func_def == NULL) return NULL;
-  size_t n = VARR_LENGTH (func_summary_t, func_summaries);
-  func_summary_t *arr = VARR_ADDR (func_summary_t, func_summaries);
-  for (size_t i = 0; i < n; i++)
-    if (arr[i].func_def == func_def) return &arr[i];
-  return NULL;
+  if (func_summaries == NULL || func_def == NULL || ow_fidx_tab == NULL) return NULL;
+  if (ow_curr_idx != (size_t) -1) ow_record_dep (ow_func_idx (func_def));
+  return summary_lookup_raw (func_def);
 }
 
 /* Install (or update in place) a summary for func_def.  Marks
@@ -1037,7 +1152,7 @@ static void summary_install (c2m_ctx_t c2m_ctx, node_t func_def,
                              const param_attr_t *param_attrs,
                              int returns_owned_p,
                              const char *returns_release_fn) {
-  func_summary_t *s = summary_lookup (func_def);
+  func_summary_t *s = summary_lookup_raw (func_def);
   int changed_p = 0;
   if (s == NULL) {
     func_summary_t fresh;
@@ -1049,6 +1164,8 @@ static void summary_install (c2m_ctx_t c2m_ctx, node_t func_def,
     fresh.returns_owned_p    = returns_owned_p;
     fresh.returns_release_fn = returns_release_fn;
     VARR_PUSH (func_summary_t, func_summaries, fresh);
+    VARR_ADDR (ow_funcinfo_t, ow_funcs)[ow_func_idx (func_def)].summary_idx_p1
+      = VARR_LENGTH (func_summary_t, func_summaries);
     changed_p = 1;
   } else {
     if (s->returns_owned_p != returns_owned_p) changed_p = 1;
@@ -1065,7 +1182,10 @@ static void summary_install (c2m_ctx_t c2m_ctx, node_t func_def,
       }
     }
   }
-  if (changed_p) summaries_dirty_p = 1;
+  if (changed_p) {
+    summaries_dirty_p = 1;
+    ow_last_install_changed_p = 1;
+  }
 }
 
 /* Read inferred attribute for a callee parameter; PA_DEFAULT if no summary. */
@@ -3281,6 +3401,7 @@ static void analyze_function (c2m_ctx_t c2m_ctx, node_t func_def) {
   if (VARR_LENGTH (candidate_t, cands) == 0 &&
       !func_might_return_owned_inline (func_def)) {
     /* No ownership state to track and no inline acquire return → trivial summary. */
+    ow_last_trivial_p = 1;
     summary_install (c2m_ctx, func_def, 0, NULL, 0, NULL);
     VARR_DESTROY (candidate_t, cands);
     return;
@@ -3352,6 +3473,36 @@ static void analyze_function (c2m_ctx_t c2m_ctx, node_t func_def) {
   VARR_DESTROY (candidate_t, cands);
 }
 
+/* Tracked analysis wrapper.  Sets up dependency recording for the duration
+   of one analyze_function run, caches the trivial verdict, and — during
+   silent inference — queues dependents when this function's summary
+   changed.  In the final (diagnostic) pass, a function whose last analysis
+   was trivial is skipped outright: it built no CFG, can emit no
+   diagnostics, and its summary is already stable (any callee-summary
+   change would have re-queued it during the worklist drain, refreshing the
+   verdict). */
+static void ow_analyze_function (c2m_ctx_t c2m_ctx, node_t func_def) {
+  size_t idx = ow_func_idx (func_def);
+  size_t saved_idx;
+  ow_funcinfo_t *fi;
+
+  if (!ow_inference_p) {
+    fi = &VARR_ADDR (ow_funcinfo_t, ow_funcs)[idx];
+    if (fi->analyzed_p && fi->trivial_p) return;
+  }
+  saved_idx = ow_curr_idx;
+  ow_curr_idx = idx;
+  ow_last_install_changed_p = 0;
+  ow_last_trivial_p = 0;
+  analyze_function (c2m_ctx, func_def);
+  ow_curr_idx = saved_idx;
+  /* Re-fetch: the registry may have grown (and moved) during analysis. */
+  fi = &VARR_ADDR (ow_funcinfo_t, ow_funcs)[idx];
+  fi->analyzed_p = 1;
+  fi->trivial_p = (unsigned char) ow_last_trivial_p;
+  if (ow_inference_p && ow_last_install_changed_p) ow_enqueue_dependents (idx);
+}
+
 /* Recursively walk an AST subtree, accounting for any SPEC_DECLs the check
  * pass marked as auto-defer candidates, and kicking off the per-function
  * leak check at each N_FUNC_DEF.  When `verbose_p` is set, prints one line
@@ -3365,7 +3516,7 @@ static void ownership_walk (c2m_ctx_t c2m_ctx, node_t n, int *count, int verbose
      hoisted to module top, but other future nesting patterns may appear)
      are visited and the auto-defer candidate count stays correct. */
   if (n->code == N_FUNC_DEF)
-    analyze_function (c2m_ctx, n);
+    ow_analyze_function (c2m_ctx, n);
 
   if (n->code == N_SPEC_DECL) {
     decl_t d = (decl_t) n->attr;
@@ -3391,17 +3542,20 @@ static void ownership_walk (c2m_ctx_t c2m_ctx, node_t n, int *count, int verbose
 
 /* Entry point: run the ownership analysis over an entire module's AST.
  *
- * Interprocedural iteration: the first pass walks every function with
- * empty summaries and treats unannotated calls as conservative escapes.
- * Subsequent passes re-walk using the summaries the previous pass
- * derived; convergence is detected via `summaries_dirty_p` (set by
- * summary_install whenever a stored summary changes).  Diagnostics are
- * suppressed during inference passes via `ownership_silent_pass_p` so
- * users only see the warnings from the final stable state.
+ * Interprocedural iteration: one silent walk analyzes every function with
+ * empty summaries (unannotated calls default to conservative escapes),
+ * recording which callee summaries each analysis consulted.  Whenever a
+ * summary changes, exactly the recorded dependents are pushed on a
+ * worklist and re-analyzed — a call-graph fixpoint instead of the old
+ * fixed-count whole-module re-walks.  Diagnostics are suppressed during
+ * inference via `ownership_silent_pass_p`; a final walk with diagnostics
+ * enabled replays the analysis under the stable summaries, skipping
+ * functions whose cached verdict is trivial (no candidates, no inline
+ * acquire-return — they can't emit anything).
  *
- * Bounded by OWNERSHIP_MAX_PASSES — most TUs converge in 1-2 inference
- * passes; pathological mutual-recursion cases hit the cap and we accept
- * whatever summaries we have.
+ * The drain is bounded by OWNERSHIP_MAX_PASSES * nfuncs as a termination
+ * safety net; pathological mutual-recursion cases hit the cap and we
+ * accept whatever summaries we have (as before).
  *
  * Returns the number of errors emitted (always 0 today — ownership pass
  * doesn't fail the compile yet). */
@@ -3418,40 +3572,58 @@ static int ownership_run (c2m_ctx_t c2m_ctx, node_t module) {
   report_header_emitted_p = 0;
 
   /* Reset interprocedural state for this TU. */
+  ow_alloc = alloc;
   if (func_summaries == NULL)
     VARR_CREATE (func_summary_t, func_summaries, alloc, 64);
   else
     VARR_TRUNC (func_summary_t, func_summaries, 0);
+  if (ow_funcs == NULL) {
+    VARR_CREATE (ow_funcinfo_t, ow_funcs, alloc, 128);
+    VARR_CREATE (int, ow_worklist, alloc, 64);
+    HTAB_CREATE (ow_fidx_t, ow_fidx_tab, alloc, 512, ow_fidx_hash, ow_fidx_eq, NULL);
+  } else {
+    for (size_t i = 0; i < VARR_LENGTH (ow_funcinfo_t, ow_funcs); i++)
+      VARR_DESTROY (int, VARR_ADDR (ow_funcinfo_t, ow_funcs)[i].dependents);
+    VARR_TRUNC (ow_funcinfo_t, ow_funcs, 0);
+    VARR_TRUNC (int, ow_worklist, 0);
+    HTAB_CLEAR (ow_fidx_t, ow_fidx_tab);
+  }
 
-  /* ---- Interprocedural inference iterations (silent) ---- */
+  /* ---- Inference (silent): one full walk + call-graph worklist drain ---- */
   ownership_silent_pass_p = 1;
-  int converged_p = 0;
-  for (int pass = 0; pass < OWNERSHIP_MAX_PASSES - 1; pass++) {
-    summaries_dirty_p  = 0;
-    summaries_pass_idx = pass;
+  ow_inference_p = 1;
+  summaries_dirty_p = 0;
+  summaries_pass_idx = 0;
+  if (verbose_p) fprintf (stderr, "  [ownership] inference pass (silent)\n");
+  {
     int local_count = 0;
-    if (verbose_p)
-      fprintf (stderr, "  [ownership] inference pass %d (silent)\n", pass);
     ownership_walk (c2m_ctx, module, &local_count, verbose_p);
     count = local_count;
-    /* Convergence: a pass that left every summary unchanged AND saw at
-       least one prior pass means we're stable.  Pass 0 always reports
-       dirty (every summary is new), so we need pass >= 1 before stopping. */
-    if (!summaries_dirty_p && pass >= 1) {
-      if (verbose_p)
-        fprintf (stderr, "  [ownership] converged after %d silent pass%s\n",
-                 pass + 1, pass == 0 ? "" : "es");
-      converged_p = 1;
-      break;
-    }
   }
-  if (!converged_p && verbose_p)
-    fprintf (stderr,
-             "  [ownership] hit OWNERSHIP_MAX_PASSES (%d) without convergence — "
-             "using current summaries\n", OWNERSHIP_MAX_PASSES);
+  {
+    size_t nfuncs = VARR_LENGTH (ow_funcinfo_t, ow_funcs);
+    size_t cap = (size_t) OWNERSHIP_MAX_PASSES * nfuncs + 16; /* termination safety net */
+    size_t reanalyzed = 0;
 
-  /* ---- Final pass: emit diagnostics with stable summaries ---- */
+    summaries_pass_idx = 1;
+    while (VARR_LENGTH (int, ow_worklist) > 0 && reanalyzed < cap) {
+      int idx = VARR_POP (int, ow_worklist);
+
+      VARR_ADDR (ow_funcinfo_t, ow_funcs)[idx].on_worklist_p = 0;
+      ow_analyze_function (c2m_ctx, VARR_GET (ow_funcinfo_t, ow_funcs, idx).func_def);
+      reanalyzed++;
+    }
+    if (verbose_p)
+      fprintf (stderr,
+               "  [ownership] worklist drained: %lu targeted re-analyses (%lu functions)%s\n",
+               (unsigned long) reanalyzed, (unsigned long) nfuncs,
+               VARR_LENGTH (int, ow_worklist) > 0 ? " — hit safety cap" : "");
+  }
+
+  /* ---- Final pass: emit diagnostics with stable summaries.  Cached-trivial
+     functions are skipped (see ow_analyze_function). ---- */
   ownership_silent_pass_p = 0;
+  ow_inference_p = 0;
   summaries_pass_idx = OWNERSHIP_MAX_PASSES;
   if (verbose_p)
     fprintf (stderr, "  [ownership] final pass (diagnostics enabled)\n");

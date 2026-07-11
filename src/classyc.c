@@ -22421,232 +22421,146 @@ static void gen_run_defers (c2m_ctx_t c2m_ctx, size_t from) {
 
 /* ========== Dict runtime call helpers ========== */
 
-static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
+/* ───────── Runtime-helper import declaration ─────────
+   Counterpart of gen_rt_call/gen_rt_call_void below: every runtime helper
+   (dict_*, c2m_str_*, cy_*, _safety_trap) is declared the same way — one
+   proto item plus one import item, both hoisted to the module start so
+   references from any function resolve.  These helpers collapse that
+   boilerplate (each *_ensure_imports below used to hand-write it per
+   helper).
+
+   ARG_SPEC is a space-separated list of parameter names.  Every parameter
+   is I64 (pointers, sizes and ints all pass as I64) unless the name is
+   prefixed with '.', which marks a double (e.g. ".v").  RES_P: 1 -> the
+   helper returns one I64 value, 0 -> void.  PROTO_BASE names the proto
+   item "__<proto_base>_p"; pass NULL to use NAME (it exists only for the
+   few helpers whose historical proto name differs from the import name,
+   e.g. import "setjmp" with proto "__cy_setjmp_p").  MIR interns both the
+   proto name and the parameter names, so the stack buffers here are safe. */
+#define RT_IMPORT_MAX_ARGS 8
+
+/* Import-only variant: used when several imports share one proto
+   (e.g. c2m_str_from_int/uint/bool/char all use __c2m_str_from_i64_p). */
+static MIR_item_t rt_import_item (c2m_ctx_t c2m_ctx, const char *name) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_item_t item = MIR_new_import (c2m_ctx->ctx, name);
+
+  move_item_to_module_start (curr_func->module, item);
+  return item;
+}
+
+static void rt_import (c2m_ctx_t c2m_ctx, const char *name, const char *proto_base,
+                       MIR_item_t *proto, MIR_item_t *item, int res_p, const char *arg_spec) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_module_t module = curr_func->module;
-  MIR_type_t ptr_t = MIR_T_I64; /* DictValue* is a pointer */
-  MIR_var_t vars[3];
+  MIR_type_t res_type = MIR_T_I64;
+  MIR_var_t vars[RT_IMPORT_MAX_ARGS];
+  char names[128], proto_name[128];
+  size_t nargs = 0;
+
+  if (arg_spec != NULL && arg_spec[0] != '\0') {
+    size_t len = strlen (arg_spec);
+
+    assert (len < sizeof (names));
+    memcpy (names, arg_spec, len + 1);
+    for (char *p = names; *p != '\0';) {
+      assert (nargs < RT_IMPORT_MAX_ARGS);
+      vars[nargs].type = MIR_T_I64;
+      if (*p == '.') {
+        vars[nargs].type = MIR_T_D;
+        p++;
+      }
+      vars[nargs].name = p;
+      nargs++;
+      while (*p != '\0' && *p != ' ') p++;
+      while (*p == ' ') *p++ = '\0';
+    }
+  }
+  snprintf (proto_name, sizeof (proto_name), "__%s_p", proto_base != NULL ? proto_base : name);
+  *proto = MIR_new_proto_arr (ctx, proto_name, res_p ? 1 : 0, &res_type, nargs, vars);
+  move_item_to_module_start (curr_func->module, *proto);
+  *item = rt_import_item (c2m_ctx, name);
+}
+
+static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
 
   if (dict_create_object_item != NULL) return; /* already imported */
 
-  /* dict_create_object() -> DictValue*   (no args) */
-  dict_create_object_proto = MIR_new_proto_arr (ctx, "__dict_create_object_p", 1, &ptr_t, 0, NULL);
-  dict_create_object_item = MIR_new_import (ctx, "dict_create_object");
-  move_item_to_module_start (module, dict_create_object_proto);
-  move_item_to_module_start (module, dict_create_object_item);
-
-  /* dict_create_bool(int b) -> DictValue* */
-  vars[0].name = "b"; vars[0].type = MIR_T_I64;
-  dict_create_bool_proto = MIR_new_proto_arr (ctx, "__dict_create_bool_p", 1, &ptr_t, 1, vars);
-  dict_create_bool_item = MIR_new_import (ctx, "dict_create_bool");
-  move_item_to_module_start (module, dict_create_bool_proto);
-  move_item_to_module_start (module, dict_create_bool_item);
-
-  /* dict_create_int64(int64_t n) -> DictValue* */
-  vars[0].name = "n"; vars[0].type = MIR_T_I64;
-  dict_create_int64_proto = MIR_new_proto_arr (ctx, "__dict_create_int64_p", 1, &ptr_t, 1, vars);
-  dict_create_int64_item = MIR_new_import (ctx, "dict_create_int64");
-  move_item_to_module_start (module, dict_create_int64_proto);
-  move_item_to_module_start (module, dict_create_int64_item);
-
-  /* dict_create_number(double n) -> DictValue* */
-  vars[0].name = "n"; vars[0].type = MIR_T_D;
-  dict_create_number_proto = MIR_new_proto_arr (ctx, "__dict_create_number_p", 1, &ptr_t, 1, vars);
-  dict_create_number_item = MIR_new_import (ctx, "dict_create_number");
-  move_item_to_module_start (module, dict_create_number_proto);
-  move_item_to_module_start (module, dict_create_number_item);
-
-  /* dict_create_string(const char *s) -> DictValue* */
-  vars[0].name = "s"; vars[0].type = MIR_T_I64;
-  dict_create_string_proto = MIR_new_proto_arr (ctx, "__dict_create_string_p", 1, &ptr_t, 1, vars);
-  dict_create_string_item = MIR_new_import (ctx, "dict_create_string");
-  move_item_to_module_start (module, dict_create_string_proto);
-  move_item_to_module_start (module, dict_create_string_item);
-
-  /* dict_object_set(DictValue *obj, const char *key, DictValue *val) -> int */
-  MIR_type_t int_t = MIR_T_I64;
-  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
-  vars[1].name = "key"; vars[1].type = MIR_T_I64;
-  vars[2].name = "val"; vars[2].type = MIR_T_I64;
-  dict_object_set_proto = MIR_new_proto_arr (ctx, "__dict_object_set_p", 1, &int_t, 3, vars);
-  dict_object_set_item = MIR_new_import (ctx, "dict_object_set");
-  move_item_to_module_start (module, dict_object_set_proto);
-  move_item_to_module_start (module, dict_object_set_item);
-
-  /* dict_object_get(const DictValue *obj, const char *key) -> DictValue* */
-  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
-  vars[1].name = "key"; vars[1].type = MIR_T_I64;
-  dict_object_get_proto = MIR_new_proto_arr (ctx, "__dict_object_get_p", 1, &ptr_t, 2, vars);
-  dict_object_get_item = MIR_new_import (ctx, "dict_object_get");
-  move_item_to_module_start (module, dict_object_get_proto);
-  move_item_to_module_start (module, dict_object_get_item);
-
-  /* dict_value_copy(const DictValue *src) -> DictValue*  (deep clone) */
-  vars[0].name = "src"; vars[0].type = MIR_T_I64;
-  dict_value_copy_proto = MIR_new_proto_arr (ctx, "__dict_value_copy_p", 1, &ptr_t, 1, vars);
-  dict_value_copy_item = MIR_new_import (ctx, "dict_value_copy");
-  move_item_to_module_start (module, dict_value_copy_proto);
-  move_item_to_module_start (module, dict_value_copy_item);
-
-  /* dict_object_count(const DictValue *obj) -> size_t */
-  MIR_type_t sz_t = MIR_T_I64;
-  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
-  dict_object_count_proto = MIR_new_proto_arr (ctx, "__dict_object_count_p", 1, &sz_t, 1, vars);
-  dict_object_count_item = MIR_new_import (ctx, "dict_object_count");
-  move_item_to_module_start (module, dict_object_count_proto);
-  move_item_to_module_start (module, dict_object_count_item);
-
-  /* dict_object_key_at(const DictValue *obj, size_t index) -> const char* */
-  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
-  vars[1].name = "idx"; vars[1].type = MIR_T_I64;
-  dict_object_key_at_proto = MIR_new_proto_arr (ctx, "__dict_object_key_at_p", 1, &ptr_t, 2, vars);
-  dict_object_key_at_item = MIR_new_import (ctx, "dict_object_key_at");
-  move_item_to_module_start (module, dict_object_key_at_proto);
-  move_item_to_module_start (module, dict_object_key_at_item);
-
-  /* dict_object_value_at(const DictValue *obj, size_t index) -> DictValue* */
-  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
-  vars[1].name = "idx"; vars[1].type = MIR_T_I64;
-  dict_object_value_at_proto = MIR_new_proto_arr (ctx, "__dict_object_value_at_p", 1, &ptr_t, 2, vars);
-  dict_object_value_at_item = MIR_new_import (ctx, "dict_object_value_at");
-  move_item_to_module_start (module, dict_object_value_at_proto);
-  move_item_to_module_start (module, dict_object_value_at_item);
-
-  /* dict_value_at(const DictValue *obj, size_t index) -> DictValue* */
-  vars[0].name = "obj"; vars[0].type = MIR_T_I64;
-  vars[1].name = "idx"; vars[1].type = MIR_T_I64;
-  dict_value_at_proto = MIR_new_proto_arr (ctx, "__dict_value_at_p", 1, &ptr_t, 2, vars);
-  dict_value_at_item = MIR_new_import (ctx, "dict_value_at");
-  move_item_to_module_start (module, dict_value_at_proto);
-  move_item_to_module_start (module, dict_value_at_item);
-
-  /* dict_is_array(const DictValue *d) -> int   (1 iff d->type == DICT_ARRAY) */
-  vars[0].name = "d"; vars[0].type = MIR_T_I64;
-  dict_is_array_proto = MIR_new_proto_arr (ctx, "__dict_is_array_p", 1, &int_t, 1, vars);
-  dict_is_array_item = MIR_new_import (ctx, "dict_is_array");
-  move_item_to_module_start (module, dict_is_array_proto);
-  move_item_to_module_start (module, dict_is_array_item);
-
-  /* dict_iter_count(const DictValue *d) -> size_t
-     Array length for DICT_ARRAY, pair count for DICT_OBJECT, 0 otherwise. */
-  vars[0].name = "d"; vars[0].type = MIR_T_I64;
-  dict_iter_count_proto = MIR_new_proto_arr (ctx, "__dict_iter_count_p", 1, &sz_t, 1, vars);
-  dict_iter_count_item = MIR_new_import (ctx, "dict_iter_count");
-  move_item_to_module_start (module, dict_iter_count_proto);
-  move_item_to_module_start (module, dict_iter_count_item);
-
-  /* dict_create_array() -> DictValue* */
-  dict_create_array_proto = MIR_new_proto_arr (ctx, "__dict_create_array_p", 1, &ptr_t, 0, NULL);
-  dict_create_array_item = MIR_new_import (ctx, "dict_create_array");
-  move_item_to_module_start (module, dict_create_array_proto);
-  move_item_to_module_start (module, dict_create_array_item);
-
-  /* dict_array_append(DictValue *arr, DictValue *val) -> void */
-  vars[0].name = "arr"; vars[0].type = MIR_T_I64;
-  vars[1].name = "val"; vars[1].type = MIR_T_I64;
-  dict_array_append_proto = MIR_new_proto_arr (ctx, "__dict_array_append_p", 0, NULL, 2, vars);
-  dict_array_append_item = MIR_new_import (ctx, "dict_array_append");
-  move_item_to_module_start (module, dict_array_append_proto);
-  move_item_to_module_start (module, dict_array_append_item);
-
-  /* dict_deserialize_json(const char *json) -> DictValue* */
-  vars[0].name = "json"; vars[0].type = MIR_T_I64;
-  dict_deserialize_json_proto = MIR_new_proto_arr (ctx, "__dict_deserialize_json_p", 1, &ptr_t, 1, vars);
-  dict_deserialize_json_item = MIR_new_import (ctx, "dict_deserialize_json");
-  move_item_to_module_start (module, dict_deserialize_json_proto);
-  move_item_to_module_start (module, dict_deserialize_json_item);
-
-  /* dict_serialize_json(const DictValue *val, char *buf, size_t len, int pretty) -> char* */
-  MIR_var_t svars[4];
-  svars[0].name = "val";  svars[0].type = MIR_T_I64;
-  svars[1].name = "buf";  svars[1].type = MIR_T_I64;
-  svars[2].name = "len";  svars[2].type = MIR_T_I64;
-  svars[3].name = "pretty"; svars[3].type = MIR_T_I64;
-  dict_serialize_json_proto = MIR_new_proto_arr (ctx, "__dict_serialize_json_p", 1, &ptr_t, 4, svars);
-  dict_serialize_json_item = MIR_new_import (ctx, "dict_serialize_json");
-  move_item_to_module_start (module, dict_serialize_json_proto);
-  move_item_to_module_start (module, dict_serialize_json_item);
-
-  /* dict_serialize_json_heap(const DictValue *val, int pretty) -> char*
-     Heap-allocating, right-sized variant used by the compiler's `d.json()` /
-     `json(d)` codegen.  The returned pointer is plain-malloc'd; the compiler
-     registers it with the String arena (c2m_str_attach) so the normal scope
-     cleanup / return-protection path manages its lifetime. */
-  {
-    MIR_var_t hvars[2];
-    hvars[0].name = "val";    hvars[0].type = MIR_T_I64;
-    hvars[1].name = "pretty"; hvars[1].type = MIR_T_I64;
-    dict_serialize_json_heap_proto = MIR_new_proto_arr (ctx, "__dict_serialize_json_heap_p",
-                                                        1, &ptr_t, 2, hvars);
-    dict_serialize_json_heap_item = MIR_new_import (ctx, "dict_serialize_json_heap");
-    move_item_to_module_start (module, dict_serialize_json_heap_proto);
-    move_item_to_module_start (module, dict_serialize_json_heap_item);
-  }
-
-  /* dict_destroy(DictValue *val) -> void  — used by `delete d` for dict */
-  vars[0].name = "val"; vars[0].type = MIR_T_I64;
-  dict_destroy_proto = MIR_new_proto_arr (ctx, "__dict_destroy_p", 0, NULL, 1, vars);
-  dict_destroy_item = MIR_new_import (ctx, "dict_destroy");
-  move_item_to_module_start (module, dict_destroy_proto);
-  move_item_to_module_start (module, dict_destroy_item);
-
-  /* dict_create_heap_arena(size_t bytes) -> DictValue*  — used by `new dict(size)` */
-  vars[0].name = "bytes"; vars[0].type = MIR_T_I64;
-  dict_create_heap_arena_proto = MIR_new_proto_arr (ctx, "__dict_create_heap_arena_p", 1, &ptr_t, 1, vars);
-  dict_create_heap_arena_item = MIR_new_import (ctx, "dict_create_heap_arena");
-  move_item_to_module_start (module, dict_create_heap_arena_proto);
-  move_item_to_module_start (module, dict_create_heap_arena_item);
+  /* All DictValue* / char* / size_t / int values pass and return as I64;
+     see include/dict_types.h for the C-level declarations. */
+  rt_import (c2m_ctx, "dict_create_object", NULL, &dict_create_object_proto,
+             &dict_create_object_item, 1, "");
+  rt_import (c2m_ctx, "dict_create_bool", NULL, &dict_create_bool_proto, &dict_create_bool_item,
+             1, "b");
+  rt_import (c2m_ctx, "dict_create_int64", NULL, &dict_create_int64_proto,
+             &dict_create_int64_item, 1, "n");
+  rt_import (c2m_ctx, "dict_create_number", NULL, &dict_create_number_proto,
+             &dict_create_number_item, 1, ".n"); /* takes a double */
+  rt_import (c2m_ctx, "dict_create_string", NULL, &dict_create_string_proto,
+             &dict_create_string_item, 1, "s");
+  rt_import (c2m_ctx, "dict_object_set", NULL, &dict_object_set_proto, &dict_object_set_item, 1,
+             "obj key val");
+  rt_import (c2m_ctx, "dict_object_get", NULL, &dict_object_get_proto, &dict_object_get_item, 1,
+             "obj key");
+  /* dict_value_copy: deep clone */
+  rt_import (c2m_ctx, "dict_value_copy", NULL, &dict_value_copy_proto, &dict_value_copy_item, 1,
+             "src");
+  rt_import (c2m_ctx, "dict_object_count", NULL, &dict_object_count_proto,
+             &dict_object_count_item, 1, "obj");
+  rt_import (c2m_ctx, "dict_object_key_at", NULL, &dict_object_key_at_proto,
+             &dict_object_key_at_item, 1, "obj idx");
+  rt_import (c2m_ctx, "dict_object_value_at", NULL, &dict_object_value_at_proto,
+             &dict_object_value_at_item, 1, "obj idx");
+  rt_import (c2m_ctx, "dict_value_at", NULL, &dict_value_at_proto, &dict_value_at_item, 1,
+             "obj idx");
+  /* dict_is_array: 1 iff d->type == DICT_ARRAY */
+  rt_import (c2m_ctx, "dict_is_array", NULL, &dict_is_array_proto, &dict_is_array_item, 1, "d");
+  /* dict_iter_count: array length for DICT_ARRAY, pair count for DICT_OBJECT, else 0 */
+  rt_import (c2m_ctx, "dict_iter_count", NULL, &dict_iter_count_proto, &dict_iter_count_item, 1,
+             "d");
+  rt_import (c2m_ctx, "dict_create_array", NULL, &dict_create_array_proto,
+             &dict_create_array_item, 1, "");
+  rt_import (c2m_ctx, "dict_array_append", NULL, &dict_array_append_proto,
+             &dict_array_append_item, 0, "arr val");
+  rt_import (c2m_ctx, "dict_deserialize_json", NULL, &dict_deserialize_json_proto,
+             &dict_deserialize_json_item, 1, "json");
+  rt_import (c2m_ctx, "dict_serialize_json", NULL, &dict_serialize_json_proto,
+             &dict_serialize_json_item, 1, "val buf len pretty");
+  /* dict_serialize_json_heap: heap-allocating, right-sized variant used by the
+     compiler's `d.json()` / `json(d)` codegen.  The returned pointer is
+     plain-malloc'd; the compiler registers it with the String arena
+     (c2m_str_attach) so the normal scope cleanup / return-protection path
+     manages its lifetime. */
+  rt_import (c2m_ctx, "dict_serialize_json_heap", NULL, &dict_serialize_json_heap_proto,
+             &dict_serialize_json_heap_item, 1, "val pretty");
+  /* dict_destroy: used by `delete d` for dict */
+  rt_import (c2m_ctx, "dict_destroy", NULL, &dict_destroy_proto, &dict_destroy_item, 0, "val");
+  /* dict_create_heap_arena: used by `new dict(size)` */
+  rt_import (c2m_ctx, "dict_create_heap_arena", NULL, &dict_create_heap_arena_proto,
+             &dict_create_heap_arena_item, 1, "bytes");
 }
 
   /* Exception runtime helpers - lazily imported on first try/throw encountered. */
 static void exception_ensure_imports (c2m_ctx_t c2m_ctx) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
 
   if (cy_exc_throw_item != NULL) return;
 
-  MIR_module_t module = curr_func->module;
-  MIR_type_t ptr_t = MIR_T_I64;
-  MIR_var_t vars[4], one;
-
   /* void *cy_exc_push(void) - push a frame, return a pointer to its jmp_buf. */
-  cy_exc_push_proto = MIR_new_proto_arr (ctx, "__cy_exc_push_p", 1, &ptr_t, 0, NULL);
-  cy_exc_push_item  = MIR_new_import (ctx, "cy_exc_push");
-  move_item_to_module_start (module, cy_exc_push_proto);
-  move_item_to_module_start (module, cy_exc_push_item);
-
+  rt_import (c2m_ctx, "cy_exc_push", NULL, &cy_exc_push_proto, &cy_exc_push_item, 1, "");
   /* void cy_exc_pop(void) - unwind one frame. */
-  cy_exc_pop_proto = MIR_new_proto_arr (ctx, "__cy_exc_pop_p", 0, NULL, 0, NULL);
-  cy_exc_pop_item  = MIR_new_import (ctx, "cy_exc_pop");
-  move_item_to_module_start (module, cy_exc_pop_proto);
-  move_item_to_module_start (module, cy_exc_pop_item);
-
+  rt_import (c2m_ctx, "cy_exc_pop", NULL, &cy_exc_pop_proto, &cy_exc_pop_item, 0, "");
   /* void *cy_exc_current(void) - pointer to the current exception record. */
-  cy_exc_current_proto = MIR_new_proto_arr (ctx, "__cy_exc_current_p", 1, &ptr_t, 0, NULL);
-  cy_exc_current_item  = MIR_new_import (ctx, "cy_exc_current");
-  move_item_to_module_start (module, cy_exc_current_proto);
-  move_item_to_module_start (module, cy_exc_current_item);
-
+  rt_import (c2m_ctx, "cy_exc_current", NULL, &cy_exc_current_proto, &cy_exc_current_item, 1, "");
   /* void cy_exc_throw(unsigned id, const char *msg, const char *file, int line)
      records the exception and longjmps to the innermost frame (never returns). */
-  vars[0].name = "id";   vars[0].type = MIR_T_I64;
-  vars[1].name = "msg";  vars[1].type = ptr_t;
-  vars[2].name = "file"; vars[2].type = ptr_t;
-  vars[3].name = "line"; vars[3].type = MIR_T_I64;
-  cy_exc_throw_proto = MIR_new_proto_arr (ctx, "__cy_exc_throw_p", 0, NULL, 4, vars);
-  cy_exc_throw_item  = MIR_new_import (ctx, "cy_exc_throw");
-  move_item_to_module_start (module, cy_exc_throw_proto);
-  move_item_to_module_start (module, cy_exc_throw_item);
-
+  rt_import (c2m_ctx, "cy_exc_throw", NULL, &cy_exc_throw_proto, &cy_exc_throw_item, 0,
+             "id msg file line");
   /* int setjmp(void *buf) - libc; emitted inline in the try-containing function
      so it captures that frame.  Declared to return a 64-bit value (the int
      result is zero/sign-extended in the return register on supported ABIs). */
-  one.name = "buf"; one.type = ptr_t;
-  cy_setjmp_proto = MIR_new_proto_arr (ctx, "__cy_setjmp_p", 1, &ptr_t, 1, &one);
-  cy_setjmp_item  = MIR_new_import (ctx, "setjmp");
-  move_item_to_module_start (module, cy_setjmp_proto);
-  move_item_to_module_start (module, cy_setjmp_item);
+  rt_import (c2m_ctx, "setjmp", "cy_setjmp", &cy_setjmp_proto, &cy_setjmp_item, 1, "buf");
 }
 
 /* Emit cy_exc_throw(id, msg, file, line).  Never returns (it longjmps or
@@ -22677,50 +22591,21 @@ static void gen_exception_throw_call (c2m_ctx_t c2m_ctx,
 
 static void safety_ensure_imports (c2m_ctx_t c2m_ctx) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_var_t vars[3];
+
   if (safety_trap_item != NULL) return;
   exception_ensure_imports (c2m_ctx); /* also pull in cy_exc_* */
-  MIR_module_t module = curr_func->module;
-  vars[0].name = "reason";  vars[0].type = MIR_T_I64;
-  vars[1].name = "file_id"; vars[1].type = MIR_T_I64;
-  vars[2].name = "line";    vars[2].type = MIR_T_I64;
-  safety_trap_proto = MIR_new_proto_arr (ctx, "__safety_trap_p", 0, NULL, 3, vars);
-  safety_trap_item  = MIR_new_import (ctx, "_safety_trap");
-  move_item_to_module_start (module, safety_trap_proto);
-  move_item_to_module_start (module, safety_trap_item);
-
+  /* void _safety_trap(long reason, long file_id, long line) */
+  rt_import (c2m_ctx, "_safety_trap", "safety_trap", &safety_trap_proto, &safety_trap_item, 0,
+             "reason file_id line");
   /* void *cy_safe_alloc(uint64_t size) */
-  {
-    MIR_type_t ret_t = MIR_T_I64;
-    MIR_var_t v; v.name = "size"; v.type = MIR_T_I64;
-    cy_safe_alloc_proto = MIR_new_proto_arr (ctx, "__cy_safe_alloc_p", 1, &ret_t, 1, &v);
-    cy_safe_alloc_item  = MIR_new_import (ctx, "cy_safe_alloc");
-    move_item_to_module_start (module, cy_safe_alloc_proto);
-    move_item_to_module_start (module, cy_safe_alloc_item);
-  }
-
+  rt_import (c2m_ctx, "cy_safe_alloc", NULL, &cy_safe_alloc_proto, &cy_safe_alloc_item, 1,
+             "size");
   /* void cy_safe_free(void *ptr, long line) */
-  {
-    MIR_var_t vs[2];
-    vs[0].name = "ptr";  vs[0].type = MIR_T_I64;
-    vs[1].name = "line"; vs[1].type = MIR_T_I64;
-    cy_safe_free_proto = MIR_new_proto_arr (ctx, "__cy_safe_free_p", 0, NULL, 2, vs);
-    cy_safe_free_item  = MIR_new_import (ctx, "cy_safe_free");
-    move_item_to_module_start (module, cy_safe_free_proto);
-    move_item_to_module_start (module, cy_safe_free_item);
-  }
-
+  rt_import (c2m_ctx, "cy_safe_free", NULL, &cy_safe_free_proto, &cy_safe_free_item, 0,
+             "ptr line");
   /* void cy_safe_deref(void *ptr, long line) */
-  {
-    MIR_var_t vs[2];
-    vs[0].name = "ptr";  vs[0].type = MIR_T_I64;
-    vs[1].name = "line"; vs[1].type = MIR_T_I64;
-    cy_safe_deref_proto = MIR_new_proto_arr (ctx, "__cy_safe_deref_p", 0, NULL, 2, vs);
-    cy_safe_deref_item  = MIR_new_import (ctx, "cy_safe_deref");
-    move_item_to_module_start (module, cy_safe_deref_proto);
-    move_item_to_module_start (module, cy_safe_deref_item);
-  }
+  rt_import (c2m_ctx, "cy_safe_deref", NULL, &cy_safe_deref_proto, &cy_safe_deref_item, 0,
+             "ptr line");
 }
 
 /* Guard: if ptr_op == 0 (NULL), call _safety_trap(2, 0, line).
@@ -22864,34 +22749,17 @@ static void gen_class_deref_check (c2m_ctx_t c2m_ctx, op_t ptr_op, long line) {
    cy_obj_check verifies liveness before an ownership-CHECK dereference. */
 static void object_guard_ensure_imports (c2m_ctx_t c2m_ctx) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_var_t vs[2];
+
   if (cy_obj_check_item != NULL) return;
   exception_ensure_imports (c2m_ctx); /* cy_obj_* may throw via cy_exc_throw */
-  MIR_module_t module = curr_func->module;
-
   /* void cy_obj_track(void *ptr) */
-  vs[0].name = "ptr"; vs[0].type = MIR_T_I64;
-  cy_obj_track_proto = MIR_new_proto_arr (ctx, "__cy_obj_track_p", 0, NULL, 1, vs);
-  cy_obj_track_item  = MIR_new_import (ctx, "cy_obj_track");
-  move_item_to_module_start (module, cy_obj_track_proto);
-  move_item_to_module_start (module, cy_obj_track_item);
-
+  rt_import (c2m_ctx, "cy_obj_track", NULL, &cy_obj_track_proto, &cy_obj_track_item, 0, "ptr");
   /* void cy_obj_note_free(void *ptr, long line) */
-  vs[0].name = "ptr";  vs[0].type = MIR_T_I64;
-  vs[1].name = "line"; vs[1].type = MIR_T_I64;
-  cy_obj_note_free_proto = MIR_new_proto_arr (ctx, "__cy_obj_note_free_p", 0, NULL, 2, vs);
-  cy_obj_note_free_item  = MIR_new_import (ctx, "cy_obj_note_free");
-  move_item_to_module_start (module, cy_obj_note_free_proto);
-  move_item_to_module_start (module, cy_obj_note_free_item);
-
+  rt_import (c2m_ctx, "cy_obj_note_free", NULL, &cy_obj_note_free_proto, &cy_obj_note_free_item,
+             0, "ptr line");
   /* void cy_obj_check(void *ptr, long line) */
-  vs[0].name = "ptr";  vs[0].type = MIR_T_I64;
-  vs[1].name = "line"; vs[1].type = MIR_T_I64;
-  cy_obj_check_proto = MIR_new_proto_arr (ctx, "__cy_obj_check_p", 0, NULL, 2, vs);
-  cy_obj_check_item  = MIR_new_import (ctx, "cy_obj_check");
-  move_item_to_module_start (module, cy_obj_check_proto);
-  move_item_to_module_start (module, cy_obj_check_item);
+  rt_import (c2m_ctx, "cy_obj_check", NULL, &cy_obj_check_proto, &cy_obj_check_item, 0,
+             "ptr line");
 }
 
 /* cy_obj_track(ptr) — register a freshly `new`-allocated object as live. */
@@ -23750,218 +23618,67 @@ static void string_ensure_imports (c2m_ctx_t c2m_ctx) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
   MIR_module_t module = curr_func->module;
-  MIR_type_t ptr_t = MIR_T_I64; /* char* / size_t / int64_t all pass as I64 */
-  MIR_var_t vars[4];
 
   if (str_length_item != NULL) return; /* already imported */
 
-  /* size_t c2m_str_length(const char *s) */
-  vars[0].name = "s"; vars[0].type = MIR_T_I64;
-  str_length_proto = MIR_new_proto_arr (ctx, "__c2m_str_length_p", 1, &ptr_t, 1, vars);
-  str_length_item = MIR_new_import (ctx, "c2m_str_length");
-  move_item_to_module_start (module, str_length_proto);
-  move_item_to_module_start (module, str_length_item);
-
-  /* int64_t c2m_str_empty(const char *s) */
-  vars[0].name = "s"; vars[0].type = MIR_T_I64;
-  str_empty_proto = MIR_new_proto_arr (ctx, "__c2m_str_empty_p", 1, &ptr_t, 1, vars);
-  str_empty_item = MIR_new_import (ctx, "c2m_str_empty");
-  move_item_to_module_start (module, str_empty_proto);
-  move_item_to_module_start (module, str_empty_item);
-
-  /* char *c2m_str_substr(const char *s, ssize_t pos, ssize_t len) */
-    vars[0].name = "s";   vars[0].type = MIR_T_I64;
-    vars[1].name = "pos"; vars[1].type = MIR_T_I64;
-    vars[2].name = "len"; vars[2].type = MIR_T_I64;
-    str_substr_proto = MIR_new_proto_arr (ctx, "__c2m_str_substr_p", 1, &ptr_t, 3, vars);
-  str_substr_item = MIR_new_import (ctx, "c2m_str_substr");
-  move_item_to_module_start (module, str_substr_proto);
-  move_item_to_module_start (module, str_substr_item);
-
-  /* size_t c2m_str_find(const char *s, const char *needle) */
-  vars[0].name = "s";      vars[0].type = MIR_T_I64;
-  vars[1].name = "needle"; vars[1].type = MIR_T_I64;
-  str_find_proto = MIR_new_proto_arr (ctx, "__c2m_str_find_p", 1, &ptr_t, 2, vars);
-  str_find_item = MIR_new_import (ctx, "c2m_str_find");
-  move_item_to_module_start (module, str_find_proto);
-  move_item_to_module_start (module, str_find_item);
-
-  /* char *c2m_str_replace(const char *s, ssize_t pos, ssize_t len, const char *repl) */
-    vars[0].name = "s";    vars[0].type = MIR_T_I64;
-    vars[1].name = "pos";  vars[1].type = MIR_T_I64;
-    vars[2].name = "len";  vars[2].type = MIR_T_I64;
-    vars[3].name = "repl"; vars[3].type = MIR_T_I64;
-    str_replace_proto = MIR_new_proto_arr (ctx, "__c2m_str_replace_p", 1, &ptr_t, 4, vars);
-  str_replace_item = MIR_new_import (ctx, "c2m_str_replace");
-  move_item_to_module_start (module, str_replace_proto);
-  move_item_to_module_start (module, str_replace_item);
-
-  /* char *c2m_str_replace_all(const char *s, const char *needle, const char *repl) */
-  vars[0].name = "s";      vars[0].type = MIR_T_I64;
-  vars[1].name = "needle"; vars[1].type = MIR_T_I64;
-  vars[2].name = "repl";   vars[2].type = MIR_T_I64;
-  str_replace_all_proto = MIR_new_proto_arr (ctx, "__c2m_str_replace_all_p", 1, &ptr_t, 3, vars);
-  str_replace_all_item = MIR_new_import (ctx, "c2m_str_replace_all");
-  move_item_to_module_start (module, str_replace_all_proto);
-  move_item_to_module_start (module, str_replace_all_item);
-
-  /* char *c2m_str_upper(const char *s) */
-  vars[0].name = "s"; vars[0].type = MIR_T_I64;
-  str_upper_proto = MIR_new_proto_arr (ctx, "__c2m_str_upper_p", 1, &ptr_t, 1, vars);
-  str_upper_item = MIR_new_import (ctx, "c2m_str_upper");
-  move_item_to_module_start (module, str_upper_proto);
-  move_item_to_module_start (module, str_upper_item);
-
-  /* char *c2m_str_lower(const char *s) */
-  vars[0].name = "s"; vars[0].type = MIR_T_I64;
-  str_lower_proto = MIR_new_proto_arr (ctx, "__c2m_str_lower_p", 1, &ptr_t, 1, vars);
-  str_lower_item = MIR_new_import (ctx, "c2m_str_lower");
-  move_item_to_module_start (module, str_lower_proto);
-  move_item_to_module_start (module, str_lower_item);
-
-  /* int64_t c2m_str_starts_with(const char *s, const char *prefix) */
-  vars[0].name = "s";      vars[0].type = MIR_T_I64;
-  vars[1].name = "prefix"; vars[1].type = MIR_T_I64;
-  str_starts_with_proto = MIR_new_proto_arr (ctx, "__c2m_str_starts_with_p", 1, &ptr_t, 2, vars);
-  str_starts_with_item = MIR_new_import (ctx, "c2m_str_starts_with");
-  move_item_to_module_start (module, str_starts_with_proto);
-  move_item_to_module_start (module, str_starts_with_item);
-
-  /* int64_t c2m_str_ends_with(const char *s, const char *suffix) */
-  vars[0].name = "s";      vars[0].type = MIR_T_I64;
-  vars[1].name = "suffix"; vars[1].type = MIR_T_I64;
-  str_ends_with_proto = MIR_new_proto_arr (ctx, "__c2m_str_ends_with_p", 1, &ptr_t, 2, vars);
-  str_ends_with_item = MIR_new_import (ctx, "c2m_str_ends_with");
-  move_item_to_module_start (module, str_ends_with_proto);
-  move_item_to_module_start (module, str_ends_with_item);
-
-  /* int64_t c2m_str_contains(const char *s, const char *needle) */
-  vars[0].name = "s";      vars[0].type = MIR_T_I64;
-  vars[1].name = "needle"; vars[1].type = MIR_T_I64;
-  str_contains_proto = MIR_new_proto_arr (ctx, "__c2m_str_contains_p", 1, &ptr_t, 2, vars);
-  str_contains_item = MIR_new_import (ctx, "c2m_str_contains");
-  move_item_to_module_start (module, str_contains_proto);
-  move_item_to_module_start (module, str_contains_item);
-
-  /* char *c2m_str_trim(const char *s) */
-  vars[0].name = "s"; vars[0].type = MIR_T_I64;
-  str_trim_proto = MIR_new_proto_arr (ctx, "__c2m_str_trim_p", 1, &ptr_t, 1, vars);
-  str_trim_item = MIR_new_import (ctx, "c2m_str_trim");
-  move_item_to_module_start (module, str_trim_proto);
-  move_item_to_module_start (module, str_trim_item);
-
-  /* void *c2m_str_split(const char *s, const char *delim) -> List<String>* */
-  vars[0].name = "s";     vars[0].type = MIR_T_I64;
-  vars[1].name = "delim"; vars[1].type = MIR_T_I64;
-  str_split_proto = MIR_new_proto_arr (ctx, "__c2m_str_split_p", 1, &ptr_t, 2, vars);
-  str_split_item = MIR_new_import (ctx, "c2m_str_split");
-  move_item_to_module_start (module, str_split_proto);
-  move_item_to_module_start (module, str_split_item);
-
-  /* char *c2m_str_join(void *list, const char *delim) -- List<String>* receiver as opaque ptr */
-  vars[0].name = "list";  vars[0].type = MIR_T_I64;
-  vars[1].name = "delim"; vars[1].type = MIR_T_I64;
-  str_join_proto = MIR_new_proto_arr (ctx, "__c2m_str_join_p", 1, &ptr_t, 2, vars);
-  str_join_item = MIR_new_import (ctx, "c2m_str_join");
-  move_item_to_module_start (module, str_join_proto);
-  move_item_to_module_start (module, str_join_item);
-
-  /* int64_t c2m_str_equals(const char *s, const char *other) */
-  vars[0].name = "s";     vars[0].type = MIR_T_I64;
-  vars[1].name = "other"; vars[1].type = MIR_T_I64;
-  str_equals_proto = MIR_new_proto_arr (ctx, "__c2m_str_equals_p", 1, &ptr_t, 2, vars);
-  str_equals_item = MIR_new_import (ctx, "c2m_str_equals");
-  move_item_to_module_start (module, str_equals_proto);
-  move_item_to_module_start (module, str_equals_item);
-
-  /* char *c2m_str_detach(const char *s) */
-  vars[0].name = "s"; vars[0].type = MIR_T_I64;
-  str_detach_proto = MIR_new_proto_arr (ctx, "__c2m_str_detach_p", 1, &ptr_t, 1, vars);
-  str_detach_item = MIR_new_import (ctx, "c2m_str_detach");
-  move_item_to_module_start (module, str_detach_proto);
-  move_item_to_module_start (module, str_detach_item);
-
-  /* char *c2m_str_own(const char *s) -- fresh untracked owned heap copy */
-  vars[0].name = "s"; vars[0].type = MIR_T_I64;
-  str_own_proto = MIR_new_proto_arr (ctx, "__c2m_str_own_p", 1, &ptr_t, 1, vars);
-  str_own_item = MIR_new_import (ctx, "c2m_str_own");
-  move_item_to_module_start (module, str_own_proto);
-  move_item_to_module_start (module, str_own_item);
-
-  /* void c2m_str_drop(const char *s) -- free an object-owned String field */
-  vars[0].name = "s"; vars[0].type = MIR_T_I64;
-  str_drop_proto = MIR_new_proto_arr (ctx, "__c2m_str_drop_p", 0, NULL, 1, vars);
-  str_drop_item = MIR_new_import (ctx, "c2m_str_drop");
-  move_item_to_module_start (module, str_drop_proto);
-  move_item_to_module_start (module, str_drop_item);
-
-  /* char *c2m_str_attach(const char *s) */
-  vars[0].name = "s"; vars[0].type = MIR_T_I64;
-  str_attach_proto = MIR_new_proto_arr (ctx, "__c2m_str_attach_p", 1, &ptr_t, 1, vars);
-  str_attach_item = MIR_new_import (ctx, "c2m_str_attach");
-  move_item_to_module_start (module, str_attach_proto);
-  move_item_to_module_start (module, str_attach_item);
-
-  /* size_t c2m_str_checkpoint(void) */
-  str_checkpoint_proto = MIR_new_proto_arr (ctx, "__c2m_str_checkpoint_p", 1, &ptr_t, 0, NULL);
-  str_checkpoint_item = MIR_new_import (ctx, "c2m_str_checkpoint");
-  move_item_to_module_start (module, str_checkpoint_proto);
-  move_item_to_module_start (module, str_checkpoint_item);
-
-  /* void c2m_str_release_to(size_t mark) */
-  vars[0].name = "mark"; vars[0].type = MIR_T_I64;
-  str_release_to_proto = MIR_new_proto_arr (ctx, "__c2m_str_release_to_p", 0, NULL, 1, vars);
-  str_release_to_item = MIR_new_import (ctx, "c2m_str_release_to");
-  move_item_to_module_start (module, str_release_to_proto);
-  move_item_to_module_start (module, str_release_to_item);
-
-  /* void *c2m_str_release_keeping(size_t mark, void *keep)  (result ignored) */
-  vars[0].name = "mark"; vars[0].type = MIR_T_I64;
-  vars[1].name = "keep"; vars[1].type = MIR_T_I64;
-  str_release_keeping_proto
-    = MIR_new_proto_arr (ctx, "__c2m_str_release_keeping_p", 0, NULL, 2, vars);
-	  str_release_keeping_item = MIR_new_import (ctx, "c2m_str_release_keeping");
-	  move_item_to_module_start (module, str_release_keeping_proto);
-	  move_item_to_module_start (module, str_release_keeping_item);
-
-	  /* char *c2m_str_copy(const char *p, int64_t len) */
-	  vars[0].name = "p";   vars[0].type = MIR_T_I64;
-	  vars[1].name = "len"; vars[1].type = MIR_T_I64;
-	  str_copy_proto = MIR_new_proto_arr (ctx, "__c2m_str_copy_p", 1, &ptr_t, 2, vars);
-	  str_copy_item = MIR_new_import (ctx, "c2m_str_copy");
-	  move_item_to_module_start (module, str_copy_proto);
-	  move_item_to_module_start (module, str_copy_item);
-
-	  /* char *c2m_str_concat(const char *a, const char *b) */
-  vars[0].name = "a"; vars[0].type = MIR_T_I64;
-  vars[1].name = "b"; vars[1].type = MIR_T_I64;
-  str_concat_proto = MIR_new_proto_arr (ctx, "__c2m_str_concat_p", 1, &ptr_t, 2, vars);
-  str_concat_item = MIR_new_import (ctx, "c2m_str_concat");
-  move_item_to_module_start (module, str_concat_proto);
-  move_item_to_module_start (module, str_concat_item);
+  /* char* / size_t / int64_t all pass and return as I64.  See
+     src/mir-aot-runtime.c and the String arena runtime for definitions. */
+  rt_import (c2m_ctx, "c2m_str_length", NULL, &str_length_proto, &str_length_item, 1, "s");
+  rt_import (c2m_ctx, "c2m_str_empty", NULL, &str_empty_proto, &str_empty_item, 1, "s");
+  rt_import (c2m_ctx, "c2m_str_substr", NULL, &str_substr_proto, &str_substr_item, 1,
+             "s pos len");
+  rt_import (c2m_ctx, "c2m_str_find", NULL, &str_find_proto, &str_find_item, 1, "s needle");
+  rt_import (c2m_ctx, "c2m_str_replace", NULL, &str_replace_proto, &str_replace_item, 1,
+             "s pos len repl");
+  rt_import (c2m_ctx, "c2m_str_replace_all", NULL, &str_replace_all_proto, &str_replace_all_item,
+             1, "s needle repl");
+  rt_import (c2m_ctx, "c2m_str_upper", NULL, &str_upper_proto, &str_upper_item, 1, "s");
+  rt_import (c2m_ctx, "c2m_str_lower", NULL, &str_lower_proto, &str_lower_item, 1, "s");
+  rt_import (c2m_ctx, "c2m_str_starts_with", NULL, &str_starts_with_proto, &str_starts_with_item,
+             1, "s prefix");
+  rt_import (c2m_ctx, "c2m_str_ends_with", NULL, &str_ends_with_proto, &str_ends_with_item, 1,
+             "s suffix");
+  rt_import (c2m_ctx, "c2m_str_contains", NULL, &str_contains_proto, &str_contains_item, 1,
+             "s needle");
+  rt_import (c2m_ctx, "c2m_str_trim", NULL, &str_trim_proto, &str_trim_item, 1, "s");
+  /* c2m_str_split returns List<String>*; c2m_str_join takes it as opaque ptr. */
+  rt_import (c2m_ctx, "c2m_str_split", NULL, &str_split_proto, &str_split_item, 1, "s delim");
+  rt_import (c2m_ctx, "c2m_str_join", NULL, &str_join_proto, &str_join_item, 1, "list delim");
+  rt_import (c2m_ctx, "c2m_str_equals", NULL, &str_equals_proto, &str_equals_item, 1, "s other");
+  rt_import (c2m_ctx, "c2m_str_detach", NULL, &str_detach_proto, &str_detach_item, 1, "s");
+  /* c2m_str_own: fresh untracked owned heap copy */
+  rt_import (c2m_ctx, "c2m_str_own", NULL, &str_own_proto, &str_own_item, 1, "s");
+  /* c2m_str_drop: free an object-owned String field */
+  rt_import (c2m_ctx, "c2m_str_drop", NULL, &str_drop_proto, &str_drop_item, 0, "s");
+  rt_import (c2m_ctx, "c2m_str_attach", NULL, &str_attach_proto, &str_attach_item, 1, "s");
+  rt_import (c2m_ctx, "c2m_str_checkpoint", NULL, &str_checkpoint_proto, &str_checkpoint_item, 1,
+             "");
+  rt_import (c2m_ctx, "c2m_str_release_to", NULL, &str_release_to_proto, &str_release_to_item, 0,
+             "mark");
+  /* c2m_str_release_keeping returns the kept pointer; the result is ignored. */
+  rt_import (c2m_ctx, "c2m_str_release_keeping", NULL, &str_release_keeping_proto,
+             &str_release_keeping_item, 0, "mark keep");
+  rt_import (c2m_ctx, "c2m_str_copy", NULL, &str_copy_proto, &str_copy_item, 1, "p len");
+  rt_import (c2m_ctx, "c2m_str_concat", NULL, &str_concat_proto, &str_concat_item, 1, "a b");
 
   /* char *c2m_str_from_int/uint/bool/char(int64_t v) — one shared proto. */
-  vars[0].name = "v"; vars[0].type = MIR_T_I64;
-  str_from_i64_proto = MIR_new_proto_arr (ctx, "__c2m_str_from_i64_p", 1, &ptr_t, 1, vars);
-  move_item_to_module_start (module, str_from_i64_proto);
-  str_from_int_item = MIR_new_import (ctx, "c2m_str_from_int");
-  move_item_to_module_start (module, str_from_int_item);
-  str_from_uint_item = MIR_new_import (ctx, "c2m_str_from_uint");
-  move_item_to_module_start (module, str_from_uint_item);
-  str_from_bool_item = MIR_new_import (ctx, "c2m_str_from_bool");
-  move_item_to_module_start (module, str_from_bool_item);
-  str_from_char_item = MIR_new_import (ctx, "c2m_str_from_char");
-  move_item_to_module_start (module, str_from_char_item);
+  {
+    MIR_type_t i64_t = MIR_T_I64;
+    MIR_var_t v;
+
+    v.name = "v";
+    v.type = MIR_T_I64;
+    str_from_i64_proto = MIR_new_proto_arr (ctx, "__c2m_str_from_i64_p", 1, &i64_t, 1, &v);
+    move_item_to_module_start (module, str_from_i64_proto);
+    str_from_int_item = rt_import_item (c2m_ctx, "c2m_str_from_int");
+    str_from_uint_item = rt_import_item (c2m_ctx, "c2m_str_from_uint");
+    str_from_bool_item = rt_import_item (c2m_ctx, "c2m_str_from_bool");
+    str_from_char_item = rt_import_item (c2m_ctx, "c2m_str_from_char");
+  }
 
   /* char *c2m_str_from_double(double v) */
-  {
-    MIR_var_t dvars[1];
-    dvars[0].name = "v"; dvars[0].type = MIR_T_D;
-    str_from_double_proto = MIR_new_proto_arr (ctx, "__c2m_str_from_double_p", 1, &ptr_t, 1, dvars);
-    move_item_to_module_start (module, str_from_double_proto);
-    str_from_double_item = MIR_new_import (ctx, "c2m_str_from_double");
-    move_item_to_module_start (module, str_from_double_item);
-  }
+  rt_import (c2m_ctx, "c2m_str_from_double", NULL, &str_from_double_proto, &str_from_double_item,
+             1, ".v");
 }
 
 /* Emit: res = c2m_str_concat(a, b).  Both operands are char* (I64). */
@@ -24176,32 +23893,17 @@ static void gen_class_string_members_drop (c2m_ctx_t c2m_ctx, MIR_op_t obj_ptr_o
    normal extern path. */
 static void object_ensure_imports (c2m_ctx_t c2m_ctx) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
-  MIR_module_t module = curr_func->module;
-  MIR_type_t ptr_t = MIR_T_I64;
-  MIR_var_t vars[1];
 
   if (obj_checkpoint_item != NULL) return;
 
   /* size_t c2m_obj_checkpoint(void) */
-  obj_checkpoint_proto = MIR_new_proto_arr (ctx, "__c2m_obj_checkpoint_p", 1, &ptr_t, 0, NULL);
-  obj_checkpoint_item = MIR_new_import (ctx, "c2m_obj_checkpoint");
-  move_item_to_module_start (module, obj_checkpoint_proto);
-  move_item_to_module_start (module, obj_checkpoint_item);
-
+  rt_import (c2m_ctx, "c2m_obj_checkpoint", NULL, &obj_checkpoint_proto, &obj_checkpoint_item, 1,
+             "");
   /* void c2m_obj_release_to(size_t mark) */
-  vars[0].name = "mark"; vars[0].type = MIR_T_I64;
-  obj_release_to_proto = MIR_new_proto_arr (ctx, "__c2m_obj_release_to_p", 0, NULL, 1, vars);
-  obj_release_to_item = MIR_new_import (ctx, "c2m_obj_release_to");
-  move_item_to_module_start (module, obj_release_to_proto);
-  move_item_to_module_start (module, obj_release_to_item);
-
+  rt_import (c2m_ctx, "c2m_obj_release_to", NULL, &obj_release_to_proto, &obj_release_to_item, 0,
+             "mark");
   /* void *c2m_obj_detach(void *p)  (result ignored) */
-  vars[0].name = "p"; vars[0].type = MIR_T_I64;
-  obj_detach_proto = MIR_new_proto_arr (ctx, "__c2m_obj_detach_p", 1, &ptr_t, 1, vars);
-  obj_detach_item = MIR_new_import (ctx, "c2m_obj_detach");
-  move_item_to_module_start (module, obj_detach_proto);
-  move_item_to_module_start (module, obj_detach_item);
+  rt_import (c2m_ctx, "c2m_obj_detach", NULL, &obj_detach_proto, &obj_detach_item, 1, "p");
 }
 
 /* c2m_obj_detach(p) : remove p from the object arena without destroying it, so a
