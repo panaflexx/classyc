@@ -11155,6 +11155,12 @@ static struct type *create_class_type (c2m_ctx_t c2m_ctx, node_t class_node) {
   return t;
 }
 
+/* Forward: defined with the other symbol helpers. */
+static node_t find_def (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, node_t scope,
+                        node_t *aux_node);
+static node_t find_class_dtor_def (c2m_ctx_t c2m_ctx, node_t class_def);
+static int class_has_dtor_p (c2m_ctx_t c2m_ctx, struct type *type);
+
 /* Zero-initialize a decl_spec struct with sensible defaults. */
 static void init_decl_spec (struct decl_spec *ds) {
   ds->typedef_p = ds->extern_p = ds->static_p = FALSE;
@@ -11413,6 +11419,54 @@ static node_t find_def (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, nod
       return sym.def_node;
     }
   }
+}
+
+/* Look up the user destructor `__dtor_<ClassName>` for a class tag, or NULL.
+   Safe in both check and gen: prefers top_scope (where ctors/dtors are
+   mirrored), then curr_scope when a check context is live. */
+static node_t find_class_dtor_def (c2m_ctx_t c2m_ctx, node_t class_def) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
+  node_t cid;
+  char dtor_name[320];
+  node_t dtor_id, def;
+
+  if (class_def == NULL || class_def->code != N_CLASS) return NULL;
+  cid = TAG_ID (class_def);
+  if (cid == NULL || cid->code != N_ID || cid->u.s.s == NULL) return NULL;
+  snprintf (dtor_name, sizeof (dtor_name), "__dtor_%s", cid->u.s.s);
+  dtor_id = build_id (c2m_ctx, dtor_name, POS (class_def));
+  if (check_ctx != NULL && top_scope != NULL) {
+    def = find_def (c2m_ctx, S_REGULAR, dtor_id, top_scope, NULL);
+    if (def != NULL && def->code == N_FUNC_DEF) return def;
+  }
+  if (check_ctx != NULL && curr_scope != NULL) {
+    def = find_def (c2m_ctx, S_REGULAR, dtor_id, curr_scope, NULL);
+    if (def != NULL && def->code == N_FUNC_DEF) return def;
+  }
+  return NULL;
+}
+
+/* TRUE iff TYPE is a by-value class that owns resources via a user destructor. */
+static int class_has_dtor_p (c2m_ctx_t c2m_ctx, struct type *type) {
+  if (type == NULL || type->mode != TM_CLASS || type->u.tag_type == NULL) return FALSE;
+  return find_class_dtor_def (c2m_ctx, type->u.tag_type) != NULL;
+}
+
+/* TRUE for monomorphized List/Map/Set specializations (`__generic_List_int`,
+   `__generic_Map_String_int`, …).  These own a heap buffer; shallow assign/
+   copy-init aliases the buffer and double-frees.  Ordinary by-value classes
+   with dtors (element types like LapSample) are NOT covered — List internals
+   freely assign those. */
+static int class_is_move_only_collection_p (c2m_ctx_t c2m_ctx, struct type *type) {
+  node_t cid;
+  const char *nm;
+  if (!class_has_dtor_p (c2m_ctx, type)) return FALSE;
+  cid = TAG_ID (type->u.tag_type);
+  if (cid == NULL || cid->code != N_ID || cid->u.s.s == NULL) return FALSE;
+  nm = cid->u.s.s;
+  return (strncmp (nm, "__generic_List_", 15) == 0
+          || strncmp (nm, "__generic_Map_", 14) == 0
+          || strncmp (nm, "__generic_Set_", 14) == 0);
 }
 
 static node_t process_tag (c2m_ctx_t c2m_ctx, node_t r, node_t id, node_t decl_list) {
@@ -14521,7 +14575,11 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
          initializer is a call whose callee is the class name.  We lower it to
          the same in-place `c.__ctor_C(args)` method call (constructing directly
          into the variable's storage -- no temporary, no by-value return) and
-         then neutralize the initializer so gen takes the RAII ctor path. */
+         then neutralize the initializer so gen takes the RAII ctor path.
+
+         Classes with a user destructor are move-only for init/assign: a plain
+         copy would shallow-copy the object and double-free on both dtors.  Allow
+         only default construction, ClassName(args), or `move other`. */
       if (decl_node->code == N_SPEC_DECL && declarator->code == N_DECL && id != NULL
           && id->code == N_ID && scope != NULL && scope->code == N_BLOCK && !param_p
           && !decl->decl_spec.typedef_p && !decl->decl_spec.static_p
@@ -14537,12 +14595,24 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         int ctor_init_p = (ctor_init_callee != NULL && ctor_init_callee->code == N_ID
                            && cid != NULL && cid->code == N_ID
                            && strcmp (ctor_init_callee->u.s.s, cid->u.s.s) == 0);
-        if ((initializer == NULL || initializer->code == N_IGNORE || ctor_init_p)
-            && cid != NULL && cid->code == N_ID) {
-          char nm[320];
-          unsigned saved_errs;
-          node_t cdtor_id, call;
-          symbol_t ctor_sym;
+        int move_init_p = (initializer != NULL && initializer->code == N_MOVE);
+        int move_only = class_is_move_only_collection_p (c2m_ctx, decl->decl_spec.type);
+        char nm[320];
+        unsigned saved_errs;
+        node_t cdtor_id, call;
+        symbol_t ctor_sym;
+
+        if (cid != NULL && cid->code == N_ID) {
+          /* Ban shallow copy-init of List/Map/Set (owning buffer). */
+          if (move_only && initializer != NULL && initializer->code != N_IGNORE
+              && !ctor_init_p && !move_init_p) {
+            error (c2m_ctx, POS (id),
+                   "cannot copy-initialize collection '%s' "
+                   "(shallow copy would double-free); use default construction, "
+                   "Name(...), or `move`",
+                   cid->u.s.s);
+          }
+
           snprintf (nm, sizeof (nm), "__ctor_%s", cid->u.s.s);
           if (ctor_init_p) {
             /* Reuse the supplied argument list for the in-place ctor call, and
@@ -14561,7 +14631,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
             if (n_errors == saved_errs) decl->ctor_call = call;
             /* Turn the original initializer into a no-op. */
             initializer->code = N_IGNORE;
-          } else {
+          } else if (initializer == NULL || initializer->code == N_IGNORE) {
             int has_default_ctor = FALSE;
             /* Constructor: auto-invoke only when a zero-argument (default) ctor
                exists, so a class with only parametrized ctors is not flagged
@@ -14594,10 +14664,12 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
               if (n_errors == saved_errs) decl->ctor_call = call;
             }
           }
-          /* Destructor. */
+          /* Always register dtor for stack class values (ctor-init, default,
+             or move-init).  Copy-init of dtor classes is rejected above. */
           snprintf (nm, sizeof (nm), "__dtor_%s", cid->u.s.s);
           cdtor_id = build_id (c2m_ctx, nm, POS (id));
-          if (find_def (c2m_ctx, S_REGULAR, cdtor_id, scope, NULL) != NULL) {
+          if (find_def (c2m_ctx, S_REGULAR, cdtor_id, scope, NULL) != NULL
+              || find_def (c2m_ctx, S_REGULAR, cdtor_id, top_scope, NULL) != NULL) {
             call = new_pos_node2 (c2m_ctx, N_CALL, POS (id),
                                   new_pos_node2 (c2m_ctx, N_FIELD, POS (id),
                                                  copy_node (c2m_ctx, id),
@@ -16008,6 +16080,17 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         e = create_expr (c2m_ctx, r);
         if (!e1->u.lvalue_node) {
           error (c2m_ctx, POS (r), "lvalue required as left operand of assignment");
+        }
+        /* Move-only collections (List/Map/Set): ban bare shallow assign which
+           would alias the heap buffer and double-free.  Require `move`. */
+        if (class_is_move_only_collection_p (c2m_ctx, t1)
+            && class_is_move_only_collection_p (c2m_ctx, t2)
+            && op2->code != N_MOVE) {
+          node_t cid = (t1->u.tag_type != NULL) ? TAG_ID (t1->u.tag_type) : NULL;
+          error (c2m_ctx, POS (r),
+                 "cannot assign collection '%s' (shallow copy would double-free); "
+                 "use `move` to transfer ownership",
+                 (cid != NULL && cid->code == N_ID) ? cid->u.s.s : "?");
         }
         check_assignment_types (c2m_ctx, t1, t2, e2, r);
         *e->type = *t1;
@@ -17675,6 +17758,72 @@ if (base != NULL && base->code == N_ID) {
           e->builtin_call_p = TRUE;
           e->def_node = dtor_def;
           break;
+        }
+        /* ClassName(args) value construction: temporary by-value class object.
+           Enables brace-init `new List<Pt>{ Pt(1,2), Pt(3,4) }`, call args
+           `take(Pt(1,2))`, and `xs.Add(Pt(1,2))`.  Result type is TM_CLASS;
+           gen constructs into a stack temporary via the matching constructor
+           (same protocol as N_NEW, but without malloc).  Marked builtin_call_p
+           so the normal function-call path is skipped. */
+        if (op1->code == N_ID) {
+          node_t class_def = find_def (c2m_ctx, S_REGULAR, op1,
+                                       skip_struct_scopes (curr_scope), NULL);
+          if (class_def == NULL)
+            class_def = find_def (c2m_ctx, S_TAG, op1,
+                                 skip_struct_scopes (curr_scope), NULL);
+          if (class_def != NULL && class_def->code == N_CLASS) {
+            node_t val_arg_list = NL_NEXT (op1);
+            node_t arg, param, ctor_def = NULL;
+            char ctor_name[320];
+            node_t ctor_id;
+            symbol_t ctor_sym;
+            int has_ctor_sym;
+            struct type *class_type;
+
+            if (val_arg_list == NULL) val_arg_list = new_node (c2m_ctx, N_LIST);
+            for (arg = NL_HEAD (val_arg_list->u.ops); arg != NULL; arg = NL_NEXT (arg))
+              check (c2m_ctx, arg, r);
+
+            snprintf (ctor_name, sizeof (ctor_name), "__ctor_%s", op1->u.s.s);
+            ctor_id = build_id (c2m_ctx, ctor_name, POS (r));
+            has_ctor_sym = find_overload_sym (c2m_ctx, ctor_id, curr_scope, &ctor_sym);
+            if (has_ctor_sym)
+              ctor_def = select_method_overload (c2m_ctx, &ctor_sym, class_def, val_arg_list);
+
+            e = create_expr (c2m_ctx, r);
+            class_type = create_class_type (c2m_ctx, class_def);
+            set_class_layout (c2m_ctx, class_def, class_type);
+            e->type = class_type;
+            e->builtin_call_p = TRUE;
+            e->def_node = ctor_def;
+
+            if (ctor_def != NULL && ctor_def->code == N_FUNC_DEF) {
+              decl_t cdecl = ctor_def->attr;
+              struct func_type *ft = cdecl->decl_spec.type->u.func_type;
+              param = NL_HEAD (ft->param_list->u.ops);
+              if (param != NULL) param = NL_NEXT (param); /* skip 'this' */
+              arg = NL_HEAD (val_arg_list->u.ops);
+              for (; arg != NULL && param != NULL;
+                   arg = NL_NEXT (arg), param = NL_NEXT (param)) {
+                struct decl_spec *pds = get_param_decl_spec (param);
+                check_assignment_types (c2m_ctx, pds->type, NULL, arg->attr, r);
+              }
+              if (arg != NULL)
+                error (c2m_ctx, POS (r),
+                       "too many arguments to constructor of '%s'", op1->u.s.s);
+              if (param != NULL)
+                error (c2m_ctx, POS (r),
+                       "too few arguments to constructor of '%s'", op1->u.s.s);
+            } else if (NL_HEAD (val_arg_list->u.ops) != NULL) {
+              error (c2m_ctx, POS (r),
+                     "class '%s' has no constructor matching these arguments",
+                     op1->u.s.s);
+            }
+            /* Reserve stack call-arg area for the temporary (same as return-by-value). */
+            if (curr_scope != top_scope)
+              update_call_arg_area_offset (c2m_ctx, class_type, TRUE);
+            break;
+          }
         }
         if (op1->code == N_ID) {
           alloca_p = str_eq_p(op1->u.s.s, ALLOCA);
@@ -20366,11 +20515,13 @@ if (base != NULL && base->code == N_ID) {
   }
   case N_MOVE:
   case N_READONLY: {
-    /* move <expr> / readonly <expr>: both yield the SAME pointer value as the
-       inner expression — they are value-level pass-throughs whose meaning is
-       enforced by the ownership pass (move transfers ownership and leaves the
-       source a read-only view; readonly borrows a non-owning view).  The
-       result type equals the inner expression's type.
+    /* move <expr> / readonly <expr>:
+       - Pointer form (owned layer): yield the same pointer value; ownership
+         pass tracks move vs borrow.
+       - Class-value form (`move` only): transfer a by-value class with a
+         destructor (e.g. stack List) — result type is the class; gen zeros
+         the source so its RAII dtor is a no-op.  Required for move-only
+         assign/init of resource-owning classes.
 
        Like N_DETACH, these classify as expressions, so we MUST assign to the
        outer `e` (not a shadowing local) to suppress the trailing error-
@@ -20384,17 +20535,25 @@ if (base != NULL && base->code == N_ID) {
     ie = inner->attr;
     if (ie == NULL || ie->type == NULL) break; /* degrade: tail stamps int expr */
     it = ie->type;
-    /* Managed ownership is a pointer-to-object concept today.  Applying the
-       keyword to a non-pointer is almost certainly a mistake; warn but keep
-       the value flowing so generic code still compiles. */
-    if (it->mode != TM_PTR)
+    if (r->code == N_MOVE && it->mode == TM_CLASS) {
+      if (!class_has_dtor_p (c2m_ctx, it))
+        warning (c2m_ctx, POS (r),
+                 "`move` on a class without a destructor is a plain value copy");
+      else if (ie->u.lvalue_node == NULL)
+        error (c2m_ctx, POS (r),
+               "`move` of a class value requires an lvalue source");
+      /* Reserve stack space for the moved-value temporary emitted in gen. */
+      if (curr_scope != top_scope)
+        update_call_arg_area_offset (c2m_ctx, it, TRUE);
+    } else if (it->mode != TM_PTR) {
+      /* readonly still pointer-only; move of non-class non-ptr is a no-op warn. */
       warning (c2m_ctx, POS (r),
-               "`%s` applies to owned pointer values; this operand is not a "
-               "pointer, so it has no managed-ownership effect", kw);
+               "`%s` applies to owned pointers or moveable class values; this "
+               "operand has no managed-ownership effect", kw);
+    }
     e = create_expr (c2m_ctx, r);
-    /* Share the inner's type pointer verbatim (same pointer type / pointee).
-       The result is a freshly produced value (the moved / borrowed pointer),
-       not an lvalue — create_expr already nulled u.lvalue_node. */
+    /* Share the inner's type pointer verbatim.  Result is a value, not an
+       lvalue — create_expr already nulled u.lvalue_node. */
     e->type = it;
     break;
   }
@@ -26049,9 +26208,47 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       if ((val_p || true_label != NULL) && r->code != N_POST_INC && r->code != N_POST_DEC)
         emit2_noopt (c2m_ctx, tp_mov (t), res.mir_op, val.mir_op);
     } else { /* block move */
-      mir_size_t size = type_size (c2m_ctx, ((struct expr *) r->attr)->type);
+      struct type *at = ((struct expr *) r->attr)->type;
+      mir_size_t size = type_size (c2m_ctx, at);
 
       assert (r->code == N_ASSIGN);
+      /* Note: for move-assign of List/Map/Set, the RHS is `move src` which
+         already destroyed/zeroed the source; destroy the LHS by calling its
+         dtor if present so the previous buffer is not leaked.  Done only for
+         move-only collections — ordinary by-value class elements (Pt) use
+         plain block_move as List does internally. */
+      if (class_is_move_only_collection_p (c2m_ctx, at)
+          && NL_EL (r->u.ops, 1) != NULL
+          && NL_EL (r->u.ops, 1)->code == N_MOVE) {
+        node_t ddef = find_class_dtor_def (c2m_ctx, at->u.tag_type);
+        if (ddef != NULL && ddef->code == N_FUNC_DEF && ddef->attr != NULL) {
+          decl_t dd = ddef->attr;
+          if (dd->u.item != NULL) {
+            struct func_type *dft = dd->decl_spec.type->u.func_type;
+            MIR_item_t dproto;
+            char dpname[64];
+            size_t dops;
+            op_t addr = mem_to_address (c2m_ctx, var, TRUE);
+            collect_args_and_func_types (c2m_ctx, dft);
+            sprintf (dpname, "__assigndtorproto%d", new_proto_count++);
+            dproto = MIR_new_proto_arr (ctx, dpname,
+                                        VARR_LENGTH (MIR_type_t, proto_info.ret_types),
+                                        VARR_ADDR (MIR_type_t, proto_info.ret_types),
+                                        VARR_LENGTH (MIR_var_t, proto_info.arg_vars),
+                                        VARR_ADDR (MIR_var_t, proto_info.arg_vars));
+            move_item_to_module_start (curr_func->module, dproto);
+            dops = VARR_LENGTH (MIR_op_t, call_ops);
+            VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, dproto));
+            VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, dd->u.item));
+            VARR_PUSH (MIR_op_t, call_ops, addr.mir_op);
+            emit_insn (c2m_ctx,
+                       MIR_new_insn_arr (ctx, MIR_CALL,
+                                         VARR_LENGTH (MIR_op_t, call_ops) - dops,
+                                         VARR_ADDR (MIR_op_t, call_ops) + dops));
+            VARR_TRUNC (MIR_op_t, call_ops, dops);
+          }
+        }
+      }
       block_move (c2m_ctx, var, val, size);
     }
     break;
@@ -26923,6 +27120,79 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     /* __destroy(x) intrinsic (resolved in check): run x's destructor in place if
        its class has one, else emit nothing.  Modeled on the N_DELETE dtor call,
        minus the heap free (the buffer free is the template's responsibility). */
+    /* ClassName(args) value temporary: construct into call-arg-area stack slot. */
+    if (call_expr->builtin_call_p && call_expr->type != NULL
+        && call_expr->type->mode == TM_CLASS && func->code == N_ID) {
+      node_t ctor_def = call_expr->def_node;
+      mir_size_t csize = type_size (c2m_ctx, call_expr->type);
+      mir_size_t arg_area_offset = curr_call_arg_area_offset + ns->size - ns->call_arg_area_size;
+      op_t base, this_ptr;
+
+      /* Stack address of the temporary slot. */
+      base = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit3 (c2m_ctx, MIR_ADD, base.mir_op,
+             MIR_new_reg_op (ctx, MIR_reg (ctx, FP_NAME, curr_func->u.func)),
+             MIR_new_int_op (ctx, arg_area_offset));
+      update_call_arg_area_offset (c2m_ctx, call_expr->type, FALSE);
+      if (csize > 0) gen_memset (c2m_ctx, 0, base.mir_op.u.reg, csize);
+      this_ptr = base;
+
+      if (ctor_def != NULL && ctor_def->code == N_FUNC_DEF) {
+        decl_t cdecl = ctor_def->attr;
+        struct func_type *ft = cdecl->decl_spec.type->u.func_type;
+        MIR_item_t proto;
+        char pname[64];
+        size_t cops_start;
+        node_t param;
+        target_arg_info_t ctor_arg_info;
+        struct type *this_ptr_type = create_type (c2m_ctx, NULL);
+
+        this_ptr_type->mode = TM_PTR;
+        this_ptr_type->u.ptr_type = call_expr->type;
+        set_type_layout (c2m_ctx, this_ptr_type);
+
+        collect_args_and_func_types (c2m_ctx, ft);
+        sprintf (pname, "__valctorproto%d", new_proto_count++);
+        proto = MIR_new_proto_arr (ctx, pname,
+                                   VARR_LENGTH (MIR_type_t, proto_info.ret_types),
+                                   VARR_ADDR (MIR_type_t, proto_info.ret_types),
+                                   VARR_LENGTH (MIR_var_t, proto_info.arg_vars),
+                                   VARR_ADDR (MIR_var_t, proto_info.arg_vars));
+        move_item_to_module_start (curr_func->module, proto);
+        cops_start = VARR_LENGTH (MIR_op_t, call_ops);
+        VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, proto));
+        VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, cdecl->u.item));
+        target_init_arg_vars (c2m_ctx, &ctor_arg_info);
+        target_add_call_arg_op (c2m_ctx, this_ptr_type, &ctor_arg_info, this_ptr);
+        param = NL_HEAD (ft->param_list->u.ops);
+        if (param != NULL) param = NL_NEXT (param);
+        for (node_t a = NL_HEAD (args->u.ops); a != NULL; a = NL_NEXT (a)) {
+          struct type *a_type = ((struct expr *) a->attr)->type;
+          int is_agg = (a_type->mode == TM_STRUCT || a_type->mode == TM_UNION
+                        || a_type->mode == TM_CLASS);
+          op_t av = gen (c2m_ctx, a, NULL, NULL, !is_agg, NULL, NULL);
+          if (param != NULL) {
+            struct decl_spec *pds = get_param_decl_spec (param);
+            a_type = pds->type;
+            is_agg = (a_type->mode == TM_STRUCT || a_type->mode == TM_UNION
+                      || a_type->mode == TM_CLASS);
+            if (!is_agg && scalar_type_p (a_type))
+              av = promote (c2m_ctx, av,
+                            promote_mir_int_type (get_mir_type (c2m_ctx, a_type)), FALSE);
+            param = NL_NEXT (param);
+          }
+          target_add_call_arg_op (c2m_ctx, a_type, &ctor_arg_info, av);
+        }
+        emit_insn (c2m_ctx,
+                   MIR_new_insn_arr (ctx, MIR_CALL,
+                                     VARR_LENGTH (MIR_op_t, call_ops) - cops_start,
+                                     VARR_ADDR (MIR_op_t, call_ops) + cops_start));
+        VARR_TRUNC (MIR_op_t, call_ops, cops_start);
+      }
+      /* Yield the temporary as a memory aggregate (value-semantic class result). */
+      res = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, base.mir_op.u.reg, 0, 1));
+      break;
+    }
     if (func->code == N_ID && strcmp (func->u.s.s, "__destroy") == 0
         && call_expr->builtin_call_p) {
       node_t dtor_def = call_expr->def_node;
@@ -27783,6 +28053,26 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           var = gen (c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
           op_t val_op = val_gen (c2m_ctx, initializer);
           emit2 (c2m_ctx, MIR_MOV, var.mir_op, val_op.mir_op);
+        } else if (initializer->code == N_MOVE && decl->scope != top_scope
+                   && decl->decl_spec.type->mode == TM_CLASS) {
+          /* Local:  List<int> b = move a;  (class-value ownership transfer)
+             Evaluate the move (zeros the source) and block-copy into `b`.
+             Register the RAII dtor (create_decl always synthesizes it for
+             stack class values with a user destructor). */
+          if (id->attr == NULL) {
+            node_t saved_scope = curr_scope;
+            curr_scope = decl->scope;
+            check (c2m_ctx, id, NULL);
+            curr_scope = saved_scope;
+          }
+          var = gen (c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
+          {
+            op_t mval = gen (c2m_ctx, initializer, NULL, NULL, FALSE, NULL, NULL);
+            mir_size_t csize = type_size (c2m_ctx, decl->decl_spec.type);
+            if (csize > 0) block_move (c2m_ctx, var, mval, csize);
+          }
+          if (decl->dtor_call != NULL)
+            VARR_PUSH (node_t, defer_stmts, decl->dtor_call);
         } else if (initializer->code != N_IGNORE) {  // ??? general code
           init_start = VARR_LENGTH (init_el_t, init_els);
           collect_init_els (c2m_ctx, NULL, &decl->decl_spec.type, initializer,
@@ -29057,18 +29347,41 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     (void) gen (c2m_ctx, NL_HEAD (r->u.ops), true_label, false_label, FALSE, NULL, NULL);
     break;
   case N_MOVE: {
-    /* move <expr>: yield the inner pointer value, then NULL the source lvalue
-       so the moved-from binding is no longer an owner.  Combined with the
-       null-safe `delete` above, this is what makes single-ownership transfer
-       double-free-proof: a later explicit `delete src;` or the synthesized
-       scope-exit delete of `src` sees NULL and does nothing, while the move
-       target (or owning collection) becomes the sole owner.
-
-       Only a simple lvalue source is neutralized (local / field / deref);
-       `move new T(...)` / `move f()` have no source to null and pass through. */
+    /* move <expr>:
+       Pointer form: yield the pointer, then NULL the source lvalue so a later
+       delete of the source is a no-op (single-ownership transfer).
+       Class-value form: block-copy the aggregate into a stack temp, then zero
+       the source object so its RAII destructor frees nothing. */
     node_t inner = NL_HEAD (r->u.ops);
     node_t src = inner;
+    struct expr *me = r->attr;
     while (src != NULL && src->code == N_CAST) src = NL_EL (src->u.ops, 1);
+
+    if (me != NULL && me->type != NULL && me->type->mode == TM_CLASS) {
+      mir_size_t csize = type_size (c2m_ctx, me->type);
+      op_t src_lv = gen (c2m_ctx, inner, NULL, NULL, FALSE, NULL, NULL);
+      /* Temporary aggregate holding the moved value. */
+      mir_size_t arg_area_offset
+        = curr_call_arg_area_offset
+          + ((struct node_scope *) FUNC_DEF_BLOCK (curr_func_def)->attr)->size
+          - ((struct node_scope *) FUNC_DEF_BLOCK (curr_func_def)->attr)->call_arg_area_size;
+      op_t base = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit3 (c2m_ctx, MIR_ADD, base.mir_op,
+             MIR_new_reg_op (ctx, MIR_reg (ctx, FP_NAME, curr_func->u.func)),
+             MIR_new_int_op (ctx, arg_area_offset));
+      update_call_arg_area_offset (c2m_ctx, me->type, FALSE);
+      res = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, base.mir_op.u.reg, 0, 1));
+      if (csize > 0) {
+        block_move (c2m_ctx, res, src_lv, csize);
+        /* Zero the source so ~T is a no-op (List: data=NULL, length=0). */
+        if (src_lv.mir_op.mode == MIR_OP_MEM) {
+          op_t saddr = mem_to_address (c2m_ctx, src_lv, TRUE);
+          gen_memset (c2m_ctx, 0, saddr.mir_op.u.reg, csize);
+        }
+      }
+      break;
+    }
+
     op_t mval = gen (c2m_ctx, inner, NULL, NULL, TRUE, NULL, NULL);
     mval = force_val (c2m_ctx, mval, FALSE);
     /* Copy into a fresh temp first: nulling the source may share the same

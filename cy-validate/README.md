@@ -43,6 +43,7 @@ assertions (0 == all passed). The runner prints a per-file summary.
 | `val-015-string-literal-and-replace.cy` | String methods on a string-literal receiver (B1), 2-arg `replace(needle,repl)` search-and-replace (A2), and `List<T>.Map` (B4) |
 | `val-022-owned-move-readonly.cy` | **Memory:** managed-ownership layer — `owned` single-owner auto-release at scope exit, `move` ownership transfer (source → read-only view, no double free), chained moves, `readonly` non-owning borrow |
 | `val-038-list-stack-byval.cy` | Stack/value `List`/`Map`: `List<int> a;`, `auto xs = List<int>()`, RAII `~List`, by-value class elements + `__destroy`, heap form still works |
+| `val-039-brace-init-move.cy` | `ClassName(args)` value temps · `new List<Pt>{ Pt(...), ... }` · `Add(Pt(...))` · move-only List assign (`b = move a`) |
 
 ## Headline findings
 

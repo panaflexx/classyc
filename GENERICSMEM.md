@@ -350,9 +350,25 @@ Methods use the same `this` pointer whether the receiver is a stack value
 (`.` auto-deref) or a heap pointer. Transform methods (`Where`, `Copy`, …)
 still return **new heap** lists the caller must `delete` / `owned`.
 
-**Caveat:** assignment between two stack Lists is still a shallow field copy
-of the buffer pointer (no deep copy / move protocol yet). Prefer a single
-owner, or explicit `Copy()` into a heap list.
+**Move-only collections:** `List`/`Map`/`Set` own a heap buffer. Bare assign
+or copy-init is a **compile error** (would double-free). Transfer with `move`:
+
+```c
+auto a = List<int>();
+a.Add(1);
+auto b = List<int>();
+b = move a;           // a emptied; b owns the buffer
+auto c = move b;      // c owns it now
+```
+
+Element types with destructors (e.g. `List<Pt>`) still allow internal element
+assign (buffer moves of `T`); only the *collection object* is move-only.
+
+**Brace-init with class values:**
+```c
+List<Pt>* xs = new List<Pt>{ Pt(1, 2), Pt(3, 4) };  // ClassName(args) temps
+xs.Add(Pt(5, 6));
+```
 
 ### Element destruction in `Set<T>` and `Map<K, V>` (done)
 

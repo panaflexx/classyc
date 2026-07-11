@@ -34,6 +34,11 @@
  * Slice/Copy/Filter/Where/Select/Plus return new heap lists the caller must free.
  * Those results are always non-owning — they never copy the source .owns() flag.
  *
+ * Move-only: bare assign / copy-init of List is an error (buffer alias).
+ *   auto b = move a;   or   b = move a;   transfers ownership; source emptied.
+ * Brace-init supports class ctor expressions:
+ *   new List<Pt>{ Pt(1,2), Pt(3,4) };   xs.Add(Pt(5,6));
+ *
  * Pointer ownership:
  *   - List of by-value T: __destroy auto-runs element destructor
  *   - List of T-star default: non-owning
