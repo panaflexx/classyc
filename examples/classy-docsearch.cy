@@ -1037,10 +1037,12 @@ void draw_ui(List<Doc*>* corpus, List<Hit>* hits, const char* query,
     printf("╝%s\n", term_reset());
 
     /* stats */
-    printf("  %s%d%s docs  ·  %s%d%s terms  ·  %s%ld%s KB plain\n",
+    printf("  %s%d%s docs  ·  %s%d%s terms  ·  %s%ld%s KB plain",
            term_bright_green(), corpus.Count(), term_reset(),
            term_bright_green(), n_terms, term_reset(),
            term_bright_green(), g_bytes_indexed / 1024, term_reset());
+    if (g_from_db) printf("  %s[sqlite]%s", term_dim(), term_reset());
+    printf("\n");
 
     /* query line */
     int qfocus = (focus == focus_query);
@@ -1101,7 +1103,13 @@ void draw_ui(List<Doc*>* corpus, List<Hit>* hits, const char* query,
     fflush(stdout);
 }
 
-/* ───────────────────────── main ───────────────────────── */
+/* ───────────────────────── SQLite index persist ───────────────────────── */
+
+#define DEFAULT_DB_NAME "index.db"
+
+char g_db_path[MAX_PATH];
+int  g_reindex = 0;
+int  g_from_db = 0;          /* 1 if corpus loaded from sqlite */
 
 int env_int(const char* key, int defv) {
     const char* s = getenv(key);
@@ -1109,12 +1117,312 @@ int env_int(const char* key, int defv) {
     return atoi(s);
 }
 
+void ensure_parent_dir(const char* file_path) {
+    char dir[MAX_PATH];
+    int n = (int)strlen(file_path);
+    if (n <= 0 || n >= MAX_PATH) return;
+    memcpy(dir, file_path, (size_t)n + 1);
+    char* slash = strrchr(dir, '/');
+    if (!slash || slash == dir) return;
+    *slash = 0;
+    /* recursive mkdir via shell — portable enough for a cache path */
+    if (!path_safe(dir)) return;
+    char cmd[MAX_PATH + 32];
+    snprintf(cmd, sizeof(cmd), "mkdir -p -- '%s' 2>/dev/null", dir);
+    system(cmd);
+}
+
+/* Resolve DB path: --db / DOCSEARCH_DB / ~/.cache/classy-docsearch/index.db */
+void resolve_db_path(const char* override_path) {
+    if (override_path && override_path[0]) {
+        snprintf(g_db_path, sizeof(g_db_path), "%s", override_path);
+        return;
+    }
+    const char* env = getenv("DOCSEARCH_DB");
+    if (env && env[0]) {
+        snprintf(g_db_path, sizeof(g_db_path), "%s", env);
+        return;
+    }
+    const char* home = getenv("HOME");
+    if (home && home[0]) {
+        snprintf(g_db_path, sizeof(g_db_path),
+                 "%s/.cache/classy-docsearch/%s", home, DEFAULT_DB_NAME);
+        return;
+    }
+    snprintf(g_db_path, sizeof(g_db_path), "./%s", DEFAULT_DB_NAME);
+}
+
+void schema_init(Sqlite* db) {
+    db.execute("PRAGMA journal_mode=WAL");
+    db.execute("PRAGMA synchronous=NORMAL");
+    db.execute("PRAGMA temp_store=MEMORY");
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS meta ("
+        "  key   TEXT PRIMARY KEY,"
+        "  value TEXT NOT NULL)"
+    );
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS docs ("
+        "  id      INTEGER PRIMARY KEY,"
+        "  title   TEXT NOT NULL,"
+        "  path    TEXT NOT NULL UNIQUE,"
+        "  section TEXT,"
+        "  kind    INTEGER NOT NULL)"
+    );
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS postings ("
+        "  term   TEXT    NOT NULL,"
+        "  doc_id INTEGER NOT NULL,"
+        "  tf     INTEGER NOT NULL,"
+        "  PRIMARY KEY (term, doc_id))"
+    );
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_postings_term ON postings(term)"
+    );
+}
+
+int db_has_index(Sqlite* db) {
+    try {
+        dict row = db.query_one(
+            "SELECT COUNT(*) AS n FROM docs");
+        if (!row) return 0;
+        long n = (long)row.n;
+        return n > 0;
+    } catch (SqliteError e) {
+        (void)e;
+        return 0;
+    }
+}
+
+void meta_set(Sqlite* db, const char* key, const char* value) {
+    db.execute(
+        "INSERT INTO meta(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        "ss", (char*)key, (char*)value);
+}
+
+/* Wipe + rewrite full index from in-memory corpus + inverted map. */
+int save_index(Sqlite* db, List<Doc*>* corpus, Map<String, Term*>* inv) {
+    printf("  writing SQLite index → %s\n", g_db_path);
+    fflush(stdout);
+
+    try {
+        db.execute("DROP TABLE IF EXISTS postings");
+        db.execute("DROP TABLE IF EXISTS docs");
+        db.execute("DROP TABLE IF EXISTS meta");
+        schema_init(db);
+
+        Transaction* tx = db.begin();
+        defer delete tx;
+
+        Statement* ins_doc = db.prepare(
+            "INSERT INTO docs(id, title, path, section, kind) VALUES (?,?,?,?,?)");
+        defer delete ins_doc;
+
+        for (auto d in corpus) {
+            const char* title = d.title;
+            const char* path = d.path;
+            const char* section = d.section;
+            if (!title) title = "";
+            if (!path) path = "";
+            if (!section) section = "";
+            ins_doc.bind(1, d.id);
+            ins_doc.bind(2, title);
+            ins_doc.bind(3, path);
+            ins_doc.bind(4, section);
+            ins_doc.bind(5, (int)d.kind);
+            ins_doc.execute();
+        }
+
+        Statement* ins_post = db.prepare(
+            "INSERT INTO postings(term, doc_id, tf) VALUES (?,?,?)");
+        defer delete ins_post;
+
+        int n_posts = 0;
+        for (auto term, t in inv) {
+            if (!t || !t.docIds) continue;
+            const char* w = term;
+            if (!w || !w[0]) continue;
+
+            /* Aggregate multiplicity in docIds → tf per doc_id. */
+            auto tf_map = Map<int, int>();
+            for (auto docId in t.docIds) {
+                int c = tf_map.GetOr(docId, 0);
+                tf_map.Set(docId, c + 1);
+            }
+            for (auto docId, tf in tf_map) {
+                if (tf <= 0) continue;
+                ins_post.bind(1, w);
+                ins_post.bind(2, docId);
+                ins_post.bind(3, tf);
+                ins_post.execute();
+                n_posts++;
+                if ((n_posts % 50000) == 0) {
+                    fprintf(stderr, "\r  wrote %d posting rows…", n_posts);
+                    fflush(stderr);
+                }
+            }
+        }
+
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%d", corpus.Count());
+        meta_set(db, "doc_count", buf);
+        snprintf(buf, sizeof(buf), "%d", inv.Count());
+        meta_set(db, "term_count", buf);
+        snprintf(buf, sizeof(buf), "%d", n_posts);
+        meta_set(db, "posting_count", buf);
+        snprintf(buf, sizeof(buf), "%ld", g_bytes_indexed);
+        meta_set(db, "bytes_indexed", buf);
+        snprintf(buf, sizeof(buf), "%d", g_max_files);
+        meta_set(db, "max_files", buf);
+
+        time_t now = time(NULL);
+        snprintf(buf, sizeof(buf), "%ld", (long)now);
+        meta_set(db, "indexed_at", buf);
+
+        tx.commit();
+        fprintf(stderr, "\r  saved %d docs · %d terms · %d postings                 \n",
+                corpus.Count(), inv.Count(), n_posts);
+        return 1;
+    } catch (SqliteError e) {
+        printf("  %sSQLite save failed:%s %s\n",
+               term_bold_red(), term_reset(), e.msg ? e.msg : "?");
+        return 0;
+    }
+}
+
+/* Load docs + postings into empty corpus/inv.  Returns 1 on success. */
+int load_index(Sqlite* db, List<Doc*>* corpus, Map<String, Term*>* inv) {
+    printf("  loading SQLite index ← %s\n", g_db_path);
+    fflush(stdout);
+
+    try {
+        List<dict>* drows = db.query(
+            "SELECT id, title, path, section, kind FROM docs ORDER BY id");
+        if (!drows) return 0;
+        defer delete drows;
+
+        for (auto r in drows) {
+            int id = (int)(long)r.id;
+            String title = str_dup_c((char*)r.title);
+            String path = str_dup_c((char*)r.path);
+            String section = str_dup_c((char*)r.section);
+            DocKind kind = (DocKind)(int)(long)r.kind;
+            /* body not persisted — open path re-reads original for viewing */
+            String body = str_dup_c("");
+            Doc* d = new Doc(id, title, path, section, kind, body);
+            corpus.Add(d);
+        }
+
+        /* Stream postings with the raw C API so we don't materialise millions of dicts. */
+        sqlite3* h = 0;
+        if (sqlite3_open(g_db_path, &h) != SQLITE_OK) {
+            if (h) sqlite3_close(h);
+            term_print_err("cannot reopen db for postings stream");
+            return 0;
+        }
+        sqlite3_stmt* st = 0;
+        const char* sql = "SELECT term, doc_id, tf FROM postings";
+        if (sqlite3_prepare_v2(h, sql, -1, &st, 0) != SQLITE_OK) {
+            sqlite3_close(h);
+            term_print_err("prepare postings failed");
+            return 0;
+        }
+
+        int n_posts = 0;
+        int rc;
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+            const char* term = (const char*)sqlite3_column_text(st, 0);
+            int doc_id = sqlite3_column_int(st, 1);
+            int tf = sqlite3_column_int(st, 2);
+            if (!term || !term[0] || tf <= 0) continue;
+
+            String w = str_dup_c(term);
+            Term* t = NULL;
+            if (inv.TryGet(w, &t) && t != NULL) {
+                for (int k = 0; k < tf; k++) t.docIds.Add(doc_id);
+            } else {
+                t = new Term(w);
+                for (int k = 0; k < tf; k++) t.docIds.Add(doc_id);
+                inv.Set(w, t);
+            }
+            n_posts++;
+            if ((n_posts % 100000) == 0) {
+                fprintf(stderr, "\r  loaded %d posting rows…", n_posts);
+                fflush(stderr);
+            }
+        }
+        sqlite3_finalize(st);
+        sqlite3_close(h);
+
+        if (rc != SQLITE_DONE) {
+            term_print_err("postings step failed");
+            return 0;
+        }
+
+        dict mc = db.query_one("SELECT value AS v FROM meta WHERE key='bytes_indexed'");
+        if (mc) g_bytes_indexed = atol((char*)mc.v);
+
+        g_files_indexed = corpus.Count();
+        fprintf(stderr, "\r  loaded %d docs · %d terms · %d posting rows            \n",
+                corpus.Count(), inv.Count(), n_posts);
+        g_from_db = 1;
+        return corpus.Count() > 0;
+    } catch (SqliteError e) {
+        printf("  %sSQLite load failed:%s %s\n",
+               term_bold_red(), term_reset(), e.msg ? e.msg : "?");
+        return 0;
+    }
+}
+
+void print_usage(void) {
+    printf("Usage: classy-docsearch [options] [root-dirs…]\n");
+    printf("  --reindex, -r     rebuild index (ignore existing SQLite cache)\n");
+    printf("  --db PATH         index database (default ~/.cache/classy-docsearch/index.db)\n");
+    printf("  --help, -h        this help\n");
+    printf("  root dirs         crawl roots (default: /usr/share/man + /usr/share/doc)\n");
+    printf("Env: DOCSEARCH_DB, DOCSEARCH_MAX, DOCSEARCH_REINDEX=1, DOCSEARCH_BATCH=1\n");
+    printf("Link: classyc -I include -l sqlite3 examples/classy-docsearch.cy -eg\n");
+}
+
+/* ───────────────────────── main ───────────────────────── */
+
 int main(int argc, char** argv) {
     g_max_files = env_int("DOCSEARCH_MAX", DEFAULT_MAX_FILES);
     g_batch = env_int("DOCSEARCH_BATCH", 0);
+    g_reindex = env_int("DOCSEARCH_REINDEX", 0);
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+
+    const char* db_override = NULL;
+    auto roots = List<String>();
+
+    for (int i = 1; i < argc; i++) {
+        const char* a = argv[i];
+        if (!a) continue;
+        if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
+            print_usage();
+            return 0;
+        }
+        if (strcmp(a, "--reindex") == 0 || strcmp(a, "-r") == 0) {
+            g_reindex = 1;
+            continue;
+        }
+        if (strcmp(a, "--db") == 0) {
+            if (i + 1 < argc) db_override = argv[++i];
+            continue;
+        }
+        if (strncmp(a, "--db=", 5) == 0) {
+            db_override = a + 5;
+            continue;
+        }
+        if (a[0] == '-') continue;   /* skip unknown flags */
+        roots.Add((String)a);
+    }
+
+    resolve_db_path(db_override);
+    ensure_parent_dir(g_db_path);
 
     printf("\n");
     printf("%s", term_bold_cyan());
@@ -1125,7 +1433,7 @@ int main(int argc, char** argv) {
     printf("   ██████╔╝╚██████╔╝╚██████╗███████║███████╗██║  ██║██║  ██║╚██████╗██║  ██║\n");
     printf("   ╚═════╝  ╚═════╝  ╚═════╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝\n");
     printf("%s", term_reset());
-    printf("              man · markdown · html  ·  type-to-search TUI\n");
+    printf("              man · markdown · html  ·  SQLite index  ·  type-to-search\n");
     printf("   types: %s · %s · %s\n\n",
            nameof<DocKind>(), nameof<Hit>(), typeof<Doc*>());
 
@@ -1135,14 +1443,7 @@ int main(int argc, char** argv) {
     auto inv = Map<String, Term*>();
     inv.ownsValues();   /* ~Map deletes each Term* */
 
-    /* Roots: argv paths after the program name, or defaults. */
-    auto roots = List<String>();
-    for (int i = 1; i < argc; i++) {
-        if (argv[i][0] == '-') continue;   /* skip flags if any slip through */
-        roots.Add((String)argv[i]);
-    }
     if (roots.Count() == 0) {
-        /* Full man tree (all sections: man1…man8, man3type, …) + package docs. */
         const char* defs[] = {
             "/usr/share/man",
             "/usr/share/doc",
@@ -1161,42 +1462,103 @@ int main(int argc, char** argv) {
         printf("  max files: unlimited  (DOCSEARCH_MAX=0 · Google mode)\n");
     else
         printf("  max files: %d  (DOCSEARCH_MAX)\n", g_max_files);
-    printf("  crawling:\n");
-    for (auto r in roots) printf("    · %s\n", r);
-    printf("\n");
+    printf("  index db: %s\n", g_db_path);
+    if (g_reindex) printf("  mode:     %sREINDEX%s (rebuild forced)\n",
+                          term_bold_yellow(), term_reset());
 
-    /* Phase 1: discover everything, then index (all of it unless capped). */
-    auto paths = List<String>();
-    for (auto r in roots) collect_paths(r, 0, &paths);
-    fprintf(stderr, "\r  scanned %d files, %d candidates.                \n",
-            g_files_seen, paths.Count());
+    /* Open SQLite early — load cache or rebuild. */
+    Sqlite* db = Sqlite.open(g_db_path);
+    if (!db) {
+        term_print_err("cannot open SQLite index database");
+        printf("  path: %s\n", g_db_path);
+        return 1;
+    }
+    defer delete db;
 
-    /* Sort only matters when budget is capped — short names / man1+man3 first. */
-    if (g_max_files > 0) paths.Sort(by_priority);
-
-    int sec_used[9];
-    for (int i = 0; i < 9; i++) sec_used[i] = 0;
-
-    for (auto p in paths) {
-        if (g_max_files > 0 && g_files_indexed >= g_max_files) break;
-        int before = g_files_indexed;
-        ingest_file(p, &corpus, &inv);
-        if (g_files_indexed > before) {
-            int s = section_id(p);
-            if (s < 0 || s > 8) s = 0;
-            sec_used[s]++;
+    int loaded = 0;
+    if (!g_reindex) {
+        try {
+            schema_init(db);
+            if (db_has_index(db))
+                loaded = load_index(db, &corpus, &inv);
+            else
+                printf("  (no cached index yet — will crawl & save)\n");
+        } catch (SqliteError e) {
+            printf("  cache unreadable (%s) — will reindex\n",
+                   e.msg ? e.msg : "?");
+            loaded = 0;
         }
     }
-    fprintf(stderr, "\r  indexed %d files (%ld KB plain).                      \n",
-            g_files_indexed, g_bytes_indexed / 1024);
-    printf("  section mix:");
-    for (int i = 0; i < 9; i++) {
-        if (sec_used[i] <= 0) continue;
-        if (i == 0) printf(" doc=%d", sec_used[i]);
-        else printf(" man%d=%d", i, sec_used[i]);
+
+    if (!loaded) {
+        /* Fresh corpus — wipe any partial state after failed load. */
+        if (corpus.Count() > 0 || inv.Count() > 0) {
+            /* cannot Clear owns easily mid-flight; restart lists */
+            printf("  rebuilding from filesystem…\n");
+        }
+
+        printf("  crawling:\n");
+        for (auto r in roots) printf("    · %s\n", r);
+        printf("\n");
+
+        g_files_indexed = 0;
+        g_bytes_indexed = 0;
+        g_files_seen = 0;
+        g_from_db = 0;
+
+        /* New empty collections if we partially loaded */
+        auto corpus2 = List<Doc*>();
+        corpus2.owns();
+        auto inv2 = Map<String, Term*>();
+        inv2.ownsValues();
+
+        auto paths = List<String>();
+        for (auto r in roots) collect_paths(r, 0, &paths);
+        fprintf(stderr, "\r  scanned %d files, %d candidates.                \n",
+                g_files_seen, paths.Count());
+
+        if (g_max_files > 0) paths.Sort(by_priority);
+
+        int sec_used[9];
+        for (int i = 0; i < 9; i++) sec_used[i] = 0;
+
+        for (auto p in paths) {
+            if (g_max_files > 0 && g_files_indexed >= g_max_files) break;
+            int before = g_files_indexed;
+            ingest_file(p, &corpus2, &inv2);
+            if (g_files_indexed > before) {
+                int s = section_id(p);
+                if (s < 0 || s > 8) s = 0;
+                sec_used[s]++;
+            }
+        }
+        fprintf(stderr, "\r  indexed %d files (%ld KB plain).                      \n",
+                g_files_indexed, g_bytes_indexed / 1024);
+        printf("  section mix:");
+        for (int i = 0; i < 9; i++) {
+            if (sec_used[i] <= 0) continue;
+            if (i == 0) printf(" doc=%d", sec_used[i]);
+            else printf(" man%d=%d", i, sec_used[i]);
+        }
+        printf("\n");
+        printf("  inverted index: %d unique terms\n", inv2.Count());
+
+        if (corpus2.Count() == 0) {
+            term_print_err("no documents indexed — check paths / permissions");
+            return 1;
+        }
+
+        save_index(db, &corpus2, &inv2);
+
+        /* Move built index into outer shells for search/TUI lifetime.
+         * Move-only collections: transfer buffer ownership. */
+        corpus = move corpus2;
+        inv = move inv2;
+    } else {
+        printf("  inverted index: %d unique terms  %s(from cache)%s\n",
+               inv.Count(), term_dim(), term_reset());
     }
     printf("\n");
-    printf("  inverted index: %d unique terms\n\n", inv.Count());
 
     if (corpus.Count() == 0) {
         term_print_err("no documents indexed — check paths / permissions");
