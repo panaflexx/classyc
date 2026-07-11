@@ -328,7 +328,7 @@ int main() {
             check(dnk->Count() == 1, "12a found Dijkstra");
             dict d = dnk->Get(0);
             /* JSON null serializes as the literal string "null". */
-            char* j = d.json;
+            char* j = d.json();
             printf("  row: %s\n", j);
             /* Crude but effective: ensure the JSON contains `"email":null`. */
             check(strstr(j, "\"email\":null") != 0,

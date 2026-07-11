@@ -86,7 +86,7 @@ int main() {
         check(d.server != 0,              "1e  nested object created");
         check(d.server.port != 0,         "1f  nested integer access");
 
-        printf("    d.json (partial): %s\n", d.json);
+        printf("    d.json (partial): %s\n", d.json());
     }
     /* defer delete ran here — arena + all owned memory released */
 
@@ -143,9 +143,9 @@ int main() {
         check(key_count >= 7, "3b  for-in visited the expected number of keys");
 
         /* json round-trip sanity */
-        char *j = big.json;
+        char *j = big.json();
         check(j != 0 && strlen(j) > 100, "3c  json serialization produced substantial output");
-        printf("    big.json length = %zu\n", (size_t)strlen(j));
+        printf("    big.json() length = %zu\n", (size_t)strlen(j));
     }
 
     /* ── 4. delete without defer (explicit cleanup) ─────────────────── */

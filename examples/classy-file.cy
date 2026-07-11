@@ -69,7 +69,7 @@ int sum_bytes_cb(char *chunk, int len, void *ctx) {
 
 /* A well-formed JSON object we write to disk then parse back.
    8 lines, including the final newline. */
-static char *JSON_PATH = "/tmp/classy_file_test.json";
+static char *JSON_PATH = "/tmp/classy_file_test.json()";
 static char *JSON = "{\n"
     "  \"language\": \"classy\",\n"
     "  \"version\": 1,\n"
@@ -149,7 +149,7 @@ int main() {
         check("author" in data.meta,   "5h  data.meta.author present");
         check("stable" in data.meta,   "5i  data.meta.stable present");
 
-        printf("    dict as JSON: %s\n", data.json);
+        printf("    dict as JSON: %s\n", data.json());
     }
 
     /* ── 6. read_line ─────────────────────────────────────────────── */
@@ -285,7 +285,7 @@ int main() {
     /* ── 13. Error handling — bad path ───────────────────────────── */
     printf("\n-- 13. error handling --\n");
     {
-        File *bad = File.open("/no/such/path/nope.json", "r");
+        File *bad = File.open("/no/such/path/nope.json()", "r");
         defer delete bad;
 
         check(!bad->ok(),              "13a bad path: ok()==0");

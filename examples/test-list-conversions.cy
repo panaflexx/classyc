@@ -35,22 +35,22 @@ int main() {
 
     /* ── IntsToJsonArray() ────────────────────────────────────────────── */
     dict ints = { "items": nums->IntsToJsonArray() };
-    printf("ints:    %s\n", ints.json);
+    printf("ints:    %s\n", ints.json());
 
     /* ── ToJsonArrayBy(): project each element (square it) ────────────── */
     dict squares = { "items": nums->ToJsonArrayBy(squareAsNum) };
-    printf("squares: %s\n", squares.json);
+    printf("squares: %s\n", squares.json());
 
     /* ── ToDictBy(): build an object keyed by element ─────────────────── */
     dict byKey = nums->ToDictBy(keyOf, valOf);
-    printf("byKey:   %s\n", byKey.json);
+    printf("byKey:   %s\n", byKey.json());
     delete nums;
 
     /* ── StringsToJsonArray() (the SymptomController GET path) ─────────── */
     String csv = "fever,cough,fatigue";
     List<String>* parts = csv.split(",");
     dict out = { "symptomList": parts->StringsToJsonArray() };
-    printf("strings: %s\n", out.json);
+    printf("strings: %s\n", out.json());
 
     /* ── ToJsonArray(): automagical, type-dispatched conversion ───────── */
     List<int>* ai = new List<int>{ 1, 2, 3 };
@@ -60,7 +60,7 @@ int main() {
         "doubles": ad->ToJsonArray(),
         "strings": parts->ToJsonArray()
     };
-    printf("auto:    %s\n", autos.json);
+    printf("auto:    %s\n", autos.json());
     delete ai; delete ad; delete parts;
 
     return 0;

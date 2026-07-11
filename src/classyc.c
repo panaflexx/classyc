@@ -5693,6 +5693,16 @@ static generic_fn_tmpl_t *get_generic_fn_template (c2m_ctx_t c2m_ctx, const char
   return NULL;
 }
 
+/* UFCS (Uniform Function Call Syntax) for free generic functions:
+ *   list->GroupBy(fn)  ↔  GroupBy(list, fn)
+ * Instance methods always win member lookup; UFCS is only a fallback when the
+ * class has no such method and a free generic template with that name exists.
+ * (Non-generic free-function UFCS can be added later.) */
+static int ufcs_free_fn_candidate_p (c2m_ctx_t c2m_ctx, const char *name) {
+  if (name == NULL || name[0] == '\0') return 0;
+  return is_generic_fn_p (c2m_ctx, name);
+}
+
 /* Build a mangled specialization name for a generic function, e.g.
    Max + int -> "__genfn_Max_int".  Reuses the same arg-name mapping as
    mangle_generic_name so the spelling of primitive/class args is consistent
@@ -16916,6 +16926,16 @@ if (base != NULL && base->code == N_ID) {
                     break;
                   }
                 }
+                /* UFCS placeholder: free generic `f` may be called as `obj.f(...)`.
+                   N_CALL rewrites to f(obj, ...).  Same void-placeholder pattern as
+                   seq methods / List.join / nameof. */
+                if (op2 != NULL && op2->code == N_ID
+                    && ufcs_free_fn_candidate_p (c2m_ctx, op2->u.s.s)) {
+                  e->type->mode = TM_BASIC;
+                  e->type->u.basic_type = TP_VOID;
+                  e->u.lvalue_node = NULL;
+                  break;
+                }
                 error (c2m_ctx, POS (r), "class has no member %s", op2->u.s.s);
                 break;
               }
@@ -16929,30 +16949,17 @@ if (base != NULL && base->code == N_ID) {
           }
          if (t1->mode == TM_DICT) {
            e = create_expr(c2m_ctx, r);
-           if (strcmp(op2->u.s.s, "json") == 0) {
-             /* d.json — serialize dict to JSON String (works in f-strings and +).
-                TP_STRING is pointer-sized; set raw_size/align manually because
-                basic_type_size() does not handle TP_STRING. */
-             e->type->mode = TM_BASIC;
-             e->type->u.basic_type = TP_STRING;
-             e->type->raw_size = 8;
-             e->type->align    = 8;
-           } else {
-             /* Dict member access: every leaf stays TM_DICT (a tagged
-                DictValue*), so chaining (`d.a.b.c`), `json(leaf)`, and a future
-                typed-class binder can walk the subtree losslessly.  Scalar
-                consumers (assignment to int/String, `(int)d.x`, varargs, etc.)
-                already unwrap the union payload via maybe_unwrap_dict_value /
-                the N_CAST path.  NOTE: this used to special-case `.value` and
-                `.desc` to scalar/char*, which produced a raw intptr_t when the
-                LHS was inferred `dict` and made `json(v)` SIGSEGV on a numeric
-                leaf (SHORTCOMINGS C2).  Use an explicit `(int)d.value` /
-                `(char*)d.desc` cast when you need the unwrapped scalar.
-                Dict-wide built-ins like `d.length()` / `d.count()` are
-                dispatched in the N_CALL handler (so they don't shadow real
-                dict keys named `length` / `count`). */
-             e->type->mode = TM_DICT; /* keep TM_DICT for chaining */
-           }
+           /* Dict member access: every leaf stays TM_DICT (a tagged
+              DictValue*), so chaining (`d.a.b.c`), `json(leaf)`, and a future
+              typed-class binder can walk the subtree losslessly.  Scalar
+              consumers (assignment to int/String, `(int)d.x`, varargs, etc.)
+              already unwrap the union payload via maybe_unwrap_dict_value /
+              the N_CAST path.
+
+              Serialize with `d.json()` (method), not property `d.json` — a key
+              named "json" (e.g. `d.items.json`) is real field access, same
+              pattern as `d.length` key vs `d.length()` size. */
+           e->type->mode = TM_DICT; /* keep TM_DICT for chaining */
            e->u.lvalue_node = r; /* allow assignment */
            r->attr = e;
            break;
@@ -17650,14 +17657,15 @@ if (base != NULL && base->code == N_ID) {
                              Concrete: remaining mangled args (int, …). */
                           const char *_open = spec_nm + _pl;
                           const char *_conc = an + _pl;
-                          /* Simple single-param case (List_T / List_int). */
+                          /* Simple single-param case (List_T / List_int / List_PilotP). */
                           if (_gt->n_type_params == 1) {
                             int _tpi = -1;
                             for (int i = 0; i < gtmpl->n_type_params; i++)
                               if (gtmpl->type_params[i]
                                   && strcmp (gtmpl->type_params[i], _open) == 0)
                                 { _tpi = i; break; }
-                            /* Also List_TP (pointer element) — strip trailing P. */
+                            /* Template open form List_TP means element is T*
+                               (the open type-param name still binds free-fn T). */
                             if (_tpi < 0) {
                               size_t _ol = strlen (_open);
                               while (_ol > 0 && _open[_ol - 1] == 'P') _ol--;
@@ -17671,29 +17679,78 @@ if (base != NULL && base->code == N_ID) {
                               }
                             }
                             if (_tpi >= 0 && inferred[_tpi] == NULL) {
-                              /* Concrete arg segment (may include trailing P). */
-                              size_t _cl = strlen (_conc);
-                              while (_cl > 0 && _conc[_cl - 1] == 'P') _cl--;
-                              char _cn[64];
-                              if (_cl > 0 && _cl < sizeof (_cn)) {
-                                memcpy (_cn, _conc, _cl); _cn[_cl] = '\0';
-                                node_t _tn = NULL;
-                                if (strcmp (_cn, "int") == 0)
-                                  _tn = new_pos_node (c2m_ctx, N_INT, POS (op1));
-                                else if (strcmp (_cn, "String") == 0)
-                                  _tn = new_pos_node (c2m_ctx, N_STRING, POS (op1));
-                                else if (strcmp (_cn, "double") == 0)
-                                  _tn = new_pos_node (c2m_ctx, N_DOUBLE, POS (op1));
-                                else if (strcmp (_cn, "long") == 0)
-                                  _tn = new_pos_node (c2m_ctx, N_LONG, POS (op1));
-                                else if (strcmp (_cn, "bool") == 0)
-                                  _tn = new_pos_node (c2m_ctx, N_BOOL, POS (op1));
-                                else
-                                  _tn = build_id (c2m_ctx, _cn, POS (op1));
-                                if (_tn != NULL) {
-                                  inferred[_tpi] = _tn;
-                                  if (_tpi + 1 > n_inferred) n_inferred = _tpi + 1;
+                              node_t _tn = NULL;
+                              pos_t _ip = POS (op1);
+                              /* Prefer the specialization cache: args already
+                                 carry N_POINTER wrappers for T=Pilot*, etc. */
+                              generic_spec_t *_csp
+                                = find_generic_spec_by_name (c2m_ctx, an);
+                              if (_csp != NULL && _csp->n_args >= 1
+                                  && _csp->args[0] != NULL) {
+                                node_t a = _csp->args[0];
+                                int pd = 0;
+                                while (a != NULL && a->code == N_POINTER) {
+                                  pd++;
+                                  a = NL_HEAD (a->u.ops);
                                 }
+                                if (a != NULL) {
+                                  if (a->code == N_ID)
+                                    _tn = build_id (c2m_ctx, a->u.s.s, _ip);
+                                  else
+                                    _tn = new_pos_node (c2m_ctx, a->code, _ip);
+                                  for (int d = 0; d < pd; d++)
+                                    _tn = new_pos_node1 (c2m_ctx, N_POINTER, _ip,
+                                                         _tn);
+                                }
+                              }
+                              /* Mangle fallback: trailing P means pointer depth
+                                 (PilotP -> Pilot*, intPP -> int**).  Never strip
+                                 P into a bare value type — that used to specialize
+                                 GroupBy for List<Pilot> when the call had
+                                 List<Pilot*>, then SIGSEGV in the JIT. */
+                              if (_tn == NULL) {
+                                size_t _cl = strlen (_conc);
+                                int _pd = 0;
+                                while (_cl > 0 && _conc[_cl - 1] == 'P') {
+                                  _pd++;
+                                  _cl--;
+                                }
+                                char _cn[64];
+                                if (_cl > 0 && _cl < sizeof (_cn)) {
+                                  memcpy (_cn, _conc, _cl); _cn[_cl] = '\0';
+                                  if (strcmp (_cn, "int") == 0)
+                                    _tn = new_pos_node (c2m_ctx, N_INT, _ip);
+                                  else if (strcmp (_cn, "String") == 0)
+                                    _tn = new_pos_node (c2m_ctx, N_STRING, _ip);
+                                  else if (strcmp (_cn, "double") == 0)
+                                    _tn = new_pos_node (c2m_ctx, N_DOUBLE, _ip);
+                                  else if (strcmp (_cn, "float") == 0)
+                                    _tn = new_pos_node (c2m_ctx, N_FLOAT, _ip);
+                                  else if (strcmp (_cn, "long") == 0)
+                                    _tn = new_pos_node (c2m_ctx, N_LONG, _ip);
+                                  else if (strcmp (_cn, "short") == 0)
+                                    _tn = new_pos_node (c2m_ctx, N_SHORT, _ip);
+                                  else if (strcmp (_cn, "char") == 0)
+                                    _tn = new_pos_node (c2m_ctx, N_CHAR, _ip);
+                                  else if (strcmp (_cn, "bool") == 0)
+                                    _tn = new_pos_node (c2m_ctx, N_BOOL, _ip);
+                                  else if (strcmp (_cn, "void") == 0)
+                                    _tn = new_pos_node (c2m_ctx, N_VOID, _ip);
+                                  else if (strcmp (_cn, "dict") == 0)
+                                    _tn = new_pos_node (c2m_ctx, N_DICT, _ip);
+                                  else if (strcmp (_cn, "unsigned") == 0)
+                                    _tn = new_pos_node (c2m_ctx, N_UNSIGNED, _ip);
+                                  else
+                                    _tn = build_id (c2m_ctx, _cn, _ip);
+                                  if (_tn != NULL)
+                                    for (int d = 0; d < _pd; d++)
+                                      _tn = new_pos_node1 (c2m_ctx, N_POINTER,
+                                                           _ip, _tn);
+                                }
+                              }
+                              if (_tn != NULL) {
+                                inferred[_tpi] = _tn;
+                                if (_tpi + 1 > n_inferred) n_inferred = _tpi + 1;
                               }
                             }
                           }
@@ -18293,6 +18350,42 @@ if (base != NULL && base->code == N_ID) {
 	                  if (expanded != NULL) func_def = expanded;
 	                }
 	                if (!func_def) {
+	                  /* UFCS: rewrite `recv->F(args)` → `F(recv, args)` when F is a
+	                     free generic function (e.g. list->GroupBy(fn)). */
+	                  if (method_id != NULL && method_id->code == N_ID
+	                      && ufcs_free_fn_candidate_p (c2m_ctx, method_id->u.s.s)) {
+	                    node_t free_id = build_id (c2m_ctx, method_id->u.s.s, POS (r));
+	                    node_t this_arg;
+	                    node_t obj_copy = copy_node (c2m_ctx, obj);
+	                    obj_copy->attr = obj->attr;
+	                    if (op1->code == N_FIELD) {
+	                      /* value.method(): pass &value */
+	                      this_arg = new_node1 (c2m_ctx, N_ADDR, obj_copy);
+	                      {
+	                        struct expr *ae = create_expr (c2m_ctx, this_arg);
+	                        ae->type->mode = TM_PTR;
+	                        ae->type->u.ptr_type = obj_type;
+	                        set_type_layout (c2m_ctx, ae->type);
+	                      }
+	                    } else {
+	                      /* ptr->method(): receiver is already a pointer */
+	                      this_arg = obj_copy;
+	                    }
+	                    /* Replace FIELD/DEREF_FIELD callee with free function name. */
+	                    NL_REMOVE (r->u.ops, op1);
+	                    NL_PREPEND (r->u.ops, free_id);
+	                    NL_PREPEND (arg_list->u.ops, this_arg);
+	                    r->attr = NULL;
+	                    free_id->attr = NULL;
+	                    /* Re-check as free generic call (inference + ordinary call path).
+	                       call_nodes already contains r from the outer visit — skip
+	                       double-push by detecting re-entry via a temporary flag: the
+	                       inner check will push again; gen_mir_protos tolerates
+	                       duplicate entries for the same rewritten N_ID call. */
+	                    check (c2m_ctx, r, context);
+	                    e = r->attr;
+	                    break;
+	                  }
 	                  error(c2m_ctx, POS(r), "method '%s' not found in class", method_id->u.s.s);
 	                  break;
 	                }
@@ -18572,21 +18665,19 @@ if (base != NULL && base->code == N_ID) {
 	                ret_type = &res_type;
 	                method_call_p = TRUE;
 	              } else if (obj_type->mode == TM_DICT) {
-	                /* Built-in dict method call: d.length() / d.count() return
-	                   the unified iteration size (array length OR object
-	                   pair-count).  Implemented as methods, not properties, so
-	                   they cannot collide with real dict keys named `length` or
-	                   `count` (e.g. `d.count = 100; d.count` reads the user's
-	                   value back via the regular runtime lookup, while
-	                   `d.count()` always means the iteration size).  Lowered to
-	                   `dict_iter_count` in gen. */
+	                /* Built-in dict methods (not properties — keys of the same
+	                   name stay readable via bare field access):
+	                     d.length() / d.count() → size
+	                     d.type()               → DictType tag
+	                     d.json()               → JSON String (serialize) */
 	                node_t method_id = NL_NEXT(obj);
 	                const char *mname = (method_id && method_id->code == N_ID)
 	                                      ? method_id->u.s.s : "?";
 	                if (strcmp(mname, "length") != 0 && strcmp(mname, "count") != 0
-	                    && strcmp(mname, "type") != 0) {
+	                    && strcmp(mname, "type") != 0
+	                    && strcmp(mname, "json") != 0) {
 	                  error(c2m_ctx, POS(r),
-	                        "unknown dict method '%s' (only 'length' / 'count' / 'type' are built in)",
+	                        "unknown dict method '%s' (only 'length' / 'count' / 'type' / 'json' are built in)",
 	                        mname);
 	                  break;
 	                }
@@ -18596,10 +18687,17 @@ if (base != NULL && base->code == N_ID) {
 	                init_type(&res_type);
 	                res_type.mode = TM_BASIC;
 	                if (strcmp(mname, "type") == 0)
-	                  res_type.u.basic_type = TP_INT;  /* DictType tag (DICT_NULL..DICT_OBJECT) */
-	                else
+	                  res_type.u.basic_type = TP_INT;  /* DictType tag */
+	                else if (strcmp(mname, "json") == 0) {
+	                  /* String result; TP_STRING size not in basic_type_size. */
+	                  res_type.u.basic_type = TP_STRING;
+	                  res_type.type_qual.const_p = 1;
+	                  res_type.raw_size = 8;
+	                  res_type.align = 8;
+	                } else
 	                  res_type.u.basic_type = get_uint_basic_type(sizeof(mir_size_t)); /* size_t */
-	                set_type_layout(c2m_ctx, &res_type);
+	                if (strcmp(mname, "json") != 0)
+	                  set_type_layout(c2m_ctx, &res_type);
 	                ret_type = &res_type;
 	                method_call_p = TRUE;
 	              } else {
@@ -22471,7 +22569,7 @@ static void dict_ensure_imports (c2m_ctx_t c2m_ctx) {
   move_item_to_module_start (module, dict_serialize_json_item);
 
   /* dict_serialize_json_heap(const DictValue *val, int pretty) -> char*
-     Heap-allocating, right-sized variant used by the compiler's `d.json` /
+     Heap-allocating, right-sized variant used by the compiler's `d.json()` /
      `json(d)` codegen.  The returned pointer is plain-malloc'd; the compiler
      registers it with the String arena (c2m_str_attach) so the normal scope
      cleanup / return-protection path manages its lifetime. */
@@ -26389,14 +26487,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       if (obj_e != NULL && obj_e->type != NULL && obj_e->type->mode == TM_DICT
           && key_node != NULL && key_node->code == N_ID) {
         const char *key_str = key_node->u.s.s;
-        if (strcmp (key_str, "json") == 0) {
-          /* d.json — serialize dict to JSON string.
-             The result must survive across returns / try-block cleanup, so
-             route through the String arena (see gen_dict_serialize_to_tracked_string). */
-          op1 = val_gen (c2m_ctx, obj_node);
-          res = gen_dict_serialize_to_tracked_string (c2m_ctx, op1.mir_op);
-          break;
-        }
+        /* Bare d.json is ordinary key lookup (same as d.length).  Serialize with
+           d.json() — see N_CALL dict-method path below. */
         op1 = val_gen (c2m_ctx, obj_node);
         MIR_op_t key_op = gen_dict_key_op (c2m_ctx, key_str, strlen (key_str) + 1);
         op_t got = gen_dict_object_get (c2m_ctx, op1.mir_op, key_op);
@@ -27005,10 +27097,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         goto finish;
       }
     }
-    /* Built-in dict method call: d.length() / d.count() -> dict_iter_count.
-       Recognized here (rather than as magic dot-access on TM_DICT) so that
-       a user-supplied dict key called `length` or `count` is still readable
-       via `d.length` / `d.count` and assignable via `d.length = ...`. */
+    /* Built-in dict methods (not key access):
+         d.length() / d.count() → dict_iter_count
+         d.type()               → DictType tag
+         d.json()               → serialize to arena String
+       Bare d.length / d.json stay ordinary key lookups. */
     if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
       node_t mobj = NL_HEAD (func->u.ops);
       node_t mid  = NL_NEXT (mobj);
@@ -27028,6 +27121,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         /* d.type() -> DictType tag at offset 0 (no payload unwrap). */
         op_t recv = val_gen (c2m_ctx, mobj);
         res = gen_dict_type_tag (c2m_ctx, recv);
+        goto finish;
+      }
+      if (mid != NULL && mid->code == N_ID && obj_e != NULL
+          && obj_e->type != NULL && obj_e->type->mode == TM_DICT
+          && strcmp (mid->u.s.s, "json") == 0
+          && (args == NULL || NL_LENGTH (args->u.ops) == 0)) {
+        /* d.json() — serialize; result is arena-tracked String. */
+        op_t recv = val_gen (c2m_ctx, mobj);
+        res = gen_dict_serialize_to_tracked_string (c2m_ctx, recv.mir_op);
         goto finish;
       }
     }
@@ -29333,15 +29435,14 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
             && sfe->type->u.basic_type == TP_VOID)
           continue;
       }
-      /* Built-in dict methods (d.length() / d.count()) are lowered directly
-         to dict_iter_count() in gen and carry no user-level C prototype.
-         Identified by: receiver type is TM_DICT and the method name is one
-         of the recognized dict builtins. */
+      /* Built-in dict methods (d.length/count/type/json) are lowered in gen
+         and carry no user-level C prototype. */
       if (smethod != NULL && smethod->code == N_ID && sobj_e != NULL
           && sobj_e->type != NULL && sobj_e->type->mode == TM_DICT
           && (strcmp (smethod->u.s.s, "length") == 0
               || strcmp (smethod->u.s.s, "count") == 0
-              || strcmp (smethod->u.s.s, "type") == 0))
+              || strcmp (smethod->u.s.s, "type") == 0
+              || strcmp (smethod->u.s.s, "json") == 0))
         continue;
     }
     type = ((struct expr *) func->attr)->type;

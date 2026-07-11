@@ -380,7 +380,7 @@ handles in `List<Any<I>*>` **and** `Map<K, Any<I>*>` (for-in over both). See
 ## D. What works well (for contrast)
 - `dict` objects: init, nested init, dot read/write, dynamic key creation,
   `[ ]` subscript, `"k" in d`, `for (auto k in d)`, `for (auto k, v in d)`,
-  `json()` parse/serialize round-trip, `d.json` shorthand.
+  `json()` parse/serialize round-trip, `d.json()` shorthand.
 - dict JSON arrays at the value level: `d.nums` retrieves it, `json(d.nums)`
   -> `[10,20,30]`, integer subscript `d.nums[0]` returns the element.
 - Automatic String arena: returns survive (release_keeping), tight 200k-alloc

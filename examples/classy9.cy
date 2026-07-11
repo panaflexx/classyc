@@ -6,5 +6,5 @@ int main() {
 	List<String> sah = {"sah"};
 
 	auto d = {"animal": "cat"};
-	printf(f"{d.json} - {blah.ToJson()} - {sah.ToJson()}\n");
+	printf(f"{d.json()} - {blah.ToJson()} - {sah.ToJson()}\n");
 }

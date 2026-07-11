@@ -48,13 +48,18 @@
  *   for (auto k in map)        -> k over keys, in insertion order
  *   for (auto k, v in map)     -> k = key, v = value
  *
- * Missing keys: Get(k) on an absent key returns a zero-initialized V (0 / NULL /
- * empty).  Use Contains(k) to distinguish "absent" from "present with zero
- * value", or GetOr(k, fallback) to supply your own default.
+ * Missing keys: Get(k) **throws KeyException**.  Prefer GetOr(k, fallback),
+ * TryGet(k, &out), or try/catch when absence is expected.  Contains(k) /
+ * ContainsKey(k) test presence without throwing.
  *
- * Memory: Caller owns via `defer delete`.  Copy()/Merge() return new heap maps
- * the caller must free.  For Map<…, MyClass*> the map owns only the pointers,
- * not the pointed-to objects (free those yourself).
+ * Memory: Caller owns via `defer delete` (or `owned` / `defer delete ownsValues()`).
+ * Copy()/Merge() return new heap maps the caller must free.  Keys()/Values()
+ * return new List* the caller must free.  For Map<…, MyClass*> the map owns
+ * only the pointers unless ownsValues()/ownsKeys() was used.
+ *
+ * List grouping: free `GroupBy(list, keyFn)` (UFCS: `list->GroupBy(keyFn)`)
+ * lives here to avoid a list.h↔map.h include cycle.  ListGroupBy is a compat
+ * alias of the same free function.
  *
  * Thread safety: None.
  */
@@ -595,7 +600,7 @@ class Map<K, V> {
      * (ToJson() would free the referenced value dicts). */
     String ToJson() const {
         dict obj = this->ToDict();
-        String j = obj.json;
+        String j = obj.json();
         dict_destroy(obj);
         return j;
     }
@@ -607,12 +612,33 @@ class Map<K, V> {
 
 };
 
-/* List.GroupBy as a free generic function.
+/* List.GroupBy as a free generic function (method form via UFCS).
  * list.h cannot return Map from a method without #including map.h (cycle:
- * map.h already includes list.h for Keys/Values).  Until UFCS, call:
- *   Map<int, List<int>*>* g = ListGroupBy(nums, parity);  // T,G inferred
+ * map.h already includes list.h for Keys/Values).  Call either way:
+ *   Map<int, List<int>*>* g = nums->GroupBy(parity);     // UFCS method form
+ *   Map<int, List<int>*>* g = GroupBy(nums, parity);     // free form
+ *   Map<int, List<int>*>* g = ListGroupBy(nums, parity); // compat alias
  *   defer delete g->ownsValues();
+ * Map<K,V>::GroupBy stays the instance method on maps (same name, method wins).
  */
+Map<G, List<T>*>* GroupBy<T, G>(List<T>* self, G(*keySelector)(T))
+    __attribute__((da_ignore)) {
+    Map<G, List<T>*>* result = new Map<G, List<T>*>();
+    if (!self) return result;
+    for (int i = 0; i < self->Count(); i++) {
+        T item = self->Get(i);
+        G gk = keySelector(item);
+        List<T>* bucket;
+        if (!result->TryGet(gk, &bucket)) {
+            bucket = new List<T>();
+            result->Set(gk, bucket);
+        }
+        bucket->Add(item);
+    }
+    return result;
+}
+
+/* Compat alias of GroupBy (pre-UFCS name). */
 Map<G, List<T>*>* ListGroupBy<T, G>(List<T>* self, G(*keySelector)(T))
     __attribute__((da_ignore)) {
     Map<G, List<T>*>* result = new Map<G, List<T>*>();

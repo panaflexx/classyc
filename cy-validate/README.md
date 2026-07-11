@@ -28,7 +28,7 @@ assertions (0 == all passed). The runner prints a per-file summary.
 |------|-------|
 | `val-001-string-methods.cy`   | String API: length/substr/find/replace/upper/lower/trim/split/join/equals + auto-cast concat |
 | `val-002-string-arena.cy`     | **Memory:** automatic String arena (release_keeping on return; 200k-alloc loop stays bounded) |
-| `val-003-dict.cy`             | dict: init/nested/dot/subscript/dynamic keys/`in`/for-in/json round-trip/`.json` |
+| `val-003-dict.cy`             | dict: init/nested/dot/subscript/dynamic keys/`in`/for-in/json round-trip/`.json()` |
 | `val-004-dict-arrays.cy`      | dict JSON arrays: `d.arr[i]`, `d.items[0].name`, `(int)d.items[0].value`, documented limits |
 | `val-005-dict-arena.cy`       | **Memory:** `new dict(bytes)` / `new dict()` / `delete` / `defer delete`; 2000-arena churn |
 | `val-006-map.cy`              | Map<K,V>: subscript, for-in, KeyAt/ValAt, Copy/Merge, object values, 5k-entry growth |

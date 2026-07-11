@@ -164,7 +164,7 @@ class CustomersController {
         int first = 1;
         for (auto r in rows) {
             if (!first) out = out + ",";
-            out = out + r.json;
+            out = out + r.json();
             first = 0;
         }
         return out + "]";
@@ -202,7 +202,7 @@ class CustomersController {
                 "SELECT * FROM customers WHERE id=?", "i", id);
             defer delete rows;
             if (rows->Count() == 0) return resp_not_found(f"Customer {id}");
-            return resp_ok(rows->Get(0).json);
+            return resp_ok(rows->Get(0).json());
         } catch (SqliteError e) {
             return resp_500(e.msg);
         }
@@ -249,7 +249,7 @@ class CustomersController {
             List<dict>* created = this.db->query(
                 "SELECT * FROM customers WHERE id=?", "l", new_id);
             defer delete created;
-            return resp_created(created->Get(0).json);
+            return resp_created(created->Get(0).json());
         } catch (SqliteError e) {
             return resp_500(e.msg);
         }
@@ -296,7 +296,7 @@ class CustomersController {
             List<dict>* fresh = this.db->query(
                 "SELECT * FROM customers WHERE id=?", "i", id);
             defer delete fresh;
-            return resp_ok(fresh->Get(0).json);
+            return resp_ok(fresh->Get(0).json());
         } catch (SqliteError e) {
             return resp_500(e.msg);
         }
@@ -344,7 +344,7 @@ void log_request(Request* req) {
     printf("→ %s %s%s%s\n",
            req->method, req->path,
            req->query.empty() ? "" : "?", req->query);
-    if (req->body != 0) printf("  body: %s\n", req->body.json);
+    if (req->body != 0) printf("  body: %s\n", req->body.json());
 }
 
 void log_response(Response* res) {

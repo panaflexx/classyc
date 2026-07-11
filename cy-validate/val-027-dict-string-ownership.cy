@@ -45,8 +45,8 @@ int main(void) {
     d["var"] = s;
     d["lit"] = "hello";
     check(strcmp((char*)d["var"], "world-42") == 0, "(1) String var reads back correctly");
-    check(strstr(d.json, "\"var\":\"world-42\"") != 0, "(1) String var serializes as JSON string");
-    check(strstr(d.json, "\"lit\":\"hello\"")    != 0, "(1) literal still serializes as JSON string");
+    check(strstr(d.json(), "\"var\":\"world-42\"") != 0, "(1) String var serializes as JSON string");
+    check(strstr(d.json(), "\"lit\":\"hello\"")    != 0, "(1) literal still serializes as JSON string");
 
     /* (2) Dict String fields set from an inner scope survive the scope's arena
        release (dict owns a copy — no dangling / garbage). */
@@ -55,7 +55,7 @@ int main(void) {
     check(strcmp((char*)a["name"],  "user#1")             == 0, "(2) inner-scope String field intact");
     check(strcmp((char*)a["email"], "user#1@example.com") == 0, "(2) inner-scope concat field intact");
     check(strcmp((char*)b["name"],  "user#2")             == 0, "(2) second dict field intact (no aliasing)");
-    check(strstr(a.json, "\"name\":\"user#1\"") != 0, "(2) json serializes owned String field");
+    check(strstr(a.json(), "\"name\":\"user#1\"") != 0, "(2) json serializes owned String field");
 
     /* (3) substr temporaries stored into a dict are owned copies. */
     dict e = dict_create_object();

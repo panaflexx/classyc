@@ -4,7 +4,7 @@
  *   Map: GetOrAdd, ContainsValue, AddOrUpdate, Where*, Any/All,
  *        SelectValues<W>, SelectKeys<G>, GroupBy<G>, int-key ToJson
  *   List: Range factory, Slice, Concat chain
- *   Free: ListGroupBy (map.h; List method deferred — circular #include)
+ *   Free: ListGroupBy / GroupBy (map.h; method form via UFCS in val-033)
  *
  * Run:  ./bin/classyc -g -I include cy-validate/val-032-map-list-cleanup.cy -eg
  */

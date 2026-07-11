@@ -33,15 +33,15 @@ String qparam(String qs, String key) {
 }
 
 int main() {
-    /* 1. d.json now returns String — works in f-strings and + */
+    /* 1. d.json() now returns String — works in f-strings and + */
     dict alice = { "id": 1, "name": "Alice", "email": "alice@example.com", "role": "admin" };
-    printf("raw json : %s\n", alice.json);
+    printf("raw json : %s\n", alice.json());
 
-    String label = f"User payload: {alice.json}";
+    String label = f"User payload: {alice.json()}";
     printf("%s\n", label);
 
     /* can also concat */
-    String envelope = "[" + alice.json + "]";
+    String envelope = "[" + alice.json() + "]";
     printf("array    : %s\n", envelope);
 
     /* 2. List<dict> — JSON store */
@@ -52,11 +52,11 @@ int main() {
     store->Add(bob);
     store->Add(carol);
 
-    /* build a JSON array response using + since d.json is now String */
+    /* build a JSON array response using + since d.json() is now String */
     String arr = "[";
     for (int i = 0; i < store->Count(); i++) {
         if (i > 0) arr = arr + ",";
-        arr = arr + store->Get(i).json;
+        arr = arr + store->Get(i).json();
     }
     arr = arr + "]";
     printf("store    : %s\n\n", arr);
@@ -85,10 +85,10 @@ int main() {
     int status = 201;
     dict created = { "id": 4, "name": "Dave", "email": "dave@example.com", "role": "viewer" };
     printf("\nHTTP/1.1 %d Created\n", status);
-    printf("Content-Type: application/json\n\n%s\n", created.json);
+    printf("Content-Type: application/json\n\n%s\n", created.json());
 
     /* 7. f-string composing path + method + status — all String */
-    String log_line = f"[201] POST /api/users → {created.json}";
+    String log_line = f"[201] POST /api/users → {created.json()}";
     printf("\nlog: %s\n", log_line);
 
     delete store;

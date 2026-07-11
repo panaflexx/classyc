@@ -60,7 +60,7 @@ int main() {
     check(strcmp((char*)json(s0), "\"a\"") == 0,    "C2: json(string-leaf) prints '\"a\"'");
 
     /* round-trip whole structure preserves the nested array */
-    dict d2 = json((char*)r.json);
+    dict d2 = json((char*)r.json());
     check("items" in d2,                            "round-trip preserves array key");
 
     /* C3: for-in over a dict array iterates N times.

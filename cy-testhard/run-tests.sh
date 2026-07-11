@@ -27,7 +27,7 @@ run_test() {
     shift
     extra_flags="$*"
     banner "$name"
-    $CLASSYC "$DIR/$name" -eg $extra_flags
+    $CLASSYC -I include "$DIR/$name" -eg $extra_flags
     status=$?
     if [ $status -eq 0 ]; then
         PASS=$((PASS + 1))

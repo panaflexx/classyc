@@ -10,7 +10,7 @@ class Fruit {
        Compiler sugar:
          - Fruit.Apple   in integer/constant contexts resolves to .value (0)
          - Fruit itself (or .variants) is the dict for runtime:
-             for-in, "name" in Fruit, subscript, .json, mutation, etc.
+             for-in, "name" in Fruit, subscript, .json(), mutation, etc.
          - Exhaustiveness checking possible on switch using the keys.
     */
     dict variants = {
@@ -92,12 +92,12 @@ int main() {
 
     printf("\nMembership: %s\n", ("Kiwi" in Fruit.variants) ? "yes" : "no");
 
-    printf("\nFull declarative structure as JSON:\n%s\n", Fruit.variants.json);
+    printf("\nFull declarative structure as JSON:\n%s\n", Fruit.variants.json());
 
     /* Still fully dynamic because it's just a dict */
-    dict live = json(Fruit.variants.json);
+    dict live = json(Fruit.variants.json());
     live.Peach = { "value": 99, "desc": "Furry peach." };
-    printf("\nAfter runtime addition of Peach:\n%s\n", live.json);
+    printf("\nAfter runtime addition of Peach:\n%s\n", live.json());
 
     return 0;
 }

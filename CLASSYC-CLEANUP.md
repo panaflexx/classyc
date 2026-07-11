@@ -69,8 +69,9 @@ Concrete primitives, pointers, by-value classes, and nested collection specialis
     * **FIXED partially:** `Where`/`Select`/`SelectString`, `Any`/`All`/`Find*`/`AddRange`/`InsertRange`/`Distinct`/`Repeat`.
     * **FIXED:** generic `Select<U>` — `xs->Select<String>(fn)` / inferred `xs->Select(fn)`. `val-031`.
     * **FIXED:** `Range` factory via `nameof<T>()` + integral guard (throws on non-int `T` / negative count).
-    * **FIXED (free fn):** `ListGroupBy` in `map.h` (List method form deferred — circular `#include` with Map).
-    * **NOT FIXED:** slice sugar `list[1..3]`, `operator+`.
+    * **FIXED (free fn + UFCS):** free `GroupBy(list, fn)` / `ListGroupBy` compat in `map.h`; method form `list->GroupBy(fn)` via UFCS (avoids list↔map include cycle).
+    * **FIXED (method stand-in):** `List.Plus(other)` non-mutating concat (operator+ / slice sugar still language-level).
+    * **NOT FIXED:** slice sugar `list[1..3]`, language `operator+`.
 
 7.  **Constructor confusion:** capacity vs singleton for `int`.
     * **NOT FIXED — intentional** C# semantics: `new List<int>(4)` capacity, `new List<int>{4}` singleton.
@@ -88,13 +89,13 @@ Concrete primitives, pointers, by-value classes, and nested collection specialis
 * **FIXED:** `GetOrAdd`/`ContainsValue`/`AddOrUpdate`/`Where`/`WhereKeys`/`WhereValues`/`Any`/`All`.
 * **FIXED:** method-generic `SelectValues<W>`/`SelectKeys<G>`/`GroupBy<G>` (nested `Map<G, List<V>*>` monomorphization in `classyc.c`).
 * **FIXED:** int/long/short/bool key JSON via `nameof` + decimal keys in `ToDict`/`ToJson`.
-* **FIXED (List companion):** free `ListGroupBy(list, keyFn)` in `map.h` (avoids list↔map include cycle); method form needs UFCS.
-* Validated by `cy-validate/val-032-map-list-cleanup.cy` (42 tests).
+* **FIXED (List companion):** free `GroupBy(list, keyFn)` / `ListGroupBy` alias in `map.h`; UFCS method form `list->GroupBy(fn)`.
+* Validated by `cy-validate/val-032-map-list-cleanup.cy` (42) + `val-033-list-map-ufcs.cy` (26).
 
 ### `dict` — you have JSON-like but not JS-like
 
 * Safe nav `?.`, nullish `??`, spread `...`, array literals in dict: **NOT FIXED** (parser).
-* Prefer `v.json` over free `json(v)` in docs.
+* Prefer `v.json()` (method) over free `json(v)` for serialize; bare `v.json` is a **key** named `"json"` (same idea as `v.length` vs `v.length()`).
 
 ### Static methods & Object model
 
@@ -143,9 +144,13 @@ Generic free-function inference (`Max(3,5)`): **works** (`val-023`). Mark langua
 
 **Done (Map higher-order + List Range/GroupBy free fn):** val-032 (42); nested `Map<G,List<V>*>` method generics; free-fn type inference for `List<T>*` / `G(*fn)(T)`; free-fn crossref drain; `create_expr` zero `def_node` (fixes List-internal `data[i]` gen crash in val-024).
 
-**Next:** UFCS (`ListGroupBy` as method); expand `builtin_method` to dict/seq; `?.` `??` `..`; `owned auto` docs.
+**Done (UFCS + List.Plus):** generic free-fn UFCS (`list->GroupBy(fn)` ↔ `GroupBy(list, fn)`); free `GroupBy` primary + `ListGroupBy` alias; `List.Plus` non-mutating concat; map Get docs corrected (throws). val-033 (26).
 
-**Later:** Spread dict, properties, list `[]` literals, `is_int<T>` / `Range`.
+**Done (free-fn pointer type-arg inference):** peels `__generic_List_PilotP` keeping trailing `P` as `N_POINTER` (cache args preferred). Fixes JIT SIGSEGV when `GroupBy` monomorphized `T=Pilot` for `List<Pilot*>`. val-034 (13); neon-grid uses `grid->GroupBy(faction_bucket)`.
+
+**Next:** expand `builtin_method` to dict/seq; `?.` `??` `..`; `owned auto` docs.
+
+**Later:** Spread dict, properties, list `[]` literals, language `operator+` / slice sugar, `is_int<T>`.
 
 ### Notes from implementation
 

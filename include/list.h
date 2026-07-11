@@ -283,10 +283,34 @@ class List<T> {
         }
     }
 
-    List<T>* Concat(List<T>* other) { if(other){ int oc=other->Count(); EnsureCapacity(length+oc); for(int i=0;i<oc;i++) Add(other->Get(i)); } return this; }
+    /* Append other onto this list; returns this for chaining (mutating).
+     * Prefer Plus(other) when you need a new list (Python-style + semantics). */
+    List<T>* Concat(List<T>* other) {
+        if (other) {
+            int oc = other->Count();
+            EnsureCapacity(length + oc);
+            for (int i = 0; i < oc; i++) Add(other->Get(i));
+        }
+        return this;
+    }
 
-    void AddRange(List<T>* other) { if(!other) return; int oc=other->Count(); EnsureCapacity(length+oc); for(int i=0;i<oc;i++) Add(other->Get(i)); }
-    void InsertRange(int index, List<T>* other) { if(!other||other->Count()==0) return; if(index<0) index=0; if(index>length) index=length; int oc=other->Count(); EnsureCapacity(length+oc); for(int i=length-1;i>=index;i--) data[i+oc]=data[i]; for(int i=0;i<oc;i++) data[index+i]=other->Get(i); length+=oc; }
+    void AddRange(List<T>* other) {
+        if (!other) return;
+        int oc = other->Count();
+        EnsureCapacity(length + oc);
+        for (int i = 0; i < oc; i++) Add(other->Get(i));
+    }
+
+    void InsertRange(int index, List<T>* other) {
+        if (!other || other->Count() == 0) return;
+        if (index < 0) index = 0;
+        if (index > length) index = length;
+        int oc = other->Count();
+        EnsureCapacity(length + oc);
+        for (int i = length - 1; i >= index; i--) data[i + oc] = data[i];
+        for (int i = 0; i < oc; i++) data[index + i] = other->Get(i);
+        length += oc;
+    }
 
     /* Return new heap list with [start, start+count). Clamps to valid range.
      * Caller must `delete` the result. */
@@ -306,6 +330,15 @@ class List<T> {
         for (int i = 0; i < this->length; i++)
             c->Add(this->data[i]);
         return c;
+    }
+
+    /* New heap list = this ++ other (non-mutating).  Caller must delete.
+     * Stand-in for operator+ until the language gets overloaded +.
+     * Declared after Copy/AddRange (method order matters). */
+    List<T>* Plus(List<T>* other) __attribute__((da_ignore)) {
+        List<T>* r = this->Copy();
+        if (other) r->AddRange(other);
+        return r;
     }
 
     /* ═════════════════════════ Array conversions ═══════════════════════ */
@@ -371,9 +404,11 @@ class List<T> {
         return result;
     }
 
-    /* NOTE: GroupBy for List lives as free ListGroupBy<T,G> in map.h — list.h
-     * cannot #include map.h (map includes list). Prefer Map.GroupBy when the
-     * source is already a map; use ListGroupBy for lists until UFCS arrives. */
+    /* NOTE: GroupBy for List lives as free GroupBy<T,G> / ListGroupBy in map.h
+     * (list.h cannot #include map.h — map includes list).  With UFCS:
+     *   nums->GroupBy(keyFn)   // method-style
+     *   GroupBy(nums, keyFn)   // free form
+     * Prefer Map.GroupBy when the source is already a map. */
 
     int Any(int(*pred)(T)) __attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++)
@@ -463,7 +498,7 @@ class List<T> {
      *
      *   List<String>* parts = s.split(",");
      *   dict out = { "items": parts->StringsToJsonArray() };
-     *   return resp_ok(out.json);
+     *   return resp_ok(out.json());
      *
      * The returned dict is a heap-allocated array owned by whatever dict
      * references it (or freed when that dict is deleted).
@@ -602,7 +637,7 @@ class List<T> {
      * the referenced element dicts). */
     String ToJson() __attribute__((da_ignore)) {
         dict arr = this->ToJsonArray();
-        String j = arr.json;
+        String j = arr.json();
         dict_destroy(arr);
         return j;
     }

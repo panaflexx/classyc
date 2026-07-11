@@ -532,7 +532,7 @@ C2M_DICT_API char *dict_serialize_json(const DictValue *val, char *buffer, size_
  * Returns NULL on allocation failure or if the value is malformed; otherwise
  * the caller owns the returned pointer and must free() it.
  *
- * Used by the compiler's `d.json` and `json(d)` codegen so the result
+ * Used by the compiler's `d.json()` and `json(d)` codegen so the result
  * survives across function returns and `try`-block scope cleanup (the prior
  * stack-alloca path returned a dangling pointer once the producing frame went
  * away). */

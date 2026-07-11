@@ -217,7 +217,7 @@ class UsersController {
            In production push active=1 to SQL; here it demonstrates ->Filter(). */
         List<dict>* data = rows->Filter((dict r) => (int)(long)r.active != 0);
         defer delete data;
-        for (auto r in data) printf("  row: %s\n", r.json);
+        for (auto r in data) printf("  row: %s\n", r.json());
 
         try {
             dict env = {
@@ -226,7 +226,7 @@ class UsersController {
                 "limit": limit,
                 "data":  data->ToDict()
             };
-            return resp_ok(env.json);
+            return resp_ok(env.json());
         }
         catch (Exception e) {
             return resp_bad("Internal server error");
@@ -245,7 +245,7 @@ class UsersController {
         }
         defer delete rows;
         /* Use the dict JSON directly (simpler & avoids manual f-string) */
-        return resp_ok(rows->Get(0).json);
+        return resp_ok(rows->Get(0).json());
     }
 
     /* ── POST /api/users  (Pythonic: explicit tx + audit log) ─────────── */
@@ -293,10 +293,10 @@ class UsersController {
             "i", (int)new_id);
         if (!fresh) {
             dict created = { "id": (int)new_id };
-            return resp_created(created.json);
+            return resp_created(created.json());
         }
         defer delete fresh;
-        return resp_created(fresh->Get(0).json);
+        return resp_created(fresh->Get(0).json());
     }
 
     /* ── PUT /api/users/{id}  (partial update via prepared statement) ──── */

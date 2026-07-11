@@ -22,7 +22,7 @@
  *     curl -s -X DELETE http://127.0.0.1:8080/api/users/3
  *
  * Memory model / ergonomics: one-shot bound `db->execute(sql, fmt, ...)` /
- * `db->query(sql, fmt, ...)`, rows come back as `dict` (so `.json` serialises
+ * `db->query(sql, fmt, ...)`, rows come back as `dict` (so `.json()` serialises
  * them for free), `try { ... } catch (SqliteError e) { ... }` maps DB failures
  * to a 500, and a `Transaction*` with `defer delete` rolls back unless
  * `commit()` runs.  It just works.
@@ -74,11 +74,11 @@ class UsersController {
                     "SELECT * FROM users WHERE role=? ORDER BY id LIMIT ?",
                     "si", (char*)role, limit);
 
-            /* Build the response as a real dict and let `.json` serialise it.
+            /* Build the response as a real dict and let `.json()` serialise it.
                `rows->ToDict()` turns the List<dict> into a DICT_ARRAY; the dict
                literal deep-copies it under the "data" key. */
             owned auto out = { "total": rows->Count(), "data": rows->ToDict() };
-            return resp_ok(out.json);
+            return resp_ok(out.json());
         } catch (SqliteError e) {
             return resp_500(e.msg);
         }
@@ -90,7 +90,7 @@ class UsersController {
             owned auto rows = this.db->query(
                 "SELECT * FROM users WHERE id=?", "i", id);
             if (rows->Count() == 0) return resp_not_found(f"User {id}");
-            return resp_ok(rows->Get(0).json);
+            return resp_ok(rows->Get(0).json());
         } catch (SqliteError e) {
             return resp_500(e.msg);
         }
@@ -123,7 +123,7 @@ class UsersController {
 
             owned auto created = this.db->query(
                 "SELECT * FROM users WHERE id=?", "l", new_id);
-            return resp_created(created->Get(0).json);
+            return resp_created(created->Get(0).json());
         } catch (SqliteError e) {
             return resp_500(e.msg);
         }
@@ -157,7 +157,7 @@ class UsersController {
 
             owned auto fresh = this.db->query(
                 "SELECT * FROM users WHERE id=?", "i", id);
-            return resp_ok(fresh->Get(0).json);
+            return resp_ok(fresh->Get(0).json());
         } catch (SqliteError e) {
             return resp_500(e.msg);
         }

@@ -16,7 +16,7 @@ class myC {
 		dict ev = { "seq": this.get_seq(), "type": "event", "event": "" };
 		dict ev2 = { "seq": get_seq(), "type": "event", "event": "" };
 
-		String s = ev.json;
+		String s = ev.json();
 		printf(f"ev = {s}\n");
 	}
 };

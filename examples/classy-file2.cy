@@ -19,7 +19,7 @@
 
 /* ── the text we'll analyse ────────────────────────────────────────── */
 static char *NOTES_PATH  = "/tmp/notes.txt";
-static char *REPORT_PATH = "/tmp/notes_report.json";
+static char *REPORT_PATH = "/tmp/notes_report.json()";
 
 static char *NOTES =
     "The compiler spoke:\n"
@@ -129,7 +129,7 @@ int main() {
         report["keyword"]    = srch.needle;
         report["match_line"] = srch.found_lineno;
 
-        File.write_text(REPORT_PATH, report.json);
+        File.write_text(REPORT_PATH, report.json());
         printf("Saved report → %s\n", REPORT_PATH);
     }   /* f closes here via defer delete */
 
@@ -140,7 +140,7 @@ int main() {
         free(raw);
 
         printf("\nLoaded report (JSON round-trip):\n");
-        printf("  %s\n", rep.json);
+        printf("  %s\n", rep.json());
 
         /* iterate keys to show for-in over a parsed dict */
         printf("\n  keys present:");

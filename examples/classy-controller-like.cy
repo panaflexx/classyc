@@ -9,7 +9,7 @@
  *   · In-memory store as List<dict>   (each dict IS the row)
  *   · String methods for routing, parsing, and formatting
  *   · f-strings for log lines and human-readable messages
- *   · d.json now returns String, so it composes with + and f"{…}"
+ *   · d.json() now returns String, so it composes with + and f"{…}"
  *   · VALUE-SEMANTIC String fields: `this.path = path.trim().lower()` just
  *     copies into the object and is freed with it — no `.detach()`, no manual
  *     free.  Strings live and die with their object, like C# `string`.
@@ -150,7 +150,7 @@ class Response {
         this.status     = status;
         this.statusText = statusText;
         /* `body` is a transient arena String (an f-string, a `+` chain, or a
-           `d.json` result); assigning it to this String field copies it into
+           `d.json()` result); assigning it to this String field copies it into
            a buffer the Response owns and frees on destruction. */
         this.body       = body;
     }
@@ -231,7 +231,7 @@ class UsersController {
         int first = 1;
         for (int i = from; i < to && i < this.db->Count(); i++) {
             if (!first) out = out + ",";
-            out   = out + this.db->Get(i).json;
+            out   = out + this.db->Get(i).json();
             first = 0;
         }
         return out + "]";
@@ -271,7 +271,7 @@ class UsersController {
         int first = 1;
         for (int i = from; i < to; i++) {
             if (!first) arr = arr + ",";
-            arr   = arr + view->Get(i).json;
+            arr   = arr + view->Get(i).json();
             first = 0;
         }
         arr = arr + "]";
@@ -286,7 +286,7 @@ class UsersController {
         int idx = this->FindIndex(id);
         if (idx < 0)
             return resp_not_found(f"User {id}");
-        return resp_ok(this.db->Get(idx).json);
+        return resp_ok(this.db->Get(idx).json());
     }
 
     /* ── POST /api/users ─────────────────────────────────────────────── */
@@ -316,7 +316,7 @@ class UsersController {
         user.active = 1;
         this.db->Add(user);
 
-        return resp_created(user.json);
+        return resp_created(user.json());
     }
 
     /* ── PUT /api/users/{id} ─────────────────────────────────────────── */
@@ -338,7 +338,7 @@ class UsersController {
         /* Write back */
         this.db->Set(idx, existing);
 
-        return resp_ok(this.db->Get(idx).json);
+        return resp_ok(this.db->Get(idx).json());
     }
 
     /* ── DELETE /api/users/{id} ──────────────────────────────────────── */

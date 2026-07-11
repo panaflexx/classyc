@@ -124,9 +124,9 @@ static int dap_send_message(FILE *out, char *json_str) {
     return 0;
 }
 
-/* Send a dict as a DAP message via its .json serialization. */
+/* Send a dict as a DAP message via its .json() serialization. */
 static int dap_send_dict(FILE *out, dict msg) {
-    char *j = msg.json;
+    char *j = msg.json();
     if (!j) return -1;
     return dap_send_message(out, j);
 }

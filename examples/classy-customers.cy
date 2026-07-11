@@ -36,7 +36,7 @@
 #include "map.h"
 
 /* ── Schema ─────────────────────────────────────────────────────────
-   These mirror customers.json one-for-one.  We use `class` (not plain struct)
+   These mirror customers.json() one-for-one.  We use `class` (not plain struct)
    so the `String` fields get VALUE SEMANTICS: the typed bind copies each
    string into a buffer the object owns, and the auto-generated destructor
    frees them when the Customer is destroyed (recursing into the nested
@@ -78,7 +78,7 @@ Map<int, Customer*>* load_customers(char *path) {
         return 0;
     }
 
-    /* Parse the whole file into a dict.  customers.json is a bare JSON array,
+    /* Parse the whole file into a dict.  customers.json() is a bare JSON array,
        so the result has DICT_ARRAY at its root.  The dict is a transient: once
        we have bound every record (which copies the strings into the owning
        Customer objects) we delete it here — the customers keep their own

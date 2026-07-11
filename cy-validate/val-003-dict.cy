@@ -2,7 +2,7 @@
  *
  * Covers: object init, nested init, dot read/write, dynamic key creation,
  * [ ] subscript, "k" in d, for-in (keys and key,value), json() parse/serialize
- * round-trip, and the d.json shorthand.
+ * round-trip, and the d.json() shorthand.
  *
  * NOTE (see SHORTCOMINGS.md A4): printing a dict value with %s needs json() or a
  * (char*) cast on a known-string leaf; numeric leaves must be read as scalars.
@@ -69,11 +69,16 @@ int main() {
     dict reparsed = json(ser);
     check("name" in reparsed && "age" in reparsed, "json round-trip preserves keys");
 
-    /* d.json shorthand */
+    /* d.json() serialize method (not a key — keys use bare d.json) */
     dict tiny = { "a": 1, "b": 2 };
-    char *j = tiny.json;
-    check(j != 0 && strlen(j) > 5, "d.json shorthand serializes");
-    printf("  tiny.json = %s\n", j);
+    char *j = tiny.json();
+    check(j != 0 && strlen(j) > 5, "d.json() serializes");
+    printf("  tiny.json() = %s\n", j);
+
+    /* Bare d.json is a field named "json", not serialization */
+    dict mixed = { "a": 1, "json": "payload" };
+    check(strcmp((char*)mixed.json, "payload") == 0, "bare d.json is key access");
+    check(strstr(mixed.json(), "payload") != 0, "d.json() still serializes whole object");
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed;

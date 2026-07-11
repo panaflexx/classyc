@@ -102,8 +102,8 @@ int main() {
     check(deep.outer != 0,        "3f  nested auto dict outer");
     check(deep.outer.inner != 0,  "3g  nested auto dict inner");
 
-    printf("    cfg.json  = %s\n", cfg.json);
-    printf("    deep.json = %s\n", deep.json);
+    printf("    cfg.json()  = %s\n", cfg.json());
+    printf("    deep.json() = %s\n", deep.json());
 
     /* ---- explicit dict still works alongside auto ---- */
     printf("\n-- explicit dict coexistence --\n");

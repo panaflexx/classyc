@@ -28,7 +28,7 @@
  *  32-37. for (auto x in array) loops
  *  38. json(string) -> dict  (parse)
  *  39. json(dict) -> string  (serialize)
- *  40. d.json property shorthand
+ *  40. d.json() property shorthand
  *  41. Round-trip json(json(d)) fidelity
  *  42. Mutate parsed dict then re-serialize
  *  43. for-in on parsed dict
@@ -383,11 +383,11 @@ int main() {
     check((int)strlen(j1) > 5,    "39b serialized string has content");
     printf("    json(ser) = %s\n", j1);
 
-    /* 40. d.json property shorthand */
-    char *j2 = ser.json;
-    check(j2 != 0,                "40a d.json returns non-null string");
-    check((int)strlen(j2) > 5,    "40b d.json has content");
-    printf("    ser.json  = %s\n", j2);
+    /* 40. d.json() property shorthand */
+    char *j2 = ser.json();
+    check(j2 != 0,                "40a d.json() returns non-null string");
+    check((int)strlen(j2) > 5,    "40b d.json() has content");
+    printf("    ser.json()  = %s\n", j2);
 
     /* 41. Round-trip: parse then serialize preserves content */
     dict rt = json("{\"name\":\"bob\",\"age\":42}");
@@ -402,7 +402,7 @@ int main() {
     dict md = json("{\"color\":\"red\"}");
     md.size = 42;
     md.color = "blue";
-    printf("    mutated = %s\n", md.json);
+    printf("    mutated = %s\n", md.json());
     check("size" in md,           "42a mutated parsed dict has new key");
 
     /* 43. for-in over a parsed dict */
@@ -418,13 +418,13 @@ int main() {
 
     printf("\n--- serialised state ---\n");
 
-    printf("flat   = %s\n\n", flat.json);
-    printf("cfg    = %s\n\n", cfg.json);
-    printf("meta   = %s\n\n", meta.json);
-    printf("local1 = %s\n\n", local1.json);
-    printf("nested = %s\n\n", nested.json);
+    printf("flat   = %s\n\n", flat.json());
+    printf("cfg    = %s\n\n", cfg.json());
+    printf("meta   = %s\n\n", meta.json());
+    printf("local1 = %s\n\n", local1.json());
+    printf("nested = %s\n\n", nested.json());
     printf("pt     = %s\n\n", json(pt));
-    printf("deep   = %s\n\n", deep.json);
+    printf("deep   = %s\n\n", deep.json());
 
     /* ========== SUMMARY ========== */
 
