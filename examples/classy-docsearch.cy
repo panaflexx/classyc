@@ -8,7 +8,7 @@
  *   Memory   · stack List/Map RAII · value-returning Take/Copy/Where
  *            · List<Doc*>.owns() · Map<String,Term*>.ownsValues()
  *            · unowned for malloc/popen buffers (C heap, not `new`)
- *   LINQ     · Where / Take / Sort / First  on ranked hits
+ *   LINQ     · capturing Where (local min_score) · Take / Sort on ranked hits
  *   Map      · stack Map for O(1) term → Term*  · title-path scan fallback
  *   String   · equals / contains / starts_with · f-strings
  *   I/O      · zcat for .gz  · man -l to open pages  · strip HTML / light MD
@@ -136,7 +136,11 @@ class Hit {
 
 int ByScoreDesc(Hit a, Hit b) { return b.score - a.score; }
 
-/* ───────────────────────── globals (lambdas can't close over locals) ───────────────────────── */
+/* ───────────────────────── globals (UI / load state shared across crawl + TUI) ─────────────────────────
+ * Note: capturing lambdas as HOF args (Where/Filter/…) can close over locals now
+ * (Strategy A open-code; see LAMBDA-CAPTURE.md).  These g_* bindings are for
+ * cross-function UI/load state, not a workaround for missing captures.
+ */
 
 int g_max_files = DEFAULT_MAX_FILES;
 int g_files_seen = 0;
@@ -1890,7 +1894,15 @@ int main(int argc, char** argv) {
                 printf("   %d. %-28s  [%s] score=%d\n",
                        h + 1, d.title, d.section, hit.score);
             }
-            if (hits.Count() == 0) printf("   (none)\n");
+            if (hits.Count() == 0) {
+                printf("   (none)\n");
+            } else if (hits.Count() >= 2) {
+                /* Capturing Where on Hit list — local score floor (no g_*). */
+                int floor = hits.Get(0).score;
+                auto elite = hits.Where((Hit h) => h.score >= floor);
+                printf("   capturing Where(score >= %d) → %d peer(s) at top rank\n",
+                       floor, elite.Count());
+            }
             printf("\n");
         }
         term_print_ok("batch docsearch complete");

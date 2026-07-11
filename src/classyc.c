@@ -6149,18 +6149,15 @@ static node_t parse_lambda_body (c2m_ctx_t c2m_ctx, pos_t pos) {
 
 /* Lambda expression: ( typed-param-list? ) => expr-or-block
    Always called via TRY(); returns err_node if this is not a lambda.
-   On success, pushes a synthetic N_FUNC_DEF onto pending_lambdas and
-   returns an N_ID referencing the generated lambda name.
 
-   Untyped parameter lists —  (a, b) => body  — are also accepted here; they
-   produce an N_LAMBDA(param_ids, body) node whose parameter types are
-   inferred later at the call site (filter/map/reduce receiver element type).
-   The single-identifier shorthand  x => body  is handled in primary_expr. */
+   All lambdas (typed and untyped) are deferred to check as N_LAMBDA so
+   free-variable analysis can detect captures before any static hoist.
+   Non-capturing lambdas become static funcs at check time; capturing ones
+   are only legal as direct args to recognized HOFs (Where/Filter/…). */
 D (lambda_expr) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t plist, r, body;
   pos_t pos;
-  int untyped_p = FALSE;
 
   if (!C ('(')) return err_node;
   pos = curr_token->pos;
@@ -6185,7 +6182,6 @@ D (lambda_expr) {
         if (!M (',')) break;
       }
       if (!M (')')) return err_node;
-      untyped_p = TRUE;
     }
   }
 
@@ -6194,22 +6190,7 @@ D (lambda_expr) {
   M (T_FAT_ARROW); /* consume '=>' — committed from here on */
 
   body = parse_lambda_body (c2m_ctx, pos);
-
-  if (untyped_p) /* parameter types unknown: defer everything to check */
-    return new_pos_node2 (c2m_ctx, N_LAMBDA, pos, plist, body);
-
-  /* Generate a unique name for this lambda */
-  char lname[64];
-  snprintf (lname, sizeof (lname), "__lambda_%u", lambda_uid++);
-
-  node_t func_def = build_lambda_func_def (c2m_ctx, lname, plist, body, pos);
-
-  /* Enqueue for module-level injection before the containing top-level item */
-  VARR_PUSH (node_t, pending_lambdas, func_def);
-
-  /* The lambda expression evaluates to a pointer to the generated function */
-  r = build_id (c2m_ctx, lname, pos);
-  return r;
+  return new_pos_node2 (c2m_ctx, N_LAMBDA, pos, plist, body);
 }
 
 D (par_type_name) {
@@ -13751,6 +13732,646 @@ static node_t instantiate_lambda (c2m_ctx_t c2m_ctx, node_t lam, struct type **p
   return func_def;
 }
 
+/* ==========================================================================
+   Capturing lambdas — Strategy A (open-code / desugar at HOF call sites).
+   See LAMBDA-CAPTURE.md.  Capturing lambda literal args to List/Map/Set HOFs
+   are rewritten into for-in loops in the caller's frame so free locals stay
+   normal names.  Non-capturing lambdas still lower to thin static functions.
+   ========================================================================== */
+
+enum hof_kind {
+  HOF_NONE = 0,
+  HOF_WHERE,
+  HOF_FILTER,
+  HOF_MAP,
+  HOF_FOREACH,
+  HOF_ANY,
+  HOF_ALL,
+  HOF_FIND
+};
+
+static enum hof_kind get_hof_kind (const char *name) {
+  if (name == NULL) return HOF_NONE;
+  if (strcmp (name, "Where") == 0) return HOF_WHERE;
+  if (strcmp (name, "Filter") == 0) return HOF_FILTER;
+  if (strcmp (name, "Map") == 0) return HOF_MAP;
+  if (strcmp (name, "ForEach") == 0) return HOF_FOREACH;
+  if (strcmp (name, "Any") == 0) return HOF_ANY;
+  if (strcmp (name, "All") == 0) return HOF_ALL;
+  if (strcmp (name, "Find") == 0) return HOF_FIND;
+  return HOF_NONE;
+}
+
+/* True if params is a typed parameter list (N_SPEC_DECL/N_TYPE) or empty;
+   false for untyped identifier lists used by shorthand lambdas. */
+static int lambda_typed_p (node_t params) {
+  node_t p;
+  if (params == NULL || params->code != N_LIST) return FALSE;
+  for (p = NL_HEAD (params->u.ops); p != NULL; p = NL_NEXT (p))
+    if (p->code == N_ID) return FALSE;
+  return TRUE;
+}
+
+/* Parameter name of an N_LAMBDA param: N_ID (untyped) or N_SPEC_DECL (typed). */
+static const char *lambda_param_name (node_t p) {
+  node_t decl, id;
+  if (p == NULL) return NULL;
+  if (p->code == N_ID) return p->u.s.s;
+  if (p->code == N_SPEC_DECL) {
+    decl = NL_EL (p->u.ops, 1);
+    if (decl != NULL && decl->code == N_DECL) {
+      id = NL_HEAD (decl->u.ops);
+      if (id != NULL && id->code == N_ID) return id->u.s.s;
+    }
+  }
+  return NULL;
+}
+
+static int name_in_varr (VARR (cstr_t) * names, const char *s) {
+  size_t i;
+  if (s == NULL) return FALSE;
+  for (i = 0; i < VARR_LENGTH (cstr_t, names); i++)
+    if (strcmp (VARR_GET (cstr_t, names, i), s) == 0) return TRUE;
+  return FALSE;
+}
+
+/* True if def is an automatic binding in an enclosing function/method frame
+   (local, parameter, or for/for-in binding) — not a global/static/function. */
+static int def_is_auto_capture_p (c2m_ctx_t c2m_ctx, node_t def) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
+  decl_t d;
+  node_t scope;
+
+  if (def == NULL) return FALSE;
+  if (def->code == N_FUNC_DEF || def->code == N_FUNC) return FALSE;
+  if (def->code == N_ENUM_CONST || def->code == N_CLASS || def->code == N_INTERFACE)
+    return FALSE;
+  if (def->code == N_MEMBER) return FALSE; /* bare member access is not a free local */
+  if (def->code != N_SPEC_DECL) return FALSE;
+  d = def->attr;
+  if (d == NULL) return FALSE;
+  if (d->decl_spec.static_p || d->decl_spec.extern_p || d->decl_spec.typedef_p
+      || d->decl_spec.thread_local_p)
+    return FALSE;
+  scope = d->scope;
+  if (scope == NULL) return FALSE;
+  /* File-scope objects are not captures. */
+  if (scope == top_scope || scope->code == N_MODULE) return FALSE;
+  return TRUE;
+}
+
+/* Recursively collect free automatic names used by NODE into FREE, ignoring
+   names in BOUND.  Declarations push into BOUND for nested scopes (trunc on exit). */
+static void lambda_free_vars_walk (c2m_ctx_t c2m_ctx, node_t n, VARR (cstr_t) * bound,
+                                   VARR (cstr_t) * free_names) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
+  size_t bound_mark;
+  node_t c;
+
+  if (n == NULL) return;
+  switch (n->code) {
+  case N_IGNORE: case N_I: case N_L: case N_LL: case N_U: case N_UL: case N_ULL:
+  case N_F: case N_D: case N_LD: case N_CH: case N_CH16: case N_CH32:
+  case N_STR: case N_STR16: case N_STR32: case N_STRING:
+    return;
+  case N_ID: {
+    const char *s = n->u.s.s;
+    node_t def;
+    if (s == NULL) return;
+    if (name_in_varr (bound, s)) return;
+    if (name_in_varr (free_names, s)) return;
+    /* this is the method receiver — treat as a free auto-like binding. */
+    if (strcmp (s, "this") == 0) {
+      VARR_PUSH (cstr_t, free_names, s);
+      return;
+    }
+    def = find_def (c2m_ctx, S_REGULAR, n, curr_scope, NULL);
+    if (def_is_auto_capture_p (c2m_ctx, def))
+      VARR_PUSH (cstr_t, free_names, s);
+    return;
+  }
+  case N_SPEC_DECL: {
+    node_t decl = NL_EL (n->u.ops, 1);
+    node_t init = NL_EL (n->u.ops, 4);
+    /* Walk initializer first (names not yet in scope), then bind the id. */
+    if (init != NULL && init->code != N_IGNORE)
+      lambda_free_vars_walk (c2m_ctx, init, bound, free_names);
+    if (decl != NULL && decl->code == N_DECL) {
+      node_t id = NL_HEAD (decl->u.ops);
+      if (id != NULL && id->code == N_ID && id->u.s.s != NULL
+          && !name_in_varr (bound, id->u.s.s))
+        VARR_PUSH (cstr_t, bound, id->u.s.s);
+    }
+    return;
+  }
+  case N_BLOCK:
+  case N_FOR:
+  case N_FORIN:
+  case N_SWITCH:
+  case N_WHILE:
+  case N_DO:
+  case N_IF: {
+    bound_mark = VARR_LENGTH (cstr_t, bound);
+    /* FORIN binds its loop vars before body/collection uses. */
+    if (n->code == N_FORIN) {
+      node_t key = NL_EL (n->u.ops, 1);
+      node_t val = NL_EL (n->u.ops, 2);
+      if (key != NULL && key->code == N_ID && key->u.s.s != NULL
+          && !name_in_varr (bound, key->u.s.s))
+        VARR_PUSH (cstr_t, bound, key->u.s.s);
+      if (val != NULL && val->code == N_ID && val->u.s.s != NULL
+          && !name_in_varr (bound, val->u.s.s))
+        VARR_PUSH (cstr_t, bound, val->u.s.s);
+    }
+    for (c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+      lambda_free_vars_walk (c2m_ctx, c, bound, free_names);
+    VARR_TRUNC (cstr_t, bound, bound_mark);
+    return;
+  }
+  default:
+    if (generic_node_has_scalar_data (n->code)) return;
+    for (c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+      lambda_free_vars_walk (c2m_ctx, c, bound, free_names);
+    return;
+  }
+}
+
+/* Collect free automatic names of LAM into FREE_NAMES (caller-owned VARR).
+   Parameters and locals declared in the body are bound. */
+static void lambda_collect_free_vars (c2m_ctx_t c2m_ctx, node_t lam,
+                                      VARR (cstr_t) * free_names) {
+  node_t params, body, p;
+  VARR (cstr_t) * bound;
+
+  if (lam == NULL || lam->code != N_LAMBDA) return;
+  params = NL_HEAD (lam->u.ops);
+  body = NL_NEXT (params);
+  {
+    MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+    VARR_CREATE (cstr_t, bound, alloc, 8);
+  }
+  if (params != NULL && params->code == N_LIST)
+    for (p = NL_HEAD (params->u.ops); p != NULL; p = NL_NEXT (p)) {
+      const char *pn = lambda_param_name (p);
+      if (pn != NULL && !name_in_varr (bound, pn)) VARR_PUSH (cstr_t, bound, pn);
+    }
+  lambda_free_vars_walk (c2m_ctx, body, bound, free_names);
+  VARR_DESTROY (cstr_t, bound);
+}
+
+/* Instantiate a typed N_LAMBDA (params already N_SPEC_DECL list) as a static
+   function, or reuse a prior instantiation stashed on lam->attr. */
+static node_t instantiate_typed_lambda (c2m_ctx_t c2m_ctx, node_t lam) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  node_t params, body, func_def, insert_before;
+  char lname[64];
+  struct expr *le;
+
+  if (lam->attr != NULL && (le = lam->attr)->def_node != NULL
+      && le->def_node->code == N_FUNC_DEF)
+    return le->def_node;
+
+  params = NL_HEAD (lam->u.ops);
+  body = NL_NEXT (params);
+  if ((insert_before = curr_lambda_def != NULL ? curr_lambda_def : curr_module_item) == NULL
+      || module_item_list == NULL) {
+    error (c2m_ctx, POS (lam), "lambda is only supported inside a function body");
+    return NULL;
+  }
+  snprintf (lname, sizeof (lname), "__lambda_%u", lambda_uid++);
+  /* Deep-copy body/params so a second check pass does not reparent the only copy. */
+  func_def = build_lambda_func_def (c2m_ctx, lname, parse_copy_expr (c2m_ctx, params),
+                                    parse_copy_expr (c2m_ctx, body), POS (lam));
+  DLIST_INSERT_BEFORE (node_t, module_item_list->u.ops, insert_before, func_def);
+  check_lambda_func_def (c2m_ctx, func_def);
+  if (func_def->attr == NULL || ((decl_t) func_def->attr)->decl_spec.type == NULL
+      || ((decl_t) func_def->attr)->decl_spec.type->mode != TM_FUNC)
+    return NULL;
+  {
+    decl_t ld = func_def->attr;
+    le = create_expr (c2m_ctx, lam);
+    le->type->mode = TM_PTR;
+    le->type->u.ptr_type = ld->decl_spec.type;
+    set_type_layout (c2m_ctx, le->type);
+    le->def_node = func_def;
+    le->u.lvalue_node = NULL;
+  }
+  return func_def;
+}
+
+/* If body is a single-return block `{ return e; }`, return e; else NULL. */
+static node_t lambda_single_return_expr (node_t body) {
+  node_t stmts, only, expr;
+  if (body == NULL || body->code != N_BLOCK) return NULL;
+  stmts = NL_EL (body->u.ops, 1);
+  if (stmts == NULL || stmts->code != N_LIST) return NULL;
+  only = NL_HEAD (stmts->u.ops);
+  if (only == NULL || NL_NEXT (only) != NULL || only->code != N_RETURN) return NULL;
+  expr = NL_EL (only->u.ops, 1);
+  if (expr == NULL || expr->code == N_IGNORE) return NULL;
+  return expr;
+}
+
+/* Build `auto name = init;` SPEC_DECL. */
+static node_t build_auto_init_decl (c2m_ctx_t c2m_ctx, pos_t pos, const char *name,
+                                    node_t init) {
+  node_t specs = new_node (c2m_ctx, N_LIST);
+  op_append (c2m_ctx, specs, new_pos_node (c2m_ctx, N_AUTO, pos));
+  return build_spec_decl (c2m_ctx, pos, specs,
+                          build_decl (c2m_ctx, pos, build_id (c2m_ctx, name, pos), NULL),
+                          NULL, NULL, init);
+}
+
+/* Build recv.method(args...) as N_CALL(N_FIELD(recv, method), arglist). */
+static node_t build_dot_call (c2m_ctx_t c2m_ctx, pos_t pos, node_t recv, const char *method,
+                              node_t arglist) {
+  node_t field = new_pos_node2 (c2m_ctx, N_FIELD, pos, recv, build_id (c2m_ctx, method, pos));
+  if (arglist == NULL) arglist = new_node (c2m_ctx, N_LIST);
+  return new_pos_node2 (c2m_ctx, N_CALL, pos, field, arglist);
+}
+
+/* Classify a checked receiver type as List/Map/Set specialization. */
+static int coll_class_kind (struct type *t, const char **kind_out, node_t *cid_out) {
+  node_t cid;
+  const char *nm;
+  if (t == NULL) return FALSE;
+  if (t->mode == TM_PTR && t->u.ptr_type != NULL) t = t->u.ptr_type;
+  if (t->mode != TM_CLASS || t->u.tag_type == NULL) return FALSE;
+  cid = TAG_ID (t->u.tag_type);
+  if (cid == NULL || cid->code != N_ID || cid->u.s.s == NULL) return FALSE;
+  nm = cid->u.s.s;
+  if (strncmp (nm, "__generic_List_", 15) == 0) {
+    if (kind_out) *kind_out = "List";
+    if (cid_out) *cid_out = cid;
+    return TRUE;
+  }
+  if (strncmp (nm, "__generic_Map_", 14) == 0) {
+    if (kind_out) *kind_out = "Map";
+    if (cid_out) *cid_out = cid;
+    return TRUE;
+  }
+  if (strncmp (nm, "__generic_Set_", 14) == 0) {
+    if (kind_out) *kind_out = "Set";
+    if (cid_out) *cid_out = cid;
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/* Deep-copy N, replacing free occurrences of identifier FROM with a fresh
+   copy of TO (used to rewrite lambda params as recv.Get(i) in open-coded HOFs). */
+static node_t lambda_subst_id (c2m_ctx_t c2m_ctx, node_t n, const char *from, node_t to) {
+  node_t r, c;
+  if (n == NULL) return NULL;
+  if (n->code == N_ID && n->u.s.s != NULL && from != NULL && strcmp (n->u.s.s, from) == 0)
+    return parse_copy_expr (c2m_ctx, to);
+  if (generic_node_has_scalar_data (n->code) || n->code == N_ID || n->code == N_STRING
+      || n->code == N_IGNORE)
+    return copy_node (c2m_ctx, n);
+  r = new_node (c2m_ctx, n->code);
+  set_node_pos (c2m_ctx, r, POS (n));
+  for (c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    op_append (c2m_ctx, r, lambda_subst_id (c2m_ctx, c, from, to));
+  return r;
+}
+
+/* Build `recv.Count()` call AST. */
+static node_t build_count_call (c2m_ctx_t c2m_ctx, pos_t pos, node_t recv) {
+  return build_dot_call (c2m_ctx, pos, parse_copy_expr (c2m_ctx, recv), "Count",
+                         new_node (c2m_ctx, N_LIST));
+}
+
+/* Build `recv.Get(index_expr)` call AST. */
+static node_t build_get_call (c2m_ctx_t c2m_ctx, pos_t pos, node_t recv, node_t index_expr) {
+  return build_dot_call (c2m_ctx, pos, parse_copy_expr (c2m_ctx, recv), "Get",
+                         new_node1 (c2m_ctx, N_LIST, parse_copy_expr (c2m_ctx, index_expr)));
+}
+
+/* Open-code a capturing HOF call.  Replaces *CALL with an N_STMTEXPR and
+   fully type-checks it.  Returns TRUE on success (call is rewritten). */
+static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
+                                  struct type *recv_cls_type, node_t cid,
+                                  const char *coll_kind, enum hof_kind hk,
+                                  node_t lam) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  pos_t pos = POS (call);
+  node_t params = NL_HEAD (lam->u.ops);
+  node_t body = NL_NEXT (params);
+  node_t p0, p1;
+  const char *pn0, *pn1;
+  int nparams;
+  unsigned uid;
+  char rname[64], aname[64], bname[64];
+  node_t pred_expr = NULL;
+  node_t stmt_list, block, stmtexpr, last;
+  node_t for_body, for_body_stmts;
+  node_t result_init, result_decl;
+  DLIST_LINK (node_t) saved_link;
+  int is_map = (coll_kind != NULL && strcmp (coll_kind, "Map") == 0);
+  int want_2 = is_map && (hk == HOF_WHERE || hk == HOF_FOREACH || hk == HOF_ANY
+                          || hk == HOF_ALL);
+
+  if (params == NULL || params->code != N_LIST) return FALSE;
+  nparams = (int) NL_LENGTH (params->u.ops);
+  p0 = NL_HEAD (params->u.ops);
+  p1 = p0 != NULL ? NL_NEXT (p0) : NULL;
+  pn0 = lambda_param_name (p0);
+  pn1 = lambda_param_name (p1);
+  if (want_2) {
+    if (nparams != 2 || pn0 == NULL || pn1 == NULL) {
+      error (c2m_ctx, POS (lam), "Map HOF lambda must take two parameters (key, value)");
+      return FALSE;
+    }
+  } else {
+    if (nparams != 1 || pn0 == NULL) {
+      error (c2m_ctx, POS (lam),
+             "capturing HOF lambda must take one parameter matching the element type");
+      return FALSE;
+    }
+  }
+
+  /* Predicate/map HOFs need an expression-bodied (or single-return) lambda.
+     ForEach also prefers a single expression; otherwise the block body is
+     open-coded statement-by-statement. */
+  pred_expr = lambda_single_return_expr (body);
+  if (pred_expr != NULL) pred_expr = parse_copy_expr (c2m_ctx, pred_expr);
+  if ((hk == HOF_WHERE || hk == HOF_FILTER || hk == HOF_MAP || hk == HOF_ANY
+       || hk == HOF_ALL || hk == HOF_FIND)
+      && pred_expr == NULL) {
+    error (c2m_ctx, POS (lam),
+           "capturing HOF lambda must use an expression body or a single `return expr;` "
+           "(block multi-statement predicates not yet supported for capture desugar)");
+    return FALSE;
+  }
+
+  uid = lambda_uid++;
+  snprintf (rname, sizeof (rname), "__cap_r_%u", uid);
+  snprintf (aname, sizeof (aname), "__cap_a_%u", uid);
+  snprintf (bname, sizeof (bname), "__cap_b_%u", uid);
+
+  stmt_list = new_node (c2m_ctx, N_LIST);
+
+  /* Result container for filter/map HOFs (same specialized type as receiver). */
+  if (hk == HOF_WHERE || hk == HOF_FILTER || hk == HOF_MAP) {
+    result_init = new_pos_node2 (c2m_ctx, N_CALL, pos,
+                                 build_id (c2m_ctx, cid->u.s.s, pos),
+                                 new_node (c2m_ctx, N_LIST));
+    result_decl = build_auto_init_decl (c2m_ctx, pos, rname, result_init);
+    op_append (c2m_ctx, stmt_list, result_decl);
+  } else if (hk == HOF_ANY) {
+    op_append (c2m_ctx, stmt_list,
+               build_spec_decl (c2m_ctx, pos,
+                                new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_INT, pos)),
+                                build_decl (c2m_ctx, pos, build_id (c2m_ctx, rname, pos), NULL),
+                                NULL, NULL, new_i_node (c2m_ctx, 0, pos)));
+  } else if (hk == HOF_ALL) {
+    op_append (c2m_ctx, stmt_list,
+               build_spec_decl (c2m_ctx, pos,
+                                new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_INT, pos)),
+                                build_decl (c2m_ctx, pos, build_id (c2m_ctx, rname, pos), NULL),
+                                NULL, NULL, new_i_node (c2m_ctx, 1, pos)));
+  }
+  /* FOREACH / FIND: no pre-loop result (FIND handled via break binding below). */
+
+  for_body_stmts = new_node (c2m_ctx, N_LIST);
+
+  if (is_map) {
+    /* Map: for (auto k, v in recv) … keeps KeyAt/ValAt protocol. */
+    if (hk == HOF_WHERE || hk == HOF_FILTER) {
+      node_t args = new_node (c2m_ctx, N_LIST);
+      op_append (c2m_ctx, args, build_id (c2m_ctx, pn0, pos));
+      op_append (c2m_ctx, args, build_id (c2m_ctx, pn1, pos));
+      node_t then_call
+        = build_dot_call (c2m_ctx, pos, build_id (c2m_ctx, rname, pos), "Set", args);
+      node_t then_stmt
+        = new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST), then_call);
+      op_append (c2m_ctx, for_body_stmts,
+                 new_pos_node4 (c2m_ctx, N_IF, pos, new_node (c2m_ctx, N_LIST), pred_expr,
+                                then_stmt, new_node (c2m_ctx, N_IGNORE)));
+    } else if (hk == HOF_FOREACH) {
+      if (pred_expr != NULL)
+        op_append (c2m_ctx, for_body_stmts,
+                   new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST), pred_expr));
+      else if (body->code == N_BLOCK) {
+        node_t bs = NL_EL (body->u.ops, 1);
+        for (node_t s = (bs != NULL) ? NL_HEAD (bs->u.ops) : NULL; s != NULL; s = NL_NEXT (s))
+          if (s->code == N_RETURN) {
+            node_t re = NL_EL (s->u.ops, 1);
+            if (re != NULL && re->code != N_IGNORE)
+              op_append (c2m_ctx, for_body_stmts,
+                         new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST),
+                                        parse_copy_expr (c2m_ctx, re)));
+          } else
+            op_append (c2m_ctx, for_body_stmts, parse_copy_expr (c2m_ctx, s));
+      }
+    } else if (hk == HOF_ANY || hk == HOF_ALL) {
+      node_t cond = (hk == HOF_ANY) ? pred_expr : new_pos_node1 (c2m_ctx, N_NOT, pos, pred_expr);
+      node_t setv = new_pos_node2 (c2m_ctx, N_ASSIGN, pos, build_id (c2m_ctx, rname, pos),
+                                   new_i_node (c2m_ctx, hk == HOF_ANY ? 1 : 0, pos));
+      node_t brk = new_pos_node1 (c2m_ctx, N_BREAK, pos, new_node (c2m_ctx, N_LIST));
+      node_t then_list = new_node (c2m_ctx, N_LIST);
+      op_append (c2m_ctx, then_list,
+                 new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST), setv));
+      op_append (c2m_ctx, then_list, brk);
+      node_t then_blk
+        = new_pos_node2 (c2m_ctx, N_BLOCK, pos, new_node (c2m_ctx, N_LIST), then_list);
+      then_blk->attr = NULL;
+      op_append (c2m_ctx, for_body_stmts,
+                 new_pos_node4 (c2m_ctx, N_IF, pos, new_node (c2m_ctx, N_LIST), cond, then_blk,
+                                new_node (c2m_ctx, N_IGNORE)));
+    } else {
+      return FALSE;
+    }
+    for_body = new_pos_node2 (c2m_ctx, N_BLOCK, pos, new_node (c2m_ctx, N_LIST), for_body_stmts);
+    for_body->attr = NULL;
+    {
+      node_t fin = new_pos_node5 (c2m_ctx, N_FORIN, pos, new_node (c2m_ctx, N_LIST),
+                                  build_id (c2m_ctx, pn0, pos), build_id (c2m_ctx, pn1, pos),
+                                  parse_copy_expr (c2m_ctx, recv), for_body);
+      op_append (c2m_ctx, stmt_list, fin);
+    }
+  } else if (hk == HOF_FIND) {
+    error (c2m_ctx, POS (lam),
+           "capturing lambda in Find is not supported yet (use Where/Any or a non-capturing pred)");
+    return FALSE;
+  } else {
+    /* List / Set: open-code with Count/Get (matches list.h Filter's double-Get
+       policy so by-value class elements like Hit don't miscompile via for-in
+       RAII loop vars inside statement expressions). */
+    char iname[64];
+    node_t i_id, i_decl, cond, incr, get1, get2, loop_body, for_loop;
+    node_t pred_sub = NULL;
+
+    snprintf (iname, sizeof (iname), "__cap_i_%u", uid);
+    i_id = build_id (c2m_ctx, iname, pos);
+    i_decl = build_spec_decl (c2m_ctx, pos,
+                              new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_INT, pos)),
+                              build_decl (c2m_ctx, pos, build_id (c2m_ctx, iname, pos), NULL),
+                              NULL, NULL, new_i_node (c2m_ctx, 0, pos));
+    cond = new_pos_node2 (c2m_ctx, N_LT, pos, build_id (c2m_ctx, iname, pos),
+                          build_count_call (c2m_ctx, pos, recv));
+    incr = new_pos_node2 (c2m_ctx, N_ASSIGN, pos, build_id (c2m_ctx, iname, pos),
+                          new_pos_node2 (c2m_ctx, N_ADD, pos, build_id (c2m_ctx, iname, pos),
+                                         new_i_node (c2m_ctx, 1, pos)));
+    get1 = build_get_call (c2m_ctx, pos, recv, i_id);
+    get2 = build_get_call (c2m_ctx, pos, recv, i_id);
+
+    if (pred_expr != NULL)
+      pred_sub = lambda_subst_id (c2m_ctx, pred_expr, pn0, get1);
+
+    if (hk == HOF_WHERE || hk == HOF_FILTER) {
+      /* if (pred(Get(i))) result.Add(Get(i)); */
+      node_t args = new_node1 (c2m_ctx, N_LIST, get2);
+      node_t then_call
+        = build_dot_call (c2m_ctx, pos, build_id (c2m_ctx, rname, pos), "Add", args);
+      node_t then_stmt
+        = new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST), then_call);
+      op_append (c2m_ctx, for_body_stmts,
+                 new_pos_node4 (c2m_ctx, N_IF, pos, new_node (c2m_ctx, N_LIST), pred_sub,
+                                then_stmt, new_node (c2m_ctx, N_IGNORE)));
+    } else if (hk == HOF_MAP) {
+      node_t mapped = pred_sub;
+      node_t args = new_node1 (c2m_ctx, N_LIST, mapped);
+      node_t add = build_dot_call (c2m_ctx, pos, build_id (c2m_ctx, rname, pos), "Add", args);
+      op_append (c2m_ctx, for_body_stmts,
+                 new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST), add));
+    } else if (hk == HOF_FOREACH) {
+      if (pred_sub != NULL)
+        op_append (c2m_ctx, for_body_stmts,
+                   new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST), pred_sub));
+      else if (body->code == N_BLOCK) {
+        /* Block ForEach: bind auto x = Get(i) then run statements. */
+        node_t bind
+          = build_auto_init_decl (c2m_ctx, pos, pn0, get1);
+        op_append (c2m_ctx, for_body_stmts, bind);
+        node_t bs = NL_EL (body->u.ops, 1);
+        for (node_t s = (bs != NULL) ? NL_HEAD (bs->u.ops) : NULL; s != NULL; s = NL_NEXT (s))
+          if (s->code == N_RETURN) {
+            node_t re = NL_EL (s->u.ops, 1);
+            if (re != NULL && re->code != N_IGNORE)
+              op_append (c2m_ctx, for_body_stmts,
+                         new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST),
+                                        parse_copy_expr (c2m_ctx, re)));
+          } else
+            op_append (c2m_ctx, for_body_stmts, parse_copy_expr (c2m_ctx, s));
+      }
+    } else if (hk == HOF_ANY || hk == HOF_ALL) {
+      node_t condp
+        = (hk == HOF_ANY) ? pred_sub : new_pos_node1 (c2m_ctx, N_NOT, pos, pred_sub);
+      node_t setv = new_pos_node2 (c2m_ctx, N_ASSIGN, pos, build_id (c2m_ctx, rname, pos),
+                                   new_i_node (c2m_ctx, hk == HOF_ANY ? 1 : 0, pos));
+      node_t brk = new_pos_node1 (c2m_ctx, N_BREAK, pos, new_node (c2m_ctx, N_LIST));
+      node_t then_list = new_node (c2m_ctx, N_LIST);
+      op_append (c2m_ctx, then_list,
+                 new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST), setv));
+      op_append (c2m_ctx, then_list, brk);
+      node_t then_blk
+        = new_pos_node2 (c2m_ctx, N_BLOCK, pos, new_node (c2m_ctx, N_LIST), then_list);
+      then_blk->attr = NULL;
+      op_append (c2m_ctx, for_body_stmts,
+                 new_pos_node4 (c2m_ctx, N_IF, pos, new_node (c2m_ctx, N_LIST), condp, then_blk,
+                                new_node (c2m_ctx, N_IGNORE)));
+    } else {
+      return FALSE;
+    }
+
+    loop_body = new_pos_node2 (c2m_ctx, N_BLOCK, pos, new_node (c2m_ctx, N_LIST), for_body_stmts);
+    loop_body->attr = NULL;
+    for_loop = new_pos_node (c2m_ctx, N_FOR, pos);
+    for_loop->attr = NULL;
+    op_append (c2m_ctx, for_loop, new_node (c2m_ctx, N_LIST)); /* labels */
+    op_append (c2m_ctx, for_loop, i_decl);
+    op_append (c2m_ctx, for_loop, cond);
+    op_append (c2m_ctx, for_loop, incr);
+    op_append (c2m_ctx, for_loop, loop_body);
+    op_append (c2m_ctx, stmt_list, for_loop);
+  }
+
+  /* Yield result (move for collections). ForEach yields 0 (void-like int). */
+  if (hk == HOF_FOREACH) {
+    last = new_i_node (c2m_ctx, 0, pos);
+  } else if (hk == HOF_WHERE || hk == HOF_FILTER || hk == HOF_MAP) {
+    last = new_pos_node1 (c2m_ctx, N_MOVE, pos, build_id (c2m_ctx, rname, pos));
+  } else {
+    last = build_id (c2m_ctx, rname, pos);
+  }
+  op_append (c2m_ctx, stmt_list,
+             new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST), last));
+
+  block = new_pos_node2 (c2m_ctx, N_BLOCK, pos, new_node (c2m_ctx, N_LIST), stmt_list);
+  block->attr = NULL;
+  stmtexpr = new_pos_node1 (c2m_ctx, N_STMTEXPR, pos, block);
+
+  /* Replace call in place, preserving sibling links. */
+  saved_link = call->op_link;
+  check (c2m_ctx, stmtexpr, NULL);
+  *call = *stmtexpr;
+  call->op_link = saved_link;
+  (void) recv_cls_type; /* reserved for future type checks */
+  (void) aname;
+  (void) bname;
+  return TRUE;
+}
+
+/* If CALL is recv.Where/Filter/... (N_FIELD or N_DEREF_FIELD) with an N_LAMBDA
+   arg that captures outer automatics, open-code it.  Returns TRUE if rewritten. */
+static int try_desugar_capturing_hof_call (c2m_ctx_t c2m_ctx, node_t call) {
+  node_t op1, recv, mid, arg_list, lam;
+  struct expr *re;
+  struct type *obj_type;
+  enum hof_kind hk;
+  const char *coll_kind = NULL;
+  node_t cid = NULL;
+  VARR (cstr_t) * free_names;
+  int nfree;
+
+  if (call == NULL || call->code != N_CALL) return FALSE;
+  op1 = NL_HEAD (call->u.ops);
+  if (op1 == NULL || (op1->code != N_FIELD && op1->code != N_DEREF_FIELD)) return FALSE;
+  recv = NL_HEAD (op1->u.ops);
+  mid = NL_NEXT (recv);
+  arg_list = NL_NEXT (op1);
+  if (mid == NULL || mid->code != N_ID || arg_list == NULL || arg_list->code != N_LIST)
+    return FALSE;
+  hk = get_hof_kind (mid->u.s.s);
+  if (hk == HOF_NONE) return FALSE;
+  lam = NL_HEAD (arg_list->u.ops);
+  if (lam == NULL || lam->code != N_LAMBDA || NL_NEXT (lam) != NULL) return FALSE;
+
+  if (recv->attr == NULL) check (c2m_ctx, recv, call);
+  re = recv->attr;
+  if (re == NULL || re->type == NULL) return FALSE;
+  obj_type = re->type;
+  if (op1->code == N_DEREF_FIELD) {
+    if (obj_type->mode != TM_PTR || obj_type->u.ptr_type == NULL) return FALSE;
+    obj_type = obj_type->u.ptr_type;
+  }
+  if (!coll_class_kind (obj_type, &coll_kind, &cid)) return FALSE;
+
+  /* Collection-specific HOF membership. */
+  if (strcmp (coll_kind, "List") == 0) {
+    if (hk == HOF_NONE) return FALSE;
+  } else if (strcmp (coll_kind, "Map") == 0) {
+    if (hk != HOF_WHERE && hk != HOF_FOREACH && hk != HOF_ANY && hk != HOF_ALL)
+      return FALSE;
+  } else if (strcmp (coll_kind, "Set") == 0) {
+    if (hk != HOF_FILTER && hk != HOF_FOREACH && hk != HOF_ANY && hk != HOF_ALL)
+      return FALSE;
+  }
+
+  {
+    MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+    VARR_CREATE (cstr_t, free_names, alloc, 4);
+  }
+  lambda_collect_free_vars (c2m_ctx, lam, free_names);
+  nfree = (int) VARR_LENGTH (cstr_t, free_names);
+  VARR_DESTROY (cstr_t, free_names);
+  if (nfree == 0) return FALSE; /* non-capturing: keep thin function-pointer path */
+
+  return desugar_capturing_hof (c2m_ctx, call, recv, obj_type, cid, coll_kind, hk, lam);
+}
+
 /* Build a generic type-argument AST node (exactly as parse_generic_type_arg
    would have produced for an explicit `List<EL>`) denoting element type EL, so
    arr.ToList() can instantiate List<EL>.  Returns NULL for element types we
@@ -14167,12 +14788,16 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
     node_t func_def;
     decl_t ld;
     struct expr *le;
+    node_t lparams = NL_HEAD (cb_node->u.ops);
 
     /* Initializer expressions may be checked twice (auto deduction + decl
        creation): reuse the FUNC_DEF instantiated on the first pass. */
     if (cb_node->attr != NULL && (le = cb_node->attr)->def_node != NULL
         && le->def_node->code == N_FUNC_DEF) {
       func_def = le->def_node;
+    } else if (lambda_typed_p (lparams)) {
+      /* Typed lambda: hoist as static (same as free-standing typed lambdas). */
+      if ((func_def = instantiate_typed_lambda (c2m_ctx, cb_node)) == NULL) return NULL;
     } else {
       if (sm == SEQM_REDUCE) {
         ptypes[0] = acc_type;
@@ -14701,9 +15326,12 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
                            && cid != NULL && cid->code == N_ID
                            && strcmp (ctor_init_callee->u.s.s, cid->u.s.s) == 0);
         int move_init_p = (initializer != NULL && initializer->code == N_MOVE);
-        /* Function/method call returning a collection by value is a prvalue
-           ownership transfer (RAII bind), not a shallow alias of an lvalue. */
-        int prvalue_init_p = (initializer != NULL && initializer->code == N_CALL
+        /* Function/method call or statement-expression (capturing HOF desugar)
+           returning a collection by value is a prvalue ownership transfer
+           (RAII bind), not a shallow alias of an lvalue. */
+        int prvalue_init_p = (initializer != NULL
+                              && (initializer->code == N_CALL
+                                  || initializer->code == N_STMTEXPR)
                               && !ctor_init_p);
         int move_only = class_is_move_only_collection_p (c2m_ctx, decl->decl_spec.type);
         char nm[320];
@@ -15766,13 +16394,48 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         }
         break;
       }
-      case N_LAMBDA:
-        /* An untyped lambda outside a filter/map/reduce argument: there is no
-           context to infer the parameter types from. */
-        error (c2m_ctx, POS (r),
-               "untyped lambda is only supported as a filter/map/reduce argument"
-               " (add parameter types:  (int x) => ...)");
+      case N_LAMBDA: {
+        /* Typed non-capturing lambdas lower to static functions (thin C
+           function pointers).  Capturing lambdas are only legal as direct
+           arguments to Where/Filter/… (open-coded before this case runs).
+           Untyped lambdas still need a seq.filter/map/reduce context. */
+        node_t params = NL_HEAD (r->u.ops);
+        VARR (cstr_t) * free_names;
+        int nfree;
+        MIR_alloc_t alloc;
+
+        if (r->attr != NULL) break; /* already instantiated */
+        alloc = c2m_alloc (c2m_ctx);
+        VARR_CREATE (cstr_t, free_names, alloc, 4);
+        lambda_collect_free_vars (c2m_ctx, r, free_names);
+        nfree = (int) VARR_LENGTH (cstr_t, free_names);
+        if (nfree > 0) {
+          const char *fn = VARR_GET (cstr_t, free_names, 0);
+          error (c2m_ctx, POS (r),
+                 "lambda captures local '%s' but is not a direct argument to "
+                 "Where/Filter/Map/ForEach/Any/All",
+                 fn != NULL ? fn : "?");
+          error (c2m_ctx, POS (r),
+                 "hint: use xs.Where((T x) => …) inline, or pass a non-capturing function");
+          VARR_DESTROY (cstr_t, free_names);
+          break;
+        }
+        VARR_DESTROY (cstr_t, free_names);
+        if (!lambda_typed_p (params)) {
+          error (c2m_ctx, POS (r),
+                 "untyped lambda is only supported as a filter/map/reduce argument"
+                 " (add parameter types:  (int x) => ...)");
+          break;
+        }
+        if (instantiate_typed_lambda (c2m_ctx, r) == NULL) {
+          /* errors already reported */
+          break;
+        }
+        /* Publish the func-ptr expr to the outer `e` so the post-switch
+           recovery path does not overwrite attr with a dummy TP_INT. */
+        e = r->attr;
         break;
+      }
       case N_I:
       case N_L:
         e = create_basic_type_expr (c2m_ctx, r, r->code == N_I ? TP_INT : TP_LONG);
@@ -16216,7 +16879,8 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
            lvalues; allow prvalue RHS from a by-value call return. */
         if (class_is_move_only_collection_p (c2m_ctx, t1)
             && class_is_move_only_collection_p (c2m_ctx, t2)
-            && op2->code != N_MOVE && op2->code != N_CALL) {
+            && op2->code != N_MOVE && op2->code != N_CALL
+            && op2->code != N_STMTEXPR) {
           node_t cid = (t1->u.tag_type != NULL) ? TAG_ID (t1->u.tag_type) : NULL;
           error (c2m_ctx, POS (r),
                  "cannot assign collection '%s' (shallow copy would double-free); "
@@ -18303,6 +18967,14 @@ if (base != NULL && base->code == N_ID) {
         builtin_call_p = alloca_p || va_arg_p || va_start_p || add_overflow_p || sub_overflow_p
                          || mul_overflow_p || expect_p || jcall_p || jret_p || prop_set_p || prop_eq_p
                          || prop_ne_p || json_p;
+        /* Capturing HOF desugar must run before call_nodes is populated (same
+           reason as nameof): the node is rewritten into an N_STMTEXPR, which is
+           not a call for MIR proto generation. */
+        if ((op1->code == N_FIELD || op1->code == N_DEREF_FIELD)
+            && try_desugar_capturing_hof_call (c2m_ctx, r)) {
+          e = r->attr;
+          break;
+        }
         if (!builtin_call_p || jcall_p) {
             VARR_PUSH(node_t, call_nodes, r);
             //printf("XXXXX call_nodes add uid=%d N_ID = %s \n", r->uid, op1->u.s.s);
@@ -18594,9 +19266,9 @@ if (base != NULL && base->code == N_ID) {
 	                obj_type = obj_type->u.ptr_type;  // Get the pointed-to type
 	              }
 
-              /* Sequence lambda-method call: receiver is an array, a slice, or
-                 a class with the Count()/Get(int) protocol — and, for classes,
-                 no user method shadows the builtin name. */
+	              /* Sequence lambda-method call: receiver is an array, a slice, or
+	                 a class with the Count()/Get(int) protocol — and, for classes,
+	                 no user method shadows the builtin name. */
               {
                 node_t seq_mid = NL_NEXT (obj);
                 enum seq_method seqm = seq_mid != NULL && seq_mid->code == N_ID
@@ -20065,6 +20737,11 @@ if (base != NULL && base->code == N_ID) {
   }
   case N_STMTEXPR: {
     node_t block = NL_HEAD (r->u.ops);
+    if (r->attr != NULL) {
+      /* Already checked (auto-deduction + create_decl may visit twice). */
+      e = r->attr;
+      break;
+    }
     if (c2m_options->pedantic_p) {
       error (c2m_ctx, POS (r), "statement expression is not a part of C11 standard");
       break;
@@ -20077,9 +20754,11 @@ if (base != NULL && base->code == N_ID) {
     }
     node_t expr = NL_EL (last_stmt->u.ops, 1);
     e1 = expr->attr;
+    if (e1 == NULL || e1->type == NULL) break;
     t1 = e1->type;
     e = create_expr (c2m_ctx, r);
-    *e->type = *t1;
+    e->type = create_type (c2m_ctx, t1);
+    set_type_layout (c2m_ctx, e->type);
     break;
   }
   case N_BLOCK:
@@ -26465,7 +27144,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       if (class_is_move_only_collection_p (c2m_ctx, at)
           && NL_EL (r->u.ops, 1) != NULL
           && (NL_EL (r->u.ops, 1)->code == N_MOVE
-              || NL_EL (r->u.ops, 1)->code == N_CALL)) {
+              || NL_EL (r->u.ops, 1)->code == N_CALL
+              || NL_EL (r->u.ops, 1)->code == N_STMTEXPR)) {
         node_t ddef = find_class_dtor_def (c2m_ctx, at->u.tag_type);
         if (ddef != NULL && ddef->code == N_FUNC_DEF && ddef->attr != NULL) {
           decl_t dd = ddef->attr;
@@ -28333,11 +29013,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           }
           if (decl->dtor_call != NULL)
             VARR_PUSH (node_t, defer_stmts, decl->dtor_call);
-        } else if (initializer->code == N_CALL && decl->scope != top_scope
+        } else if ((initializer->code == N_CALL || initializer->code == N_STMTEXPR)
+                   && decl->scope != top_scope
                    && decl->decl_spec.type->mode == TM_CLASS
                    && class_is_move_only_collection_p (c2m_ctx, decl->decl_spec.type)) {
-          /* Local:  auto xs = make();  /  List<int> xs = src.Take(3);
-             By-value collection return: evaluate the call (ALLOCA return slot),
+          /* Local:  auto xs = make();  /  List xs = src.Take(3);
+             / capturing HOF desugar ({ …; move r; })
+             By-value collection return: evaluate the call or stmtexpr,
              block-copy into the local, then RAII-register ~List/~Map/~Set so the
              buffer is freed at scope exit.  This is the first-class idiom — no
              `owned auto` for everyday LINQ pipelines. */
@@ -29987,7 +30669,8 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
   HTAB_CREATE (MIR_item_t, proto_tab, alloc, 512, proto_hash, proto_eq, NULL);
   for (size_t i = 0; i < VARR_LENGTH (node_t, call_nodes); i++) {
     call = VARR_GET (node_t, call_nodes, i);
-    assert (call->code == N_CALL);
+    /* Call nodes can be rewritten in place (e.g. capturing HOF → N_STMTEXPR). */
+    if (call->code != N_CALL) continue;
     op1 = NL_HEAD (call->u.ops);
     if (op1->code == N_ID && strcmp (op1->u.s.s, JCALL) == 0)
       func = NL_HEAD (NL_NEXT (op1)->u.ops);

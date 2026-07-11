@@ -1,12 +1,15 @@
 /* classy-lambda.c — test basic typed lambda (anonymous function) syntax.
  *
- * Lambdas are lowered at parse time to static named functions:
+ * Non-capturing lambdas lower to static named functions (thin C pointers):
  *
  *   (type param, ...) => expr         expression lambda (implicit return)
  *   (type param, ...) => { stmts }    block lambda
- *   ()                => { stmts }    zero-arg lambda
+ *   ()                => expr         zero-arg lambda
  *
- * No closures: lambdas are pure function pointers with no captured state.
+ * Capturing lambdas (free outer locals) are open-coded when used as a direct
+ * argument to List/Map/Set HOFs (Where/Filter/Map/ForEach/Any/All) — see
+ * LAMBDA-CAPTURE.md and cy-validate/val-042-lambda-capture.cy.  Assigning a
+ * capturing lambda to a variable is an error in v1.
  */
 #include <stdio.h>
 
