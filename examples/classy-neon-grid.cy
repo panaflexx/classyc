@@ -8,9 +8,10 @@
  *   Map   · TryAdd / GetOrAdd / AddOrUpdate / ContainsKey
  *         · Where / SelectValues / SelectKeys / GroupBy
  *         · Keys() / Values() · ownsValues() · ToJson
- *   Style · Pilot methods + typed lambdas (no pilot_callsign helpers)
+ *   Style · Pilot methods + typed lambdas
+ *         · named enums as fields + nameof/typeof reverse-map
  *         · owned auto cleanup instead of defer delete
- *         · f-strings, nameof/typeof, throwing Get + try-catch
+ *         · f-strings, throwing Get + try-catch
  *
  * Usage (from project root):
  *   ./bin/classyc -I include examples/classy-neon-grid.cy -eg
@@ -23,14 +24,26 @@
 
 /* ───────────────────────── Domain ───────────────────────── */
 
-class Pilot {
-    int    id;
-    String callsign;
-    String faction;   /* "nova" | "ember" | "void" */
-    int    elo;
-    int    best_ms;   /* best lap, milliseconds */
+/* Named enums register as bare type names (like classes): Faction field,
+ * Faction param/return, (Faction)cast, and enum Faction locals all work. */
+enum Faction { nova = 0, ember = 1, voids = 2 };
+enum EloTier { C = 0, B = 1, A = 2, S = 3 };
 
-    Pilot(int id, String callsign, String faction, int elo, int best_ms) {
+EloTier RankOf(int elo) {
+    if (elo >= 2000) return S;
+    if (elo >= 1800) return A;
+    if (elo >= 1500) return B;
+    return C;
+}
+
+class Pilot {
+    int      id;
+    String   callsign;
+    Faction  faction;
+    int      elo;
+    int      best_ms;   /* best lap, milliseconds */
+
+    Pilot(int id, String callsign, Faction faction, int elo, int best_ms) {
         this->id = id;
         this->callsign = callsign;
         this->faction = faction;
@@ -42,50 +55,26 @@ class Pilot {
         printf("      ~Pilot #%d %s decommissioned\n", id, callsign);
     }
 
-    /* Accessors — Select/Where lambdas call these, not free pilot_* helpers */
-    int    Id()       { return id; }
-    String Callsign() { return callsign; }
-    String Faction()  { return faction; }
-    int    Elo()      { return elo; }
-    int    BestMs()   { return best_ms; }
+    int      Id()         { return id; }
+    String   Callsign()   { return callsign; }
+    Faction  FactionOf()  { return faction; }
+    int      Elo()        { return elo; }
+    int      BestMs()     { return best_ms; }
 
     int IsAce()  { return elo >= 1800; }
     int IsFast() { return best_ms < 62000; }
+    EloTier Tier() { return RankOf(elo); }
 
-    /* Stable faction key for list->GroupBy */
-    int FactionBucket() {
-        const char* f = (const char*)faction;
-        if (f && f[0] == 'n') return 0; /* nova  */
-        if (f && f[0] == 'e') return 1; /* ember */
-        return 2;                        /* void  */
-    }
+    /* GroupBy key as int (Map monomorphization is int-friendly). */
+    int FactionKey() { return (int)faction; }
 
     void Banner() {
+        Faction f = faction;
         printf("   ▶  #%02d  %-12s  %-6s  elo=%4d  best=%d.%03ds\n",
-               id, callsign, faction, elo, best_ms / 1000, best_ms % 1000);
+               id, callsign, ((String)f.nameof()).upper(),
+               elo, best_ms / 1000, best_ms % 1000);
     }
 };
-
-/* Scalar helpers (no Pilot receiver) stay free */
-int EloTier(int elo) {
-    if (elo >= 2000) return 3; /* S */
-    if (elo >= 1800) return 2; /* A */
-    if (elo >= 1500) return 1; /* B */
-    return 0;                  /* C */
-}
-
-const char* EloTierName(int tier) {
-    if (tier == 3) return "S";
-    if (tier == 2) return "A";
-    if (tier == 1) return "B";
-    return "C";
-}
-
-const char* FactionName(int bucket) {
-    if (bucket == 0) return "NOVA";
-    if (bucket == 1) return "EMBER";
-    return "VOID";
-}
 
 void hr(const char* title) {
     printf("\n════════════════════════════════════════════════════════════\n");
@@ -104,24 +93,39 @@ int main() {
     printf("   ██║ ╚████║███████╗╚██████╔╝██║ ╚████║    ╚██████╔╝██║  ██║██║██████╔╝\n");
     printf("   ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═══╝     ╚═════╝ ╚═╝  ╚═╝╚═╝╚═════╝ \n");
     printf("              live race telemetry · ClassyC List/Map showcase\n");
-    printf("   reflection: list T = %s · map peeks at typeof(int*) = %s\n",
-           nameof<int>(), typeof<int*>());
+    printf("   reflection: nameof<%s>()=%s · typeof<%s>()=%s · %s.nameof()=%s · %s.typeof()=%s\n",
+           "int", nameof<int>(), "Pilot*", typeof<Pilot*>(),
+           nameof(S), S.nameof(), nameof(nova), nova.typeof());
+
+    /* Enum variable reverse-map (val-030 / val-037). */
+    enum Faction demo_fac = ember;
+    EloTier demo_tier = A;
+    printf("   enum vars:  %s.nameof()=%s  → reassigned ",
+           nameof(demo_fac), demo_fac.nameof());
+    demo_fac = voids;
+    printf("%s · %s.nameof()=%s\n",
+           demo_fac.nameof(), nameof(demo_tier), demo_tier.nameof());
 
     /* ═══ 1. Own the grid ══════════════════════════════════════════════════ */
     hr("1 · ROSTER  (List<Pilot*>.owns — reclaimed by owned auto)");
 
     owned auto grid = new List<Pilot*>().owns();
 
-    grid->Add(new Pilot(1,  "AURORA",   "nova",  2140, 59840));
-    grid->Add(new Pilot(2,  "HEXFIRE",  "ember", 1912, 61220));
-    grid->Add(new Pilot(3,  "NULLCAT",  "void",  1766, 63110));
-    grid->Add(new Pilot(4,  "KITE",     "nova",  1630, 64005));
-    grid->Add(new Pilot(5,  "RIVEN",    "ember", 2055, 60112));
-    grid->Add(new Pilot(6,  "GLITCH",   "void",  1488, 67200));
-    grid->Add(new Pilot(7,  "SOLACE",   "nova",  1880, 61550));
-    grid->Add(new Pilot(8,  "EMBERX",   "ember", 1520, 65890));
+    grid->Add(new Pilot(1,  "AURORA",   nova,  2140, 59840));
+    grid->Add(new Pilot(2,  "HEXFIRE",  ember, 1912, 61220));
+    grid->Add(new Pilot(3,  "NULLCAT",  voids, 1766, 63110));
+    grid->Add(new Pilot(4,  "KITE",     nova,  1630, 64005));
+    grid->Add(new Pilot(5,  "RIVEN",    ember, 2055, 60112));
+    grid->Add(new Pilot(6,  "GLITCH",   voids, 1488, 67200));
+    grid->Add(new Pilot(7,  "SOLACE",   nova,  1880, 61550));
+    grid->Add(new Pilot(8,  "EMBERX",   ember, 1520, 65890));
 
-    printf("  Pilots on the grid: %d\n", grid->Count());
+    printf("  Pilots on the grid: %d  · domain enums: %s / %s\n",
+           grid->Count(), nameof<Faction>(), nameof<EloTier>());
+    printf("  constants: %s.nameof()=%s  %s.nameof()=%s  free nameof(%s)=%s\n",
+           nameof(nova), nova.nameof(),
+           nameof(S), S.nameof(),
+           nameof(ember), nameof(ember));
     for (auto p in grid) p->Banner();
 
     /* Shallow non-owning snapshot for Select/GroupBy. Keeps `grid` as the sole
@@ -149,8 +153,10 @@ int main() {
 
     Pilot* pole = grid->Find((Pilot* p) => p->IsFast());
     if (pole) {
-        printf("  first sub-62s pilot found: %s (%d ms)\n",
-               pole->Callsign(), pole->BestMs());
+        Faction pf = pole->FactionOf();
+        EloTier pt = pole->Tier();
+        printf("  first sub-62s pilot found: %s (%d ms) · faction=%s · tier=%s\n",
+               pole->Callsign(), pole->BestMs(), pf.nameof(), pt.nameof());
     }
 
     /* ═══ 3. Range · Plus · Slice · Distinct ══════════════════════════════ */
@@ -159,7 +165,6 @@ int main() {
     owned auto heat_a = List<int>.Range(1, 5);   /* laps 1..5  */
     owned auto heat_b = List<int>.Range(6, 5);   /* laps 6..10 */
 
-    /* Plus is non-mutating concat (operator+ stand-in). heat_a stays intact. */
     owned auto full_race = heat_a->Plus(heat_b);
     printf("  heat A:     %s  (untouched by Plus)\n", heat_a->ToJson());
     printf("  heat B:     %s\n", heat_b->ToJson());
@@ -174,25 +179,30 @@ int main() {
            noisy->ToJson(), clean->ToJson());
 
     /* ═══ 4. list->GroupBy (UFCS, T = Pilot*) ══════════════════════════════ */
-    hr("4 · FACTION BRIEFING  (list->GroupBy via UFCS · T = Pilot*)");
+    hr("4 · FACTION BRIEFING  (list->GroupBy · Faction enum · nameof)");
 
-    /* ownsValues(): bucket lists die with the map; pilots stay under grid. */
-    owned auto by_faction = roster->GroupBy((Pilot* p) => p->FactionBucket()).ownsValues();
+    owned auto by_faction = roster->GroupBy((Pilot* p) => p->FactionKey());
 
-    printf("  factions online: %d\n", by_faction->Count());
+    printf("  factions online: %d  (bucket keys are %s values)\n",
+           by_faction->Count(), nameof<Faction>());
     for (auto bucket, group in by_faction) {
+        enum Faction fac = (Faction)bucket;
         printf("\n  ▸ %s division (%d pilots)\n",
-               FactionName(bucket), group->Count());
+               ((String)fac.nameof()).upper(), group->Count());
         group->Sort((Pilot* a, Pilot* b) => b->Elo() - a->Elo());
         for (auto p in group) p->Banner();
     }
 
-    /* Free form — same monomorphization. */
-    owned auto again = GroupBy(roster, (Pilot* p) => p->FactionBucket()).ownsValues();
+    owned auto again = GroupBy(roster, (Pilot* p) => p->FactionKey());
     printf("\n  free GroupBy(roster, …) agrees: %d factions\n", again->Count());
 
-    owned auto elo_buckets = elos->GroupBy(EloTier).ownsValues();
-    printf("  elo ladder GroupBy tiers: %d\n", elo_buckets->Count());
+    owned auto elo_buckets = elos->GroupBy((int e) => (int)RankOf(e));
+    printf("  elo ladder GroupBy tiers (%s):", nameof<EloTier>());
+    for (auto tier, scores in elo_buckets) {
+        EloTier t = (EloTier)tier;
+        printf("  %s=%d", t.nameof(), scores->Count());
+    }
+    printf("\n");
 
     /* ═══ 5. Live scoreboard Map ═══════════════════════════════════════════ */
     hr("5 · SCOREBOARD  (Map GetOrAdd / TryAdd / AddOrUpdate / Where*)");
@@ -201,7 +211,7 @@ int main() {
     for (auto p in grid) board->Set(p->Callsign(), p->Elo());
 
     board->AddOrUpdate("AURORA", 0, (int v) => v + 25);
-    board->AddOrUpdate("NEWBIE", 1200, (int v) => v + 25);   /* insert path */
+    board->AddOrUpdate("NEWBIE", 1200, (int v) => v + 25);
     printf("  AURORA after bump: %d\n", board->Get("AURORA"));
     printf("  NEWBIE seeded at:  %d\n", board->Get("NEWBIE"));
     printf("  TryAdd AURORA again? %s\n",
@@ -232,7 +242,7 @@ int main() {
     }
 
     /* ═══ 6. Map higher-order generics ═════════════════════════════════════ */
-    hr("6 · MAP LINQ  (SelectValues · SelectKeys · GroupBy tiers)");
+    hr("6 · MAP LINQ  (SelectValues · SelectKeys · GroupBy EloTier nameof)");
 
     owned auto doubled = board->SelectValues<int>((String k, int v) => {
         (void)k;
@@ -249,15 +259,16 @@ int main() {
            coded->Count());
     printf("    %s\n", coded->ToJson());
 
-    owned auto tiers = board->GroupBy<int>((String k, int v) => {
+    owned auto tiers = board->GroupBy((String k, int v) => {
         (void)k;
-        return EloTier(v);
-    }).ownsValues();
+        return (int)RankOf(v);
+    });
 
-    printf("  elo tiers (0=C … 3=S):\n");
+    printf("  elo tiers via %s nameof (C…S):\n", nameof<EloTier>());
     for (auto tier, scores in tiers) {
+        EloTier t = (EloTier)tier;
         printf("    tier %s: %d pilots  scores=%s\n",
-               EloTierName(tier), scores->Count(), scores->ToJson());
+               t.nameof(), scores->Count(), scores->ToJson());
     }
 
     owned auto names = board->Keys();
@@ -275,12 +286,16 @@ int main() {
     for (int i = 0; i < 3 && i < by_pace->Count(); i++) {
         Pilot* p = by_pace->Get(i);
         podium->Set(p->Callsign(), p);
-        printf("  podium #%d  %s  %d.%03ds\n",
-               i + 1, p->Callsign(), p->BestMs() / 1000, p->BestMs() % 1000);
+        Faction fac = p->FactionOf();
+        EloTier tier = p->Tier();
+        printf("  podium #%d  %s  %d.%03ds  [%s / tier %s]\n",
+               i + 1, p->Callsign(), p->BestMs() / 1000, p->BestMs() % 1000,
+               ((String)fac.nameof()).upper(), tier.nameof());
     }
     printf("  podium for-in:\n");
     for (auto sign, p in podium) {
-        printf("    [%s] faction=%s elo=%d\n", sign, p->Faction(), p->Elo());
+        Faction fac = p->FactionOf();
+        printf("    [%s] faction=%s elo=%d\n", sign, fac.nameof(), p->Elo());
     }
 
     /* ═══ 8. Broadcast uplink ══════════════════════════════════════════════ */
@@ -293,8 +308,9 @@ int main() {
     printf("  f-string feed:   %s\n",
            f"NEON GRID · {grid->Count()} pilots · {aces->Count()} aces · polesitter {(pole ? pole->Callsign() : (String)\"?\")}");
 
-    printf("\n  type intel:  nameof<Pilot>() would be open; concrete: List of %s, Map keys typeof sample int* = %s\n",
-           "Pilot*", typeof<int*>());
+    printf("\n  type intel:  nameof<%s>()=%s · typeof<%s>()=%s · %s.nameof()=%s · free nameof(%s)=%s\n",
+           "Pilot", nameof<Pilot>(), "Pilot*", typeof<Pilot*>(),
+           nameof(ember), ember.nameof(), nameof(voids), nameof(voids));
 
     hr("SHUTDOWN  (owned auto · owning List reclaims every Pilot)");
     printf("  dropping scope… watch ~Pilot for each roster seat:\n");

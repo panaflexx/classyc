@@ -7780,6 +7780,13 @@ DA (type_spec) {
       op2 = new_node (c2m_ctx, N_IGNORE);
     }
     r = new_pos_node2 (c2m_ctx, N_ENUM, pos, op1, op2);
+    /* ClassyC ergonomics (C++-like): a *named* enum definition also registers
+       as a bare type name so `Faction x` works like `enum Faction x`.  Only
+       definitions (with a body) register the name; bare `enum Faction` uses
+       still parse via the ENUM keyword.  Classes already do the same via
+       tpname_add for their tag. */
+    if (id_p && op2->code != N_IGNORE)
+      tpname_add (c2m_ctx, op1, curr_scope, TRUE);
   } else if (arg == NULL) {
     /* Any<Interface> erased handle: `Any` is not a registered type name, so
        intercept it here before typedef_name.  On first reference the __Any_<I>
@@ -11870,6 +11877,12 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
 
       set_type_pos_node (type, n);
       if (def == NULL) {
+        /* Named enums also live under S_TAG (like struct tags).  After bare-name
+           registration, prefer S_REGULAR; fall back to the tag table so older
+           units and forward uses still resolve. */
+        def = find_def (c2m_ctx, S_TAG, n, skip_struct_scopes (curr_scope), NULL);
+      }
+      if (def == NULL) {
         error (c2m_ctx, POS (n), "unknown type %s", n->u.s.s);
         init_type (type);
         type->mode = TM_BASIC;
@@ -11880,6 +11893,13 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
         type->u.tag_type = def;
         set_type_pos_node(type, def);
         set_class_layout(c2m_ctx, def, type);
+      } else if (def->code == N_ENUM) {
+        /* Named enum used as a type name: `Faction x` / `(Faction)v`. */
+        type->mode = TM_ENUM;
+        type->u.tag_type = def;
+        set_type_pos_node (type, def);
+        if (incomplete_type_p (c2m_ctx, type))
+          error (c2m_ctx, POS (n), "enum storage size is unknown");
       } else {
         assert (def->code == N_SPEC_DECL);
         if (!def->attr) {
@@ -11999,6 +12019,15 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
       check_type_duplication (c2m_ctx, type, n, "enum", size, sign);
       type->mode = TM_ENUM;
       type->u.tag_type = res_tag_type;
+      /* Mirror class bare-name registration: `Faction` resolves as a type, not
+         only as `enum Faction`.  S_TAG is already set by process_tag. */
+      if (id->code == N_ID) {
+        symbol_t _esym;
+        node_t _enum_sym_scope = skip_struct_scopes (curr_scope);
+        if (!symbol_find (c2m_ctx, S_REGULAR, id, _enum_sym_scope, &_esym))
+          symbol_insert (c2m_ctx, S_REGULAR, id, _enum_sym_scope, res_tag_type, NULL);
+        tpname_add (c2m_ctx, id, _enum_sym_scope, TRUE);
+      }
       if (enum_list->code == N_IGNORE) {
         if (incomplete_type_p (c2m_ctx, type))
           error (c2m_ctx, POS (n), "enum storage size is unknown");
