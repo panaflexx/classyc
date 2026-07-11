@@ -31,11 +31,13 @@
  *
  * Memory: Stack Lists own their buffer; destructor runs at scope exit.
  * Heap Lists: caller owns (owned auto / defer delete / delete).
- * Slice/Copy/Filter/Where/Select/Plus return new heap lists the caller must free.
- * Those results are always non-owning — they never copy the source .owns() flag.
+ * Slice/Copy/Filter/Where/Select/Plus/Take/Skip/… return List<T> by value
+ * (RAII shells — no owned/delete needed for local pipelines). Results are
+ * always non-owning of T* pointees — they never copy the source .owns() flag.
  *
  * Move-only: bare assign / copy-init of List is an error (buffer alias).
  *   auto b = move a;   or   b = move a;   transfers ownership; source emptied.
+ *   auto c = f();  /  return a;   binds or moves a by-value List return.
  * Brace-init supports class ctor expressions:
  *   new List<Pt>{ Pt(1,2), Pt(3,4) };   xs.Add(Pt(5,6));
  *
@@ -352,33 +354,33 @@ class List<T> {
         length += oc;
     }
 
-    /* Return new heap list with [start, start+count). Clamps to valid range.
-     * Always non-owning (does not copy .owns()). Caller must `delete`. */
-    List<T>* Slice(int start, int count) __attribute__((da_ignore)) {
+    /* Return a by-value list with [start, start+count). Clamps to valid range.
+     * Always non-owning of pointees (does not copy .owns()). RAII shell. */
+    List<T> Slice(int start, int count) __attribute__((da_ignore)) {
         if (start < 0)                   start = 0;
         if (start >= this->length)       count = 0;
         if (count < 0)                   count = 0;
         if (start + count > this->length) count = this->length - start;
-        List<T>* result = new List<T>(count > 0 ? count : 1);
-        for (int i = 0; i < count; i++) result->Add(this->data[start + i]);
-        return result;
+        auto result = List<T>(count > 0 ? count : 1);
+        for (int i = 0; i < count; i++) result.Add(this->data[start + i]);
+        return move result;
     }
 
-    /* Shallow copy. Always non-owning (does not copy .owns()). Caller must `delete`. */
-    List<T>* Copy() __attribute__((da_ignore)) {
-        List<T>* c = new List<T>(this->length > 0 ? this->length : 1);
+    /* Shallow copy into a by-value list. Always non-owning of pointees. */
+    List<T> Copy() __attribute__((da_ignore)) {
+        auto c = List<T>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++)
-            c->Add(this->Get(i));
-        return c;
+            c.Add(this->Get(i));
+        return move c;
     }
 
-    /* New heap list = this ++ other (non-mutating).  Caller must delete.
+    /* By-value list = this ++ other (non-mutating).
      * Stand-in for operator+ until the language gets overloaded +.
      * Declared after Copy/AddRange (method order matters). */
-    List<T>* Plus(List<T>* other) __attribute__((da_ignore)) {
-        List<T>* r = this->Copy();
-        if (other) r->AddRange(other);
-        return r;
+    List<T> Plus(List<T>* other) __attribute__((da_ignore)) {
+        auto r = this->Copy();
+        if (other) r.AddRange(other);
+        return move r;
     }
 
     /* ═════════════════════════ Array conversions ═══════════════════════ */
@@ -395,11 +397,11 @@ class List<T> {
         return 1;
     }
     /* Unique elements; String uniqueness is by content (via IndexOf/LIST_EQ). */
-    List<T>* Distinct() __attribute__((da_ignore)) {
-        List<T>* r = new List<T>(length > 0 ? length : 4);
+    List<T> Distinct() __attribute__((da_ignore)) {
+        auto r = List<T>(length > 0 ? length : 4);
         for (int i = 0; i < length; i++)
-            if (r->IndexOf(data[i]) < 0) r->Add(data[i]);
-        return r;
+            if (r.IndexOf(data[i]) < 0) r.Add(data[i]);
+        return move r;
     }
 
     /* ═════════════════════════ Higher-order ═══════════════════════════ */
@@ -412,58 +414,57 @@ class List<T> {
         }
     }
 
-    /* New heap list of elements where pred(item) != 0. Always non-owning.
-     * Caller must `delete`. */
-    List<T>* Filter(int(*pred)(T)) __attribute__((da_ignore)) {
-        List<T>* result = new List<T>();
+    /* By-value list of elements where pred(item) != 0. Always non-owning of T*. */
+    List<T> Filter(int(*pred)(T)) __attribute__((da_ignore)) {
+        auto result = List<T>();
         for (int i = 0; i < this->length; i++) {
             /* Call Get twice rather than `T item = Get(i)`: a named by-value
                class local with a user dtor is RAII-registered and, with current
                aggregate call/return codegen, can corrupt monomorphized filter
                results.  pred/Add take value params that copy from Get. */
-            if (pred(this->Get(i))) result->Add(this->Get(i));
+            if (pred(this->Get(i))) result.Add(this->Get(i));
         }
-        return result;
+        return move result;
     }
 
-	    /* Return new heap list with fn(item) applied to every element.
-	     * Same-type transform (T -> T), so it chains with Filter:
-	     *   nums->Filter(p)->Map(f).  Caller must `delete` the result. */
-	    List<T>* Map(T(*fn)(T)) __attribute__((da_ignore)) {
-	        List<T>* result = new List<T>(this->length > 0 ? this->length : 1);
-	        for (int i = 0; i < this->length; i++) {
-	            T item = this->Get(i);
-	            result->Add(fn(item));
-	        }
-	        return result;
-	    }
-
-    /* Where == Filter. Always non-owning view for T*; by-value T is copied. */
-    List<T>* Where(int(*pred)(T)) __attribute__((da_ignore)) {
-        List<T>* result = new List<T>();
+    /* By-value list with fn(item) applied to every element (T → T).
+     * Chains with Filter:  auto r = nums.Filter(p).Map(f); */
+    List<T> Map(T(*fn)(T)) __attribute__((da_ignore)) {
+        auto result = List<T>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++) {
-            if (pred(this->Get(i))) result->Add(this->Get(i));
+            T item = this->Get(i);
+            result.Add(fn(item));
         }
-        return result;
+        return move result;
+    }
+
+    /* Where == Filter. Non-owning view for T*; by-value T is copied. */
+    List<T> Where(int(*pred)(T)) __attribute__((da_ignore)) {
+        auto result = List<T>();
+        for (int i = 0; i < this->length; i++) {
+            if (pred(this->Get(i))) result.Add(this->Get(i));
+        }
+        return move result;
     }
 
     /* LINQ-style projection: T → U.  U is a method type parameter (specialized
-     * at the call site): xs->Select<String>(toName) or xs->Select(fn) with U
-     * inferred from fn's return type.  Caller must delete/own the result. */
-    List<U>* Select<U>(U(*fn)(T)) __attribute__((da_ignore)) {
-        List<U>* result = new List<U>(this->length > 0 ? this->length : 1);
+     * at the call site): xs.Select<String>(toName) or xs.Select(fn) with U
+     * inferred from fn's return type.  Returns List<U> by value (RAII). */
+    List<U> Select<U>(U(*fn)(T)) __attribute__((da_ignore)) {
+        auto result = List<U>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++) {
             T item = this->Get(i);
-            result->Add(fn(item));
+            result.Add(fn(item));
         }
-        return result;
+        return move result;
     }
 
     /* Same-type Select / Map (T → T) — kept as Map() for chains that stay on T. */
 
-    /* Compat: T → String projection. Prefer Select<String>(fn).  Body is open-coded
-     * (not delegated to Select) so List specializations type-check without nesting
-     * another generic-method monomorphization during method-body check. */
+    /* Compat: T → String projection. Prefer Select<String>(fn).
+     * Nested concrete List<String> by-value shells inside a List<T> method body
+     * still hit a monomorphization edge; keep the heap-pointer return here.
+     * Call sites use `owned auto` or `delete`, or open-code Select. */
     List<String>* SelectString(String(*fn)(T)) __attribute__((da_ignore)) {
         List<String>* result = new List<String>(this->length > 0 ? this->length : 4);
         for (int i = 0; i < this->length; i++) {
@@ -513,42 +514,45 @@ class List<T> {
         return fb;
     }
 
-    static List<T>* Repeat(T item, int count) __attribute__((da_ignore)) {
+    static List<T> Repeat(T item, int count) __attribute__((da_ignore)) {
         if (count < 0) count = 0;
-        List<T>* r = new List<T>(count > 0 ? count : 4);
-        for (int i = 0; i < count; i++) r->Add(item);
-        return r;
+        auto r = List<T>(count > 0 ? count : 4);
+        for (int i = 0; i < count; i++) r.Add(item);
+        return move r;
     }
-    static List<T>* Range(int start, int count) __attribute__((da_ignore)) {
+    static List<T> Range(int start, int count) __attribute__((da_ignore)) {
         if (count < 0) throw(OutOfBoundsException, "List.Range count < 0");
         const char* tn = nameof<T>();
         if (strcmp(tn, "int") != 0 && strcmp(tn, "short") != 0 && strcmp(tn, "long") != 0
                 && strcmp(tn, "unsigned") != 0 && strcmp(tn, "bool") != 0) {
             throw(RuntimeException, "List.Range requires integral T");
         }
-        List<T>* r = new List<T>(count > 0 ? count : 4);
+        auto r = List<T>(count > 0 ? count : 4);
         for (int i = 0; i < count; i++) {
             int v = start + i;
-            r->Add(*(T*)&v);
+            r.Add(*(T*)&v);
         }
-        return r;
+        return move r;
     }
 
-    List<T>* Take(int count) __attribute__((da_ignore)) {
+    List<T> Take(int count) __attribute__((da_ignore)) {
         if (count < 0) count = 0;
         if (count > this->length) count = this->length;
-        List<T>* result = new List<T>(count > 0 ? count : 4);
-        for (int i = 0; i < count; i++) result->Add(Get(i));
-        return result;
+        auto result = List<T>(count > 0 ? count : 4);
+        for (int i = 0; i < count; i++) result.Add(Get(i));
+        return move result;
     }
 
-    List<T>* Skip(int count) __attribute__((da_ignore)) {
+    List<T> Skip(int count) __attribute__((da_ignore)) {
         if (count < 0) count = 0;
-        if (count >= this->length) return new List<T>(4);
+        if (count >= this->length) {
+            auto empty = List<T>(4);
+            return move empty;
+        }
         int remaining = this->length - count;
-        List<T>* result = new List<T>(remaining);
-        for (int i = count; i < this->length; i++) result->Add(Get(i));
-        return result;
+        auto result = List<T>(remaining);
+        for (int i = count; i < this->length; i++) result.Add(Get(i));
+        return move result;
     }
 
     dict ToArrayDict() __attribute__((da_ignore)) {

@@ -67,11 +67,14 @@ int main(void) {
     check(ages->Get(label(0)) == 0,     "(3) first key findable after loop");
     check(ages->Get(label(499)) == 499, "(3) last key findable after loop");
 
-    /* (4) Copy() of a String list yields independent buffers: deleting the
-       copy must not corrupt or double-free the source. */
-    List<String>* copy = names->Copy();
-    delete copy;  /* must not free names' buffers */
-    check(strcmp(names->Get(0), "item#0") == 0, "(4) source intact after copy deleted");
+    /* (4) Copy() yields a by-value RAII list of independent String buffers;
+       destroying the copy must not corrupt or free the source buffers. */
+    {
+        auto copy = names->Copy();
+        check(copy.Count() == names->Count(), "(4) copy has same count");
+        /* ~copy at scope end must not free names' buffers */
+    }
+    check(strcmp(names->Get(0), "item#0") == 0, "(4) source intact after copy destroyed");
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed;

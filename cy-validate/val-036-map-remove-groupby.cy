@@ -134,9 +134,8 @@ int main() {
         m->Set(1, 10);
         m->Merge(NULL);
         check(m->Count() == 1 && m->Get(1) == 10, "5a  Merge(NULL) no-op");
-        Map<int, int>* c = m->Copy();
-        defer delete c;
-        check(c->Count() == 1 && c->Get(1) == 10, "5b  Copy shallow contents");
+        auto c = m->Copy();  /* Copy returns Map by value / RAII */
+        check(c.Count() == 1 && c.Get(1) == 10, "5b  Copy shallow contents");
     }
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);

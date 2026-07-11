@@ -62,9 +62,8 @@ int main() {
     {
         auto xs = List<int>();
         xs.Add(1); xs.Add(2); xs.Add(3); xs.Add(4); xs.Add(5);
-        List<int>* ev = xs.Where((int x) => x % 2 == 0);
+        auto ev = xs.Where((int x) => x % 2 == 0);  /* by-value RAII result */
         check(ev.Count() == 2 && ev.Get(0) == 2, "2a Where from stack List");
-        delete ev; /* transforms still return heap lists */
         int sum = 0;
         for (auto v in xs) sum += v;
         check(sum == 15, "2b for-in stack List");
@@ -82,10 +81,9 @@ int main() {
             int sum = 0;
             for (auto p in xs) sum += p.getX();
             check(sum == 6, "3b for-in List<Pt>");
-            List<Pt>* ev = xs.Where(even_x);
+            auto ev = xs.Where(even_x);  /* by-value RAII result */
             check(ev.Count() == 1 && ev.First().getX() == 2, "3c Where on List<Pt>");
-            delete ev;
-        } /* ~List runs __destroy on 3 copies; stack Pt a/b/c also dtor */
+        } /* ~List runs __destroy on copies; stack Pt a/b/c also dtor */
         check(dtors >= 3, "3d element dtors on stack List scope exit");
         printf("    total dtors=%d (list elements + stack temps)\n", dtors);
     }

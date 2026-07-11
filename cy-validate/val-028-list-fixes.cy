@@ -148,13 +148,11 @@ int main() {
     List<int>* nums = new List<int>{ 1, 2, 3, 4, 5, 6 };
     defer delete nums;
 
-    List<int>* wh = nums->Where(is_even);
-    defer delete wh;
-    check(wh->Count() == 3 && wh->Get(0) == 2, "5a  Where(even) filters");
+    auto wh = nums->Where(is_even);
+    check(wh.Count() == 3 && wh.Get(0) == 2, "5a  Where(even) filters");
 
-    List<int>* sel = nums->Select(times2);
-    defer delete sel;
-    check(sel->Get(0) == 2 && sel->Get(5) == 12, "5b  Select(x*2) maps");
+    auto sel = nums->Select(times2);
+    check(sel.Get(0) == 2 && sel.Get(5) == 12, "5b  Select(x*2) maps");
 
     check(nums->Any(is_even) == 1 && nums->All(is_pos) == 1, "5c  Any/All predicates");
     check(nums->Any(gt_10) == 0, "5d  Any(gt_10) false on [1..6]");
@@ -183,14 +181,12 @@ int main() {
 
     List<int>* dup = new List<int>{ 1, 2, 2, 3, 1, 4, 2 };
     defer delete dup;
-    List<int>* uniq = dup->Distinct();
-    defer delete uniq;
-    check(uniq->Count() == 4, "5l  Distinct removes duplicates");
-    check(uniq->Contains(1) && uniq->Contains(4), "5m  Distinct preserves values");
+    auto uniq = dup->Distinct();
+    check(uniq.Count() == 4, "5l  Distinct removes duplicates");
+    check(uniq.Contains(1) && uniq.Contains(4), "5m  Distinct preserves values");
 
-    List<int>* rep = List<int>.Repeat(42, 3);
-    defer delete rep;
-    check(rep->Count() == 3 && rep->Get(1) == 42, "5n  Repeat(42,3)");
+    auto rep = List<int>.Repeat(42, 3);
+    check(rep.Count() == 3 && rep.Get(1) == 42, "5n  Repeat(42,3)");
 
     dict arrDict = nums->ToArrayDict();
     check((int)arrDict.length() == 6, "5o  ToArrayDict() alias works");
@@ -209,12 +205,11 @@ int main() {
     check(tags->Contains("AURORA") == 1, "5q  List<String>.Contains literal by content");
     check(tags->Contains("NOPE") == 0,   "5r  Contains miss");
     check(tags->IndexOf("RIVEN") == 1,   "5s  IndexOf content");
-    List<String>* utags = tags->Distinct();
-    defer delete utags;
-    check(utags->Count() == 2,            "5t  Distinct String by content");
+    auto utags = tags->Distinct();
+    check(utags.Count() == 2,            "5t  Distinct String by content");
     List<String>* t2 = new List<String>{"AURORA", "RIVEN"};
     defer delete t2;
-    check(utags->Equals(t2) == 1,         "5u  Equals String lists by content");
+    check(utags.Equals(t2) == 1,         "5u  Equals String lists by content");
 
     /* ── 6. Copy correctness ──────────────────────────────────────── */
     printf("\n-- 6. Copy correctness --\n");

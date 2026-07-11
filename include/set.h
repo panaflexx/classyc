@@ -271,29 +271,29 @@ class Set<T> {
 
     /* ───────────────────── Set operations ───────────────────── */
 
-    Set<T>* Union(Set<T>* other) const {
-        Set<T>* r = new Set<T>(this->count + other->Count());
-        for (int i = 0; i < this->count; i++)        r->Add(this->dense[i]);
-        for (int i = 0; i < other->Count(); i++)     r->Add(other->Get(i));
-        return r;
+    Set<T> Union(Set<T>* other) const {
+        auto r = Set<T>(this->count + other->Count());
+        for (int i = 0; i < this->count; i++)        r.Add(this->dense[i]);
+        for (int i = 0; i < other->Count(); i++)     r.Add(other->Get(i));
+        return move r;
     }
 
-    Set<T>* Intersect(Set<T>* other) const {
-        Set<T>* r = new Set<T>(this->count);
+    Set<T> Intersect(Set<T>* other) const {
+        auto r = Set<T>(this->count);
         for (int i = 0; i < this->count; i++) {
             T v = this->dense[i];
-            if (other->Contains(v)) r->Add(v);
+            if (other->Contains(v)) r.Add(v);
         }
-        return r;
+        return move r;
     }
 
-    Set<T>* Difference(Set<T>* other) const {
-        Set<T>* r = new Set<T>(this->count);
+    Set<T> Difference(Set<T>* other) const {
+        auto r = Set<T>(this->count);
         for (int i = 0; i < this->count; i++) {
             T v = this->dense[i];
-            if (!other->Contains(v)) r->Add(v);
+            if (!other->Contains(v)) r.Add(v);
         }
-        return r;
+        return move r;
     }
 
     int IsSubsetOf(Set<T>* other) const {
@@ -316,11 +316,11 @@ class Set<T> {
         for (int i = 0; i < this->count; i++) action(this->dense[i]);
     }
 
-    Set<T>* Filter(int(*pred)(T)) const __attribute__((da_ignore)) {
-        Set<T>* r = new Set<T>(this->count);
+    Set<T> Filter(int(*pred)(T)) const __attribute__((da_ignore)) {
+        auto r = Set<T>(this->count);
         for (int i = 0; i < this->count; i++)
-            if (pred(this->dense[i])) r->Add(this->dense[i]);
-        return r;
+            if (pred(this->dense[i])) r.Add(this->dense[i]);
+        return move r;
     }
 
 };

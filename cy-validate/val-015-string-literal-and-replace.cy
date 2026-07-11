@@ -59,13 +59,12 @@ int main() {
     check(strcmp((char*)p.replace(0, 3, "XYZ"), "XYZdef") == 0,
           "positional replace(pos,len,repl) preserved");
 
-    /* ── B4: List<T>.Map (chains with Filter) ──────────────────────────── */
+    /* ── B4: List<T>.Map (chains with Filter; both return by value) ──── */
     List<int>* nums = new List<int>{ 1, 2, 3, 4 };
     defer delete nums;
-    List<int>* out = nums->Filter((int x) => x > 1)->Map(dbl);
-    defer delete out;
-    check(out->Count() == 3, "List.Map after Filter: count");
-    check(out->Get(0) == 4 && out->Get(1) == 6 && out->Get(2) == 8,
+    auto out = nums->Filter((int x) => x > 1).Map(dbl);
+    check(out.Count() == 3, "List.Map after Filter: count");
+    check(out.Get(0) == 4 && out.Get(1) == 6 && out.Get(2) == 8,
           "List.Map applies fn to each element");
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);

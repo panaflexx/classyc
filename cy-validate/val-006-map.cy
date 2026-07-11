@@ -68,15 +68,14 @@ int main() {
     check(strcmp((char*)s->KeyAt(0), "alpha") == 0, "KeyAt(0) preserves insertion order");
     check(s->ValAt(2) == 30,          "ValAt(2) is third value");
 
-    /* Copy + Merge independence */
+    /* Copy + Merge independence (Copy returns Map by value / RAII) */
     Map<String, int>* base = new Map<String, int>();
     defer delete base;
     base["x"] = 1; base["y"] = 2;
-    Map<String, int>* dup = base->Copy();
-    defer delete dup;
+    auto dup = base->Copy();
     dup["z"] = 3;
-    check(base->Count() == 2 && dup->Count() == 3, "Copy is independent");
-    base->Merge(dup);
+    check(base->Count() == 2 && dup.Count() == 3, "Copy is independent");
+    base->Merge(&dup);
     check(base->Count() == 3 && base["z"] == 3,    "Merge pulls entries across");
 
     /* int -> String keys */

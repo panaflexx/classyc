@@ -4,8 +4,10 @@
  *
  *   Domain   · Pilot* owning stack List  · LapSample by-value List (POD DTO)
  *            · fluent Bump · named ctor args · enums + nameof
- *   Memory   · stack List/Map value form (RAII) · Where/Copy → heap List*
+ *   Memory   · stack List/Map value form (RAII)
+ *            · Where/Take/Skip/Copy return value shells — no owned on pipelines
  *            · List<Pilot*>.owns() for domain pointees · move-only containers
+ *            · owned / new only for heap escape (split, GroupBy Map*)
  *   LINQ     · Where / Select / Any / All / Find / FindOr / GroupBy
  *            · First / Last / Take / Skip · OrderBy helpers · ForEach
  *            · Range · Plus · Slice · Distinct
@@ -15,7 +17,7 @@
  *   String   · equals / contains / starts_with / split / join
  *   Generics · free Max<T> inference (val-023)
  *   JSON     · dict { … } brace-init · (T) d / (T)? d bind (val-020)
- *   Style    · `.` auto-deref · `?.` / `??` · owned auto · f-strings · dict DTO
+ *   Style    · `.` auto-deref · `?.` / `??` · value LINQ · f-strings · dict DTO
  *
  * Usage (from project root):
  *   ./bin/classyc -I include examples/classy-neon-grid.cy -eg
@@ -102,16 +104,16 @@ int ByEloDesc(Pilot* a, Pilot* b) { return b.elo - a.elo; }
 int ByPace(Pilot* a, Pilot* b)    { return a.best_ms - b.best_ms; }
 int ByIntAsc(int a, int b)        { return a - b; }
 
-/* Transforms return new heap lists; caller owns (owned auto / delete). */
-List<Pilot*>* OrderByElo(List<Pilot*>* src) {
-    List<Pilot*>* r = src.Copy();
+/* Order helpers return value Lists (RAII at the call site). */
+List<Pilot*> OrderByElo(List<Pilot*>* src) {
+    auto r = src.Copy();
     r.Sort(ByEloDesc);
-    return r;
+    return move r;
 }
-List<Pilot*>* OrderByPace(List<Pilot*>* src) {
-    List<Pilot*>* r = src.Copy();
+List<Pilot*> OrderByPace(List<Pilot*>* src) {
+    auto r = src.Copy();
     r.Sort(ByPace);
-    return r;
+    return r;   /* implicit move of move-only collection local */
 }
 
 void print_banner(Pilot* p) { p.Banner(); }
@@ -211,18 +213,18 @@ int main() {
            grid.Count(), grid.First().callsign, grid.Last().callsign, peak);
     grid.ForEach(print_banner);
 
-    owned auto roster = grid.Copy();     /* transforms still heap List* */
+    auto roster = grid.Copy();           /* value List shell — RAII */
 
     /* ═══ 2. Qualifying ════════════════════════════════════════════════════ */
-    hr("2 · QUALIFYING  (Where · OrderBy · Select · Find · ?. ?? · String API)");
+    hr("2 · QUALIFYING  (Where · OrderBy · Select · Find · ?. ?? · value List)");
 
-    owned auto aces_raw = grid.Where((Pilot* p) => p.IsAce());
-    owned auto aces = OrderByElo(aces_raw);
+    auto aces_raw = grid.Where((Pilot* p) => p.IsAce());
+    auto aces = OrderByElo(&aces_raw);
     printf("  aces ranked: %d  (top %s · floor %s)\n",
            aces.Count(), aces.First().callsign, aces.Last().callsign);
     aces.ForEach(print_banner);
 
-    owned auto ace_names = aces.Select<String>((Pilot* p) => p.callsign);
+    auto ace_names = aces.Select<String>((Pilot* p) => p.callsign);
     printf("  ace callsigns: %s\n", ace_names.ToJson());
 
     String sample = ace_names.First();
@@ -238,7 +240,7 @@ int main() {
     owned auto bits = tag.split("-");
     printf("  split/join: %s → %s\n", tag, bits.join("/"));
 
-    owned auto elos = roster.Select((Pilot* p) => p.elo);
+    auto elos = roster.Select((Pilot* p) => p.elo);
     elos.Sort(ByIntAsc);
     printf("  elo ladder: %s\n", elos.ToJson());
 
@@ -261,19 +263,19 @@ int main() {
     }
     printf("  FindOr miss → %s · ?? name=%s\n", ghost_name, pole_name);
 
-    /* ═══ 3. Heat windows — stack Lists + owned transform results ══════════ */
-    hr("3 · LAP WINDOWS  (Range · Plus · Slice · Distinct · Skip/Take)");
+    /* ═══ 3. Heat windows — all value shells ═══════════════════════════════ */
+    hr("3 · LAP WINDOWS  (Range · Plus · Slice · Distinct · Skip/Take chains)");
 
-    owned auto heat_a = List<int>.Range(1, 5);   /* static Range → heap */
-    owned auto heat_b = List<int>.Range(6, 5);
-    owned auto full_race = heat_a.Plus(heat_b);
-    owned auto midfield  = full_race.Slice(3, 4);
-    owned auto tail      = full_race.Skip(7).Take(3);
+    auto heat_a = List<int>.Range(1, 5);
+    auto heat_b = List<int>.Range(6, 5);
+    auto full_race = heat_a.Plus(&heat_b);
+    auto midfield  = full_race.Slice(3, 4);
+    auto tail      = full_race.Skip(7).Take(3);
 
     auto noisy = List<int>();
     noisy.Add(1); noisy.Add(2); noisy.Add(2);
     noisy.Add(3); noisy.Add(3); noisy.Add(3); noisy.Add(4);
-    owned auto clean = noisy.Distinct();
+    auto clean = noisy.Distinct();
 
     printf("  heat A:    %s\n", heat_a.ToJson());
     printf("  heat B:    %s\n", heat_b.ToJson());
@@ -293,7 +295,7 @@ int main() {
     /* ═══ 4. Faction briefing ══════════════════════════════════════════════ */
     hr("4 · FACTION BRIEFING  (GroupBy · Set watchlist · enum nameof)");
 
-    owned auto by_faction = roster.GroupBy((Pilot* p) => p.FactionKey());
+    owned auto by_faction = roster.GroupBy((Pilot* p) => p.FactionKey());  /* Map* + ownsValues buckets */
     printf("  %d factions (%s)\n", by_faction.Count(), nameof<Faction>());
 
     for (auto bucket, group in by_faction) {
@@ -315,7 +317,7 @@ int main() {
            dup ? "inserted" : "deduped",
            watch.Contains("AURORA") ? "true" : "false");
 
-    owned auto elo_buckets = elos.GroupBy((int e) => (int)RankOf(e));
+    owned auto elo_buckets = elos.GroupBy((int e) => (int)RankOf(e));  /* GroupBy → heap Map* */
     printf("  elo histogram (%s):", nameof<EloTier>());
     for (auto tier, scores in elo_buckets) {
         EloTier t = (EloTier)tier;
@@ -340,7 +342,7 @@ int main() {
     printf("  TryGet(HEXFIRE)=%s val=%d\n",
            board.TryGet("HEXFIRE", &peek) ? "true" : "false", peek);
 
-    owned auto ace_board = board.Where((String k, int v) => {
+    auto ace_board = board.Where((String k, int v) => {
         (void)k;
         return v >= 1800;
     });
@@ -358,16 +360,16 @@ int main() {
         printf("  threw? %s\n", threw ? "yes" : "no");
     }
 
-    /* ═══ 6. Map LINQ (Where/Select return heap maps) ══════════════════════ */
+    /* ═══ 6. Map LINQ (value Select* / Keys; GroupBy still heap Map*) ══════ */
     hr("6 · MAP LINQ  (SelectValues · SelectKeys · GroupBy · Keys)");
 
-    owned auto doubled = board.SelectValues<int>((String k, int v) => {
+    auto doubled = board.SelectValues<int>((String k, int v) => {
         (void)k;
         return v * 2;
     });
     printf("  SelectValues(*2):\n    %s\n", doubled.to_string());
 
-    owned auto coded = board.SelectKeys<int>((String k, int v) => {
+    auto coded = board.SelectKeys<int>((String k, int v) => {
         (void)v;
         const char* s = (const char*)k;
         return (s && s[0]) ? (int)s[0] : 0;
@@ -383,7 +385,7 @@ int main() {
         EloTier t = (EloTier)tier;
         printf("    %s: %d  %s\n", t.nameof(), scores.Count(), scores.ToJson());
     }
-    owned auto keys = board.Keys();
+    auto keys = board.Keys();
     printf("  Keys=%d  IsEmpty=%s  for-in keys:", keys.Count(),
            board.IsEmpty() ? "true" : "false");
     int shown = 0;
@@ -407,13 +409,13 @@ int main() {
     for (auto s in samples)
         printf("   · %s  quick=%s\n", s.ToString(), s.IsQuick() ? "yes" : "no");
 
-    owned auto quick_laps = samples.Where((LapSample s) => s.IsQuick());
+    auto quick_laps = samples.Where((LapSample s) => s.IsQuick());
     printf("  Where(IsQuick): %d\n", quick_laps.Count());
     for (auto s in quick_laps) printf("   · %s\n", s.ToString());
 
     /* Open-code Select: generic Select monomorphization on stack List+value-T
-       is still a rough edge; heap List* Pilot* path uses Select fine. */
-    owned auto sample_ms = new List<int>();
+       is still a rough edge; Pilot* path uses Select fine. */
+    auto sample_ms = List<int>();
     for (auto s in samples) sample_ms.Add(s.ms);
     printf("  Select(ms): %s\n", sample_ms.ToJson());
 
@@ -425,11 +427,11 @@ int main() {
     printf("  Find(ms>63000): %s\n", heavy.ToString());
 
     /* ═══ 8. Podium ════════════════════════════════════════════════════════ */
-    hr("8 · PODIUM  (OrderByPace · Take · Skip · stack Map)");
+    hr("8 · PODIUM  (OrderByPace · Take · Skip chain · stack Map — no owned)");
 
-    owned auto by_pace = OrderByPace(&grid);
-    owned auto top3    = by_pace.Take(3);
-    owned auto silver  = by_pace.Skip(1).Take(1);
+    auto by_pace = OrderByPace(&grid);
+    auto top3    = by_pace.Take(3);
+    auto silver  = by_pace.Skip(1).Take(1);
 
     printf("  silver: %s\n", silver.First().ToString());
 

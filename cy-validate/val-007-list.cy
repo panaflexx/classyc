@@ -1,11 +1,11 @@
 /* val-007-list.cy — validates the generic List<T> (include/list.h).
  *
- * Correct idiom (NOT the README's `List<int> x = {..}; x.Filter().Map()`):
+ * Correct idiom:
  *   List<int>* xs = new List<int>{ 1, 2, 3 };   // heap, brace-init
- *   xs->Filter((int x) => x > 1);               // arrow calls; Filter exists
- *   defer delete xs;
- * There is NO `.Map` method on List<T> (see SHORTCOMINGS.md B4). For array
- * pipelines use the lowercase seq methods `.filter/.map/.reduce/.ToList`.
+ *   auto pos = xs->Filter((int x) => x > 1);   // Filter/Map/Slice/Copy return by value
+ *   defer delete xs;                           // only free the heap source
+ * Transforms return RAII shells (do not delete). For C-array pipelines use
+ * lowercase seq methods `.filter/.map/.reduce/.ToList`.
  *
  * Run:  ./bin/classyc -g -I include cy-validate/val-007-list.cy -eg
  */
@@ -45,41 +45,37 @@ int main() {
     check(nums->IndexOf(5) >= 0, "IndexOf present");
     check(nums->Contains(5) == 1 && nums->Contains(999) == 0, "Contains");
 
-    /* Filter (returns new heap list) */
+    /* Filter (returns List by value / RAII) */
     List<int>* src = new List<int>{ -2, 5, -8, 3, -1, 9, 4 };
     defer delete src;
-    List<int>* pos = src->Filter((int x) => x > 0);
-    defer delete pos;
-    check(pos->Count() == 4,    "Filter keeps matching");
+    auto pos = src->Filter((int x) => x > 0);
+    check(pos.Count() == 4,    "Filter keeps matching");
 
     /* Sort in place */
-    pos->Sort((int a, int b) => a < b ? -1 : a > b ? 1 : 0);
-    check(pos->Get(0) == 3 && pos->Last() == 9, "Sort ascending");
+    pos.Sort((int a, int b) => a < b ? -1 : a > b ? 1 : 0);
+    check(pos.Get(0) == 3 && pos.Last() == 9, "Sort ascending");
 
     /* ForEach */
     g_sum = 0;
-    pos->ForEach(accum);
+    pos.ForEach(accum);
     check(g_sum == 3 + 4 + 5 + 9, "ForEach visits all");
 
     /* Reverse / Copy / Equals / Slice / Concat */
     List<int>* a = new List<int>{ 1, 2, 3 };
     defer delete a;
-    List<int>* c = a->Copy();
-    defer delete c;
-    check(a->Equals(c) == 1,    "Copy + Equals");
-    c->Reverse();
-    check(c->Get(0) == 3,       "Reverse in place");
-    List<int>* sl = a->Slice(1, 2);
-    defer delete sl;
-    check(sl->Count() == 2 && sl->Get(0) == 2, "Slice range");
+    auto c = a->Copy();
+    check(a->Equals(&c) == 1,    "Copy + Equals");
+    c.Reverse();
+    check(c.Get(0) == 3,       "Reverse in place");
+    auto sl = a->Slice(1, 2);
+    check(sl.Count() == 2 && sl.Get(0) == 2, "Slice range");
 
     /* String list + Filter */
     List<String>* fruit = new List<String>{ "apple", "banana", "avocado", "cherry" };
     defer delete fruit;
-    List<String>* aw = fruit->Filter((String s) => ((char*)s)[0] == 'a');
-    defer delete aw;
-    check(aw->Count() == 2,     "String Filter by predicate");
-    check(strcmp(aw->Get(0), "apple") == 0, "String Filter element 0");
+    auto aw = fruit->Filter((String s) => ((char*)s)[0] == 'a');
+    check(aw.Count() == 2,     "String Filter by predicate");
+    check(strcmp(aw.Get(0), "apple") == 0, "String Filter element 0");
 
     /* C array -> List<T> via .ToList() (length threads in via items.count()) */
     String names[3] = { "alice", "bob", "carol" };

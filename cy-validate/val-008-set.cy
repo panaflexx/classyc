@@ -56,13 +56,12 @@ int main() {
     check(lib->Count() == 2,      "re-Add same pointer is a no-op");
     delete t1; delete t2;
 
-    /* set algebra */
+    /* set algebra (Union returns Set by value / RAII) */
     Set<int>* a = new Set<int>{1, 2, 3, 4};
     Set<int>* b = new Set<int>{3, 4, 5, 6};
     defer delete a; defer delete b;
-    Set<int>* un = a->Union(b);
-    defer delete un;
-    check(un->Count() == 6,       "Union cardinality");
+    auto un = a->Union(b);
+    check(un.Count() == 6,       "Union cardinality");
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed;

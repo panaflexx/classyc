@@ -1,413 +1,211 @@
 # Generics, Memory & the Collection Protocol in ClassyC
 
-How `List<T>` and `Set<T>` store their elements, what `T` is allowed to be,
-and the duck-typed `Count()` / `Get(int)` / `Set(int,T)` protocol that ties the
-language features (`for-in`, `coll[i]`) to user-written collection classes.
+How `List<T>` / `Set<T>` / `Map<K,V>` store elements, what `T` may be, stack
+vs heap shells, and the duck-typed protocols that drive `for-in` and `coll[i]`.
 
-This file records findings from getting `List<T>` / `Set<T>` to work with custom
-classes (`include/list.h`, `include/set.h`, and the `classy-*` examples). It is
-both a user guide ("what works, what to write") and an implementer's map ("where
-the relevant code lives, what's still missing").
+User guide + implementer map. Product stance (C++ vector / RAII) and the
+**next target** (value-returning transforms) are in [`BY-VALUE.md`](BY-VALUE.md)
+and [`CLASSYC-CLEANUP.md`](CLASSYC-CLEANUP.md).
 
 ---
 
 ## TL;DR
 
-| Element type `T`                     | `List<T>` | `Set<T>` | `Map<K,V>` | Notes |
-|--------------------------------------|:---------:|:--------:|:----------:|-------|
-| `int`, `double`, `char`, `bool`, …   | ✅ | ✅ | ✅ | value stored inline; byte-hash / value-compare |
-| `String`                             | ✅ | ✅ | ✅ | `Set`/`Map` key hashes/compares **by content** (see below) |
-| `char*` / other pointers             | ✅ | ✅ | ✅ | hashed/compared **by address** (identity) |
-| `MyClass*` (pointer to a class)      | ✅ | ✅ | ✅ | a class in a collection by reference |
-| `MyClass` (class **by value**)       | ✅ | ⚠️ | ⚠️ | stored inline; `List<MyClass>` destroys its elements on `delete` (see "By-value class elements") |
+| Element type `T` | List | Set | Map K/V | Notes |
+|------------------|:----:|:---:|:-------:|-------|
+| scalars | ✅ | ✅ | ✅ | inline |
+| `String` | ✅ | ✅ | ✅ | content hash/eq for keys |
+| pointers / `MyClass*` | ✅ | ✅ | ✅ | identity; optional `.owns()` |
+| **by-value class** | ✅ | ✅ | ✅ | inline + `__destroy` on Clear/delete |
 
-(`Map<K,V>` columns describe both the key type `K` and the value type `V`; `K`
-is hashed/compared exactly like a `Set<K>` element.)
+| Shell (the collection object) | Status |
+|-------------------------------|--------|
+| Stack `auto xs = List<T>();` | ✅ RAII `~List` |
+| Stack `Map` / `Set` | ✅ |
+| Heap `owned auto` / `new` | ✅ |
+| Move transfer `b = move a` | ✅ |
+| Bare assign `b = a` | ❌ compile error |
+| `Where`/`Take`/`Copy` return type | ✅ **value `List`/`Map`/`Set`** (RAII); GroupBy stays heap `Map*` |
 
-Rule of thumb: **classes are reference types.** Create them with `new` and store
-the pointer: `List<Track*>`, `Set<Track*>`. Use value element types only for
-scalars, `String`, and plain pointers.
+### Preferred house style
 
 ```c
-auto lib  = new List<Track*>();          // ✅ ordered collection of objects
-auto favs = new Set<Track*>();           // ✅ identity set of objects
-auto byId = new Map<String, Track*>();   // ✅ keyed collection (string -> object)
-lib->Add(new Track("Kashmir", 508));
-byId->Set("Kashmir", lib->Get(0));
+// Domain identity — owning list of pointers
+auto grid = List<Pilot*>();
+grid.owns();
+grid.Add(new Pilot(...));
+
+// DTOs — by-value elements, stack list
+auto samples = List<LapSample>();
+samples.Add(LapSample(1, 59840, 0));
+
+// Stack map + string subscript (value receiver)
+auto board = Map<String, int>();
+board["AURORA"] = 2165;
+
+// Transforms: value shells — no owned/delete on local pipelines
+auto quick = samples.Where((LapSample s) => s.IsQuick());
+auto top   = quick.Take(3);
 ```
 
-`Map<K, V>` (see `include/map.h`) is the first **two-type-parameter** generic.
-It stores keys and values inline (no boxing), keys hashed/compared like a
-`Set<K>` (String by content, scalars by value, objects by identity), and plugs
-into the same language sugar as `List`/`Set` plus a *keyed* variant of the
-subscript and for-in protocols (see
-[Multiple type parameters](#multiple-type-parameters-mapk-v) below).
+Rule of thumb:
+
+* **Shell** — prefer stack value; `owned`/`new` when it must escape.  
+* **Elements** — POD/DTO by value; domain objects as `T*` with **one** `.owns()` owner.  
+* **Views** — never copy `_owns_ptrs` onto Where/Copy/Take results.
 
 ---
 
-## Two storage modes
+## Two storage modes (elements)
 
-A generic collection `class List<T> { T* data; ... }` lays its backing array out
-as `sizeof(T) * capacity` bytes. What `T` *is* therefore decides everything:
+A `List<T>` buffer is `sizeof(T) * capacity`.
 
-* **Value/scalar `T`** (`int`, `double`, `String`, `char*`, `MyClass*`):
-  `T` is a register-sized value (≤ 8 bytes). `data[i]` is a normal element slot,
-  `Get` returns the value, `Add` copies it. Works everywhere.
+1. **Scalars / String / raw pointers / `MyClass*`** — slot holds a machine value;
+   Add copies bits (pointer identity for objects).
+2. **By-value `MyClass`** — full object inline; collection owns elements and runs
+   `__destroy` (user dtor if any) on Clear / Set overwrite / RemoveAt / `~List`.
 
-* **By-reference `T = MyClass*`**: the element *is* a pointer. The pointed-to
-  object lives on the heap (`new`). The collection owns the pointers, not the
-  objects (you free the objects yourself). This is the supported way to keep
-  class instances in a collection.
-
-* **By-value `T = MyClass`**: the element would be the whole class struct stored
-  inline. **Not currently supported** (three independent reasons below).
+Prefer **no user dtor** (or only quiet counters) on list-element DTOs if the type
+is bitwise relocated; use `List<T*>.owns()` when `T` needs a real destructor.
 
 ---
 
-## The collection protocol: `Count()` / `Get(int)` / `Set(int,T)`
+## Collection protocols
 
-Several language features are *duck-typed* over any class exposing these methods —
-this is why the standard `List<T>` and a user's own collection behave identically.
-
-### `for-in`
+### Indexed: `Count()` / `Get(int)` / `Set(int,T)`
 
 ```c
-for (auto x in coll)      // x = coll->Get(i)  for i in [0, coll->Count())
-for (auto i, x in coll)   // i = index (int),  x = element
+for (auto x in coll)       // Get(i)
+for (auto i, x in coll)    // index + element
+coll[i]                    // Get
+coll[i] = v                // Set
 ```
 
-Lowering: checked in `check()` `case N_FORIN`, generated in `gen()`
-`case N_FORIN` (`class_forin` branch). Requirements:
+Works for **value or pointer** receivers (`.` auto-deref).
 
-* `Count()` must return an integer type.
-* `Get(int)` must take a single integer index and **return a scalar or pointer
-  type**. A `Get` returning a class *value* is rejected — the for-in
-  codegen stores the element into a MIR register, which only holds scalars/pointers.
+`Get` may return by-value class types (for-in block-copies into the loop var).
 
-#### Keyed for-in (the `Map<K,V>` variant)
-
-A class exposing `Count()` **plus** `KeyAt(int)` and `ValAt(int)` is treated as a
-*keyed* collection, and for-in binds **(key, value)** rather than (index, element):
+### Keyed (Map): `Count()` / `KeyAt` / `ValAt` + `Get(K)` / `Set(K,V)`
 
 ```c
-for (auto k in map)       // k = map->KeyAt(i)            (keys, in insertion order)
-for (auto k, v in map)    // k = map->KeyAt(i), v = map->ValAt(i)
+for (auto k in map)
+for (auto k, v in map)
+map[k]          // Get(K) — throws KeyException if missing
+map[k] = v      // Set
 ```
 
-This mirrors the built-in `dict`'s `for (auto k, val in d)`. The keyed protocol
-is detected first in both `check()` and `gen()`; the `KeyAt`/`ValAt` return
-types (which must be scalar/pointer) become the loop-variable types. Classes
-without `KeyAt`/`ValAt` (e.g. `List`/`Set`) fall back to the index `Get`
-protocol unchanged, so there is no behavioural change for existing collections.
-
-### Subscript `coll[i]`
-
-```c
-coll[i]        // read  -> coll->Get(i)
-coll[i] = v    // write -> coll->Set(i, v)
-```
-
-* Read: `check()` `case N_IND`; `gen()` `case N_IND`.
-* Write: intercepted in `gen()` `case N_ASSIGN`; falls back to a plain
-  store when the class has no `Set(int,T)`.
-
-**Keyed subscript (non-integer keys).** The subscript protocol is no longer
-restricted to integer indices. `check()` `case N_IND` now reads `Get`'s key
-*parameter* type: if it is integer, an integer index is required (List/Set,
-unchanged); otherwise any index assignable to the key type is accepted, so
-`Map<String,V>` supports `m["name"]` (read → `Get(String)`) and
-`m["name"] = v` (write → `Set(String, V)`). On the gen side the index is only
-widened to `I64` when it is integer; a non-integer key is passed through and
-coerced to the key parameter type by `gen_funcptr_call`. (Floating-point and
-aggregate keys via subscript are not meaningful here — use `Get`/`Set` directly.)
-
-**Subscript vs. raw pointer indexing (fixed).** `p[i]` where `p` is a
-*pointer to a class* used to *always* try the `Get` sugar and error with
-`class type has no Get(int) method for [] subscript` when the class had no
-`Get`. That broke the `T* data; data[i]` backing array of any collection
-specialised over a class type. It now falls back to ordinary C pointer indexing
-when the class has no `Get` method (check + gen, ≈ L13258 / L20165), so both
-`MyClass* p; p[i]` and by-value class backing arrays index correctly.
+**Stack Map + non-integer keys:** supported. Compiler must **not** apply C’s
+`i[a]`/`a[i]` operand swap when the primary is `TM_CLASS` (otherwise
+`m["k"]` becomes `"k"[m]`). Fixed in `check` `N_IND`.
 
 ---
 
-## `Set<T>` hashing & equality
+## Set / Map hashing
 
-`include/set.h` cannot rely on `==` for element equality, because **ClassyC's
-`==` on `String` is pointer identity, not content** (and string literals are not
-interned — two `"alice"` literals compare unequal). The set picks the right
-hash/equality pair at compile time with C11 `_Generic`:
-
-```c
-#define SET_HASH(k)   (_Generic((k), String: set_hash_strkey, default: set_hash_bytes)(&(k), sizeof(k)))
-#define SET_EQ(a, b)  (_Generic((a), String: set_eq_strkey,   default: set_eq_bytes)(&(a), &(b), sizeof(a)))
-```
-
-Both arms of each `_Generic` share one signature, so the single call site
-type-checks for *every* specialization `T`. Result:
-
-* `Set<String>`  → **content** hashing/equality (FNV-1a over the bytes / `strcmp`).
-* `Set<int>`, `Set<double>`, small PODs → **byte-wise** hashing/equality.
-* `Set<MyClass*>` → hashes the **pointer bits**, i.e. **identity** semantics —
-  exactly right for "the set of objects I've favourited / visited / selected".
-
-Consequence: `Set<MyClass*>` deduplicates and intersects by object identity, not
-by field contents. If you need content-based identity for objects, give each
-object a stable key (e.g. an `int id` or a `String`) and key a `Set` on that.
+* `String` keys/elements: content (FNV / strcmp).  
+* Everything else: raw bytes (scalars by value, pointers by identity).
 
 ---
 
-## Generic specialization and pointer type arguments
+## Generics (specialisation)
 
-A generic class is parsed once into a template, then deep-copied per type
-argument by `specialize_node()` (≈ L4646), substituting the type-parameter
-N_IDs. Pointer type arguments (`List<char*>`, `List<MyClass*>`) need care:
+Concrete scalars, String, pointers (`P` mangling), by-value classes, nested
+`List` inside Map, method generics (`Select<U>`), free generic fns (`Max`,
+`GroupBy` + UFCS) are supported for the std headers path.
 
-* The N_ID substitution strips pointer levels off the argument and inserts only
-  the **base** type into the type-specifier list (≈ L4656).
-* A fixup pass then re-injects the pointer level(s) into the *declarator's*
-  decoration list (≈ L4721). It must cover `N_MEMBER`, `N_SPEC_DECL`,
-  `N_FUNC_DEF`, **and `N_TYPE`**.
-
-**The `N_TYPE` case (fixed).** Abstract declarators are `N_TYPE` nodes:
-the unnamed parameters of a function-pointer type (`int(*cmp)(T,T)`), `(T*)`
-casts, and `sizeof(T)`. Without the `N_TYPE` fixup, `T = MyClass*` collapsed to a
-by-value `MyClass` there, so `List<MyClass*>::Sort/Filter/ForEach` failed with
-`cannot pass a 'MyClass *' where a by-value 'MyClass' parameter is expected`, and
-`(T*)`/`sizeof(T)` produced "incompatible types"/wrong sizes. Adding `N_TYPE` to
-the fixup makes `List<MyClass*>` work end-to-end with the higher-order methods.
-
-Other relevant spots:
-* `get_or_create_specialization()` — creates/caches a specialization,
-  with guards against instantiating a template whose body failed to parse
-  (returns a diagnostic instead of pushing a NULL class and crashing).
-* `mangle_generic_name()` — `List` + `MyClass*` → `__generic_List_MyClassP`.
+Still open: full `if constexpr` / `is_int<T>`; some method-generic sites on
+stack+value-T need workarounds; value-returning monomorphized methods (next
+target).
 
 ---
 
-## Multiple type parameters: `Map<K, V>`
+## By-value class elements
 
-`Map<K, V>` (`include/map.h`) is the first generic with **more than one** type
-parameter. Most of the multi-parameter machinery was already in place — it just
-hadn't been exercised:
+### ABI
 
-* The parser stores up to **4** type parameters per template
-  (`generic_tmpl_t::type_params[4]`) and parses both the declaration
-  (`class Map<K, V> { ... }`) and the instantiation (`Map<String, int>`) as
-  comma-separated lists.
-* `mangle_generic_name()` already loops over every argument, so
-  `Map` + `String` + `int` → `__generic_Map_String_int`, and
-  `Map<String, Track*>` → `__generic_Map_String_TrackP`.
-* `specialize_node()`'s type-parameter substitution and the pointer-arg
-  declarator fixup (`N_MEMBER` / `N_SPEC_DECL` / `N_FUNC_DEF` / `N_TYPE`) both
-  iterate `n_params`, so `K*`/`V*` fields, `sizeof(K)`/`sizeof(V)`, `(K*)` casts,
-  and `int(*)(K,K)` callbacks specialise correctly for two parameters.
+Classes pass/return like structs (`TM_CLASS` in x86_64 ABI helpers).  
+Watch: min class align is 8 → `sizeof` of 3×`int` is **16**, not 12.
 
-### The one gap that needed fixing: multi-param self-reference
+### Equality
 
-Inside a generic body, a reference to the class's **own** type
-(`Map<K, V>* Copy()`, `new Map<K, V>()`) is recorded in the template AST as a
-mangled *placeholder* N_ID built from the parameter names — `__generic_Map_K_V`.
-When the template is specialised, `specialize_node()` must rewrite that
-placeholder to the concrete name (`__generic_Map_String_int`).
+`==` / `!=` on class values → memcmp (padding participates).
 
-The old code only handled the **single**-parameter case: it compared the part
-after `__generic_<Orig>_` against one parameter name (`T` → `__generic_List_T`).
-For `Map<K,V>` the rest was `K_V`, which matched neither `K` nor `V`, so the
-placeholder leaked through unresolved and produced
-`unknown type __generic_Map_K_V`.
-
-The fix generalises the placeholder resolver: it tokenises the suffix on `_`,
-maps each token back to a parameter index, collects the corresponding concrete
-arguments, and re-mangles with all of them. It works for any parameter count
-and reduces to the original behaviour for one parameter. (It assumes parameter
-names contain no `_`, which holds for `T`, `K`, `V`, `Key`, `Value`, ….) This
-is the *only* compiler change required to let a two-parameter generic refer to
-itself, so `Copy()`/`Merge()`/internal `new Map<K,V>()` all work.
-
-### Nested generics with unresolved (and concrete) parameters — supported
-
-A generic body may instantiate **another** generic with one of its own still-
-abstract parameters — e.g. `List<K>` / `List<V>` inside `Map<K, V>`, or
-`List<T*>` inside a user `Repository<T>`.  Parsing does **not** materialise the
-nested specialisation while the outer template is still abstract: the reference
-is stored as a mangled placeholder (`__generic_List_K`, `__generic_List_TP`,
-…).  When the outer template is specialised (`Map<String, int>`),
-`specialize_node` rewrites the placeholder to the concrete name and queues the
-nested specialisation on `generic_crossrefs` for deferred materialisation.
-
-Fully concrete nested types inside a generic body — e.g. `List<String>` inside
-`List<T>.SelectString` — are also deferred during body parse (the outer
-`class_node` may still be NULL) and materialised once the outer template is
-back-filled.
-
-This is what powers:
-
-* `Map<K,V>::Keys()` / `Values()` → `List<K>*` / `List<V>*`
-* `List<T>::SelectString` → `List<String>*`
-* README nested example `class Repository<T> { List<T*>* items; ... }`
-* `As<T>` calling `Is<T>.Of(...)` (cross-generic, same param)
-
-### `Map<K, V>` hashing
-
-`map.h` reuses the `set.h` strategy verbatim, on the **key** type `K`:
-`_Generic` selects content hashing/equality for `String` keys and byte-wise
-hashing for everything else (scalars by value, pointers/objects by identity).
-Keys and values live in **parallel dense arrays** (`K* keys; V* vals;`) indexed
-by an open-addressing table of dense indices — the same layout as `Set<T>`, with
-a second value array. Insertion order is preserved, which is what `KeyAt`/
-`ValAt` and keyed for-in iterate.
-
----
-
-## By-value class elements: `List<MyClass>` now works
-
-Storing a `class` **by value** in a `List<T>` is supported: elements live inline
-in the backing buffer (cache-friendly, no per-element heap allocation), and the
-collection **owns** them — `delete list` (or a `defer delete`) runs each live
-element's destructor before freeing the buffer. Four pieces had to come
-together; each is now in place.
-
-### 1. ABI: classes pass / return by value like structs
-
-A function that takes/returns a class by value now compiles and runs:
-
-```c
-class P { int x, y; };
-P padd(P a, P b) { P r; r.x=a.x+b.x; r.y=a.y+b.y; return r; }   // ✅ works
-```
-
-The fix was in `gen()` `case N_CALL`: the result paths that special-cased
-`TM_STRUCT || TM_UNION` (the by-reg aggregate result, the va_arg block, and the
-check-side call-arg-area sizing) now include `TM_CLASS`, so a class result yields
-the expected `MIR_OP_MEM`/block-move instead of a garbage register. The ABI
-*helpers* (`simple_return_by_addr_p`, `simple_add_arg_proto`,
-`simple_add_call_arg_op`, `target_*` in `cx86_64-ABI-code.c`) already handled
-`TM_CLASS`. See `examples/test-byval-abi.cy`.
-
-### 2. `==` / `!=` on class/struct values (byte-wise)
-
-`IndexOf` / `LastIndexOf` / `Contains` / `Remove` / `Equals` do `data[i] == item`.
-For a by-value class/struct, `a == b` / `a != b` is now lowered to
-`memcmp(&a, &b, sizeof) (== / != 0)` (shallow, byte-wise equality). Checked in
-`check` N_EQ/N_NE; emitted in `gen` via `gen_memcmp`. Caveat: padding bytes
-participate, so it is only well-defined for fully-initialized values.
-
-### 3. `for-in` over aggregate elements
-
-`Get` returning a class value is accepted by the for-in checker, and the for-in
-*codegen* now block-copies the aggregate element into the loop variable's stack
-slot (the loop var is registered for frame allocation; small aggregates returned
-in registers are scattered into the slot, larger ones constructed directly into
-it via the hidden-pointer return). This makes `list.h::Concat`'s
-`for (auto x in other)` specialize for a by-value `T`.
-
-### 4. Element destruction: `__destroy(x)` intrinsic
-
-So that the collection can destroy what it owns, `~List()` calls a compiler
-intrinsic in a loop:
+### Destruction
 
 ```c
 ~List() {
-    for (int i = 0; i < this->length; i++) __destroy(this->data[i]);
-    if (this->data) free((void*) this->data);
+    for (int i = 0; i < length; i++) {
+        if (_owns_ptrs && is_pointer<T>()) delete data[i];
+        else __destroy(data[i]);
+    }
+    free(data);
 }
 ```
 
-`__destroy(x)` expands to `x`'s destructor call when `x` is a by-value class with
-a user `~T()`, and to **nothing** for scalars, `String`, and pointer element
-types — so `List<int>` / `List<String>` / `List<char*>` are unchanged. Keeping
-the loop in the template (which knows its `data`/`length` fields) avoids
-hard-coding collection internals into the compiler. See
-`examples/test-list-byval.cy`.
+Same idea in `~Set` / `~Map` (Map destroys keys **and** values).
 
-### Value-construction syntax
-
-Stack construction is parsed and lowered to in-place construction (no temporary,
-no by-value return) reusing the existing RAII ctor/dtor machinery:
+### Shell construction
 
 ```c
-Point p = Point(1, 2);        // ✅ ctor runs in place; ~Point() at scope exit
-auto q = Point(3, 4);         // ✅ same path via auto (class-name call)
-Point* h = new Point(1, 2);   // ✅ heap (unchanged)
+List<int> a;
+auto b = List<int>();
+auto c = List<int>(16);
+auto m = Map<String, int>();
+auto s = Set<String>();
+
+owned auto h = new List<int>();   // when you need a pointer / heap lifetime
 ```
 
-Generic collections can live on the stack the same way — the object owns its
-heap **buffer**, and `~List` / `~Map` / `~Set` run at scope exit:
+Brace-init heap:
 
 ```c
-List<int> a;                  // ✅ default ctor + RAII dtor
-List<int> b = List<int>();    // ✅ typed value construct
-auto c = List<int>();         // ✅ auto + List<T>() value construct
-auto d = List<int>(16);       // ✅ capacity ctor
-auto m = Map<String, int>();  // ✅ same for Map/Set
-
-// Heap form still available when you need a pointer / owned binding:
-owned auto h = new List<int>();
+owned auto xs = new List<Pt>{ Pt(1, 2), Pt(3, 4) };
 ```
 
-Methods use the same `this` pointer whether the receiver is a stack value
-(`.` auto-deref) or a heap pointer. Transform methods (`Where`, `Copy`, …)
-still return **new heap** lists the caller must `delete` / `owned`.
+Stack DTO pipeline (elements by value):
 
-**Move-only collections:** `List`/`Map`/`Set` own a heap buffer. Bare assign
-or copy-init is a **compile error** (would double-free). Transfer with `move`:
+```c
+auto samples = List<LapSample>();
+samples.Add(LapSample(1, 59840, 0));
+owned auto quick = samples.Where((LapSample s) => s.IsQuick());  // shell is heap List* today
+```
+
+### Move-only shells
 
 ```c
 auto a = List<int>();
 a.Add(1);
 auto b = List<int>();
-b = move a;           // a emptied; b owns the buffer
-auto c = move b;      // c owns it now
+b = move a;     // OK — a emptied
+// b = a;       // ERROR — would double-free
 ```
 
-Element types with destructors (e.g. `List<Pt>`) still allow internal element
-assign (buffer moves of `T`); only the *collection object* is move-only.
+---
 
-**Brace-init with class values:**
-```c
-List<Pt>* xs = new List<Pt>{ Pt(1, 2), Pt(3, 4) };  // ClassName(args) temps
-xs.Add(Pt(5, 6));
-```
+## Transform results
 
-### Element destruction in `Set<T>` and `Map<K, V>` (done)
-
-The `__destroy` loop now lives in **all three** standard collections, so
-by-value class elements are reclaimed when the owning collection is deleted:
+| API | Status |
+|-----|--------|
+| `Where` / `Filter` / `Take` / `Skip` / `Copy` / `Slice` / `Plus` / `Distinct` | ✅ `List<T>` by value + move return |
+| Map `Where` / `SelectValues` / `Copy` / `Keys` / `Values` | ✅ value `Map` / `List` |
+| Set `Union` / `Intersect` / `Filter` | ✅ value `Set` |
+| `GroupBy` | heap `Map*` (ownsValues buckets) — use `owned auto` |
+| Local pipeline | `auto r = xs.Take(3);` RAII |
 
 ```c
-~Set() {
-    for (int i = 0; i < this->count; i++) __destroy(this->dense[i]);
-    /* ... free buffers ... */
-}
-
-~Map() {
-    for (int i = 0; i < this->count; i++) {
-        __destroy(this->keys[i]);   // by-value class keys
-        __destroy(this->vals[i]);   // by-value class values
-    }
-    /* ... free buffers ... */
-}
+auto by_pace = OrderByPace(&grid);   // returns List by value
+auto top3    = by_pace.Take(3);      // value shell; Pilot* non-owning
+// grid.owns() still owns the pilots
 ```
-
-`Map` destroys **both** keys and values (each `__destroy` is a no-op for
-scalar / `String` / pointer types, so `Map<String, int>` etc. are unchanged).
-For pointer elements the collection still owns only the pointers, not the
-pointed-to objects. Covered by `cy-validate/val-015-collection-byval-dtor.cy`
-(`Set<Tag>`, `Map<int, Item>` values, and `Map<Key, int>` keys).
-
-Stack forms of generic collections now exist (see “Value-construction syntax”):
-`List<T> xs;` / `auto xs = List<T>();` run `~List` at scope exit. The heap form
-`new List<T>()` / `owned auto` remains valid for pointer identity and longer-lived
-ownership. Transform results (`Where`/`Copy`/…) stay heap-allocated.
 
 ---
 
 ## Still open
 
-* **`==` padding caveat:** consider a member-wise compare (or requiring an
-  `equals` protocol method) for classes with padding or pointer members where
-  byte equality is not the intended semantics.
+* Value-returning transforms + move return (**product next**)  
+* Member-wise `==` for classes with padding / intentional identity  
+* Slice syntax / operator+ language sugar  
+* Stronger Select monomorphization on all stack value-T receivers  
 
 ---
 
@@ -415,13 +213,15 @@ ownership. Transform results (`Where`/`Copy`/…) stay heap-allocated.
 
 | Area | Where |
 |------|-------|
-| Generic template registry / instantiation | `get_or_create_specialization` |
-| Template deep-copy + pointer-arg fixup     | `specialize_node` (N_TYPE fixup) |
-| Multi-param self-reference placeholder      ≈ L4646 (N_TYPE fixup ≈ L4731) |
-| Type → MIR type (aggregates → `MIR_T_UNDEF`)| `get_mir_type` ≈ L16392 |
-| Subscript `coll[i]` read (check / gen)      | `check` N_IND ≈ L13250 / `gen` N_IND ≈ L20165 |
-| Subscript `coll[i] = v` write               | `gen` N_ASSIGN ≈ L19913 |
-| `for-in` (check / gen)                       | `check` N_FORIN ≈ L13632 / `gen` N_FORIN ≈ L21950 |
-| Aggregate calling convention helpers        | ≈ L17236–L17351 |
-| `Set<T>` hash/eq dispatch                    | `include/set.h` (`SET_HASH` / `SET_EQ`) |
-| By-value element destruction (`__destroy`)   | `~List` / `~Set` / `~Map` in `include/{list,set,map}.h` |
+| Specialisation / placeholders | `get_or_create_specialization`, `specialize_node` |
+| Move-only collection check | `class_is_move_only_collection_p` |
+| Subscript N_IND (class, no swap) | `check` `case N_IND` |
+| Subscript assign → Set | `gen` `case N_ASSIGN` |
+| for-in | `check`/`gen` `N_FORIN` |
+| Frame layout for methods | `process_func_decls_for_allocation` (stop at N_CLASS) |
+| `__destroy` / owns | `list.h` / `map.h` / `set.h` |
+| Showcase | `examples/classy-neon-grid.cy` |
+| Validate | `val-015`, `val-038`, `val-039`, `val-028` |
+
+Related: [`BY-VALUE.md`](BY-VALUE.md), [`CLASSYC-CLEANUP.md`](CLASSYC-CLEANUP.md),
+[`CLASSYC-FINDINGS.md`](CLASSYC-FINDINGS.md).

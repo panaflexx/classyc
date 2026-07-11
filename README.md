@@ -176,84 +176,81 @@ Keys are read as `String`, so these are intended for `Map<String, V>`; for
 referenced value dicts).
 
 ### Generics, `List<T>`, `Set<T>` & Lambdas
-Collections are reference types: allocate with `new`, call methods with `->`,
-and brace-init with `new List<T>{ ... }`.
+**House style:** prefer stack/value shells with RAII. Transforms return
+`List`/`Map`/`Set` **by value** so local pipelines need no `owned`/`delete`.
+Use `new` / `owned auto` only when a collection must escape as a pointer.
 
 ```c
 #include "list.h"
 #include "set.h"
 
-List<int> *nums    = new List<int>{ 1, 2, 3, 4, 5, 6 };
-List<int> *evens   = nums->Filter((int x) => x % 2 == 0);   // Filter -> new List
-List<int> *doubled = evens->Map((int x) => x * 2);          // Map -> new List (chains)
-defer delete nums; defer delete evens; defer delete doubled;
+// Stack List — ~nums frees the buffer at scope exit
+auto nums = List<int>();
+nums.Add(1); nums.Add(2); nums.Add(3); nums.Add(4); nums.Add(5); nums.Add(6);
 
-List<String> *files = new List<String>{ "a.txt", "b.pdf", "c.txt" };
-List<String> *txt   = files->Filter((String f) => f.ends_with(".txt"));
-defer delete files; defer delete txt;
+// Value-returning LINQ (RAII shells — no owned/delete)
+auto evens   = nums.Where((int x) => x % 2 == 0);
+auto doubled = evens.Map((int x) => x * 2);
+auto top3    = nums.Take(3);                 // chain-friendly
+auto silver  = nums.Skip(1).Take(1);
 
-List<Any<View>*> *widgets = new List<Any<View>*>();
-widgets->Add(any<View>(new Button()));
-widgets->Add(any<View>(new Text()));
-for (auto v in widgets) v->render();   // heterogeneous via type erasure
+auto files = List<String>();
+files.Add("a.txt"); files.Add("b.pdf"); files.Add("c.txt");
+auto txt = files.Where((String f) => f.ends_with(".txt"));
 
-// Set<T> — content-aware for String, identity for objects
-Set<String> *tags = new Set<String>();
-tags->Add("c"); tags->Add("c"); tags->Add("rust");
-printf("unique tags: %d\n", tags->Count());   // 2
+// Heap when you need pointer identity / long-lived share
+owned auto widgets = new List<Any<View>*>();
+widgets.Add(any<View>(new Button()));
+widgets.Add(any<View>(new Text()));
+for (auto v in widgets) v.render();
+
+// Set — stack value; content-aware for String, identity for objects
+auto tags = Set<String>();
+tags.Add("c"); tags.Add("c"); tags.Add("rust");
+printf("unique tags: %d\n", tags.Count());   // 2
 ```
 
-> `List<T>` provides `Filter`, `Map`, and `ForEach`. `Map` is a same-type
-> transform (`T -> T`) that chains with `Filter`; for a cross-type (`T -> U`)
-> map/filter/reduce pipeline, use the lowercase seq methods over a **C array or
-> slice** that return a slice you can `.ToList()` (see the next section).
+> `List<T>` provides `Filter`/`Where`, `Map`, `Select<U>`, `Take`/`Skip`,
+> `Copy`/`Slice`/`Plus`/`Distinct`, and `ForEach`. Transform methods return
+> **value** shells (C++ `vector`-style). Bare assign of `List`/`Map`/`Set` is
+> banned (would double-free); transfer with `move`, or bind a by-value return.
 
-> **Element types & memory** — collections hold scalars, `String`, and pointers
-> (e.g. `List<int>`, `Set<String>`, `List<MyClass*>`) directly. A `class` is a
-> reference type, so put classes in by pointer (`List<Track*>`, `Set<Track*>`)
-> via `new`. For the full picture — value-vs-pointer storage, the
-> `Count()`/`Get(int)`/`Set(int,T)` protocol that powers `for-in` and `coll[i]`,
-> how `Set<T>` hashes `String` by content but objects by identity, and the
-> current limits on by-value class elements — see
-> **[GENERICSMEM.md](GENERICSMEM.md)**.
+> **Element types & memory** — collections hold scalars, `String`, pointers
+> (`List<MyClass*>`), and POD/DTO classes by value (`List<LapSample>`). Domain
+> objects with real destructors stay `List<T*>.owns()`. Full picture:
+> **[GENERICSMEM.md](GENERICSMEM.md)**, **[BY-VALUE.md](BY-VALUE.md)**.
 
 #### Ownership: `.owns()` auto-frees pointer elements
 
 A collection of pointers (`List<Track*>`, `Set<Track*>`, `Map<String, Track*>`)
-stores the pointers but, by default, does **not** own the pointed-to objects —
-`delete list` frees the container only. Add `.owns()` to make the collection the
-owner: deleting it then runs each element's destructor and frees it. No manual
-cleanup loop, no leaks.
+stores the pointers but, by default, does **not** own the pointed-to objects.
+Add `.owns()` so destroying the collection also deletes pointees.
 
 ```c
-// OWNING: the list owns the Tracks; delete frees them all
-auto library = new List<Track*>().owns();
-library->Add(new Track("Kashmir", 508));
-library->Add(new Track("Africa", 295));
-defer delete library;                  // frees the list AND every Track ✅
+// OWNING stack list — pointees deleted in ~List
+auto library = List<Track*>();
+library.owns();
+library.Add(new Track("Kashmir", 508));
+library.Add(new Track("Africa", 295));
+// ~library at scope exit frees every Track ✅
 
-// NON-OWNING (default): a view that shares another collection's objects
-auto epics = library->Filter((Track* t) => t->seconds > 360);
-defer delete epics;                    // frees the view's container only
+// NON-OWNING value view (Where never copies .owns())
+auto epics = library.Where((Track* t) => t.seconds > 360);
+// ~epics frees only its buffer; Tracks still owned by library
 
 // Set and Map have the same protocol:
-auto favs = new Set<Track*>().owns();              // owns its elements
-auto byId = new Map<int, Track*>().ownsValues();   // owns its values
-//        Map also has .ownsKeys() and .owns() (both keys and values)
+auto favs = List<Track*>();   // or Set
+auto byId = Map<int, Track*>();
+byId.ownsValues();
 ```
 
 Rules of thumb:
-- **Exactly one owner per object.** Make the collection that should free the
-  objects `.owns()`; leave every sharing view at the default (non-owning).
-- **Transform results are non-owning.** `Filter`, `Slice`, `Copy`, `Map`,
-  `Union`, `Intersect`, `Difference` return views that share the source's
-  elements — deleting them never double-frees.
-- **By-value elements need nothing.** `List<Track>` (value, not pointer) already
-  destroys its elements automatically via the `__destroy` intrinsic.
+- **Shell first:** stack `auto xs = List<T>();` for locals; `owned`/`new` to escape.
+- **Exactly one owner per object** for `T*`. Views from `Where`/`Copy`/`Take`
+  never steal `.owns()`.
+- **By-value elements** (`List<LapSample>`) already destroy via `__destroy`.
 
-This works for any custom collection that follows the same `~Dtor` + element
-loop pattern (it is powered by the `is_pointer<T>` compiler intrinsic and a
-per-collection ownership flag); see `include/list.h`, `set.h`, and `map.h`.
+See `include/list.h`, `set.h`, and `map.h`.
 
 #### Generic Functions & Methods
 
@@ -947,10 +944,13 @@ ClassyC manages high-level types with lightweight arenas. The big win: **heap
   caller, who then owns it (`delete` it, or store it in a collection).
 - **Dict arena (explicit)** — `new dict(bytes)` is arena-backed; `delete d`
   (or `defer delete d`) frees the whole arena and its contents in one shot.
-- **Collections (explicit)** — `new List<T>` / `Map` / `Set` are heap objects you
-  own; pair them with `defer delete`. For collections of pointers, add `.owns()`
-  (`.ownsValues()` / `.ownsKeys()` on `Map`) and `delete` will also free the
-  pointed-to objects — see *Element ownership* below.
+- **Collections (value first)** — prefer stack shells
+  `auto xs = List<T>();` / `Map` / `Set`: the destructor frees the buffer at
+  scope exit (RAII). `Where`/`Take`/`Copy`/… return **value** shells, so local
+  LINQ pipelines need no `owned`/`delete`. Use `new List<T>` / `owned auto` when
+  a collection must escape as a pointer. For collections of pointers, add
+  `.owns()` (`.ownsValues()` / `.ownsKeys()` on `Map`) so destroying the shell
+  also frees pointees — see *Element ownership* below.
 - **Managed ownership (`owned` / `move` / `readonly`)** — opt a single-owner
   heap object into automatic cleanup: `owned auto x = new Box();` is released
   exactly once at the end of its scope with no `defer delete`. `move` transfers

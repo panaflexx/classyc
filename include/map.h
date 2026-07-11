@@ -486,36 +486,35 @@ class Map<K, V> {
         return this;
     }
 
-    /* Return a new heap map with the same entries (shallow).  Does not copy
-     * ownsKeys/ownsValues flags — the result is non-owning.  Caller must `delete`. */
-    Map<K, V>* Copy() const {
-        Map<K, V>* r = new Map<K, V>(this->count > 0 ? this->count : 4);
+    /* Shallow copy into a by-value map. Does not copy ownsKeys/ownsValues. */
+    Map<K, V> Copy() const {
+        auto r = Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
-            r->Set(this->keys[i], this->vals[i]);
-        return r;
+            r.Set(this->keys[i], this->vals[i]);
+        return move r;
     }
 
     /* ── Higher-order: Where / Any / All ─── */
-    Map<K, V>* Where(int(*pred)(K, V)) const __attribute__((da_ignore)) {
-        Map<K, V>* r = new Map<K, V>(this->count > 0 ? this->count : 4);
+    Map<K, V> Where(int(*pred)(K, V)) const __attribute__((da_ignore)) {
+        auto r = Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
             if (pred(this->keys[i], this->vals[i]))
-                r->Set(this->keys[i], this->vals[i]);
-        return r;
+                r.Set(this->keys[i], this->vals[i]);
+        return move r;
     }
-    Map<K, V>* WhereKeys(int(*pred)(K)) const __attribute__((da_ignore)) {
-        Map<K, V>* r = new Map<K, V>(this->count > 0 ? this->count : 4);
+    Map<K, V> WhereKeys(int(*pred)(K)) const __attribute__((da_ignore)) {
+        auto r = Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
             if (pred(this->keys[i]))
-                r->Set(this->keys[i], this->vals[i]);
-        return r;
+                r.Set(this->keys[i], this->vals[i]);
+        return move r;
     }
-    Map<K, V>* WhereValues(int(*pred)(V)) const __attribute__((da_ignore)) {
-        Map<K, V>* r = new Map<K, V>(this->count > 0 ? this->count : 4);
+    Map<K, V> WhereValues(int(*pred)(V)) const __attribute__((da_ignore)) {
+        auto r = Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
             if (pred(this->vals[i]))
-                r->Set(this->keys[i], this->vals[i]);
-        return r;
+                r.Set(this->keys[i], this->vals[i]);
+        return move r;
     }
     int Any(int(*pred)(K, V)) const __attribute__((da_ignore)) {
         for (int i = 0; i < this->count; i++)
@@ -527,17 +526,17 @@ class Map<K, V> {
             if (!pred(this->keys[i], this->vals[i])) return 0;
         return 1;
     }
-    Map<K, W>* SelectValues<W>(W(*fn)(K, V)) const __attribute__((da_ignore)) {
-        Map<K, W>* r = new Map<K, W>(this->count > 0 ? this->count : 4);
+    Map<K, W> SelectValues<W>(W(*fn)(K, V)) const __attribute__((da_ignore)) {
+        auto r = Map<K, W>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
-            r->Set(this->keys[i], fn(this->keys[i], this->vals[i]));
-        return r;
+            r.Set(this->keys[i], fn(this->keys[i], this->vals[i]));
+        return move r;
     }
-    Map<G, V>* SelectKeys<G>(G(*fn)(K, V)) const __attribute__((da_ignore)) {
-        Map<G, V>* r = new Map<G, V>(this->count > 0 ? this->count : 4);
+    Map<G, V> SelectKeys<G>(G(*fn)(K, V)) const __attribute__((da_ignore)) {
+        auto r = Map<G, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
-            r->Set(fn(this->keys[i], this->vals[i]), this->vals[i]);
-        return r;
+            r.Set(fn(this->keys[i], this->vals[i]), this->vals[i]);
+        return move r;
     }
     /* Group values by keySelector(k,v).  The result map owns the bucket
      * List<V>* values (auto ownsValues) so `delete result` frees every bucket.
@@ -565,19 +564,17 @@ class Map<K, V> {
 
     /* ───────────────────── Conversions ───────────────────── */
 
-    /* Collect the keys (insertion order) into a new heap List<K>.  Caller
-     * `delete`s the result.  Pairs naturally with the List<T> converters. */
-    List<K>* Keys() const {
-        List<K>* r = new List<K>(this->count > 0 ? this->count : 4);
-        for (int i = 0; i < this->count; i++) r->Add(this->keys[i]);
-        return r;
+    /* Collect keys/values into by-value Lists (RAII). */
+    List<K> Keys() const {
+        auto r = List<K>(this->count > 0 ? this->count : 4);
+        for (int i = 0; i < this->count; i++) r.Add(this->keys[i]);
+        return move r;
     }
 
-    /* Collect the values (insertion order) into a new heap List<V>. */
-    List<V>* Values() const {
-        List<V>* r = new List<V>(this->count > 0 ? this->count : 4);
-        for (int i = 0; i < this->count; i++) r->Add(this->vals[i]);
-        return r;
+    List<V> Values() const {
+        auto r = List<V>(this->count > 0 ? this->count : 4);
+        for (int i = 0; i < this->count; i++) r.Add(this->vals[i]);
+        return move r;
     }
 
     /* Serialize to a JSON object `dict`.  Keys are read as String (intended for

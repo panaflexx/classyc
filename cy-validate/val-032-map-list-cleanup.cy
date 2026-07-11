@@ -78,19 +78,16 @@ int main() {
     base->Set("ant", 8);
     base->Set("zoo", 20);
 
-    Map<String, int>* w = base->Where(map_val_gt_10);
-    defer delete w;
-    check(w->Count() == 2, "2a  Where(val>10) count");
-    check(w->Contains("apple") && w->Contains("zoo"), "2b  Where keeps matching keys");
+    auto w = base->Where(map_val_gt_10);
+    check(w.Count() == 2, "2a  Where(val>10) count");
+    check(w.Contains("apple") && w.Contains("zoo"), "2b  Where keeps matching keys");
 
-    Map<String, int>* wk = base->WhereKeys(map_key_starts_a);
-    defer delete wk;
-    check(wk->Count() == 2 && wk->Contains("apple") && wk->Contains("ant"),
+    auto wk = base->WhereKeys(map_key_starts_a);
+    check(wk.Count() == 2 && wk.Contains("apple") && wk.Contains("ant"),
           "2c  WhereKeys 'a*'");
 
-    Map<String, int>* wv = base->WhereValues(map_val_even);
-    defer delete wv;
-    check(wv->Count() == 3 && wv->Contains("apple") && wv->Contains("ant") && wv->Contains("zoo"),
+    auto wv = base->WhereValues(map_val_even);
+    check(wv.Count() == 3 && wv.Contains("apple") && wv.Contains("ant") && wv.Contains("zoo"),
           "2d  WhereValues even");
 
     check(base->Any(map_any_pos) == 1, "2e  Any positive");
@@ -107,18 +104,16 @@ int main() {
     src->Set("b", 2);
     src->Set("c", 3);
 
-    Map<String, int>* doubled = src->SelectValues<int>(map_double_val);
-    defer delete doubled;
-    check(doubled->Count() == 3, "3a  SelectValues count");
-    check(doubled->Get("a") == 2 && doubled->Get("b") == 4 && doubled->Get("c") == 6,
+    auto doubled = src->SelectValues<int>(map_double_val);
+    check(doubled.Count() == 3, "3a  SelectValues count");
+    check(doubled.Get("a") == 2 && doubled.Get("b") == 4 && doubled.Get("c") == 6,
           "3b  SelectValues values");
 
-    Map<int, int>* coded = src->SelectKeys<int>(map_key_code);
-        defer delete coded;
-        check(coded->Count() == 3, "3c  SelectKeys count");
-        check(coded->Contains((int)'a') && coded->Contains((int)'b') && coded->Contains((int)'c'),
+    auto coded = src->SelectKeys<int>(map_key_code);
+        check(coded.Count() == 3, "3c  SelectKeys count");
+        check(coded.Contains((int)'a') && coded.Contains((int)'b') && coded.Contains((int)'c'),
               "3d  SelectKeys char codes");
-        check(coded->Get((int)'a') == 1 && coded->Get((int)'c') == 3, "3e  SelectKeys values intact");
+        check(coded.Get((int)'a') == 1 && coded.Get((int)'c') == 3, "3e  SelectKeys values intact");
 
     /* ── 4. Map GroupBy ───────────────────────────────────────────────── */
     printf("\n-- 4. Map GroupBy --\n");
@@ -167,19 +162,17 @@ int main() {
 
     /* ── 6. List.Range ────────────────────────────────────────────────── */
     printf("\n-- 6. List.Range --\n");
-    List<int>* r = List<int>.Range(3, 4);
-    defer delete r;
-    check(r->Count() == 4, "6a  Range count");
-    check(r->Get(0) == 3 && r->Get(1) == 4 && r->Get(2) == 5 && r->Get(3) == 6,
+    auto r = List<int>.Range(3, 4);
+    check(r.Count() == 4, "6a  Range count");
+    check(r.Get(0) == 3 && r.Get(1) == 4 && r.Get(2) == 5 && r.Get(3) == 6,
           "6b  Range values");
 
-    List<int>* r0 = List<int>.Range(0, 0);
-    defer delete r0;
-    check(r0->Count() == 0, "6c  Range(0,0) empty");
+    auto r0 = List<int>.Range(0, 0);
+    check(r0.Count() == 0, "6c  Range(0,0) empty");
 
     int range_threw = 0;
         try {
-            unowned List<int>* badR = List<int>.Range(0, -1);
+            auto badR = List<int>.Range(0, -1);
             (void)badR;
         } catch (e) {
             range_threw = 1;
@@ -214,9 +207,8 @@ int main() {
     printf("\n-- 8. List Slice / Concat --\n");
     List<int>* full = new List<int>{10, 20, 30, 40, 50};
     defer delete full;
-    List<int>* mid = full->Slice(1, 3);
-    defer delete mid;
-    check(mid->Count() == 3 && mid->Get(0) == 20 && mid->Get(2) == 40,
+    auto mid = full->Slice(1, 3);
+    check(mid.Count() == 3 && mid.Get(0) == 20 && mid.Get(2) == 40,
           "8a  Slice(1,3)");
 
     List<int>* a = new List<int>{1, 2};

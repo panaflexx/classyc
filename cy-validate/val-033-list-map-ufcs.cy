@@ -37,24 +37,21 @@ int main() {
     List<int>* b = new List<int>{3, 4, 5};
     defer delete b;
 
-    List<int>* ab = a->Plus(b);
-    defer delete ab;
-    check(ab->Count() == 5, "1a  Plus length");
-    check(ab->Get(0) == 1 && ab->Get(1) == 2 && ab->Get(2) == 3
-          && ab->Get(3) == 4 && ab->Get(4) == 5, "1b  Plus values");
+    auto ab = a->Plus(b);
+    check(ab.Count() == 5, "1a  Plus length");
+    check(ab.Get(0) == 1 && ab.Get(1) == 2 && ab.Get(2) == 3
+          && ab.Get(3) == 4 && ab.Get(4) == 5, "1b  Plus values");
     check(a->Count() == 2 && a->Get(0) == 1 && a->Get(1) == 2,
           "1c  left operand unchanged");
     check(b->Count() == 3, "1d  right operand unchanged");
 
     List<int>* empty = new List<int>();
     defer delete empty;
-    List<int>* a2 = a->Plus(empty);
-    defer delete a2;
-    check(a2->Count() == 2 && a2->Equals(a), "1e  Plus empty right");
+    auto a2 = a->Plus(empty);
+    check(a2.Count() == 2 && a2.Equals(a), "1e  Plus empty right");
 
-    List<int>* e2 = empty->Plus(b);
-    defer delete e2;
-    check(e2->Count() == 3 && e2->Equals(b), "1f  Plus empty left");
+    auto e2 = empty->Plus(b);
+    check(e2.Count() == 3 && e2.Equals(b), "1f  Plus empty left");
 
     /* ── 2. Concat still mutates (contrast with Plus) ────────────────────── */
     printf("\n-- 2. Concat mutates --\n");
@@ -132,19 +129,15 @@ int main() {
         check(ages->TryGet("ada", &v) && v == 36, "5d  TryGet present");
     }
 
-    /* ── 6. Slice + Range still compose with Plus ────────────────────────── */
+    /* ── 6. Slice + Range still compose with Plus (all by-value) ─────────── */
     printf("\n-- 6. Slice / Range / Plus chain --\n");
-    List<int>* r = List<int>.Range(0, 5);
-    defer delete r;
-    List<int>* mid = r->Slice(1, 3);
-    defer delete mid;
-    List<int>* tail = r->Slice(3, 2);
-    defer delete tail;
-    List<int>* joined = mid->Plus(tail);
-    defer delete joined;
-    check(joined->Count() == 5
-          && joined->Get(0) == 1 && joined->Get(2) == 3
-          && joined->Get(3) == 3 && joined->Get(4) == 4,
+    auto r = List<int>.Range(0, 5);
+    auto mid = r.Slice(1, 3);
+    auto tail = r.Slice(3, 2);
+    auto joined = mid.Plus(&tail);  /* Plus takes List* */
+    check(joined.Count() == 5
+          && joined.Get(0) == 1 && joined.Get(2) == 3
+          && joined.Get(3) == 3 && joined.Get(4) == 4,
           "6a  Slice+Plus composition");
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);

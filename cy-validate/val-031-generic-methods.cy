@@ -1,7 +1,8 @@
 /* val-031-generic-methods.cy — method type parameters (Select<U>).
  *
- *   List<U>* Select<U>(U(*fn)(T))
+ *   List<U> Select<U>(U(*fn)(T))   // by-value RAII result
  *   xs->Select<String>(fn) / xs->Select(fn)  with U inferred from fn return type
+ *   List<String>* SelectString(...)          // still heap (compat)
  *
  * Run:  ./bin/classyc -g -I include cy-validate/val-031-generic-methods.cy -eg
  */
@@ -36,15 +37,13 @@ int main() {
     defer delete xs;
 
     printf("-- explicit type arg --\n");
-    List<int>* d = xs->Select<int>(times2);
-    defer delete d;
-    check(d->Count() == 3, "1a  Select<int> count");
-    check(d->Get(0) == 2 && d->Get(1) == 4 && d->Get(2) == 6, "1b  Select<int> values");
+    auto d = xs->Select<int>(times2);
+    check(d.Count() == 3, "1a  Select<int> count");
+    check(d.Get(0) == 2 && d.Get(1) == 4 && d.Get(2) == 6, "1b  Select<int> values");
 
     printf("\n-- inference from fn return type --\n");
-    List<int>* e = xs->Select(plus1);
-    defer delete e;
-    check(e->Count() == 3 && e->Get(0) == 2 && e->Get(2) == 4, "2a  inferred U=int");
+    auto e = xs->Select(plus1);
+    check(e.Count() == 3 && e.Get(0) == 2 && e.Get(2) == 4, "2a  inferred U=int");
 
     printf("\n-- T* → scalar / String --\n");
     List<User*>* users = new List<User*>().owns();
@@ -52,19 +51,17 @@ int main() {
     users->Add(new User(10, "Ada"));
     users->Add(new User(20, "Bob"));
 
-    List<int>* ids = users->Select<int>(user_id);
-    defer delete ids;
-    check(ids->Count() == 2 && ids->Get(0) == 10 && ids->Get(1) == 20, "3a  Select user ids");
+    auto ids = users->Select<int>(user_id);
+    check(ids.Count() == 2 && ids.Get(0) == 10 && ids.Get(1) == 20, "3a  Select user ids");
 
-    List<String>* names = users->Select<String>(user_name);
-    defer delete names;
-    check(names->Count() == 2, "3b  Select<String> count");
-    check(strcmp((char*)names->Get(0), "Ada") == 0, "3c  Select<String> Ada");
-    check(strcmp((char*)names->Get(1), "Bob") == 0, "3d  Select<String> Bob");
+    auto names = users->Select<String>(user_name);
+    check(names.Count() == 2, "3b  Select<String> count");
+    check(strcmp((char*)names.Get(0), "Ada") == 0, "3c  Select<String> Ada");
+    check(strcmp((char*)names.Get(1), "Bob") == 0, "3d  Select<String> Bob");
 
     printf("\n-- SelectString compat --\n");
     List<String>* names2 = users->SelectString(user_name);
-    defer delete names2;
+    defer delete names2;  /* SelectString still returns heap List* */
     check(names2->Count() == 2 && strcmp((char*)names2->Get(0), "Ada") == 0,
           "4a  SelectString still works");
 

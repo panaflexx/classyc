@@ -4840,6 +4840,22 @@ static node_t try_arg_f (c2m_ctx_t c2m_ctx, nonterm_arg_func_t f, node_t arg) {
 
 /* ─────────────────────────── Generics helpers ─────────────────────────── */
 
+/* Defined later in the check phase; used when specializing over local classes. */
+static node_t find_def (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, node_t scope,
+                        node_t *aux_node);
+static void symbol_insert (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, node_t scope,
+                           node_t def_node, node_t aux_node);
+static int symbol_find (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, node_t scope,
+                        symbol_t *res);
+
+/* Local/nested classes used as generic type args (List<Item*> with Item defined
+   inside a function) are not yet visible at top_scope when the specialization is
+   first checked (it is injected before the enclosing function).  Collect them
+   here during specialization creation and apply at N_MODULE check start. */
+typedef struct { node_t id; node_t class_def; } local_type_hoist_t;
+DEF_VARR (local_type_hoist_t);
+static VARR (local_type_hoist_t) *local_type_hoists;
+
 /* Returns 1 if `name` is a registered generic class template. */
 static int is_generic_class_p (c2m_ctx_t c2m_ctx, const char *name) {
   if (c2m_ctx->parse_ctx == NULL) return 0;
@@ -5585,6 +5601,45 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
     }
   }
   VARR_PUSH (cstr_t, generic_in_progress, spec_name);
+
+  /* Collect local/nested class type args for later hoist into top_scope
+     (applied at N_MODULE check start -- see apply_local_type_hoists). */
+  if (local_type_hoists != NULL && curr_scope != NULL) {
+    for (int _ai = 0; _ai < n_args; _ai++) {
+      node_t _ta = args[_ai];
+      symbol_t _sym;
+      node_t _cdef = NULL;
+      while (_ta != NULL && _ta->code == N_POINTER) _ta = NL_HEAD (_ta->u.ops);
+      if (_ta == NULL || _ta->code != N_ID || _ta->u.s.s == NULL) continue;
+      if (strncmp (_ta->u.s.s, "__generic_", 10) == 0) continue;
+      /* Nested class tags are pre-inserted into the parse-time curr_scope
+         (the enclosing block).  Only look there -- parent walk needs
+         struct node_scope which is not yet defined at this point in the file. */
+      if (symbol_find (c2m_ctx, S_REGULAR, _ta, curr_scope, &_sym)
+          && _sym.def_node != NULL && _sym.def_node->code == N_CLASS)
+        _cdef = _sym.def_node;
+      else if (symbol_find (c2m_ctx, S_TAG, _ta, curr_scope, &_sym)
+               && _sym.def_node != NULL && _sym.def_node->code == N_CLASS)
+        _cdef = _sym.def_node;
+      if (_cdef == NULL) continue;
+      /* Dedup. */
+      {
+        int _dup = 0;
+        for (size_t _hi = 0; _hi < VARR_LENGTH (local_type_hoist_t, local_type_hoists); _hi++) {
+          local_type_hoist_t _h = VARR_GET (local_type_hoist_t, local_type_hoists, _hi);
+          if (_h.class_def == _cdef) { _dup = 1; break; }
+          if (_h.id != NULL && _h.id->u.s.s != NULL && _ta->u.s.s != NULL
+              && strcmp (_h.id->u.s.s, _ta->u.s.s) == 0) { _dup = 1; break; }
+        }
+        if (!_dup) {
+          local_type_hoist_t _h;
+          _h.id = _ta;
+          _h.class_def = _cdef;
+          VARR_PUSH (local_type_hoist_t, local_type_hoists, _h);
+        }
+      }
+    }
+  }
 
   /* Deep-copy the template with type substitution */
   size_t _xref_mark = VARR_LENGTH (generic_crossref_t, generic_crossrefs);
@@ -7748,7 +7803,10 @@ DA (type_spec) {
         /* Normal (non-generic) class */
         if (id_p) {
           tpname_add (c2m_ctx, op1, curr_scope, TRUE);
-          symbol_insert(c2m_ctx, S_TAG, op1, curr_scope, r, new_node(c2m_ctx, N_IGNORE));
+          /* Pre-register the tag at parse so members can mention their own type.
+             process_tag accepts the same node later without a redecl error. */
+          if (curr_scope != NULL)
+            symbol_insert (c2m_ctx, S_TAG, op1, curr_scope, r, new_node (c2m_ctx, N_IGNORE));
         }
       }
     }
@@ -9698,6 +9756,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (generic_tmpl_t, generic_templates, alloc, 4);
   VARR_CREATE (generic_spec_t, generic_specs, alloc, 8);
   VARR_CREATE (generic_crossref_t, generic_crossrefs, alloc, 4);
+  VARR_CREATE (local_type_hoist_t, local_type_hoists, alloc, 4);
   VARR_CREATE (iface_t, interfaces, alloc, 4);
   VARR_CREATE (generic_fn_tmpl_t, generic_fn_templates, alloc, 4);
   VARR_CREATE (generic_fn_spec_t, generic_fn_specs, alloc, 8);
@@ -9869,6 +9928,8 @@ static void parse_finish (c2m_ctx_t c2m_ctx) {
       VARR_DESTROY (generic_spec_t, generic_specs);
     if (generic_crossrefs != NULL)
       VARR_DESTROY (generic_crossref_t, generic_crossrefs);
+    if (local_type_hoists != NULL)
+      VARR_DESTROY (local_type_hoist_t, local_type_hoists);
     if (generic_fn_templates != NULL)
       VARR_DESTROY (generic_fn_tmpl_t, generic_fn_templates);
     if (generic_fn_specs != NULL)
@@ -11210,6 +11271,19 @@ static int incomplete_type_p (c2m_ctx_t c2m_ctx, struct type *type) {
     node_t scope, n = type->u.tag_type;
 
     if (NL_EL (n->u.ops, 1)->code == N_IGNORE) return TRUE;
+    /* C++ rule: class C is complete in the bodies of its own methods.  Needed
+       for by-value collection APIs (`List<T> Take(...) { auto r = List<T>();
+       return move r; }`).  Free functions and foreign-class methods still see
+       the usual incomplete-while-nested rule (field layout uses curr_func_def
+       == NULL, so data members of type C remain rejected). */
+    if (curr_func_def != NULL) {
+      decl_t fd = curr_func_def->attr;
+      if (fd != NULL && fd->decl_spec.type != NULL
+          && fd->decl_spec.type->mode == TM_FUNC) {
+        struct func_type *ft = fd->decl_spec.type->u.func_type;
+        if (ft != NULL && ft->class_scope == n) return FALSE;
+      }
+    }
     for (scope = curr_scope; scope != NULL && scope != top_scope && scope != n;
          scope = ((struct node_scope *) scope->attr)->scope)
       ;
@@ -11492,6 +11566,13 @@ static node_t process_tag (c2m_ctx_t c2m_ctx, node_t r, node_t id, node_t decl_l
     //    symbol_insert (c2m_ctx, S_REGULAR, id, scope, r, NULL);
     //else
         symbol_insert (c2m_ctx, S_TAG, id, scope, r, NULL);
+  } else if (sym.def_node == r) {
+    /* Same AST node already pre-registered at parse time (classes do this so
+       members can refer to their own type while the body is still being
+       parsed).  Not a redeclaration -- common for block-scoped/nested classes
+       where parse-time curr_scope is a real block (unlike file-scope parse
+       where curr_scope may still be NULL and the insert is effectively a
+       no-op). */
   } else if (sym.def_node->code != r->code) {
     error (c2m_ctx, POS (id), "kind of tag %s is unmatched with previous declaration", id->u.s.s);
   } else if ((tab_decl_list = NL_EL (sym.def_node->u.ops, 1))->code != N_IGNORE
@@ -14620,6 +14701,10 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
                            && cid != NULL && cid->code == N_ID
                            && strcmp (ctor_init_callee->u.s.s, cid->u.s.s) == 0);
         int move_init_p = (initializer != NULL && initializer->code == N_MOVE);
+        /* Function/method call returning a collection by value is a prvalue
+           ownership transfer (RAII bind), not a shallow alias of an lvalue. */
+        int prvalue_init_p = (initializer != NULL && initializer->code == N_CALL
+                              && !ctor_init_p);
         int move_only = class_is_move_only_collection_p (c2m_ctx, decl->decl_spec.type);
         char nm[320];
         unsigned saved_errs;
@@ -14627,13 +14712,15 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         symbol_t ctor_sym;
 
         if (cid != NULL && cid->code == N_ID) {
-          /* Ban shallow copy-init of List/Map/Set (owning buffer). */
+          /* Ban shallow copy-init of List/Map/Set (owning buffer).  Allow
+             default/ctor init, `move` from an lvalue, and prvalue bind from a
+             call that returns List/Map/Set by value (the first-class idiom). */
           if (move_only && initializer != NULL && initializer->code != N_IGNORE
-              && !ctor_init_p && !move_init_p) {
+              && !ctor_init_p && !move_init_p && !prvalue_init_p) {
             error (c2m_ctx, POS (id),
                    "cannot copy-initialize collection '%s' "
                    "(shallow copy would double-free); use default construction, "
-                   "Name(...), or `move`",
+                   "Name(...), `move`, or a by-value return",
                    cid->u.s.s);
           }
 
@@ -16125,14 +16212,15 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           error (c2m_ctx, POS (r), "lvalue required as left operand of assignment");
         }
         /* Move-only collections (List/Map/Set): ban bare shallow assign which
-           would alias the heap buffer and double-free.  Require `move`. */
+           would alias the heap buffer and double-free.  Require `move` for
+           lvalues; allow prvalue RHS from a by-value call return. */
         if (class_is_move_only_collection_p (c2m_ctx, t1)
             && class_is_move_only_collection_p (c2m_ctx, t2)
-            && op2->code != N_MOVE) {
+            && op2->code != N_MOVE && op2->code != N_CALL) {
           node_t cid = (t1->u.tag_type != NULL) ? TAG_ID (t1->u.tag_type) : NULL;
           error (c2m_ctx, POS (r),
                  "cannot assign collection '%s' (shallow copy would double-free); "
-                 "use `move` to transfer ownership",
+                 "use `move` to transfer ownership, or assign a by-value return",
                  (cid != NULL && cid->code == N_ID) ? cid->u.s.s : "?");
         }
         check_assignment_types (c2m_ctx, t1, t2, e2, r);
@@ -20043,6 +20131,23 @@ if (base != NULL && base->code == N_ID) {
         }
       }
     }
+    /* Hoist local/nested classes that appeared as generic type args
+       (List<Item*> with Item defined inside a function) into top_scope so
+       monomorphized collection methods can resolve them.  Specializations
+       of such Lists are injected before the enclosing function, so without
+       this hoist they would check against "unknown type Item". */
+    if (local_type_hoists != NULL) {
+      for (size_t _hi = 0; _hi < VARR_LENGTH (local_type_hoist_t, local_type_hoists); _hi++) {
+        local_type_hoist_t _h = VARR_GET (local_type_hoist_t, local_type_hoists, _hi);
+        if (_h.id == NULL || _h.class_def == NULL) continue;
+        if (find_def (c2m_ctx, S_REGULAR, _h.id, top_scope, NULL) == NULL) {
+          symbol_insert (c2m_ctx, S_REGULAR, _h.id, top_scope, _h.class_def, NULL);
+          symbol_insert (c2m_ctx, S_TAG, _h.id, top_scope, _h.class_def, NULL);
+          tpname_add (c2m_ctx, _h.id, top_scope, TRUE);
+        }
+      }
+      VARR_TRUNC (local_type_hoist_t, local_type_hoists, 0);
+    }
     /* First pass: queue every class method body for deferred checking so
        that cross-class references (constructor lookups, sibling-class method
        calls, etc.) can resolve regardless of source order. */
@@ -20398,6 +20503,29 @@ if (base != NULL && base->code == N_ID) {
                && (ret_type->mode != TM_BASIC || ret_type->u.basic_type != TP_VOID)) {
       error (c2m_ctx, POS (r), "return with no value in function returning non-void");
     } else if (expr->code != N_IGNORE) {
+      /* Move-only collections: returning a named local (or other lvalue) by bare
+         copy would shallow-alias the buffer and double-free when both the local
+         dtor and the caller's RAII shell run.  C++-style implicit move on return
+         of a move-only collection lvalue: rewrite `return a;` to `return move a;`.
+         Explicit `return move a;` and prvalue returns (`return f();`, ctor temps)
+         are left alone.  The inner expression is already checked above — stamp
+         the N_MOVE attr without re-checking the inner node. */
+      if (expr->code != N_MOVE && expr->attr != NULL) {
+        struct expr *re = expr->attr;
+        if (re->type != NULL && class_is_move_only_collection_p (c2m_ctx, re->type)
+            && re->u.lvalue_node != NULL) {
+          /* Detach expr from the return first: new_pos_node1 will own it as the
+             N_MOVE child, and a node may live in only one op-list. */
+          NL_REMOVE (r->u.ops, expr);
+          node_t m = new_pos_node1 (c2m_ctx, N_MOVE, POS (r), expr);
+          struct expr *me = create_expr (c2m_ctx, m);
+          me->type = re->type;
+          if (curr_scope != top_scope)
+            update_call_arg_area_offset (c2m_ctx, re->type, TRUE);
+          NL_APPEND (r->u.ops, m);
+          expr = m;
+        }
+      }
       check_assignment_types (c2m_ctx, ret_type, NULL, expr->attr, r);
     }
     break;
@@ -21433,6 +21561,55 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
 #if !MIR_NO_DBINFO
 static void dbinfo_emit_func_vars (c2m_ctx_t c2m_ctx, node_t func_def_node);
 #endif
+
+/* Pre-generate methods of block-scoped classes found under NODE so their MIR
+   items exist before the enclosing function is opened.  Idempotent. */
+static void gen_nested_class_methods_in (c2m_ctx_t c2m_ctx, node_t node) {
+  if (node == NULL) return;
+  switch (node->code) {
+  case N_LIST:
+    for (node_t el = NL_HEAD (node->u.ops); el != NULL; el = NL_NEXT (el))
+      gen_nested_class_methods_in (c2m_ctx, el);
+    break;
+  case N_BLOCK:
+    gen_nested_class_methods_in (c2m_ctx, NL_EL (node->u.ops, 1));
+    break;
+  case N_SPEC_DECL: {
+    node_t specs = SPEC_DECL_SPECS (node);
+    if (specs != NULL && specs->code == N_SHARE) specs = NL_HEAD (specs->u.ops);
+    if (specs != NULL && specs->code == N_LIST) {
+      for (node_t s = NL_HEAD (specs->u.ops); s != NULL; s = NL_NEXT (s)) {
+        if (s->code == N_CLASS && s->attr != (void *) ((intptr_t) -1))
+          gen_nested_class_methods_in (c2m_ctx, s);
+      }
+    }
+    break;
+  }
+  case N_CLASS: {
+    node_t decl_list = NL_NEXT (NL_HEAD (node->u.ops));
+    if (decl_list == NULL || decl_list->code == N_IGNORE) break;
+    for (node_t m = NL_HEAD (decl_list->u.ops); m != NULL; m = NL_NEXT (m)) {
+      if (m->code != N_FUNC_DEF || m->attr == (void *) ((intptr_t) -1)) continue;
+      decl_t md = m->attr;
+      if (md != NULL && md->u.item != NULL) continue;
+      gen (c2m_ctx, m, NULL, NULL, FALSE, NULL, NULL);
+    }
+    break;
+  }
+  case N_IF:
+    gen_nested_class_methods_in (c2m_ctx, NL_EL (node->u.ops, 1));
+    gen_nested_class_methods_in (c2m_ctx, NL_EL (node->u.ops, 2));
+    gen_nested_class_methods_in (c2m_ctx, NL_EL (node->u.ops, 3));
+    break;
+  case N_WHILE: case N_DO: case N_SWITCH:
+    gen_nested_class_methods_in (c2m_ctx, NL_EL (node->u.ops, 1));
+    break;
+  case N_FOR:
+    gen_nested_class_methods_in (c2m_ctx, NL_EL (node->u.ops, 4));
+    break;
+  default: break;
+  }
+}
 
 static op_t val_gen (c2m_ctx_t c2m_ctx, node_t r) {
   return gen (c2m_ctx, r, NULL, NULL, TRUE, NULL, NULL);
@@ -26280,14 +26457,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       mir_size_t size = type_size (c2m_ctx, at);
 
       assert (r->code == N_ASSIGN);
-      /* Note: for move-assign of List/Map/Set, the RHS is `move src` which
-         already destroyed/zeroed the source; destroy the LHS by calling its
-         dtor if present so the previous buffer is not leaked.  Done only for
+      /* Note: for move-assign of List/Map/Set, the RHS is `move src` (or a
+         prvalue call return) which transfers buffer ownership; destroy the
+         LHS first so its previous buffer is not leaked.  Done only for
          move-only collections — ordinary by-value class elements (Pt) use
          plain block_move as List does internally. */
       if (class_is_move_only_collection_p (c2m_ctx, at)
           && NL_EL (r->u.ops, 1) != NULL
-          && NL_EL (r->u.ops, 1)->code == N_MOVE) {
+          && (NL_EL (r->u.ops, 1)->code == N_MOVE
+              || NL_EL (r->u.ops, 1)->code == N_CALL)) {
         node_t ddef = find_class_dtor_def (c2m_ctx, at->u.tag_type);
         if (ddef != NULL && ddef->code == N_FUNC_DEF && ddef->attr != NULL) {
           decl_t dd = ddef->attr;
@@ -28155,6 +28333,28 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           }
           if (decl->dtor_call != NULL)
             VARR_PUSH (node_t, defer_stmts, decl->dtor_call);
+        } else if (initializer->code == N_CALL && decl->scope != top_scope
+                   && decl->decl_spec.type->mode == TM_CLASS
+                   && class_is_move_only_collection_p (c2m_ctx, decl->decl_spec.type)) {
+          /* Local:  auto xs = make();  /  List<int> xs = src.Take(3);
+             By-value collection return: evaluate the call (ALLOCA return slot),
+             block-copy into the local, then RAII-register ~List/~Map/~Set so the
+             buffer is freed at scope exit.  This is the first-class idiom — no
+             `owned auto` for everyday LINQ pipelines. */
+          if (id->attr == NULL) {
+            node_t saved_scope = curr_scope;
+            curr_scope = decl->scope;
+            check (c2m_ctx, id, NULL);
+            curr_scope = saved_scope;
+          }
+          var = gen (c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
+          {
+            op_t mval = gen (c2m_ctx, initializer, NULL, NULL, FALSE, NULL, NULL);
+            mir_size_t csize = type_size (c2m_ctx, decl->decl_spec.type);
+            if (csize > 0) block_move (c2m_ctx, var, mval, csize);
+          }
+          if (decl->dtor_call != NULL)
+            VARR_PUSH (node_t, defer_stmts, decl->dtor_call);
         } else if (initializer->code != N_IGNORE) {  // ??? general code
           init_start = VARR_LENGTH (init_el_t, init_els);
           collect_init_els (c2m_ctx, NULL, &decl->decl_spec.type, initializer,
@@ -28256,7 +28456,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           if (c2m_options->debug_p) {
             printf("DEBUG: Found method in class, generating code\n");
           }
-          gen(c2m_ctx, member, true_label, false_label, val_p, desirable_dest, expect_res);
+          /* Nested classes: methods are pre-generated by gen_nested_class_methods_in
+             before the enclosing MIR function opens.  While that outer function is
+             open, skip re-entry here (MIR forbids nested funcs); otherwise emit. */
+          if (curr_func != NULL) continue;
+          gen (c2m_ctx, member, true_label, false_label, val_p, desirable_dest, expect_res);
         }
       }
       /* Build process-wide singletons for declarative dict members so that
@@ -28324,6 +28528,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
        so refs emitted before vs after this point all resolve to the same
        MIR item at link time. */
     mangle_func_def_mir_name (c2m_ctx, r, name, sizeof (name));
+
+    /* Block-scoped classes defined in this function body have methods that
+       must become MIR functions.  MIR forbids opening a new function while
+       another is open, so walk the body now (before MIR_new_func for the
+       outer function) and generate any nested-class methods. */
+    if (stmt != NULL && stmt->code == N_BLOCK && curr_func == NULL)
+      gen_nested_class_methods_in (c2m_ctx, stmt);
 
     curr_func = ((decl_type->u.func_type->dots_p
                     ? MIR_new_vararg_func_arr
@@ -28486,6 +28697,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     if (c2m_options->debug_info_p) dbinfo_emit_func_vars (c2m_ctx, r);
 #endif
     MIR_finish_func (ctx);
+    /* MIR_finish_func clears MIR's open-func state; keep gen_ctx in sync so a
+       later N_CLASS (methods of List specializations, nested classes) is not
+       treated as "nested" and skipped. */
+    curr_func = NULL;
 
     // NEW: Export with the appropriate name
     if (func_decl->decl_spec.linkage == N_EXTERN) {

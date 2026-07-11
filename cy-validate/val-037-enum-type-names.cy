@@ -84,8 +84,8 @@ int main() {
     check(strcmp(id_f.nameof(), "voids") == 0,       "3b  bare Faction param/return");
 
     printf("\n-- GroupBy keys via named enum --\n");
-    owned auto roster = grid->Copy();
-    owned auto by = roster->GroupBy(faction_key);
+    auto roster = grid->Copy();  /* Copy returns List by value */
+    owned auto by = roster.GroupBy(faction_key);  /* GroupBy still returns Map* */
     check(by->Count() == 3,                          "4a  three faction buckets");
     {
         enum Faction nf = (Faction)0;
