@@ -651,6 +651,8 @@ typedef enum {
   REP8 (T_EL, DICT, STRING, UNION, UNSIGNED, VOID, VOLATILE, WHILE, EOFILE),
   T_IN, /* 'in' keyword for dict key-check and for-in loops */
   T_FAT_ARROW, /* => fat-arrow token for lambda expressions */
+  T_QDOT,      /* ?. safe-navigation member access */
+  T_QQ,        /* ?? null-coalescing operator */
   /* tokens existing in preprocessor only: */
   T_HEADER,         /* include header */
   T_NO_MACRO_IDENT, /* ??? */
@@ -687,6 +689,9 @@ typedef enum {
   REP8 (NODE_EL, STAR, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT),
   REP8 (NODE_EL, FUNC_DEF, MODULE, ASM, ATTR, CLASS, STRING, CONCAT, DICT),
   N_IN,     /* "key" in dict — existence check */
+  N_COALESCE, /* a ?? b — null-coalescing: a's value if non-zero/non-null, else b.
+                 a is evaluated exactly once (see the N_COALESCE cases in
+                 check/gen); ?. desugars to a marked N_COND instead. */
   N_FORIN,  /* for (auto var in dict) loop */
   N_NEW,    /* new ClassName(args) — heap allocation + constructor call */
   N_DEFER,  /* defer <stmt> — run statement at enclosing scope exit (LIFO) */
@@ -1066,6 +1071,8 @@ static const char *get_token_name (c2m_ctx_t c2m_ctx, int token_code) {
   case T_OROR: return "||";
   case T_INCDEC: return "++ or --";
   case T_ARROW: return "->";
+  case T_QDOT: return "?.";
+  case T_QQ: return "??";
   case T_UNOP: return "unary op";
   case T_DOTS: return "...";
   default:
@@ -1282,7 +1289,9 @@ static int get_line (c2m_ctx_t c2m_ctx) { /* translation phase 1 and 2 */
     if (c != '\n')
       (c2m_options->pedantic_p ? error : warning) (c2m_ctx, cs->pos, "no end of line at file end");
   }
-  remove_trigraphs (c2m_ctx);
+  /* Trigraphs are pedantic-mode only (matching modern C/GCC defaults): the
+     `??` null-coalescing operator would otherwise turn `x??(y)` into `x[y`. */
+  if (c2m_options->pedantic_p) remove_trigraphs (c2m_ctx);
   VARR_PUSH (char, cs->ln, '\n');
   reverse (cs->ln);
   return TRUE;
@@ -1815,7 +1824,23 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
       }
       assert (FALSE);
     case ';': return new_token (c2m_ctx, cs->pos, ";", curr_c, N_IGNORE);
-    case '?': return new_token (c2m_ctx, cs->pos, "?", curr_c, N_IGNORE);
+    case '?':
+      pos = cs->pos;
+      curr_c = cs_get (c2m_ctx);
+      if (curr_c == '?') return new_token (c2m_ctx, pos, "??", T_QQ, N_COALESCE);
+      if (curr_c == '.') {
+        curr_c = cs_get (c2m_ctx);
+        if (!isdigit (curr_c)) {
+          cs_unget (c2m_ctx, curr_c);
+          return new_token (c2m_ctx, pos, "?.", T_QDOT, N_IGNORE);
+        }
+        /* `cond ? .5 : x` — the dot starts a float literal, not safe-nav. */
+        cs_unget (c2m_ctx, curr_c);
+        cs_unget (c2m_ctx, '.');
+      } else {
+        cs_unget (c2m_ctx, curr_c);
+      }
+      return new_token (c2m_ctx, pos, "?", '?', N_IGNORE);
     case '(': return new_token (c2m_ctx, cs->pos, "(", curr_c, N_IGNORE);
     case ')': return new_token (c2m_ctx, cs->pos, ")", curr_c, N_IGNORE);
     case '{': return new_token (c2m_ctx, cs->pos, "{", curr_c, N_IGNORE);
@@ -6323,6 +6348,23 @@ D (primary_expr) {
   return err_node;
 }
 
+/* Deep-copy an expression subtree at parse time (attrs are not set yet, so
+   only code/pos/payload/children need duplicating).  Used by the `?.`
+   desugar to duplicate the receiver into the null guard. */
+static node_t parse_copy_expr (c2m_ctx_t c2m_ctx, node_t n) {
+  node_t r;
+
+  if (n == NULL) return NULL;
+  if (generic_node_has_scalar_data (n->code) || n->code == N_ID || n->code == N_STRING
+      || n->code == N_IGNORE)
+    return copy_node (c2m_ctx, n);
+  r = new_node (c2m_ctx, n->code);
+  set_node_pos (c2m_ctx, r, POS (n));
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    op_append (c2m_ctx, r, parse_copy_expr (c2m_ctx, c));
+  return r;
+}
+
 DA (post_expr_part) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t r, n, op, list;
@@ -6380,6 +6422,33 @@ DA (post_expr_part) {
       }
       r = n;
       continue;
+    } else if (MP (T_QDOT, pos)) {
+      /* Safe navigation: recv?.member... desugars to
+           recv ? recv->member <rest of postfix chain> : 0
+         with the WHOLE remaining chain inside the guard (C# semantics: a null
+         receiver short-circuits everything after it, so a?.b.c and a?.m(x)
+         are safe).  The receiver subtree is duplicated into the guard, so it
+         is evaluated twice — keep receivers simple (a variable or field).
+         The N_COND is tagged via the attr sentinel (void *) 2 so the checker
+         can allow void-returning methods and String members against the
+         synthesized 0 else-arm (see the N_COND case in check ()). */
+      node_t recv = r, inner;
+
+      if (MN (T_ID, r)) {
+        /* normal member/method name */
+      } else if (C (T_TYPEOF)) {
+        pos_t idpos = curr_token->pos;
+        M (T_TYPEOF);
+        r = build_id (c2m_ctx, "typeof", idpos);
+      } else {
+        return err_node;
+      }
+      inner
+        = new_pos_node2 (c2m_ctx, N_DEREF_FIELD, pos, parse_copy_expr (c2m_ctx, recv), r);
+      PA (post_expr_part, inner); /* r = remaining postfix chain applied to inner */
+      n = new_pos_node3 (c2m_ctx, N_COND, pos, recv, r, new_i_node (c2m_ctx, 0, pos));
+      n->attr = (void *) (intptr_t) 2; /* safe-navigation marker for the checker */
+      return n;
     } else if (MC ('[', pos, code)) {
       op = r;
       P (expr);
@@ -6703,12 +6772,15 @@ D (xor_expr) { return left_op (c2m_ctx, no_err_p, '^', -1, and_expr); }
 D (or_expr) { return left_op (c2m_ctx, no_err_p, '|', -1, xor_expr); }
 D (land_expr) { return left_op (c2m_ctx, no_err_p, T_ANDAND, -1, or_expr); }
 D (lor_expr) { return left_op (c2m_ctx, no_err_p, T_OROR, -1, land_expr); }
+/* a ?? b — null-coalescing: binds tighter than ?:, looser than ||, and is
+   right-associative (a ?? b ?? c == a ?? (b ?? c)), matching C#. */
+D (coalesce_expr) { return right_op (c2m_ctx, no_err_p, T_QQ, -1, lor_expr, coalesce_expr); }
 
 D (cond_expr) {
   node_t r, n;
   pos_t pos;
 
-  P (lor_expr);
+  P (coalesce_expr);
   if (!MP ('?', pos)) return r;
   n = new_pos_node1 (c2m_ctx, N_COND, pos, r);
   P (expr);
@@ -14944,6 +15016,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         REP8 (NODE_CASE, DEREF_FIELD, COND, INC, DEC, POST_INC, POST_DEC, ALIGNOF, SIZEOF)
         REP6 (NODE_CASE, EXPR_SIZEOF, CAST, COMPOUND_LITERAL, CALL, GENERIC, GENERIC_ASSOC)
         NODE_CASE (IN)
+        NODE_CASE (COALESCE)
         NODE_CASE (NEW)
         NODE_CASE (ANY)
         NODE_CASE (LAMBDA)
@@ -17013,6 +17086,12 @@ if (base != NULL && base->code == N_ID) {
         struct expr *e3;
         struct type *t3;
         int v = 0;
+        /* Safe-navigation sentinel: the parser tags the N_COND it synthesizes
+           for `recv?.member...` with attr == (void *) 2 (read BEFORE
+           create_expr overwrites attr, mirroring the N_CAST lenient-bind
+           sentinel).  It relaxes the else-arm (a synthesized int 0) against a
+           void method call or a String member in the then-arm. */
+        int safe_nav_p = (r->attr == (void *) (intptr_t) 2);
 
         process_bin_ops (c2m_ctx, r, &op1, &op2, &e1, &e2, &t1, &t2, r);
         op3 = NL_NEXT (op2);
@@ -17049,6 +17128,16 @@ if (base != NULL && base->code == N_ID) {
               e->c = e3->c;
             }
           }
+          break;
+        }
+        if (safe_nav_p && void_type_p (t2)) {
+          /* obj?.voidMethod(): result is void; the 0 else-arm is never used. */
+          e->type->u.basic_type = TP_VOID;
+          break;
+        }
+        if (safe_nav_p && builtin_string_type_p (t2)) {
+          /* obj?.stringMember: NULL String when the receiver is null. */
+          *e->type = *t2;
           break;
         }
         if (void_type_p (t2) && void_type_p (t3)) {
@@ -17107,6 +17196,53 @@ if (base != NULL && base->code == N_ID) {
             e->const_p = TRUE;
             e->c = e3->c;
           }
+        }
+        break;
+      }
+      case N_COALESCE: { /* a ?? b — a's value if non-zero/non-null, else b (a evaluated once) */
+        process_bin_ops (c2m_ctx, r, &op1, &op2, &e1, &e2, &t1, &t2, r);
+        e = create_expr (c2m_ctx, r);
+        e->type->mode = TM_BASIC;
+        e->type->u.basic_type = TP_INT;
+        if (!scalar_type_p (t1)) {
+          error (c2m_ctx, POS (r), "left operand of ?? should be of a scalar type");
+          break;
+        }
+        if (arithmetic_type_p (t1) && arithmetic_type_p (t2)) {
+          t = arithmetic_conversion (t1, t2);
+          *e->type = t;
+        } else if (builtin_string_type_p (t1)
+                   && (builtin_string_type_p (t2) || t2->mode == TM_PTR
+                       || null_const_p (e2, t2))) {
+          /* String ?? String / ?? "literal" / ?? NULL — String is pointer-width. */
+          *e->type = *t1;
+        } else if (t1->mode == TM_PTR && builtin_string_type_p (t2)) {
+          e->type = t1; /* char* ?? String */
+        } else if (t1->mode == TM_PTR && null_const_p (e2, t2)) {
+          e->type = t1;
+        } else if (t2->mode == TM_PTR && null_const_p (e1, t1)) {
+          e->type = t2;
+        } else if (t1->mode != TM_PTR || t2->mode != TM_PTR) {
+          error (c2m_ctx, POS (r), "incompatible types of ?? operands");
+          break;
+        } else if (compatible_types_p (t1, t2, TRUE)) {
+          t = composite_type (c2m_ctx, t1->u.ptr_type, t2->u.ptr_type);
+          e->type->mode = TM_PTR;
+          e->type->pos_node = r;
+          e->type->u.ptr_type = create_type (c2m_ctx, &t);
+          e->type->u.ptr_type->type_qual
+            = type_qual_union (&t1->u.ptr_type->type_qual, &t2->u.ptr_type->type_qual);
+        } else if (void_ptr_p (t1) || void_ptr_p (t2)) {
+          e->type->mode = TM_PTR;
+          e->type->pos_node = r;
+          e->type->u.ptr_type = create_type (c2m_ctx, t2->u.ptr_type);
+          e->type->u.ptr_type->pos_node = r;
+          e->type->u.ptr_type->mode = TM_BASIC;
+          e->type->u.ptr_type->u.basic_type = TP_VOID;
+          e->type->u.ptr_type->type_qual
+            = type_qual_union (&t1->u.ptr_type->type_qual, &t2->u.ptr_type->type_qual);
+        } else {
+          error (c2m_ctx, POS (r), "incompatible pointer types of ?? operands");
         }
         break;
       }
@@ -26307,6 +26443,35 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     emit_label_insn_opt (c2m_ctx, end_label);
     break;
   }
+  case N_COALESCE: { /* a ?? b — a's value if non-zero/non-null, else b; a evaluated once */
+    node_t val_expr = NL_HEAD (r->u.ops);
+    node_t def_expr = NL_EL (r->u.ops, 1);
+    struct type *res_type = ((struct expr *) r->attr)->type;
+    MIR_label_t end_label = MIR_new_label (ctx);
+
+    t = get_mir_type (c2m_ctx, res_type);
+    res = get_new_temp (c2m_ctx, t);
+    op1 = val_gen (c2m_ctx, val_expr);
+    op1 = cast (c2m_ctx, op1, t, FALSE);
+    emit2 (c2m_ctx, tp_mov (t), res.mir_op, op1.mir_op);
+    /* keep a's value when it is non-zero/non-null */
+    if (t == MIR_T_F)
+      emit3 (c2m_ctx, MIR_FBNE, MIR_new_label_op (ctx, end_label), res.mir_op,
+             MIR_new_float_op (ctx, 0.0f));
+    else if (t == MIR_T_D)
+      emit3 (c2m_ctx, MIR_DBNE, MIR_new_label_op (ctx, end_label), res.mir_op,
+             MIR_new_double_op (ctx, 0.0));
+    else if (t == MIR_T_LD)
+      emit3 (c2m_ctx, MIR_LDBNE, MIR_new_label_op (ctx, end_label), res.mir_op,
+             MIR_new_ldouble_op (ctx, 0.0));
+    else
+      emit2 (c2m_ctx, MIR_BT, MIR_new_label_op (ctx, end_label), res.mir_op);
+    op1 = val_gen (c2m_ctx, def_expr);
+    op1 = cast (c2m_ctx, op1, t, FALSE);
+    emit2 (c2m_ctx, tp_mov (t), res.mir_op, op1.mir_op);
+    emit_label_insn_opt (c2m_ctx, end_label);
+    break;
+  }
   case N_ALIGNOF:
   case N_SIZEOF:
   case N_EXPR_SIZEOF: assert (FALSE); break;
@@ -29702,7 +29867,8 @@ static const char *get_node_name (node_code_t code) {
     REP8 (C, RESTRICT, VOLATILE, ATOMIC, INLINE, NO_RETURN, ALIGNAS, FUNC, STAR);
     REP8 (C, POINTER, DOTS, ARR, INIT, FIELD_ID, TYPE, ST_ASSERT, FUNC_DEF);
     REP7 (C, MODULE, ASM, ATTR, CLASS, STRING, CONCAT, DICT);
-    C (IN); C (FORIN); C (NEW); C (DEFER); C (DELETE); C (LAMBDA); C (INTERFACE); C (ANY);
+    C (IN); C (COALESCE); C (FORIN); C (NEW); C (DEFER); C (DELETE); C (LAMBDA); C (INTERFACE);
+    C (ANY);
     C (TRY); C (CATCH); C (THROW);
     /* Arena-ownership keywords (see Memory Management in README). */
     C (DETACH); C (ATTACH); C (UNOWNED);
@@ -29928,6 +30094,7 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   case N_COMMA:
   case N_ANDAND:
   case N_OROR:
+  case N_COALESCE:
   case N_EQ:
   case N_NE:
   case N_LT:
