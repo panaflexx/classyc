@@ -119,14 +119,14 @@ int main() {
         check(dtors >= 1, "5b ~Pt on auto stack var scope exit");
     }
 
-    /* ── 6. Stack Map (same value-construct path) ─────────────────────── */
+    /* ── 6. Stack Map (same value-construct path + string subscript) ──── */
     printf("\n-- 6. stack Map --\n");
     {
         auto m = Map<String, int>();
         m.Set("a", 1);
-        m.Set("b", 2);
-        check(m.Count() == 2 && m.Get("a") == 1 && m.Get("b") == 2,
-              "6a auto m = Map<String,int>()");
+        m["b"] = 2;                                    /* value receiver + String key */
+        check(m.Count() == 2 && m.Get("a") == 1 && m["b"] == 2,
+              "6a auto m = Map<String,int>() + m[k]");
     }
 
     /* ── 7. Heap form still works ─────────────────────────────────────── */
