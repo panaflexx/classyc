@@ -68,7 +68,9 @@ Concrete primitives, pointers, by-value classes, and nested collection specialis
 6.  **Missing C# / Python essentials:**
     * **FIXED partially:** `Where`/`Select`/`SelectString`, `Any`/`All`/`Find*`/`AddRange`/`InsertRange`/`Distinct`/`Repeat`.
     * **FIXED:** generic `Select<U>` — `xs->Select<String>(fn)` / inferred `xs->Select(fn)`. `val-031`.
-    * **NOT FIXED:** `GroupBy`, slice `list[1..3]`, `operator+`, `Range` factory (needs `is_int<T>`).
+    * **FIXED:** `Range` factory via `nameof<T>()` + integral guard (throws on non-int `T` / negative count).
+    * **FIXED (free fn):** `ListGroupBy` in `map.h` (List method form deferred — circular `#include` with Map).
+    * **NOT FIXED:** slice sugar `list[1..3]`, `operator+`.
 
 7.  **Constructor confusion:** capacity vs singleton for `int`.
     * **NOT FIXED — intentional** C# semantics: `new List<int>(4)` capacity, `new List<int>{4}` singleton.
@@ -83,7 +85,11 @@ Concrete primitives, pointers, by-value classes, and nested collection specialis
 * **FIXED:** `KeyAt`/`ValAt` throw `OutOfBoundsException`.
 * **FIXED:** `Keys()`/`Values()` compile (nested generic) — caller still `delete`/`owned`.
 * **FIXED:** `classy-map.cy` + `val-006` updated for throwing `Get` (use `GetOr` / `TryGet` / try-catch).
-* **NOT FIXED:** `GetOrAdd`/`Where`/`SelectValues`/`GroupBy`-style Map API; non-String key JSON encoding.
+* **FIXED:** `GetOrAdd`/`ContainsValue`/`AddOrUpdate`/`Where`/`WhereKeys`/`WhereValues`/`Any`/`All`.
+* **FIXED:** method-generic `SelectValues<W>`/`SelectKeys<G>`/`GroupBy<G>` (nested `Map<G, List<V>*>` monomorphization in `classyc.c`).
+* **FIXED:** int/long/short/bool key JSON via `nameof` + decimal keys in `ToDict`/`ToJson`.
+* **FIXED (List companion):** free `ListGroupBy(list, keyFn)` in `map.h` (avoids list↔map include cycle); method form needs UFCS.
+* Validated by `cy-validate/val-032-map-list-cleanup.cy` (42 tests).
 
 ### `dict` — you have JSON-like but not JS-like
 
@@ -135,7 +141,9 @@ Generic free-function inference (`Max(3,5)`): **works** (`val-023`). Mark langua
 * `list.h`: real `Select<U>`; `SelectString` kept as open-coded compat.
 * Validated by `cy-validate/val-031-generic-methods.cy` (8 tests).
 
-**Next:** UFCS; `GroupBy<K>` on the new machinery; expand `builtin_method` to dict/seq; `?.` `??` `..`; `owned auto` docs.
+**Done (Map higher-order + List Range/GroupBy free fn):** val-032 (42); nested `Map<G,List<V>*>` method generics; free-fn type inference for `List<T>*` / `G(*fn)(T)`; free-fn crossref drain; `create_expr` zero `def_node` (fixes List-internal `data[i]` gen crash in val-024).
+
+**Next:** UFCS (`ListGroupBy` as method); expand `builtin_method` to dict/seq; `?.` `??` `..`; `owned auto` docs.
 
 **Later:** Spread dict, properties, list `[]` literals, `is_int<T>` / `Range`.
 

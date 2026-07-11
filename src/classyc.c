@@ -4408,6 +4408,8 @@ typedef struct {
 } generic_crossref_t;
 
 DEF_VARR (generic_crossref_t);
+typedef const char *cstr_t;
+DEF_VARR (cstr_t);
 
 /* Generic function template registry.
 
@@ -4498,6 +4500,7 @@ struct parse_ctx {
   VARR (generic_fn_spec_t) * generic_fn_specs;     /* generic function specialization cache */
   VARR (generic_method_tmpl_t) * generic_method_templates;
   VARR (generic_method_spec_t) * generic_method_specs;
+  VARR (cstr_t) * generic_in_progress;
   /* Method type params currently being parsed (Select<U>): treated like outer
      class type params for nested-specialization placeholder purposes. */
   int n_method_type_params;
@@ -4519,6 +4522,7 @@ struct parse_ctx {
 #define generic_fn_specs parse_ctx->generic_fn_specs
 #define generic_method_templates parse_ctx->generic_method_templates
 #define generic_method_specs parse_ctx->generic_method_specs
+#define generic_in_progress parse_ctx->generic_in_progress
 #define n_method_type_params parse_ctx->n_method_type_params
 #define method_type_params parse_ctx->method_type_params
 
@@ -5055,39 +5059,153 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
     if (n_params > 0 && strncmp (s, "__generic_", 10) == 0) {
       VARR (generic_tmpl_t) *_gt = generic_templates;
       if (_gt != NULL) {
+        /* Resolve one mangled type-arg segment at *_pcur (advance *_pcur).
+           Handles plain params ("T", "VP") AND nested placeholders
+           ("__generic_List_VP") so Map<G, List<V>*>* rewrites correctly:
+             __generic_Map_G___generic_List_VP  ->  __generic_Map_int___generic_List_intP */
+        node_t (*_resolve_seg) (c2m_ctx_t, const char **, int, const char **, node_t *,
+                                 pos_t) = NULL;
+        /* Local recursive lambda-via-goto-style helper as nested function not in C:
+           use a iterative stack-free approach inline per known template arity. */
         for (size_t _ti = 0; _ti < VARR_LENGTH (generic_tmpl_t, _gt); _ti++) {
           generic_tmpl_t *_t = &VARR_ADDR (generic_tmpl_t, _gt)[_ti];
           char _pfx[512];
           snprintf (_pfx, sizeof (_pfx), "__generic_%s_", _t->name);
           size_t _plen = strlen (_pfx);
           if (strncmp (s, _pfx, _plen) != 0) continue;
+
+          /* Parse exactly _t->n_type_params mangled args from the suffix. */
           node_t _resolved[4];
           int _nr = 0, _ok = 1;
           const char *_cur = s + _plen;
-          while (*_cur != '\0' && _ok) {
-            const char *_us = strchr (_cur, '_');
-            size_t _len = _us != NULL ? (size_t) (_us - _cur) : strlen (_cur);
-            /* A segment is a type-param name optionally followed by one "P"
-               per pointer level (T* -> "TP", T** -> "TPP").  Peel the trailing
-               'P's to recover the base param name and the pointer depth, then
-               re-wrap the resolved concrete arg in that many N_POINTERs so the
-               downstream re-mangle produces e.g. __generic_List_UserP.
-               (Assumes type-param names contain no '_' and do not end in 'P'.) */
-            size_t _base_len = _len;
+          while (_nr < _t->n_type_params && *_cur != '\0' && _ok) {
+            node_t _res = NULL;
             int _depth = 0;
-            while (_base_len > 0 && _cur[_base_len - 1] == 'P') { _depth++; _base_len--; }
-            int _pi = -1;
-            for (int _i = 0; _i < n_params; _i++)
-              if (params[_i] != NULL && strlen (params[_i]) == _base_len
-                  && strncmp (_cur, params[_i], _base_len) == 0) { _pi = _i; break; }
-            if (_pi < 0 || _nr >= 4) { _ok = 0; break; }
-            node_t _res = args[_pi];
-            for (int _d = 0; _d < _depth; _d++)
-              _res = new_pos_node1 (c2m_ctx, N_POINTER, POS (n), _res);
+
+            /* Nested generic placeholder as a single type arg. */
+            if (strncmp (_cur, "__generic_", 10) == 0) {
+              int _found_nested = 0;
+              for (size_t _ni = 0; _ni < VARR_LENGTH (generic_tmpl_t, _gt); _ni++) {
+                generic_tmpl_t *_nt = &VARR_ADDR (generic_tmpl_t, _gt)[_ni];
+                char _npfx[512];
+                snprintf (_npfx, sizeof (_npfx), "__generic_%s_", _nt->name);
+                size_t _nplen = strlen (_npfx);
+                if (strncmp (_cur, _npfx, _nplen) != 0) continue;
+                /* Parse nested args (simple segments only — one level of nesting is
+                   the common GroupBy / Select case). */
+                node_t _nres[4];
+                int _nn = 0, _nok = 1;
+                const char *_ncur = _cur + _nplen;
+                while (_nn < _nt->n_type_params && *_ncur != '\0' && _nok) {
+                  /* Nested type-args are simple segments.  Trailing 'P' on a
+                     segment that matches a type-param name are OUTER pointers on
+                     the nested generic (List_V* mangles as List_VP), not pointer
+                     type-args to List — GroupBy returns Map<G, List<V>*>. */
+                  if (strncmp (_ncur, "__generic_", 10) == 0) { _nok = 0; break; }
+                  const char *_nus = strchr (_ncur, '_');
+                  size_t _nlen = _nus != NULL ? (size_t) (_nus - _ncur) : strlen (_ncur);
+                  /* Prefer matching a type-param as a prefix of the segment;
+                     leftover trailing 'P's become outer pointer depth on the
+                     nested type as a whole (after all type-args are parsed). */
+                  int _npi = -1;
+                  size_t _nbase = 0;
+                  int _nouter_p = 0;
+                  for (int _i = 0; _i < n_params; _i++) {
+                    if (params[_i] == NULL) continue;
+                    size_t _plen = strlen (params[_i]);
+                    if (_plen == 0 || _plen > _nlen) continue;
+                    if (strncmp (_ncur, params[_i], _plen) != 0) continue;
+                    /* Rest of segment must be only 'P's (or empty). */
+                    int _rest_ok = 1;
+                    for (size_t _k = _plen; _k < _nlen; _k++)
+                      if (_ncur[_k] != 'P') { _rest_ok = 0; break; }
+                    if (!_rest_ok) continue;
+                    _npi = _i;
+                    _nbase = _plen;
+                    _nouter_p = (int) (_nlen - _plen);
+                    break;
+                  }
+                  if (_npi >= 0) {
+                    _nres[_nn++] = args[_npi];
+                    /* Only the LAST type-arg's trailing P's count as outer on
+                       the nested generic (e.g. List_VP).  Intermediate args keep
+                       them as pointer typeargs if ever multi-arg nested. */
+                    if (_nn == _nt->n_type_params) _depth += _nouter_p;
+                    else {
+                      node_t _r = args[_npi];
+                      for (int _d = 0; _d < _nouter_p; _d++)
+                        _r = new_pos_node1 (c2m_ctx, N_POINTER, POS (n), _r);
+                      _nres[_nn - 1] = _r;
+                    }
+                  } else {
+                    /* Concrete segment (int/String/…); peel trailing P's as ptr. */
+                    size_t _cbase = _nlen;
+                    int _cd = 0;
+                    while (_cbase > 0 && _ncur[_cbase - 1] == 'P') { _cd++; _cbase--; }
+                    char _seg[256];
+                    if (_cbase == 0 || _cbase >= sizeof (_seg)) { _nok = 0; break; }
+                    memcpy (_seg, _ncur, _cbase); _seg[_cbase] = '\0';
+                    node_t _id = build_id (c2m_ctx, _seg, POS (n));
+                    for (int _d = 0; _d < _cd; _d++)
+                      _id = new_pos_node1 (c2m_ctx, N_POINTER, POS (n), _id);
+                    _nres[_nn++] = _id;
+                  }
+                  _ncur = _nus != NULL ? _nus + 1 : _ncur + _nlen;
+                }
+                if (!_nok || _nn != _nt->n_type_params) continue;
+                /* Any further bare 'P' after nested name. */
+                while (*_ncur == 'P') { _depth++; _ncur++; }
+                const char *_nested_name
+                  = mangle_generic_name (c2m_ctx, _nt->name, _nn, _nres);
+                /* Materialize nested class (List_int). */
+                if (strcmp (_nt->name, orig_name) != 0) {
+                  generic_crossref_t _ncr;
+                  _ncr.ref_name = _nt->name;
+                  _ncr.n_args = _nn;
+                  for (int _ci = 0; _ci < _nn; _ci++) _ncr.args[_ci] = _nres[_ci];
+                  _ncr.pos = POS (n);
+                  VARR_PUSH (generic_crossref_t, generic_crossrefs, _ncr);
+                }
+                /* Rebuild as pointer-to-nested when mangled as List_VP. */
+                _res = build_id (c2m_ctx, _nested_name, POS (n));
+                for (int _d = 0; _d < _depth; _d++)
+                  _res = new_pos_node1 (c2m_ctx, N_POINTER, POS (n), _res);
+                _cur = _ncur;
+                if (*_cur == '_') _cur++;
+                _found_nested = 1;
+                break;
+              }
+              if (!_found_nested) { _ok = 0; break; }
+            } else {
+              /* Simple segment: type-param name + optional trailing P's. */
+              const char *_us = strchr (_cur, '_');
+              size_t _len = _us != NULL ? (size_t) (_us - _cur) : strlen (_cur);
+              size_t _base_len = _len;
+              _depth = 0;
+              while (_base_len > 0 && _cur[_base_len - 1] == 'P') { _depth++; _base_len--; }
+              int _pi = -1;
+              for (int _i = 0; _i < n_params; _i++)
+                if (params[_i] != NULL && strlen (params[_i]) == _base_len
+                    && strncmp (_cur, params[_i], _base_len) == 0) { _pi = _i; break; }
+              if (_pi < 0) {
+                /* Already-concrete (int/String/...) — rebuild as ID (+ pointers). */
+                char _seg[256];
+                if (_base_len == 0 || _base_len >= sizeof (_seg)) { _ok = 0; break; }
+                memcpy (_seg, _cur, _base_len); _seg[_base_len] = '\0';
+                _res = build_id (c2m_ctx, _seg, POS (n));
+                for (int _d = 0; _d < _depth; _d++)
+                  _res = new_pos_node1 (c2m_ctx, N_POINTER, POS (n), _res);
+              } else {
+                _res = args[_pi];
+                for (int _d = 0; _d < _depth; _d++)
+                  _res = new_pos_node1 (c2m_ctx, N_POINTER, POS (n), _res);
+              }
+              _cur = _us != NULL ? _us + 1 : _cur + _len;
+            }
+            if (_res == NULL || _nr >= 4) { _ok = 0; break; }
             _resolved[_nr++] = _res;
-            _cur = _us != NULL ? _us + 1 : _cur + _len;
           }
-          if (_ok && _nr > 0) {
+          if (_ok && _nr == _t->n_type_params) {
             const char *_new = mangle_generic_name (c2m_ctx, _t->name, _nr, _resolved);
             if (strcmp (_t->name, orig_name) != 0) {
               /* Cross-reference to a different generic class: record for
@@ -5102,6 +5220,9 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
             }
             return build_id (c2m_ctx, _new, POS (n));
           }
+          /* Prefix matched but arity/args failed — try next template with same
+             prefix length rare; continue scan. */
+          (void)_resolve_seg;
         }
       }
     }
@@ -5432,6 +5553,13 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
     if (strcmp (VARR_GET (generic_spec_t, generic_specs, i).spec_name, spec_name) == 0)
       return build_id (c2m_ctx, spec_name, pos);
   }
+  if (generic_in_progress != NULL) {
+    for (size_t i = 0; i < VARR_LENGTH (cstr_t, generic_in_progress); i++) {
+      cstr_t ip = VARR_GET (cstr_t, generic_in_progress, i);
+      if (ip && strcmp(ip, spec_name)==0) return build_id(c2m_ctx, spec_name, pos);
+    }
+  }
+  VARR_PUSH (cstr_t, generic_in_progress, spec_name);
 
   /* Deep-copy the template with type substitution */
   size_t _xref_mark = VARR_LENGTH (generic_crossref_t, generic_crossrefs);
@@ -5440,6 +5568,8 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
                                         tmpl->n_type_params, tmpl->type_params, args);
   if (spec_class == NULL) {
     error (c2m_ctx, pos, "cannot instantiate generic class '%s'", base_name);
+    if (generic_in_progress != NULL && VARR_LENGTH (cstr_t, generic_in_progress) > 0)
+      VARR_TRUNC (cstr_t, generic_in_progress, VARR_LENGTH (cstr_t, generic_in_progress)-1);
     return build_id (c2m_ctx, base_name, pos);
   }
 
@@ -5490,6 +5620,9 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
 
   /* Inject before the containing top-level item */
   VARR_PUSH (node_t, pending_lambdas, spec_class);
+
+  if (generic_in_progress != NULL && VARR_LENGTH (cstr_t, generic_in_progress) > 0)
+    VARR_TRUNC (cstr_t, generic_in_progress, VARR_LENGTH (cstr_t, generic_in_progress)-1);
 
   return build_id (c2m_ctx, spec_name, pos);
 }
@@ -5639,25 +5772,36 @@ static node_t get_or_create_generic_fn_specialization (c2m_ctx_t c2m_ctx,
      also renames the function name (orig_name -> spec_name) and any
      __ctor_/__dtor_ references (none for a free function).  The function name
      N_ID inside the declarator matches orig_name and is rewritten to spec_name. */
-  node_t spec_fn = specialize_node (c2m_ctx, tmpl->func_node,
-                                    base_name, spec_name,
-                                    tmpl->n_type_params, tmpl->type_params, args);
-  if (spec_fn == NULL) {
-    error (c2m_ctx, pos, "cannot instantiate generic function '%s'", base_name);
-    return build_id (c2m_ctx, base_name, pos);
+  {
+    size_t _xref_mark = VARR_LENGTH (generic_crossref_t, generic_crossrefs);
+    node_t spec_fn = specialize_node (c2m_ctx, tmpl->func_node,
+                                      base_name, spec_name,
+                                      tmpl->n_type_params, tmpl->type_params, args);
+    if (spec_fn == NULL) {
+      error (c2m_ctx, pos, "cannot instantiate generic function '%s'", base_name);
+      return build_id (c2m_ctx, base_name, pos);
+    }
+    /* Nested generic types in the free-fn body (e.g. Map<G, List<T>*> inside
+       ListGroupBy) leave crossrefs that must materialise before the specialized
+       function is type-checked.  Same drain as generic method specialization. */
+    while (VARR_LENGTH (generic_crossref_t, generic_crossrefs) > _xref_mark) {
+      generic_crossref_t _cr = VARR_POP (generic_crossref_t, generic_crossrefs);
+      (void) get_or_create_specialization (c2m_ctx, _cr.ref_name, _cr.n_args, _cr.args,
+                                           _cr.pos);
+    }
+
+    /* Record in specialization cache */
+    generic_fn_spec_t gs;
+    gs.orig_name = base_name;
+    gs.spec_name = spec_name;
+    VARR_PUSH (generic_fn_spec_t, generic_fn_specs, gs);
+
+    /* Inject before the containing top-level item (materialized by the caller
+       via materialize_pending_specs, which calls check_lambda_func_def on it). */
+    VARR_PUSH (node_t, pending_lambdas, spec_fn);
+
+    return build_id (c2m_ctx, spec_name, pos);
   }
-
-  /* Record in specialization cache */
-  generic_fn_spec_t gs;
-  gs.orig_name = base_name;
-  gs.spec_name = spec_name;
-  VARR_PUSH (generic_fn_spec_t, generic_fn_specs, gs);
-
-  /* Inject before the containing top-level item (materialized by the caller
-     via materialize_pending_specs, which calls check_lambda_func_def on it). */
-  VARR_PUSH (node_t, pending_lambdas, spec_fn);
-
-  return build_id (c2m_ctx, spec_name, pos);
 }
 
 /* Look up a registered generic method template for class.method. */
@@ -9446,6 +9590,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (generic_fn_spec_t, generic_fn_specs, alloc, 8);
   VARR_CREATE (generic_method_tmpl_t, generic_method_templates, alloc, 4);
   VARR_CREATE (generic_method_spec_t, generic_method_specs, alloc, 8);
+  VARR_CREATE (cstr_t, generic_in_progress, alloc, 8);
   n_method_type_params = 0;
   for (int i = 0; i < 4; i++) method_type_params[i] = NULL;
   builtin_methods_init (alloc);
@@ -9619,6 +9764,8 @@ static void parse_finish (c2m_ctx_t c2m_ctx) {
       VARR_DESTROY (generic_method_tmpl_t, generic_method_templates);
     if (generic_method_specs != NULL)
       VARR_DESTROY (generic_method_spec_t, generic_method_specs);
+    if (generic_in_progress != NULL)
+      VARR_DESTROY (cstr_t, generic_in_progress);
   }
   builtin_methods_finish ();
   finish_streams (c2m_ctx);
@@ -14441,14 +14588,20 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
     static struct expr *create_expr (c2m_ctx_t c2m_ctx, node_t r) {
       struct expr *e = reg_malloc (c2m_ctx, sizeof (struct expr));
 
+      /* reg_malloc is not zero-fill: any field we do not set here is garbage.
+         def_node especially must be NULL — gen N_IND treats a non-NULL def_node
+         as a stashed Get() method for class subscript sugar, so an uninit pointer
+         can crash later when indexing a T* (e.g. List<Point>::data[i]). */
       r->attr = e;
       e->type = create_type (c2m_ctx, NULL);
       e->type2 = NULL;
       e->type->pos_node = r;
       e->u.lvalue_node = NULL;
+      e->def_node = NULL;
       e->const_p = e->const_addr_p = e->builtin_call_p = FALSE;
       e->bind_p = e->lenient_p = FALSE;
       e->own_deref_class = DEREF_GUARD_DEFAULT;
+      e->c.i_val = 0;
       return e;
     }
 
@@ -17400,31 +17553,164 @@ if (base != NULL && base->code == N_ID) {
               for (; tp != NULL && ca != NULL; tp = NL_NEXT (tp), ca = NL_NEXT (ca)) {
                 /* Resolve the parameter's declared type-spec node: for N_SPEC_DECL
                    it's the (shared) spec list at op 0; for N_TYPE it's the type
-                   list at op 0.  We only handle the bare-T case: a single N_ID
-                   child that names one of the template's type parameters. */
+                   list at op 0. */
                 node_t specs = NULL;
-                if (tp->code == N_SPEC_DECL) specs = NL_HEAD (tp->u.ops);
-                else if (tp->code == N_TYPE) specs = NL_HEAD (tp->u.ops);
+                node_t tdeclr = NULL;
+                if (tp->code == N_SPEC_DECL) {
+                  specs = NL_HEAD (tp->u.ops);
+                  tdeclr = NL_EL (tp->u.ops, 1);
+                } else if (tp->code == N_TYPE) {
+                  specs = NL_HEAD (tp->u.ops);
+                  tdeclr = NL_EL (tp->u.ops, 1);
+                }
                 if (specs == NULL) continue;
                 /* Unwrap N_SHARE. */
                 if (specs->code == N_SHARE) specs = NL_HEAD (specs->u.ops);
                 if (specs->code != N_LIST) continue;
                 node_t only = NL_HEAD (specs->u.ops);
                 if (only == NULL || only->code != N_ID || NL_NEXT (only) != NULL) continue;
+
+                /* Function-pointer params `G(*fn)(T)` have return type G in the
+                   specs — do NOT bind G to the argument expression type (the fn
+                   pointer itself).  Infer G from the *return type* of the call
+                   argument if it is a function/func-ptr. */
+                int has_func_decl = 0;
+                if (tdeclr != NULL && tdeclr->code == N_DECL) {
+                  node_t dlist = DECL_LIST (tdeclr);
+                  for (node_t d = (dlist != NULL) ? NL_HEAD (dlist->u.ops) : NULL;
+                       d != NULL; d = NL_NEXT (d))
+                    if (d->code == N_FUNC || d->code == N_POINTER) {
+                      /* Pointer-to-function usually has N_POINTER then N_FUNC. */
+                      if (d->code == N_FUNC) has_func_decl = 1;
+                      if (d->code == N_POINTER) {
+                        /* Look deeper for N_FUNC. */
+                        for (node_t d2 = d; d2 != NULL;) {
+                          if (d2->code == N_FUNC) { has_func_decl = 1; break; }
+                          if (d2->code == N_POINTER || d2->code == N_LIST)
+                            d2 = NL_HEAD (d2->u.ops);
+                          else break;
+                        }
+                      }
+                      if (has_func_decl) break;
+                    }
+                  /* Also walk whole decoration list. */
+                  if (!has_func_decl && dlist != NULL)
+                    for (node_t d = NL_HEAD (dlist->u.ops); d != NULL; d = NL_NEXT (d))
+                      if (d->code == N_FUNC) { has_func_decl = 1; break; }
+                }
+
                 /* Is this N_ID one of the template's type parameters? */
                 int pi = -1;
                 for (int i = 0; i < gtmpl->n_type_params; i++)
                   if (gtmpl->type_params[i] != NULL
                       && strcmp (only->u.s.s, gtmpl->type_params[i]) == 0) { pi = i; break; }
-                if (pi < 0) continue;
-                /* Already inferred this parameter from an earlier arg? Keep
-                   the first binding (later args must be compatible, checked
-                   by the normal assignment-type check after rewrite). */
-                if (inferred[pi] != NULL) continue;
+
                 struct expr *ae = ca->attr;
-                if (ae == NULL || ae->type == NULL) { infer_ok = 0; break; }
+                if (ae == NULL || ae->type == NULL) continue;
+
+                if (has_func_decl && pi >= 0 && inferred[pi] == NULL) {
+                  /* Infer return-type type-param from fn arg return type. */
+                  struct type *ft = ae->type;
+                  while (ft != NULL && ft->mode == TM_PTR) ft = ft->u.ptr_type;
+                  if (ft != NULL && ft->mode == TM_FUNC && ft->u.func_type != NULL
+                      && ft->u.func_type->ret_type != NULL) {
+                    node_t targ = build_seq_type_arg (c2m_ctx, ft->u.func_type->ret_type,
+                                                      POS (op1));
+                    if (targ != NULL) {
+                      inferred[pi] = targ;
+                      if (pi + 1 > n_inferred) n_inferred = pi + 1;
+                    }
+                  }
+                  continue; /* don't also try bare-arg binding */
+                }
+
+                if (pi < 0) {
+                  /* Spec is a class id like __generic_List_T — extract T from the
+                     call arg if it is List_concrete (or pointer-to). */
+                  const char *spec_nm = only->u.s.s;
+                  if (spec_nm != NULL && strncmp (spec_nm, "__generic_", 10) == 0) {
+                    struct type *at = ae->type;
+                    while (at != NULL && at->mode == TM_PTR) at = at->u.ptr_type;
+                    if (at != NULL && at->mode == TM_CLASS && at->u.tag_type != NULL) {
+                      node_t tid = TAG_ID (at->u.tag_type);
+                      const char *an = (tid != NULL && tid->code == N_ID) ? tid->u.s.s : NULL;
+                      /* Match __generic_List_<Arg> against template List_T. */
+                      if (an != NULL && strncmp (an, "__generic_", 10) == 0) {
+                        /* Find shared class base and map remaining segments to type params. */
+                        for (size_t _gi = 0;
+                             parse_ctx != NULL && generic_templates != NULL
+                             && _gi < VARR_LENGTH (generic_tmpl_t, generic_templates); _gi++) {
+                          generic_tmpl_t *_gt = &VARR_ADDR (generic_tmpl_t, generic_templates)[_gi];
+                          char _pfx[256];
+                          snprintf (_pfx, sizeof (_pfx), "__generic_%s_", _gt->name);
+                          size_t _pl = strlen (_pfx);
+                          if (strncmp (spec_nm, _pfx, _pl) != 0) continue;
+                          if (strncmp (an, _pfx, _pl) != 0) continue;
+                          /* Template open: remaining param names (T, …).
+                             Concrete: remaining mangled args (int, …). */
+                          const char *_open = spec_nm + _pl;
+                          const char *_conc = an + _pl;
+                          /* Simple single-param case (List_T / List_int). */
+                          if (_gt->n_type_params == 1) {
+                            int _tpi = -1;
+                            for (int i = 0; i < gtmpl->n_type_params; i++)
+                              if (gtmpl->type_params[i]
+                                  && strcmp (gtmpl->type_params[i], _open) == 0)
+                                { _tpi = i; break; }
+                            /* Also List_TP (pointer element) — strip trailing P. */
+                            if (_tpi < 0) {
+                              size_t _ol = strlen (_open);
+                              while (_ol > 0 && _open[_ol - 1] == 'P') _ol--;
+                              char _opn[64];
+                              if (_ol > 0 && _ol < sizeof (_opn)) {
+                                memcpy (_opn, _open, _ol); _opn[_ol] = '\0';
+                                for (int i = 0; i < gtmpl->n_type_params; i++)
+                                  if (gtmpl->type_params[i]
+                                      && strcmp (gtmpl->type_params[i], _opn) == 0)
+                                    { _tpi = i; break; }
+                              }
+                            }
+                            if (_tpi >= 0 && inferred[_tpi] == NULL) {
+                              /* Concrete arg segment (may include trailing P). */
+                              size_t _cl = strlen (_conc);
+                              while (_cl > 0 && _conc[_cl - 1] == 'P') _cl--;
+                              char _cn[64];
+                              if (_cl > 0 && _cl < sizeof (_cn)) {
+                                memcpy (_cn, _conc, _cl); _cn[_cl] = '\0';
+                                node_t _tn = NULL;
+                                if (strcmp (_cn, "int") == 0)
+                                  _tn = new_pos_node (c2m_ctx, N_INT, POS (op1));
+                                else if (strcmp (_cn, "String") == 0)
+                                  _tn = new_pos_node (c2m_ctx, N_STRING, POS (op1));
+                                else if (strcmp (_cn, "double") == 0)
+                                  _tn = new_pos_node (c2m_ctx, N_DOUBLE, POS (op1));
+                                else if (strcmp (_cn, "long") == 0)
+                                  _tn = new_pos_node (c2m_ctx, N_LONG, POS (op1));
+                                else if (strcmp (_cn, "bool") == 0)
+                                  _tn = new_pos_node (c2m_ctx, N_BOOL, POS (op1));
+                                else
+                                  _tn = build_id (c2m_ctx, _cn, POS (op1));
+                                if (_tn != NULL) {
+                                  inferred[_tpi] = _tn;
+                                  if (_tpi + 1 > n_inferred) n_inferred = _tpi + 1;
+                                }
+                              }
+                            }
+                          }
+                          break;
+                        }
+                      }
+                    }
+                  }
+                  continue;
+                }
+
+                /* Bare type-param param (T x): bind from arg type. Skip function
+                   pointers (handled above). */
+                if (has_func_decl) continue;
+                if (inferred[pi] != NULL) continue;
                 node_t targ = build_seq_type_arg (c2m_ctx, ae->type, POS (op1));
-                if (targ == NULL) { infer_ok = 0; break; }
+                if (targ == NULL) continue;
                 inferred[pi] = targ;
                 if (pi + 1 > n_inferred) n_inferred = pi + 1;
               }
@@ -24922,10 +25208,18 @@ static op_t gen_class_method_call_dest (c2m_ctx_t c2m_ctx, node_t func_def,
                                         struct type *this_type MIR_UNUSED, op_t this_op,
                                         op_t *args, int n_args, op_t *agg_dest) {
   MIR_context_t ctx = c2m_ctx->ctx;
-  decl_t mdecl = func_def->attr;
-  struct func_type *ft = mdecl->decl_spec.type->u.func_type;
-  MIR_item_t proto = gen_func_proto_item (c2m_ctx, ft);
+  decl_t mdecl;
+  struct func_type *ft;
+  MIR_item_t proto;
   op_t all_args[GEN_METHOD_MAX_ARGS + 1];
+
+  assert (func_def != NULL && func_def->code == N_FUNC_DEF);
+  mdecl = func_def->attr;
+  assert (mdecl != NULL && mdecl->decl_spec.type != NULL
+          && mdecl->decl_spec.type->mode == TM_FUNC);
+  ft = mdecl->decl_spec.type->u.func_type;
+  assert (ft != NULL);
+  proto = gen_func_proto_item (c2m_ctx, ft);
 
   assert (n_args <= GEN_METHOD_MAX_ARGS);
   /* One null check on the receiver at the call site.  Method bodies treat
@@ -25811,9 +26105,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       struct type *this_type
         = arr_type->mode == TM_PTR ? arr_type : create_ptr_type (c2m_ctx, cls_type);
       node_t get_def = ((struct expr *) r->attr)->def_node;
+      /* Only trust a stashed protocol method if it really is one — a stale/garbage
+         def_node (historically from uninit create_expr) must not hijack T* indexing. */
+      if (get_def != NULL
+          && (get_def->code != N_FUNC_DEF || get_def->attr == NULL
+              || ((decl_t) get_def->attr)->decl_spec.type == NULL
+              || ((decl_t) get_def->attr)->decl_spec.type->mode != TM_FUNC))
+        get_def = NULL;
       if (get_def == NULL)
         get_def = find_class_protocol_method (c2m_ctx, cls_type->u.tag_type, "Get", 1, POS (r));
-      assert (get_def != NULL);
+      if (get_def == NULL) {
+        /* Fall through to raw pointer/array indexing (T* / class-by-value buffer). */
+      } else {
       /* Evaluate the receiver (this pointer) */
       op_t this_op;
       if (arr_type->mode == TM_PTR) {
@@ -25832,6 +26135,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       /* Call: result = this->Get(index) */
       res = gen_class_method_call (c2m_ctx, get_def, this_type, this_op, &idx_op, 1);
       break;
+      }
     }
     if (arr_type->mode == TM_SLICE) {
       /* slice[i]: element memory at slice_ptr + SLICE_HDR_SIZE + i*el_size */

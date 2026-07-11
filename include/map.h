@@ -63,6 +63,7 @@
 #define CLASSYC_MAP_H
 
 #include <stdlib.h>
+#include <stdio.h>   /* snprintf for int-key ToDict */
 #include <string.h>
 #include <stdint.h>
 #include "list.h"   /* List<T> for Keys()/Values(); shared dict_* declarations
@@ -110,6 +111,22 @@ static inline int map_eq_strkey(const void* a, const void* b, size_t n) {
 /* Content-aware hash / equality for a key of any specialization type. */
 #define MAP_HASH(k)   (_Generic((k), String: map_hash_strkey, default: map_hash_bytes)(&(k), sizeof(k)))
 #define MAP_EQ(a, b)  (_Generic((a), String: map_eq_strkey,   default: map_eq_bytes)(&(a), &(b), sizeof(a)))
+
+/* ───────── Grouping<K,V>: key + bucket (result of GroupBy) ────────── */
+class Grouping<K, V> {
+    K key;
+    List<V>* items;
+    Grouping(K k) {
+        this->key = k;
+        this->items = new List<V>();
+    }
+    ~Grouping() {
+        if (this->items) delete this->items;
+    }
+    K Key() { return this->key; }
+    List<V>* Values() { return this->items; }
+    int Count() { return this->items->Count(); }
+};
 
 /* ───────────────────────────── Map<K, V> ───────────────────────────── */
 
@@ -394,6 +411,30 @@ class Map<K, V> {
         for (int i = 0; i < this->table_cap; i++) this->table[i] = -1;
     }
 
+    /* ───────────────────── Accessors (extended) ───────────────────── */
+    V GetOrAdd(K key, V fallback) __attribute__((da_ignore)) {
+        int idx = this->find_index(key);
+        if (idx >= 0) return this->vals[idx];
+        this->Set(key, fallback);
+        return fallback;
+    }
+    bool ContainsValue(V val) const __attribute__((da_ignore)) {
+        for (int i = 0; i < this->count; i++)
+            if (this->vals[i] == val) return true;
+        return false;
+    }
+    int AddOrUpdate(K key, V val, V(*updater)(V)) __attribute__((da_ignore)) {
+        int idx = this->find_index(key);
+        if (idx >= 0) {
+            V updated = updater(this->vals[idx]);
+            this->destroy_val_at(idx);
+            this->vals[idx] = updated;
+            return 0;
+        }
+        this->Set(key, val);
+        return 1;
+    }
+
     /* ───────────────────── Bulk / functional ───────────────────── */
 
     /* Copy all entries of `other` into this map (overwriting on key clash).
@@ -410,6 +451,64 @@ class Map<K, V> {
         for (int i = 0; i < this->count; i++)
             r->Set(this->keys[i], this->vals[i]);
         return r;
+    }
+
+    /* ── Higher-order: Where / Any / All ─── */
+    Map<K, V>* Where(int(*pred)(K, V)) const __attribute__((da_ignore)) {
+        Map<K, V>* r = new Map<K, V>(this->count > 0 ? this->count : 4);
+        for (int i = 0; i < this->count; i++)
+            if (pred(this->keys[i], this->vals[i]))
+                r->Set(this->keys[i], this->vals[i]);
+        return r;
+    }
+    Map<K, V>* WhereKeys(int(*pred)(K)) const __attribute__((da_ignore)) {
+        Map<K, V>* r = new Map<K, V>(this->count > 0 ? this->count : 4);
+        for (int i = 0; i < this->count; i++)
+            if (pred(this->keys[i]))
+                r->Set(this->keys[i], this->vals[i]);
+        return r;
+    }
+    Map<K, V>* WhereValues(int(*pred)(V)) const __attribute__((da_ignore)) {
+        Map<K, V>* r = new Map<K, V>(this->count > 0 ? this->count : 4);
+        for (int i = 0; i < this->count; i++)
+            if (pred(this->vals[i]))
+                r->Set(this->keys[i], this->vals[i]);
+        return r;
+    }
+    int Any(int(*pred)(K, V)) const __attribute__((da_ignore)) {
+        for (int i = 0; i < this->count; i++)
+            if (pred(this->keys[i], this->vals[i])) return 1;
+        return 0;
+    }
+    int All(int(*pred)(K, V)) const __attribute__((da_ignore)) {
+        for (int i = 0; i < this->count; i++)
+            if (!pred(this->keys[i], this->vals[i])) return 0;
+        return 1;
+    }
+    Map<K, W>* SelectValues<W>(W(*fn)(K, V)) const __attribute__((da_ignore)) {
+        Map<K, W>* r = new Map<K, W>(this->count > 0 ? this->count : 4);
+        for (int i = 0; i < this->count; i++)
+            r->Set(this->keys[i], fn(this->keys[i], this->vals[i]));
+        return r;
+    }
+    Map<G, V>* SelectKeys<G>(G(*fn)(K, V)) const __attribute__((da_ignore)) {
+        Map<G, V>* r = new Map<G, V>(this->count > 0 ? this->count : 4);
+        for (int i = 0; i < this->count; i++)
+            r->Set(fn(this->keys[i], this->vals[i]), this->vals[i]);
+        return r;
+    }
+    Map<G, List<V>*>* GroupBy<G>(G(*keySelector)(K, V)) const __attribute__((da_ignore)) {
+        Map<G, List<V>*>* result = new Map<G, List<V>*>();
+        for (int i = 0; i < this->count; i++) {
+            G gk = keySelector(this->keys[i], this->vals[i]);
+            List<V>* bucket;
+            if (!result->TryGet(gk, &bucket)) {
+                bucket = new List<V>();
+                result->Set(gk, bucket);
+            }
+            bucket->Add(this->vals[i]);
+        }
+        return result;
     }
 
     /* Call action(key, value) for each entry, in insertion order. */
@@ -444,16 +543,14 @@ class Map<K, V> {
      *
      *   dict cfg = settings->ToDict();   // {"limit":10,"name":"prod"}
      */
-    dict ToDict() const {
+    dict ToDict() const __attribute__((da_ignore)) {
         dict obj = dict_create_object();
-        /* JSON objects only accept string keys.  nameof<K>() is compile-time;
-         * non-String maps must not cast keys to char* (was a hard segfault). */
         const char* kt = nameof<K>();
         int k_is_str = (strcmp(kt, "String") == 0 || strcmp(kt, "char") == 0);
-        if (!k_is_str) {
-            /* Empty object: safer than UB. Prefer Keys()/Values() for non-String K. */
-            return obj;
-        }
+        int k_is_int = (strcmp(kt, "int") == 0 || strcmp(kt, "short") == 0
+                       || strcmp(kt, "long") == 0 || strcmp(kt, "unsigned") == 0
+                       || strcmp(kt, "bool") == 0);
+        if (!k_is_str && !k_is_int) return obj;
         const char* vt = nameof<V>();
         for (int i = 0; i < this->count; i++) {
             V* p = &this->vals[i];
@@ -475,7 +572,19 @@ class Map<K, V> {
                 dv = *(dict*)p;
             else
                 dv = dict_create_null();
-            dict_object_set(obj, *(char**)&this->keys[i], dv);
+            const char* kstr;
+            char keybuf[64];
+            if (k_is_str) {
+                kstr = *(char**)&this->keys[i];
+            } else {
+                long kv = 0;
+                if (strcmp(kt, "long") == 0) kv = *(long*)&this->keys[i];
+                else if (strcmp(kt, "short") == 0) kv = (long)*(short*)&this->keys[i];
+                else kv = (long)*(int*)&this->keys[i];
+                snprintf(keybuf, sizeof(keybuf), "%ld", kv);
+                kstr = keybuf;
+            }
+            dict_object_set(obj, (char*)kstr, dv);
         }
         return obj;
     }
@@ -497,5 +606,28 @@ class Map<K, V> {
     String to_string() const { return this->ToJson(); }
 
 };
+
+/* List.GroupBy as a free generic function.
+ * list.h cannot return Map from a method without #including map.h (cycle:
+ * map.h already includes list.h for Keys/Values).  Until UFCS, call:
+ *   Map<int, List<int>*>* g = ListGroupBy(nums, parity);  // T,G inferred
+ *   defer delete g->ownsValues();
+ */
+Map<G, List<T>*>* ListGroupBy<T, G>(List<T>* self, G(*keySelector)(T))
+    __attribute__((da_ignore)) {
+    Map<G, List<T>*>* result = new Map<G, List<T>*>();
+    if (!self) return result;
+    for (int i = 0; i < self->Count(); i++) {
+        T item = self->Get(i);
+        G gk = keySelector(item);
+        List<T>* bucket;
+        if (!result->TryGet(gk, &bucket)) {
+            bucket = new List<T>();
+            result->Set(gk, bucket);
+        }
+        bucket->Add(item);
+    }
+    return result;
+}
 
 #endif /* CLASSYC_MAP_H */

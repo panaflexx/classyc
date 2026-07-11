@@ -371,7 +371,9 @@ class List<T> {
         return result;
     }
 
-
+    /* NOTE: GroupBy for List lives as free ListGroupBy<T,G> in map.h — list.h
+     * cannot #include map.h (map includes list). Prefer Map.GroupBy when the
+     * source is already a map; use ListGroupBy for lists until UFCS arrives. */
 
     int Any(int(*pred)(T)) __attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++)
@@ -404,6 +406,37 @@ class List<T> {
         List<T>* r = new List<T>(count > 0 ? count : 4);
         for (int i = 0; i < count; i++) r->Add(item);
         return r;
+    }
+    static List<T>* Range(int start, int count) __attribute__((da_ignore)) {
+        if (count < 0) throw(OutOfBoundsException, "List.Range count < 0");
+        const char* tn = nameof<T>();
+        if (strcmp(tn, "int") != 0 && strcmp(tn, "short") != 0 && strcmp(tn, "long") != 0
+                && strcmp(tn, "unsigned") != 0 && strcmp(tn, "bool") != 0) {
+            throw(RuntimeException, "List.Range requires integral T");
+        }
+        List<T>* r = new List<T>(count > 0 ? count : 4);
+        for (int i = 0; i < count; i++) {
+            int v = start + i;
+            r->Add(*(T*)&v);
+        }
+        return r;
+    }
+
+    List<T>* Take(int count) __attribute__((da_ignore)) {
+        if (count < 0) count = 0;
+        if (count > this->length) count = this->length;
+        List<T>* result = new List<T>(count > 0 ? count : 4);
+        for (int i = 0; i < count; i++) result->Add(Get(i));
+        return result;
+    }
+
+    List<T>* Skip(int count) __attribute__((da_ignore)) {
+        if (count < 0) count = 0;
+        if (count >= this->length) return new List<T>(4);
+        int remaining = this->length - count;
+        List<T>* result = new List<T>(remaining);
+        for (int i = count; i < this->length; i++) result->Add(Get(i));
+        return result;
     }
 
     dict ToArrayDict() __attribute__((da_ignore)) {
