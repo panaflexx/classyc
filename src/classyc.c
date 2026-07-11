@@ -19061,13 +19061,14 @@ if (base != NULL && base->code == N_ID) {
       }
     }
     /* auto type inference:  `auto x = init;` with no explicit type specifier.
-       The declared type is taken from the initializer:
-         - a scalar initializer yields its (decayed) expression type;
-         - a brace initializer is disambiguated syntactically:
-             * keyless list  `auto a = {1, 2, 3};`           -> array (int[3])
-             * keyed   list  `auto d = {"k": v, ...};`        -> dict
-           (the keyed/keyless distinction leaves room for future generic
-            container forms such as  `List<int> x = {1, 2, 3};`.) */
+           The declared type is taken from the initializer:
+             - a scalar initializer yields its (decayed) expression type;
+             - ClassName(args) / List<T>()  -> stack class value (RAII ctor/dtor);
+             - a brace initializer is disambiguated syntactically:
+                 * keyless list  `auto a = {1, 2, 3};`           -> array (int[3])
+                 * keyed   list  `auto d = {"k": v, ...};`        -> dict
+               (the keyed/keyless distinction leaves room for future generic
+                container forms such as  `List<int> x = {1, 2, 3};`.) */
     if (decl_spec.auto_p && !specs_have_type_spec_p (specs)
         && declarator->code != N_IGNORE && initializer != NULL
         && initializer->code != N_IGNORE) {
@@ -19111,6 +19112,40 @@ if (base != NULL && base->code == N_ID) {
           decl_spec.type = it;
         }
       } else {
+            /* Class-value construction as initializer:
+                 auto p = Point(1, 2);
+                 auto xs = List<int>();
+                 auto m = Map<String,int>(16);
+               The call is NOT a free-function call: the callee is a class type
+               name (or mangled generic specialization `__generic_List_int`).
+               Infer the class type here and leave the initializer as N_CALL so
+               create_decl's RAII path lowers it to an in-place `var.__ctor_T(args)`
+               and registers `~T` at scope exit — the same path as
+               `List<int> xs = List<int>();` (typed form already works).
+
+               Checking the call as a normal expression would fail with
+               "called object is not a function", so resolve the class tag
+               without type-checking the N_CALL itself. */
+            node_t ctor_callee
+              = (initializer->code == N_CALL) ? NL_HEAD (initializer->u.ops) : NULL;
+            node_t class_def = NULL;
+            if (ctor_callee != NULL && ctor_callee->code == N_ID) {
+              class_def = find_def (c2m_ctx, S_REGULAR, ctor_callee,
+                                    skip_struct_scopes (curr_scope), NULL);
+              if (class_def == NULL)
+                class_def = find_def (c2m_ctx, S_TAG, ctor_callee,
+                                      skip_struct_scopes (curr_scope), NULL);
+            }
+            if (class_def != NULL && class_def->code == N_CLASS) {
+              struct type *it = create_type (c2m_ctx, NULL);
+              it->mode = TM_CLASS;
+              it->u.tag_type = class_def;
+              it->pos_node = r;
+              set_class_layout (c2m_ctx, class_def, it);
+              set_type_layout (c2m_ctx, it);
+              decl_spec.type = it;
+              /* initializer stays N_CALL → create_decl ctor_init_p path */
+            } else {
               check (c2m_ctx, initializer, r);
               struct expr *ie = initializer->attr;
               if (ie != NULL && ie->type != NULL && ie->type->mode != TM_UNDEF) {
@@ -19130,7 +19165,8 @@ if (base != NULL && base->code == N_ID) {
                 decl_spec.type = it;
               }
             }
-    }
+          }
+  }
     /* classyc extension: minimal VLA support.
        Lower a local declaration `T name[expr];` whose size expression is
        a non-const integer into `T *name = alloca(sizeof(*name) * (expr));`.

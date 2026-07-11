@@ -328,11 +328,31 @@ no by-value return) reusing the existing RAII ctor/dtor machinery:
 
 ```c
 Point p = Point(1, 2);        // ✅ ctor runs in place; ~Point() at scope exit
+auto q = Point(3, 4);         // ✅ same path via auto (class-name call)
 Point* h = new Point(1, 2);   // ✅ heap (unchanged)
 ```
 
-`auto x = List<int>();` (a generic instance as a *value* expression) is still
-constructed with `new`.
+Generic collections can live on the stack the same way — the object owns its
+heap **buffer**, and `~List` / `~Map` / `~Set` run at scope exit:
+
+```c
+List<int> a;                  // ✅ default ctor + RAII dtor
+List<int> b = List<int>();    // ✅ typed value construct
+auto c = List<int>();         // ✅ auto + List<T>() value construct
+auto d = List<int>(16);       // ✅ capacity ctor
+auto m = Map<String, int>();  // ✅ same for Map/Set
+
+// Heap form still available when you need a pointer / owned binding:
+owned auto h = new List<int>();
+```
+
+Methods use the same `this` pointer whether the receiver is a stack value
+(`.` auto-deref) or a heap pointer. Transform methods (`Where`, `Copy`, …)
+still return **new heap** lists the caller must `delete` / `owned`.
+
+**Caveat:** assignment between two stack Lists is still a shallow field copy
+of the buffer pointer (no deep copy / move protocol yet). Prefer a single
+owner, or explicit `Copy()` into a heap list.
 
 ### Element destruction in `Set<T>` and `Map<K, V>` (done)
 
@@ -360,11 +380,10 @@ For pointer elements the collection still owns only the pointers, not the
 pointed-to objects. Covered by `cy-validate/val-015-collection-byval-dtor.cy`
 (`Set<Tag>`, `Map<int, Item>` values, and `Map<Key, int>` keys).
 
-Note there is no *stack* form of a generic collection to clean up at scope exit:
-`List`/`Set`/`Map` are reference types instantiated only with `new` (a bare
-`Map<K, V> m = ...` value expression does not parse), so ownership cleanup always
-runs through the heap `delete` path. (Plain non-generic classes *do* support
-stack value-construction with `~T()` at scope exit — see above.)
+Stack forms of generic collections now exist (see “Value-construction syntax”):
+`List<T> xs;` / `auto xs = List<T>();` run `~List` at scope exit. The heap form
+`new List<T>()` / `owned auto` remains valid for pointer identity and longer-lived
+ownership. Transform results (`Where`/`Copy`/…) stay heap-allocated.
 
 ---
 

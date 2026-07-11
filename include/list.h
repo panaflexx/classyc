@@ -11,9 +11,15 @@
  *
  * Usage:
  *   #include "list.h"
- *   List<int>* nums = new List<int>();
- *   nums->Add(42);
- *   defer delete nums;
+ *
+ *   // Stack / value form (preferred locals — ~List runs at scope exit):
+ *   auto nums = List<int>();
+ *   // or:  List<int> nums;   List<int> nums = List<int>();
+ *   nums.Add(42);
+ *
+ *   // Heap form when you need a pointer / owned binding:
+ *   owned auto heap = new List<int>();
+ *   heap.Add(42);
  *
  *   // from a C array, explicit array-view constructor:
  *   String arr[3] = {"a", "b", "c"};
@@ -23,17 +29,18 @@
  *   // to the same List(T* items, int count) constructor below:
  *   List<String>* lst2 = arr.ToList();
  *
- * Memory: Caller owns heap-allocated List<T> instances (`owned auto` / `defer delete`).
+ * Memory: Stack Lists own their buffer; destructor runs at scope exit.
+ * Heap Lists: caller owns (owned auto / defer delete / delete).
  * Slice/Copy/Filter/Where/Select/Plus return new heap lists the caller must free.
- * Those results are always non-owning — they never copy the source `.owns()` flag.
+ * Those results are always non-owning — they never copy the source .owns() flag.
  *
  * Pointer ownership:
- *   - List<T> (by-value): __destroy auto-runs ~T() on each element
- *   - List<T*>(): non-owning by default
- *   - List<T*>().owns(): owning — delete frees each pointer element
+ *   - List of by-value T: __destroy auto-runs element destructor
+ *   - List of T-star default: non-owning
+ *   - List of T-star with .owns(): owning — delete frees each pointer element
  *   - Pop() transfers the last element out (no list-side destroy/delete)
-*
-* Thread safety: None. External synchronization required for shared access.
+ *
+ * Thread safety: None. External synchronization required for shared access.
  */
 
 #ifndef CLASSYC_LIST_H
