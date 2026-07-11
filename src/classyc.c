@@ -11531,8 +11531,19 @@ static void def_symbol (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, nod
      is a method definition.  Record the additional overload (resolved at the
      call site) instead of rejecting it as an incompatible redeclaration. */
   if (curr_class != NULL && def_node->code == N_FUNC_DEF
-      && sym.def_node->code == N_FUNC_DEF) {
+      && sym.def_node != NULL && sym.def_node->code == N_FUNC_DEF) {
     VARR_PUSH (node_t, sym.defs, def_node);
+    return;
+  }
+  /* Prior entry without a declaration attr (error-recovery node, tag-only
+     registration, garbled input, …).  Do not crash; replace with the new
+     definition and report a repeated declaration. */
+  if (sym.def_node == NULL || sym.def_node->attr == NULL
+      || (sym.def_node->code != N_SPEC_DECL && sym.def_node->code != N_FUNC_DEF
+          && sym.def_node->code != N_MEMBER && sym.def_node->code != N_ENUM_CONST
+          && sym.def_node->code != N_CLASS)) {
+    error (c2m_ctx, POS (id), "repeated declaration %s", id->u.s.s);
+    symbol_def_replace (c2m_ctx, sym, def_node);
     return;
   }
   tab_decl_spec = ((decl_t) sym.def_node->attr)->decl_spec;
@@ -12097,15 +12108,17 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
       check_type_duplication (c2m_ctx, type, n, "enum", size, sign);
       type->mode = TM_ENUM;
       type->u.tag_type = res_tag_type;
-      /* Mirror class bare-name registration: `Faction` resolves as a type, not
-         only as `enum Faction`.  S_TAG is already set by process_tag. */
-      if (id->code == N_ID) {
-        symbol_t _esym;
-        node_t _enum_sym_scope = skip_struct_scopes (curr_scope);
-        if (!symbol_find (c2m_ctx, S_REGULAR, id, _enum_sym_scope, &_esym))
-          symbol_insert (c2m_ctx, S_REGULAR, id, _enum_sym_scope, res_tag_type, NULL);
-        tpname_add (c2m_ctx, id, _enum_sym_scope, TRUE);
-      }
+      /* Bare named-enum type names (`Faction x`) resolve via:
+           · tpname (parse-time; already added when the definition is parsed)
+           · S_TAG  (process_tag) then the N_ID / N_ENUM case in check_decl_spec
+         Do NOT also insert S_REGULAR with the N_ENUM tag as def_node: the enum
+         node never carries a decl_t attr, and the common C pattern
+           typedef enum EPosition EPosition;
+         would then crash in def_symbol reading ->decl_spec from a null/wrong
+         attr (and report bogus "repeated declaration" errors).  Keep the
+         parse-time tpname only; S_TAG fall-back covers type resolution. */
+      if (id->code == N_ID)
+        tpname_add (c2m_ctx, id, skip_struct_scopes (curr_scope), TRUE);
       if (enum_list->code == N_IGNORE) {
         if (incomplete_type_p (c2m_ctx, type))
           error (c2m_ctx, POS (n), "enum storage size is unknown");
@@ -14523,7 +14536,18 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       if (decl_node->code != N_MEMBER) {
         set_type_layout (c2m_ctx, decl->decl_spec.type);
         check_decl_align (c2m_ctx, &decl->decl_spec);
-        if (!decl->decl_spec.typedef_p && decl->scope != top_scope && decl->scope->code != N_FUNC)
+        /* Stack-frame allocation is only for locals/params.  Do not push
+           N_FUNC_DEF: free functions live in top_scope (already excluded),
+           but class methods are create_decl'd into the class tag scope.  Putting
+           their TM_FUNC (size 8) onto the FDA shifted every monomorphized method
+           block's offsets by 8 while frame size stayed the local span only — so
+           a BLK-by-value class param at frame+8 with size>=16 overflowed the
+           alloca and clobbered the caller's stack (List.Copy/Filter/Where of
+           List<LapSample> nulling the receiver). */
+        if (!decl->decl_spec.typedef_p && decl_node->code != N_FUNC_DEF
+            && decl->scope != top_scope && decl->scope->code != N_FUNC
+            && decl->scope->code != N_CLASS && decl->scope->code != N_STRUCT
+            && decl->scope->code != N_UNION)
           VARR_PUSH (decl_t, func_decls_for_allocation, decl);
       }
       if (declarator->code == N_DECL) {
@@ -15226,11 +15250,19 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       node_t scope;
       mir_size_t start_offset = 0; /* to remove an uninitialized warning */
 
-      /* Exclude decls which will be in regs: */
+      /* Exclude decls which will be in regs, and anything that is not a real
+         stack local/parameter (function symbols, type-only entries). */
       for (i = j = 0; i < VARR_LENGTH (decl_t, func_decls_for_allocation); i++) {
         decl = VARR_GET (decl_t, func_decls_for_allocation, i);
         type = decl->decl_spec.type;
         ns = decl->scope->attr;
+        /* Defense: never lay out a function-type symbol as a frame slot. */
+        if (type != NULL && (type->mode == TM_FUNC
+                            || (type->mode == TM_PTR && type->u.ptr_type != NULL
+                                && type->u.ptr_type->mode == TM_FUNC))) {
+          decl->reg_p = TRUE;
+          continue;
+        }
         if (scalar_type_p (type)) {
           /* In a function containing a `try` (with exceptions enabled), keep
              scalars in memory rather than MIR registers: longjmp reverts
@@ -15250,13 +15282,23 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       }
       VARR_TRUNC (decl_t, func_decls_for_allocation, j);
       qsort (VARR_ADDR (decl_t, func_decls_for_allocation), j, sizeof (decl_t), decl_cmp);
+      /* Stop walking outer scopes at class/struct/union tags as well as top_scope.
+         Method function-blocks are nested under the class node during check, but
+         that class is NOT a stack frame: treating it like one shifted every
+         method's locals by the class's accumulated `ns->size` and then wrote that
+         method span back into the class, so each monomorphized method inched
+         offsets upward (and the early +8 from the method's own FUNC_DEF made
+         BLK params of size >= 16 overrun a too-small alloca). */
+#define FRAME_SCOPE_OUTER_STOP_P(s) \
+      ((s) == top_scope || (s) == NULL \
+       || (s)->code == N_CLASS || (s)->code == N_STRUCT || (s)->code == N_UNION)
       scope = NULL;
       for (i = 0; i < VARR_LENGTH (decl_t, func_decls_for_allocation); i++) {
         decl = VARR_GET (decl_t, func_decls_for_allocation, i);
         type = decl->decl_spec.type;
         ns = decl->scope->attr;
         if (decl->scope != scope) { /* new scope: process upper scopes */
-          for (scope = ns->scope; scope != top_scope; scope = curr_ns->scope) {
+          for (scope = ns->scope; !FRAME_SCOPE_OUTER_STOP_P (scope); scope = curr_ns->scope) {
             curr_ns = scope->attr;
             ns->offset += curr_ns->size;
             curr_ns->stack_var_p = TRUE;
@@ -15275,13 +15317,14 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         decl = VARR_GET (decl_t, func_decls_for_allocation, i);
         ns = decl->scope->attr;
         if (decl->scope == scope) continue;
-        /* new scope: update upper scope sizes */
-        for (scope = ns->scope; scope != top_scope; scope = curr_ns->scope) {
+        /* new scope: update upper *frame* scope sizes only */
+        for (scope = ns->scope; !FRAME_SCOPE_OUTER_STOP_P (scope); scope = curr_ns->scope) {
           curr_ns = scope->attr;
           if (curr_ns->size < ns->offset) curr_ns->size = ns->offset;
           if (ns->stack_var_p) curr_ns->stack_var_p = TRUE;
         }
       }
+#undef FRAME_SCOPE_OUTER_STOP_P
     }
 
     static const char *check_attrs (c2m_ctx_t c2m_ctx, node_t r, decl_t decl, node_t attrs,
@@ -16098,7 +16141,12 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         break;
       case N_IND:
         process_bin_ops (c2m_ctx, r, &op1, &op2, &e1, &e2, &t1, &t2, r);
+        /* C allows `i[a]` as `a[i]` when one side is a pointer/array.  Do not
+           swap when the primary is a class value (e.g. stack Map): `m["k"]`
+           would otherwise become `"k"[m]` and report "array subscript is not
+           an integer".  Heap Map* is already TM_PTR and skips this swap. */
         if (t1->mode != TM_PTR && t1->mode != TM_ARR && t1->mode != TM_DICT
+            && t1->mode != TM_CLASS && t1->mode != TM_SLICE
             && (t2->mode == TM_PTR || t2->mode == TM_ARR)) {
           struct type *temp;
           node_t op;
@@ -22097,6 +22145,7 @@ static int MIR_UNUSED simple_add_call_res_op (c2m_ctx_t c2m_ctx, struct type *re
   MIR_context_t ctx = c2m_ctx->ctx;
   MIR_type_t type;
   op_t temp;
+  mir_size_t csize;
 
   if (void_type_p (ret_type)) return -1;
   if (!simple_return_by_addr_p (c2m_ctx, ret_type)) {
@@ -22105,12 +22154,31 @@ static int MIR_UNUSED simple_add_call_res_op (c2m_ctx_t c2m_ctx, struct type *re
     VARR_PUSH (MIR_op_t, call_ops, temp.mir_op);
     return 1;
   }
+  /* Aggregate returned via hidden pointer (RBLK).  Prefer a dedicated ALLOCA
+     slot over the shared call-arg-area for class types: the call-arg-area is
+     reclaimed when the inner call finishes (curr_call_arg_area_offset restore),
+     so using that buffer as an argument to an outer call — e.g.
+       list.Add(list.Get(i))
+       List.Copy / Filter / Where monomorphizations
+     — corrupts the still-live return value.  ALLOCA keeps each class return
+     alive for the rest of the frame (C++ temporary-like storage).  Structs and
+     unions without destructors keep the classic call-arg-area path for less
+     stack growth; classes always use ALLOCA (they may have user ~T()). */
   temp = get_new_temp (c2m_ctx, MIR_T_I64);
-  emit3 (c2m_ctx, MIR_ADD, temp.mir_op,
-         MIR_new_reg_op (ctx, MIR_reg (ctx, FP_NAME, curr_func->u.func)),
-         MIR_new_int_op (ctx, call_arg_area_offset));
+  csize = type_size (c2m_ctx, ret_type);
+  if (csize == 0) csize = 1;
+  if (ret_type->mode == TM_CLASS) {
+    (void) call_arg_area_offset;
+    MIR_append_insn (ctx, curr_func,
+                     MIR_new_insn (ctx, MIR_ALLOCA, temp.mir_op,
+                                   MIR_new_int_op (ctx, (long long) csize)));
+  } else {
+    emit3 (c2m_ctx, MIR_ADD, temp.mir_op,
+           MIR_new_reg_op (ctx, MIR_reg (ctx, FP_NAME, curr_func->u.func)),
+           MIR_new_int_op (ctx, call_arg_area_offset));
+  }
   temp.mir_op
-    = MIR_new_mem_op (ctx, MIR_T_RBLK, type_size (c2m_ctx, ret_type), temp.mir_op.u.reg, 0, 1);
+    = MIR_new_mem_op (ctx, MIR_T_RBLK, csize, temp.mir_op.u.reg, 0, 1);
   VARR_PUSH (MIR_op_t, call_ops, temp.mir_op);
   return 0;
 }
@@ -27610,7 +27678,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     if ((n = target_add_call_res_op (c2m_ctx, type, &arg_info, arg_area_offset)) < 0) {
       /* pass nothing */
     } else if (n == 0) { /* by addr */
-      if (!builtin_call_p || jcall_p) update_call_arg_area_offset (c2m_ctx, type, FALSE);
+      /* Class returns use ALLOCA (see simple_add_call_res_op) — do not burn
+         call-arg-area for them (would also reopen the reuse-clobber bug). */
+      if ((!builtin_call_p || jcall_p) && type->mode != TM_CLASS)
+        update_call_arg_area_offset (c2m_ctx, type, FALSE);
       res = new_op (NULL, VARR_LAST (MIR_op_t, call_ops));
       assert (res.mir_op.mode == MIR_OP_MEM && res.mir_op.u.mem.type == MIR_T_RBLK);
       res.mir_op = MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, res.mir_op.u.mem.base, 0, 1);
@@ -27618,12 +27689,23 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     } else if (type->mode == TM_STRUCT || type->mode == TM_UNION
                || type->mode == TM_CLASS) { /* passed in regs */
       if (!va_arg_p) {
-        res = get_new_temp (c2m_ctx, MIR_T_I64);
-        emit3 (c2m_ctx, MIR_ADD, res.mir_op,
-               MIR_new_reg_op (ctx, MIR_reg (ctx, FP_NAME, curr_func->u.func)),
-               MIR_new_int_op (ctx, arg_area_offset));
-        if (!builtin_call_p) update_call_arg_area_offset (c2m_ctx, type, FALSE);
-        res.mir_op = MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, res.mir_op.u.reg, 0, 1);
+        if (type->mode == TM_CLASS) {
+          /* Mirror the ALLOCA path used for by-addr class returns. */
+          mir_size_t csize = type_size (c2m_ctx, type);
+          if (csize == 0) csize = 1;
+          res = get_new_temp (c2m_ctx, MIR_T_I64);
+          MIR_append_insn (ctx, curr_func,
+                           MIR_new_insn (ctx, MIR_ALLOCA, res.mir_op,
+                                         MIR_new_int_op (ctx, (long long) csize)));
+          res.mir_op = MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, res.mir_op.u.reg, 0, 1);
+        } else {
+          res = get_new_temp (c2m_ctx, MIR_T_I64);
+          emit3 (c2m_ctx, MIR_ADD, res.mir_op,
+                 MIR_new_reg_op (ctx, MIR_reg (ctx, FP_NAME, curr_func->u.func)),
+                 MIR_new_int_op (ctx, arg_area_offset));
+          if (!builtin_call_p) update_call_arg_area_offset (c2m_ctx, type, FALSE);
+          res.mir_op = MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, res.mir_op.u.reg, 0, 1);
+        }
         t = MIR_T_I64;
       }
     } else if (n > 0) {

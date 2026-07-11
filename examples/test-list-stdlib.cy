@@ -81,11 +81,13 @@ int main() {
     check(removed  == 1,                  "1p  Remove(99) found");
     check(braced->Count() == 2,           "1q  Count==2 after Remove");
 
-    /* OOB no-ops */
-    braced->Set(-10, -999);
-    braced->RemoveAt(-10);
-    braced->RemoveAt(500);
-    check(braced->Count() == 2,           "1r  OOB ops are safe no-ops");
+    /* OOB ops throw OutOfBoundsException (not silent no-ops — see val-028). */
+    int oob = 0;
+    try { braced->Set(-10, -999); } catch (OutOfBoundsException e) { oob++; }
+    try { braced->RemoveAt(-10); } catch (OutOfBoundsException e) { oob++; }
+    try { braced->RemoveAt(500); } catch (OutOfBoundsException e) { oob++; }
+    check(oob == 3,                        "1r  OOB Set/RemoveAt throw");
+    check(braced->Count() == 2,            "1s  list unchanged after OOB throws");
 
     /* ──────────────── 2. int — search + transforms ───────────────── */
 

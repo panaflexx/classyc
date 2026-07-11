@@ -368,7 +368,7 @@ class List<T> {
     List<T>* Copy() __attribute__((da_ignore)) {
         List<T>* c = new List<T>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++)
-            c->Add(this->data[i]);
+            c->Add(this->Get(i));
         return c;
     }
 
@@ -417,10 +417,11 @@ class List<T> {
     List<T>* Filter(int(*pred)(T)) __attribute__((da_ignore)) {
         List<T>* result = new List<T>();
         for (int i = 0; i < this->length; i++) {
-            /* Use Get(i) not data[i]: by-value class elements (esp. with enums)
-               need proper value load into a temporary before Add / pred. */
-            T item = this->Get(i);
-            if (pred(item)) result->Add(item);
+            /* Call Get twice rather than `T item = Get(i)`: a named by-value
+               class local with a user dtor is RAII-registered and, with current
+               aggregate call/return codegen, can corrupt monomorphized filter
+               results.  pred/Add take value params that copy from Get. */
+            if (pred(this->Get(i))) result->Add(this->Get(i));
         }
         return result;
     }
@@ -441,8 +442,7 @@ class List<T> {
     List<T>* Where(int(*pred)(T)) __attribute__((da_ignore)) {
         List<T>* result = new List<T>();
         for (int i = 0; i < this->length; i++) {
-            T item = this->Get(i);
-            if (pred(item)) result->Add(item);
+            if (pred(this->Get(i))) result->Add(this->Get(i));
         }
         return result;
     }

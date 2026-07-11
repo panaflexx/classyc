@@ -30,21 +30,25 @@
  *
  * Usage:
  *   #include "map.h"
- *   Map<String, int>* ages = new Map<String, int>();
- *   ages->Set("Ada", 36);
- *   ages["Ada"] = 37;                       // subscript write == Set(key, val)
- *   int a = ages["Ada"];                    // subscript read  == Get(key)
- *   if (ages->Contains("Ada")) ...
- *   for (auto name, age in ages) ...        // (key, value) iteration
- *   defer delete ages;
+ *
+ *   // Stack / value form (preferred locals — ~Map at scope exit):
+ *   auto ages = Map<String, int>();
+ *   // or:  Map<String, int> ages;  ages = Map... is move-only, use move
+ *   ages.Set("Ada", 36);
+ *   ages["Ada"] = 37;                       // works on stack Map values
+ *   int a = ages["Ada"];
+ *
+ *   // Heap form when you need a pointer / owned binding:
+ *   owned auto heap = new Map<String, int>();
+ *   heap["Ada"] = 37;
  *
  *   // string -> object mapping:
- *   Map<String, Track*>* lib = new Map<String, Track*>();
- *   lib->Set("Kashmir", new Track("Kashmir", 508));
+ *   auto lib = Map<String, Track*>();
+ *   lib.Set("Kashmir", new Track("Kashmir", 508));
  *
- * Subscript & iteration sugar:
- *   map[k]        -> map->Get(k)          (read)
- *   map[k] = v    -> map->Set(k, v)       (write / insert / update)
+ * Subscript & iteration sugar (value or pointer receiver):
+ *   map[k]        -> map.Get(k) / map->Get(k)
+ *   map[k] = v    -> map.Set(k, v)
  *   for (auto k in map)        -> k over keys, in insertion order
  *   for (auto k, v in map)     -> k = key, v = value
  *
@@ -52,10 +56,13 @@
  * TryGet(k, &out), or try/catch when absence is expected.  Contains(k) /
  * ContainsKey(k) test presence without throwing.
  *
- * Memory: Caller owns via `owned auto` / `defer delete`.
- * Copy() is always a shallow non-owning map (does not copy ownsKeys/ownsValues).
+ * Memory: Stack Maps own their table; destructor runs at scope exit.
+ * Heap Maps: caller owns (owned auto / defer delete / delete).
+ * Where / SelectValues / SelectKeys / Copy return new heap maps the caller
+ * must free (always non-owning of pointees -- does not copy ownsKeys/ownsValues).
  * Keys()/Values() return new List* the caller must free.
- * For Map<…, MyClass*> the map owns only the pointers after ownsValues()/ownsKeys().
+ * For Map of MyClass* the map owns only the pointers after ownsValues()/ownsKeys().
+ * Move-only: bare assign of Map is an error; use move to transfer ownership.
  *
  * List/Map GroupBy results own the List* bucket values automatically
  * (ownsValues). Element ownership inside each bucket is still non-owning.

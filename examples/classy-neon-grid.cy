@@ -2,7 +2,7 @@
  *
  * Showcase weave of ClassyC features (see also cy-validate/):
  *
- *   Domain   · Pilot* owning list · LapSample by-value list (concrete class T)
+ *   Domain   · Pilot* owning list · LapSample by-value list (POD DTO, no ~T)
  *            · fluent Bump · named ctor args · enums + nameof
  *   LINQ     · Where / Select / Any / All / Find / FindOr / GroupBy
  *            · First / Last / Take / Skip · OrderBy helpers · ForEach
@@ -114,34 +114,32 @@ List<Pilot*>* OrderByPace(List<Pilot*>* src) {
 void print_banner(Pilot* p) { p.Banner(); }
 
 /* By-value concrete class — lives inline in List<LapSample>, not List<LapSample*>.
- * Works: stack construct + Add, for-in, Where/Select/Find, Sort, __destroy on list dtor.
- * Caveats (stress-tested):
- *   · brace-init `new List<T>{ T(...) }` fails for class T — use named stack temps + Add
- *   · Sort with String fields in T → shallow moves / double-free; keep T POD-ish
- *   · enum fields in T currently break specialized Where/Get paths — store as int */
-class LapSample {
-    int lap;
-    int ms;
-    int faction;   /* Faction ordinal — enum field in by-val List element is flaky */
+	 * Prefer POD / no user dtor for list elements: Where/Filter/Sort pass T by value;
+	 * a user ~T() plus aggregate pass-by-value can corrupt elements after Add (ABI).
+	 * Use List<T*>.owns() when T needs a real destructor.  See BY-VALUE.md. */
+	class LapSample {
+	    int lap;
+	    int ms;
+	    int faction;   /* Faction ordinal stored as int */
 
-    LapSample(int lap, int ms, int faction) {
-        this.lap = lap;
-        this.ms = ms;
-        this.faction = faction;
-    }
-    ~LapSample() { /* quiet */ }
+	    LapSample(int lap, int ms, int faction) {
+	        this.lap = lap;
+	        this.ms = ms;
+	        this.faction = faction;
+	    }
+	    /* no ~LapSample — trivially relocatable DTO for List by-value */
 
-    int IsQuick() { return ms < 62000; }
-    String ToString() {
-        Faction f = (Faction)faction;
-        int sec = ms / 1000;
-        int rem = ms % 1000;
-        String fac = ((String)f.nameof()).upper();
-        if (rem < 10)  return f"L{lap} {sec}.00{rem}s [{fac}]";
-        if (rem < 100) return f"L{lap} {sec}.0{rem}s [{fac}]";
-        return f"L{lap} {sec}.{rem}s [{fac}]";
-    }
-};
+	    int IsQuick() { return ms < 62000; }
+	    String ToString() {
+	        Faction f = (Faction)faction;
+	        int sec = ms / 1000;
+	        int rem = ms % 1000;
+	        String fac = ((String)f.nameof()).upper();
+	        if (rem < 10)  return f"L{lap} {sec}.00{rem}s [{fac}]";
+	        if (rem < 100) return f"L{lap} {sec}.0{rem}s [{fac}]";
+	        return f"L{lap} {sec}.{rem}s [{fac}]";
+	    }
+	};
 
 int ByLapMs(LapSample a, LapSample b) { return a.ms - b.ms; }
 
@@ -397,18 +395,13 @@ int main() {
     /* ═══ 7. By-value samples ══════════════════════════════════════════════ */
     hr("7 · LAP SAMPLES  (List<LapSample> by-value · no new per element)");
 
-    /* Concrete class *elements* on the stack; list still heap via new. */
-    owned auto samples = new List<LapSample>();
-    {
-        LapSample s1 = LapSample(1, 59840, (int)nova);
-        LapSample s2 = LapSample(2, 60112, (int)ember);
-        LapSample s3 = LapSample(3, 64005, (int)voids);
-        LapSample s4 = LapSample(4, 61550, (int)nova);
-        samples.Add(s1);
-        samples.Add(s2);
-        samples.Add(s3);
-        samples.Add(s4);
-    } /* stack temps die; list keeps *copies* */
+    /* By-value elements: brace-init with ctor exprs (or stack temps + Add). */
+    owned auto samples = new List<LapSample>{
+        LapSample(1, 59840, (int)nova),
+        LapSample(2, 60112, (int)ember),
+        LapSample(3, 64005, (int)voids),
+        LapSample(4, 61550, (int)nova)
+    };
 
     printf("  %d by-value samples · first=%s\n",
            samples.Count(), samples.First().ToString());
