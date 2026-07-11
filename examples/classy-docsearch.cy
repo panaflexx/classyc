@@ -42,7 +42,7 @@
  *   Tab / ↓       focus result list
  *   ↑ ↓  j k      move selection (list focus)
  *   Enter         open selected manpage / document in pager
- *   Esc           return to query  (or clear query if already typing)
+ *   Esc           list → query;  query → quit
  *   Ctrl-U        clear query
  *   q             quit (list focus only — so you can type "qemu")
  *   Ctrl-C/Q      quit always (restores terminal)
@@ -51,6 +51,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -142,6 +143,30 @@ int g_files_seen = 0;
 int g_files_indexed = 0;
 long g_bytes_indexed = 0;
 int g_batch = 0;                 /* 1 = non-interactive smoke */
+int g_reindex = 0;               /* 1 = force SQLite rebuild */
+int g_from_db = 0;               /* 1 if corpus loaded from sqlite */
+int g_tui_mode = 0;              /* 1 = alt-screen TUI is up (loading or live) */
+int g_index_ready = 0;           /* 0 while loading; search waits until ready */
+int g_want_quit = 0;             /* Esc/Ctrl-C while loading */
+char g_db_path[MAX_PATH];
+char g_ui_status[240];           /* live status under the query bar */
+Focus g_ui_focus = focus_query;  /* focus during load-time input */
+int   g_ui_selected = 0;         /* list selection during load-time input */
+
+/* Soft refs for progress redraw + live search while loading (set by main). */
+List<Doc*>*         g_ui_corpus = NULL;
+Map<String, Term*>* g_ui_inv = NULL;
+List<Hit>*          g_ui_hits = NULL;
+char*               g_ui_query = NULL;
+int*                g_ui_qlen = NULL;
+int                 g_ui_n_terms = 0;
+
+/* Forward decls — crawl/load call these before draw_ui is defined. */
+void ui_set_status(const char* fmt, ...);
+void ui_clear_status(void);
+void ui_poll_typeahead(void);
+void ui_live_search(void);
+List<Hit> search_docs(List<Doc*>* corpus, Map<String, Term*>* inv, const char* query);
 
 struct termios g_orig_term;
 int g_raw = 0;
@@ -150,11 +175,11 @@ int g_raw = 0;
 
 void term_leave_raw(void) {
     if (g_raw) {
+        /* leave alt screen, show cursor, restore tty */
+        fputs("\033[?25h\033[?1049l", stdout);
+        fflush(stdout);
         tcsetattr(0, TCSAFLUSH, &g_orig_term);
         g_raw = 0;
-        /* show cursor */
-        fputs("\033[?25h", stdout);
-        fflush(stdout);
     }
 }
 
@@ -169,7 +194,8 @@ void term_enter_raw(void) {
     raw.c_cc[VTIME] = 1;   /* 100 ms poll */
     if (tcsetattr(0, TCSAFLUSH, &raw) == 0) {
         g_raw = 1;
-        fputs("\033[?25l", stdout);   /* hide cursor — we draw our own */
+        /* alt screen: redraws can't scroll the original terminal */
+        fputs("\033[?1049h\033[2J\033[H\033[?25l", stdout);
         fflush(stdout);
     }
 }
@@ -669,10 +695,9 @@ void ingest_file(const char* path, List<Doc*>* corpus, Map<String, Term*>* inv) 
 
     g_files_indexed++;
     g_bytes_indexed += (long)strlen(plain);
-    if ((g_files_indexed % 100) == 0) {
-        fprintf(stderr, "\r  indexed %d files (%ld KB plain)…",
-                g_files_indexed, g_bytes_indexed / 1024);
-        fflush(stderr);
+    if ((g_files_indexed % 50) == 0) {
+        ui_set_status("indexing… %d files · %ld KB plain",
+                      g_files_indexed, g_bytes_indexed / 1024);
     }
 }
 
@@ -1011,105 +1036,331 @@ void view_doc(Doc* d) {
 
 /* ───────────────────────── TUI draw ───────────────────────── */
 
-void draw_pad(int n) { for (int i = 0; i < n; i++) putchar(' '); }
+/* Print at most `width` printable chars (best-effort for ASCII UI), then clear EOL. */
+void draw_trunc(const char* s, int width) {
+    int n = 0;
+    if (s) {
+        while (s[n] && n < width) {
+            unsigned char ch = (unsigned char)s[n];
+            if (ch < 32) break;
+            putchar((char)ch);
+            n++;
+        }
+    }
+    fputs("\033[K", stdout);   /* erase to end of line */
+}
+
+/* One screen line that ends with CR+LF only if more lines remain; track budget. */
+int draw_line(int* used, int rows, const char* fmt, ...) {
+    if (*used >= rows - 1) return 0;   /* leave last row for footer / no scroll */
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    fputs("\033[K\n", stdout);
+    (*used)++;
+    return 1;
+}
 
 void draw_ui(List<Doc*>* corpus, List<Hit>* hits, const char* query,
              Focus focus, int selected, int n_terms) {
     int cols = term_cols();
     int rows = term_rows();
-    int list_rows = rows - 10;
-    if (list_rows < 5) list_rows = 5;
-    if (list_rows > MAX_SHOW) list_rows = MAX_SHOW;
+    if (cols < 48) cols = 48;
+    if (rows < 10) rows = 10;
 
-    fputs("\033[2J\033[H", stdout);
+    /* Full repaint in alt screen — stay inside rows so the terminal never scrolls. */
+    fputs("\033[H\033[J", stdout);
 
-    /* banner */
-    printf("%s", term_bold_cyan());
-    printf("╔");
-    for (int i = 0; i < cols - 2 && i < 70; i++) printf("═");
-    printf("╗\n");
-    printf("║  CLASSY DOCSEARCH  ·  man + md + html  ·  ClassyC inverted index");
-    int pad = cols - 62;
-    if (pad > 0 && pad < 20) draw_pad(pad);
-    printf("║\n");
+    int used = 0;
+    int box_w = cols - 2;
+    if (box_w > 72) box_w = 72;
+    if (box_w < 40) box_w = 40;
+
+    /* banner (3 lines) */
+    printf("%s╔", term_bold_cyan());
+    for (int i = 0; i < box_w; i++) printf("═");
+    printf("╗\033[K\n");
+    used++;
+    printf("║  CLASSY DOCSEARCH · man+md+html · inverted index");
+    {
+        int inner = 50;
+        int pad = box_w - inner;
+        if (pad < 0) pad = 0;
+        for (int i = 0; i < pad; i++) putchar(' ');
+    }
+    printf("║\033[K\n");
+    used++;
     printf("╚");
-    for (int i = 0; i < cols - 2 && i < 70; i++) printf("═");
-    printf("╝%s\n", term_reset());
+    for (int i = 0; i < box_w; i++) printf("═");
+    printf("╝%s\033[K\n", term_reset());
+    used++;
 
     /* stats */
-    printf("  %s%d%s docs  ·  %s%d%s terms  ·  %s%ld%s KB plain",
-           term_bright_green(), corpus.Count(), term_reset(),
+    printf("  %s%d%s docs · %s%d%s terms · %s%ld%s KB",
+           term_bright_green(), corpus ? corpus.Count() : 0, term_reset(),
            term_bright_green(), n_terms, term_reset(),
            term_bright_green(), g_bytes_indexed / 1024, term_reset());
-    if (g_from_db) printf("  %s[sqlite]%s", term_dim(), term_reset());
-    printf("\n");
+    if (g_from_db) printf(" %s[sqlite]%s", term_dim(), term_reset());
+    if (!g_index_ready) printf("  %sloading…%s", term_bold_yellow(), term_reset());
+    fputs("\033[K\n", stdout);
+    used++;
 
-    /* query line */
+    /* query — always first-class, even while the index loads */
     int qfocus = (focus == focus_query);
-    printf("\n  %sQuery%s ", qfocus ? term_bold_yellow() : term_dim(), term_reset());
-    printf("%s", qfocus ? term_bold() : "");
-    printf("[%s", query);
+    printf("  %sQuery%s %s[",
+           qfocus ? term_bold_yellow() : term_dim(), term_reset(),
+           qfocus ? term_bold() : "");
+    {
+        int qmax = cols - 14;
+        if (qmax < 8) qmax = 8;
+        draw_trunc(query ? query : "", qmax);
+    }
     if (qfocus) printf("▌");
-    printf("]%s\n", term_reset());
+    printf("]%s\033[K\n", term_reset());
+    used++;
 
-    /* mode + hit count */
-    printf("  %s%d match(es)%s   focus: %s%s%s\n\n",
-           term_cyan(), hits.Count(), term_reset(),
-           term_bold(),
-           focus == focus_query ? "SEARCH  (Tab → list)" : "LIST  (Tab → search)",
-           term_reset());
-
-    /* results */
-    int n = hits.Count();
-    if (n == 0) {
-        printf("  %s(no documents matched)%s\n", term_dim(), term_reset());
+    /* live status (load progress) or match summary */
+    if (g_ui_status[0]) {
+        printf("  %s", term_bright_cyan());
+        draw_trunc(g_ui_status, cols - 4);
+        printf("%s\033[K\n", term_reset());
     } else {
+        int hc = hits ? hits.Count() : 0;
+        printf("  %s%d match(es)%s  %s%s%s\033[K\n",
+               term_cyan(), hc, term_reset(),
+               term_dim(),
+               focus == focus_query ? "SEARCH (Tab→list · Esc quit)"
+                                    : "LIST (Tab→search · Esc back)",
+               term_reset());
+    }
+    used++;
+
+    /* blank separator */
+    fputs("\033[K\n", stdout);
+    used++;
+
+    /* results: one line each — never extra path row (that blew past rows) */
+    int list_budget = rows - used - 1;   /* footer occupies last row */
+    if (list_budget < 1) list_budget = 1;
+    if (list_budget > MAX_SHOW) list_budget = MAX_SHOW;
+
+    /* Live partial search while the index is still loading. */
+    int n = hits ? hits.Count() : 0;
+    if (!g_index_ready && n == 0) {
+        draw_line(&used, rows, "  %s⏳  loading index — type to search the corpus as it fills%s",
+                  term_dim(), term_reset());
+        draw_line(&used, rows, "  %s    %s%s",
+                  term_dim(), g_db_path, term_reset());
+    } else if (n == 0) {
+        draw_line(&used, rows, "  %s(no documents matched%s)%s",
+                  term_dim(),
+                  g_index_ready ? "" : " yet — still loading",
+                  term_reset());
+    } else if (corpus) {
+        if (!g_index_ready) {
+            draw_line(&used, rows, "  %s▸ live results (index still loading…)%s",
+                      term_bold_yellow(), term_reset());
+        }
         int start = 0;
-        if (selected >= list_rows) start = selected - list_rows + 1;
+        if (selected >= list_budget) start = selected - list_budget + 1;
         if (start < 0) start = 0;
-        int end = start + list_rows;
+        int end = start + list_budget;
         if (end > n) end = n;
 
         for (int i = start; i < end; i++) {
+            if (used >= rows - 1) break;
             Hit h = hits.Get(i);
             Doc* d = corpus.Get(h.docId);
             int sel = (i == selected && focus == focus_list);
             const char* title = d.title;
             const char* section = d.section;
-            const char* path = d.path;
             if (!title) title = "?";
             if (!section) section = "";
-            if (!path) path = "";
+
             if (sel) printf("%s%s", term_bold(), term_bright_cyan());
             printf("  %s ", sel ? "▶" : " ");
-            printf("%-28.28s", title);
-            printf("  %-6.6s", section);
-            printf("  %s", d.KindLabel());
-            if (h.score > 0) {
-                printf("  %sscore=%d%s",
-                       term_dim(), h.score,
-                       sel ? term_bold() : term_reset());
-            }
+            int twidth = cols - 28;
+            if (twidth < 12) twidth = 12;
+            if (twidth > 36) twidth = 36;
+            printf("%-*.*s", twidth, twidth, title);
+            printf(" %-5.5s", section);
+            printf(" %-8.8s", d.KindLabel());
+            if (h.score > 0)
+                printf(" %s%d%s", term_dim(), h.score, sel ? term_bold() : "");
             if (sel) printf("%s", term_reset());
-            printf("\n");
-            if (sel) printf("    %s%s%s\n", term_dim(), path, term_reset());
+            fputs("\033[K\n", stdout);
+            used++;
         }
     }
 
-    /* footer help */
-    printf("\n  %s", term_dim());
-    printf("type · Tab list · ↑↓/jk move · Enter open · Ctrl-U clear · q/Ctrl-C quit");
-    printf("%s\n", term_reset());
+    /* Footer pinned to last screen row — no trailing newline (avoids scroll). */
+    printf("\033[%d;1H%s  type · Tab · ↑↓/jk · Enter open · Ctrl-U clear · Esc quit%s\033[K",
+           rows, term_dim(), term_reset());
     fflush(stdout);
+}
+
+/* Re-rank against whatever is in corpus/inv *right now* (partial OK). */
+void ui_live_search(void) {
+    if (!g_ui_corpus || !g_ui_inv || !g_ui_hits) return;
+    if (g_ui_corpus->Count() == 0) {
+        auto empty = List<Hit>();
+        *g_ui_hits = move empty;
+        g_ui_selected = 0;
+        return;
+    }
+    const char* q = g_ui_query ? g_ui_query : "";
+    auto next = search_docs(g_ui_corpus, g_ui_inv, q);
+    *g_ui_hits = move next;
+    if (g_ui_selected >= g_ui_hits->Count())
+        g_ui_selected = g_ui_hits->Count() > 0 ? g_ui_hits->Count() - 1 : 0;
+    if (g_ui_selected < 0) g_ui_selected = 0;
+}
+
+/* Open the selected hit (works mid-load once docs exist). */
+void ui_open_selected(void) {
+    if (!g_ui_hits || !g_ui_corpus) return;
+    if (g_ui_hits->Count() <= 0) return;
+    if (g_ui_selected < 0 || g_ui_selected >= g_ui_hits->Count())
+        g_ui_selected = 0;
+    Hit h = g_ui_hits->Get(g_ui_selected);
+    if (h.docId < 0 || h.docId >= g_ui_corpus->Count()) return;
+    Doc* d = g_ui_corpus->Get(h.docId);
+    view_doc(d);
+}
+
+/* Drain keystrokes while loading: typeahead + arrows/Enter (not quit on down-arrow). */
+void ui_poll_typeahead(void) {
+    if (!g_tui_mode || !g_ui_query || !g_ui_qlen) return;
+    int query_changed = 0;
+    for (;;) {
+        char c = 0;
+        int n = (int)read(0, &c, 1);
+        if (n <= 0) break;
+
+        if (c == 3 || c == 17) {               /* Ctrl-C / Ctrl-Q */
+            g_want_quit = 1;
+            break;
+        }
+
+        if (c == 27) {                         /* Esc or CSI (arrows) */
+            char seq0 = 0;
+            int n0 = (int)read(0, &seq0, 1);
+            if (n0 == 1 && seq0 == '[') {
+                char seq1 = 0;
+                if (read(0, &seq1, 1) == 1) {
+                    if (seq1 == 'A') {          /* up */
+                        if (g_ui_focus == focus_list && g_ui_selected > 0)
+                            g_ui_selected--;
+                        else if (g_ui_hits && g_ui_hits->Count() > 0) {
+                            g_ui_focus = focus_list;
+                            g_ui_selected = 0;
+                        }
+                    } else if (seq1 == 'B') {   /* down — must NOT quit */
+                        if (g_ui_focus == focus_list) {
+                            if (g_ui_hits && g_ui_selected + 1 < g_ui_hits->Count())
+                                g_ui_selected++;
+                        } else if (g_ui_hits && g_ui_hits->Count() > 0) {
+                            g_ui_focus = focus_list;
+                            g_ui_selected = 0;
+                        }
+                    }
+                }
+            } else {
+                /* bare Esc: list->query, query->quit */
+                if (g_ui_focus == focus_list) {
+                    g_ui_focus = focus_query;
+                } else {
+                    g_want_quit = 1;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (c == 9) {                          /* Tab */
+            if (g_ui_focus == focus_query) {
+                g_ui_focus = focus_list;
+                if (g_ui_hits && g_ui_selected >= g_ui_hits->Count())
+                    g_ui_selected = 0;
+            } else {
+                g_ui_focus = focus_query;
+            }
+            continue;
+        }
+
+        if (c == 10 || c == 13) {               /* Enter / CR — open hit */
+            ui_open_selected();
+            continue;
+        }
+
+        if (c == 'j' && g_ui_focus == focus_list) {
+            if (g_ui_hits && g_ui_selected + 1 < g_ui_hits->Count())
+                g_ui_selected++;
+            continue;
+        }
+        if (c == 'k' && g_ui_focus == focus_list) {
+            if (g_ui_selected > 0) g_ui_selected--;
+            continue;
+        }
+
+        if (c == 21) {                          /* Ctrl-U clear query */
+            *g_ui_qlen = 0;
+            g_ui_query[0] = 0;
+            g_ui_focus = focus_query;
+            query_changed = 1;
+            continue;
+        }
+        if (c == 127 || c == 8) {               /* backspace */
+            g_ui_focus = focus_query;
+            if (*g_ui_qlen > 0) {
+                (*g_ui_qlen)--;
+                g_ui_query[*g_ui_qlen] = 0;
+                query_changed = 1;
+            }
+            continue;
+        }
+        if (c >= 32 && c < 127 && *g_ui_qlen < MAX_QUERY - 1) {
+            g_ui_focus = focus_query;
+            g_ui_query[*g_ui_qlen] = c;
+            (*g_ui_qlen)++;
+            g_ui_query[*g_ui_qlen] = 0;
+            query_changed = 1;
+        }
+    }
+    if (query_changed) ui_live_search();
+}
+
+/* Status under the query bar; live-searches + redraws TUI if it's up. */
+void ui_set_status(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_ui_status, sizeof(g_ui_status), fmt, ap);
+    va_end(ap);
+    ui_poll_typeahead();
+    if (g_want_quit) return;
+    /* Re-search on every progress tick — empty query browses first docs. */
+    if (g_tui_mode)
+        ui_live_search();
+    if (g_tui_mode) {
+        auto empty = List<Hit>();
+        List<Hit>* hp = g_ui_hits ? g_ui_hits : &empty;
+        List<Doc*>* cp = g_ui_corpus;
+        const char* q = g_ui_query ? g_ui_query : "";
+        draw_ui(cp, hp, q, g_ui_focus, g_ui_selected, g_ui_n_terms);
+    } else if (!g_batch) {
+        fprintf(stderr, "\r  %s                    ", g_ui_status);
+        fflush(stderr);
+    }
+}
+
+void ui_clear_status(void) {
+    g_ui_status[0] = 0;
 }
 
 /* ───────────────────────── SQLite index persist ───────────────────────── */
 
 #define DEFAULT_DB_NAME "index.db"
-
-char g_db_path[MAX_PATH];
-int  g_reindex = 0;
-int  g_from_db = 0;          /* 1 if corpus loaded from sqlite */
 
 int env_int(const char* key, int defv) {
     const char* s = getenv(key);
@@ -1203,8 +1454,11 @@ void meta_set(Sqlite* db, const char* key, const char* value) {
 
 /* Wipe + rewrite full index from in-memory corpus + inverted map. */
 int save_index(Sqlite* db, List<Doc*>* corpus, Map<String, Term*>* inv) {
-    printf("  writing SQLite index → %s\n", g_db_path);
-    fflush(stdout);
+    ui_set_status("writing SQLite → %s …", g_db_path);
+    if (!g_tui_mode) {
+        printf("  writing SQLite index → %s\n", g_db_path);
+        fflush(stdout);
+    }
 
     try {
         db.execute("DROP TABLE IF EXISTS postings");
@@ -1257,10 +1511,8 @@ int save_index(Sqlite* db, List<Doc*>* corpus, Map<String, Term*>* inv) {
                 ins_post.bind(3, tf);
                 ins_post.execute();
                 n_posts++;
-                if ((n_posts % 50000) == 0) {
-                    fprintf(stderr, "\r  wrote %d posting rows…", n_posts);
-                    fflush(stderr);
-                }
+                if ((n_posts % 25000) == 0)
+                    ui_set_status("saving postings… %d rows", n_posts);
             }
         }
 
@@ -1281,20 +1533,26 @@ int save_index(Sqlite* db, List<Doc*>* corpus, Map<String, Term*>* inv) {
         meta_set(db, "indexed_at", buf);
 
         tx.commit();
-        fprintf(stderr, "\r  saved %d docs · %d terms · %d postings                 \n",
-                corpus.Count(), inv.Count(), n_posts);
+        ui_set_status("saved %d docs · %d terms · %d postings", corpus.Count(), inv.Count(), n_posts);
+        if (!g_tui_mode)
+            fprintf(stderr, "\r  saved %d docs · %d terms · %d postings                 \n",
+                    corpus.Count(), inv.Count(), n_posts);
         return 1;
     } catch (SqliteError e) {
-        printf("  %sSQLite save failed:%s %s\n",
-               term_bold_red(), term_reset(), e.msg ? e.msg : "?");
+        if (g_tui_mode) ui_set_status("SQLite save failed: %s", e.msg ? e.msg : "?");
+        else printf("  %sSQLite save failed:%s %s\n",
+                    term_bold_red(), term_reset(), e.msg ? e.msg : "?");
         return 0;
     }
 }
 
 /* Load docs + postings into empty corpus/inv.  Returns 1 on success. */
 int load_index(Sqlite* db, List<Doc*>* corpus, Map<String, Term*>* inv) {
-    printf("  loading SQLite index ← %s\n", g_db_path);
-    fflush(stdout);
+    ui_set_status("loading docs from SQLite…");
+    if (!g_tui_mode) {
+        printf("  loading SQLite index ← %s\n", g_db_path);
+        fflush(stdout);
+    }
 
     try {
         List<dict>* drows = db.query(
@@ -1302,30 +1560,37 @@ int load_index(Sqlite* db, List<Doc*>* corpus, Map<String, Term*>* inv) {
         if (!drows) return 0;
         defer delete drows;
 
+        int nd = 0;
         for (auto r in drows) {
             int id = (int)(long)r.id;
             String title = str_dup_c((char*)r.title);
             String path = str_dup_c((char*)r.path);
             String section = str_dup_c((char*)r.section);
             DocKind kind = (DocKind)(int)(long)r.kind;
-            /* body not persisted — open path re-reads original for viewing */
             String body = str_dup_c("");
             Doc* d = new Doc(id, title, path, section, kind, body);
             corpus.Add(d);
+            nd++;
+            if ((nd % 2000) == 0)
+                ui_set_status("loading docs… %d", nd);
         }
+        g_ui_n_terms = 0;
+        ui_set_status("loading postings… (%d docs)", corpus.Count());
 
         /* Stream postings with the raw C API so we don't materialise millions of dicts. */
         sqlite3* h = 0;
         if (sqlite3_open(g_db_path, &h) != SQLITE_OK) {
             if (h) sqlite3_close(h);
-            term_print_err("cannot reopen db for postings stream");
+            if (!g_tui_mode) term_print_err("cannot reopen db for postings stream");
+            else ui_set_status("cannot reopen db for postings");
             return 0;
         }
         sqlite3_stmt* st = 0;
         const char* sql = "SELECT term, doc_id, tf FROM postings";
         if (sqlite3_prepare_v2(h, sql, -1, &st, 0) != SQLITE_OK) {
             sqlite3_close(h);
-            term_print_err("prepare postings failed");
+            if (!g_tui_mode) term_print_err("prepare postings failed");
+            else ui_set_status("prepare postings failed");
             return 0;
         }
 
@@ -1347,16 +1612,24 @@ int load_index(Sqlite* db, List<Doc*>* corpus, Map<String, Term*>* inv) {
                 inv.Set(w, t);
             }
             n_posts++;
-            if ((n_posts % 100000) == 0) {
-                fprintf(stderr, "\r  loaded %d posting rows…", n_posts);
-                fflush(stderr);
+            if ((n_posts % 50000) == 0) {
+                g_ui_n_terms = inv.Count();
+                ui_set_status("loading postings… %d rows · %d terms",
+                              n_posts, inv.Count());
+                if (g_want_quit) break;
             }
+        }
+        if (g_want_quit) {
+            sqlite3_finalize(st);
+            sqlite3_close(h);
+            return 0;
         }
         sqlite3_finalize(st);
         sqlite3_close(h);
 
         if (rc != SQLITE_DONE) {
-            term_print_err("postings step failed");
+            if (!g_tui_mode) term_print_err("postings step failed");
+            else ui_set_status("postings step failed");
             return 0;
         }
 
@@ -1364,13 +1637,18 @@ int load_index(Sqlite* db, List<Doc*>* corpus, Map<String, Term*>* inv) {
         if (mc) g_bytes_indexed = atol((char*)mc.v);
 
         g_files_indexed = corpus.Count();
-        fprintf(stderr, "\r  loaded %d docs · %d terms · %d posting rows            \n",
-                corpus.Count(), inv.Count(), n_posts);
+        g_ui_n_terms = inv.Count();
         g_from_db = 1;
+        ui_set_status("ready — %d docs · %d terms · %d postings",
+                      corpus.Count(), inv.Count(), n_posts);
+        if (!g_tui_mode)
+            fprintf(stderr, "\r  loaded %d docs · %d terms · %d posting rows            \n",
+                    corpus.Count(), inv.Count(), n_posts);
         return corpus.Count() > 0;
     } catch (SqliteError e) {
-        printf("  %sSQLite load failed:%s %s\n",
-               term_bold_red(), term_reset(), e.msg ? e.msg : "?");
+        if (g_tui_mode) ui_set_status("SQLite load failed: %s", e.msg ? e.msg : "?");
+        else printf("  %sSQLite load failed:%s %s\n",
+                    term_bold_red(), term_reset(), e.msg ? e.msg : "?");
         return 0;
     }
 }
@@ -1424,19 +1702,6 @@ int main(int argc, char** argv) {
     resolve_db_path(db_override);
     ensure_parent_dir(g_db_path);
 
-    printf("\n");
-    printf("%s", term_bold_cyan());
-    printf("   ██████╗  ██████╗  ██████╗███████╗███████╗ █████╗ ██████╗  ██████╗██╗  ██╗\n");
-    printf("   ██╔══██╗██╔═══██╗██╔════╝██╔════╝██╔════╝██╔══██╗██╔══██╗██╔════╝██║  ██║\n");
-    printf("   ██║  ██║██║   ██║██║     ███████╗█████╗  ███████║██████╔╝██║     ███████║\n");
-    printf("   ██║  ██║██║   ██║██║     ╚════██║██╔══╝  ██╔══██║██╔══██╗██║     ██╔══██║\n");
-    printf("   ██████╔╝╚██████╔╝╚██████╗███████║███████╗██║  ██║██║  ██║╚██████╗██║  ██║\n");
-    printf("   ╚═════╝  ╚═════╝  ╚═════╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝\n");
-    printf("%s", term_reset());
-    printf("              man · markdown · html  ·  SQLite index  ·  type-to-search\n");
-    printf("   types: %s · %s · %s\n\n",
-           nameof<DocKind>(), nameof<Hit>(), typeof<Doc*>());
-
     auto corpus = List<Doc*>();
     corpus.owns();
 
@@ -1458,17 +1723,51 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (g_max_files == 0)
-        printf("  max files: unlimited  (DOCSEARCH_MAX=0 · Google mode)\n");
-    else
-        printf("  max files: %d  (DOCSEARCH_MAX)\n", g_max_files);
-    printf("  index db: %s\n", g_db_path);
-    if (g_reindex) printf("  mode:     %sREINDEX%s (rebuild forced)\n",
-                          term_bold_yellow(), term_reset());
+    int interactive = (!g_batch && isatty(0) && isatty(1));
 
-    /* Open SQLite early — load cache or rebuild. */
+    /* ── Interactive: paint TUI + query bar *first*, load index under it ── */
+    char query[MAX_QUERY];
+    query[0] = 0;
+    int qlen = 0;
+    Focus focus = focus_query;
+    int selected = 0;
+    auto hits = List<Hit>();
+
+    if (interactive) {
+        g_tui_mode = 1;
+        g_index_ready = 0;
+        g_want_quit = 0;
+        g_ui_corpus = &corpus;
+        g_ui_inv = &inv;
+        g_ui_hits = &hits;
+        g_ui_query = query;
+        g_ui_qlen = &qlen;
+        g_ui_n_terms = 0;
+        term_enter_raw();
+        ui_set_status("opening %s …", g_db_path);
+        if (g_want_quit) { term_leave_raw(); return 0; }
+    } else {
+        printf("\n");
+        printf("%s", term_bold_cyan());
+        printf("   CLASSY DOCSEARCH  ·  batch / non-interactive\n");
+        printf("%s", term_reset());
+        if (g_max_files == 0)
+            printf("  max files: unlimited\n");
+        else
+            printf("  max files: %d\n", g_max_files);
+        printf("  index db: %s\n", g_db_path);
+        if (g_reindex) printf("  mode: REINDEX\n");
+        printf("\n");
+    }
+
     Sqlite* db = Sqlite.open(g_db_path);
     if (!db) {
+        if (interactive) {
+            ui_set_status("cannot open SQLite db: %s", g_db_path);
+            /* brief pause so the message is visible */
+            sleep(2);
+            term_leave_raw();
+        }
         term_print_err("cannot open SQLite index database");
         printf("  path: %s\n", g_db_path);
         return 1;
@@ -1479,43 +1778,44 @@ int main(int argc, char** argv) {
     if (!g_reindex) {
         try {
             schema_init(db);
-            if (db_has_index(db))
+            if (db_has_index(db)) {
                 loaded = load_index(db, &corpus, &inv);
-            else
-                printf("  (no cached index yet — will crawl & save)\n");
+            } else {
+                ui_set_status("no cache yet — will crawl & build index…");
+            }
         } catch (SqliteError e) {
-            printf("  cache unreadable (%s) — will reindex\n",
-                   e.msg ? e.msg : "?");
+            ui_set_status("cache unreadable — reindexing (%s)", e.msg ? e.msg : "?");
             loaded = 0;
         }
+        if (g_want_quit) {
+            term_leave_raw();
+            g_tui_mode = 0;
+            return 0;
+        }
+    } else {
+        ui_set_status("REINDEX forced — crawling filesystem…");
     }
 
     if (!loaded) {
-        /* Fresh corpus — wipe any partial state after failed load. */
-        if (corpus.Count() > 0 || inv.Count() > 0) {
-            /* cannot Clear owns easily mid-flight; restart lists */
-            printf("  rebuilding from filesystem…\n");
-        }
-
-        printf("  crawling:\n");
-        for (auto r in roots) printf("    · %s\n", r);
-        printf("\n");
-
         g_files_indexed = 0;
         g_bytes_indexed = 0;
         g_files_seen = 0;
         g_from_db = 0;
 
-        /* New empty collections if we partially loaded */
         auto corpus2 = List<Doc*>();
         corpus2.owns();
         auto inv2 = Map<String, Term*>();
         inv2.ownsValues();
 
+        /* Point live search at the in-progress collections. */
+        g_ui_corpus = &corpus2;
+        g_ui_inv = &inv2;
+
+        ui_set_status("scanning roots…");
         auto paths = List<String>();
         for (auto r in roots) collect_paths(r, 0, &paths);
-        fprintf(stderr, "\r  scanned %d files, %d candidates.                \n",
-                g_files_seen, paths.Count());
+        ui_set_status("scanned %d files · %d candidates — indexing…",
+                      g_files_seen, paths.Count());
 
         if (g_max_files > 0) paths.Sort(by_priority);
 
@@ -1531,42 +1831,52 @@ int main(int argc, char** argv) {
                 if (s < 0 || s > 8) s = 0;
                 sec_used[s]++;
             }
+            g_ui_n_terms = inv2.Count();
+            if (g_want_quit) break;
         }
-        fprintf(stderr, "\r  indexed %d files (%ld KB plain).                      \n",
-                g_files_indexed, g_bytes_indexed / 1024);
-        printf("  section mix:");
-        for (int i = 0; i < 9; i++) {
-            if (sec_used[i] <= 0) continue;
-            if (i == 0) printf(" doc=%d", sec_used[i]);
-            else printf(" man%d=%d", i, sec_used[i]);
+
+        if (g_want_quit) {
+            term_leave_raw();
+            g_tui_mode = 0;
+            return 0;
         }
-        printf("\n");
-        printf("  inverted index: %d unique terms\n", inv2.Count());
 
         if (corpus2.Count() == 0) {
+            if (interactive) {
+                ui_set_status("no documents found — check paths / permissions");
+                sleep(2);
+                term_leave_raw();
+            }
             term_print_err("no documents indexed — check paths / permissions");
             return 1;
         }
 
+        g_ui_n_terms = inv2.Count();
         save_index(db, &corpus2, &inv2);
-
-        /* Move built index into outer shells for search/TUI lifetime.
-         * Move-only collections: transfer buffer ownership. */
         corpus = move corpus2;
         inv = move inv2;
-    } else {
-        printf("  inverted index: %d unique terms  %s(from cache)%s\n",
-               inv.Count(), term_dim(), term_reset());
+        g_ui_corpus = &corpus;
+        g_ui_inv = &inv;
     }
-    printf("\n");
 
     if (corpus.Count() == 0) {
+        if (interactive) {
+            ui_set_status("empty index");
+            sleep(1);
+            term_leave_raw();
+        }
         term_print_err("no documents indexed — check paths / permissions");
         return 1;
     }
 
+    /* Index is live */
+    g_index_ready = 1;
+    g_ui_n_terms = inv.Count();
+    g_ui_corpus = &corpus;
+    ui_clear_status();
+
     /* ── batch smoke: run a few canned queries and exit ── */
-    if (g_batch || !isatty(0)) {
+    if (!interactive) {
         const char* samples[] = {
             "ls", "gzip", "strncmp", "malloc", "printf", "memory", "README", NULL
         };
@@ -1587,15 +1897,17 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    /* ── interactive TUI ── */
-    char query[MAX_QUERY];
-    query[0] = 0;
-    int qlen = 0;
-    Focus focus = focus_query;
-    int selected = 0;
-
-    auto hits = search_docs(&corpus, &inv, query);
-    term_enter_raw();
+    /* ── interactive TUI (already up; index now ready) ── */
+    {
+        auto next = search_docs(&corpus, &inv, query);
+        hits = move next;
+    }
+    g_ui_hits = &hits;
+    /* Keep selection/focus from any mid-load navigation. */
+    focus = g_ui_focus;
+    selected = g_ui_selected;
+    if (selected >= hits.Count()) selected = hits.Count() > 0 ? hits.Count() - 1 : 0;
+    if (selected < 0) selected = 0;
     draw_ui(&corpus, &hits, query, focus, selected, inv.Count());
 
     for (;;) {
@@ -1635,15 +1947,12 @@ int main(int argc, char** argv) {
                     }
                 }
             } else {
-                /* bare Esc */
+                /* bare Esc (no [ following within VTIME) */
                 if (focus == focus_list) {
-                    focus = focus_query;
+                    focus = focus_query;       /* list → search bar */
                     redraw = 1;
-                } else if (qlen > 0) {
-                    qlen = 0;
-                    query[0] = 0;
-                    research = 1;
-                    redraw = 1;
+                } else {
+                    break;                     /* query focus → quit */
                 }
             }
         } else if (c == '\t') {
@@ -1703,14 +2012,19 @@ int main(int argc, char** argv) {
             auto next = search_docs(&corpus, &inv, query);
             hits = move next;
             selected = 0;
+            g_ui_hits = &hits;
+            g_ui_selected = 0;
+            g_ui_focus = focus;
         }
         if (redraw) {
+            g_ui_selected = selected;
+            g_ui_focus = focus;
             draw_ui(&corpus, &hits, query, focus, selected, inv.Count());
         }
     }
 
     term_leave_raw();
-    fputs("\033[2J\033[H", stdout);
+    g_tui_mode = 0;
     term_print_ok("docsearch closed — corpus reclaimed by RAII");
     printf("  %d docs · %d terms\n\n", corpus.Count(), inv.Count());
     return 0;
