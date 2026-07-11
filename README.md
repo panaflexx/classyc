@@ -45,7 +45,8 @@ String rejoined = parts->join(", ");
 dict cfg = {
     "server": { "host": "localhost", "port": 8080 },
     "debug": 1,
-    "timeout": 30.5
+    "timeout": 30.5,
+    "logfiles": ["access.log", "error.log"]
 };
 
 printf("%s\n", (char*)cfg.server.host);       // string leaf -> cast to char*
@@ -219,6 +220,72 @@ printf("unique tags: %d\n", tags.Count());   // 2
 > (`List<MyClass*>`), and POD/DTO classes by value (`List<LapSample>`). Domain
 > objects with real destructors stay `List<T*>.owns()`. Full picture:
 > **[GENERICSMEM.md](GENERICSMEM.md)**, **[BY-VALUE.md](BY-VALUE.md)**.
+
+#### Lambdas (typed, thin C, capturing HOF args)
+
+ClassyC has **fat-arrow lambdas** with two lowering paths — both stay
+C-shaped (no `{fn,env}` fat pointers):
+
+| Form | Lowering | Where it works |
+|------|----------|----------------|
+| **Non-capturing** | `static` function → thin `T(*)(…)` | Anywhere a function pointer is legal: HOF args, `apply(f)`, assignment |
+| **Capturing** | open-coded `for` / `for-in` at the **call site** | **Direct** argument to recognized HOFs only |
+
+```c
+// Non-capturing — thin function pointer (stable ABI)
+int is_even(int x) { return (x & 1) == 0; }
+auto a = nums.Where(is_even);
+auto b = nums.Where((int x) => (x & 1) == 0);  // same path
+
+// Capturing — free outer locals stay normal names in the caller frame
+int thr = 3;
+auto big = nums.Where((int x) => x > thr);
+
+int sum = 0;
+nums.ForEach((int x) => { sum += x; });       // may mutate outer locals
+
+String prefix = "err";
+auto bad = logs.Where((String s) => s.starts_with(prefix));
+
+int floor = 50;
+auto hot = board.Where((String k, int v) => v >= floor);  // Map
+```
+
+**HOFs that accept capturing literals (v1):**
+
+| Receiver | Methods |
+|----------|---------|
+| `List<T>` | `Where` / `Filter` / `Map` / `ForEach` / `Any` / `All` |
+| `Map<K,V>` | `Where` / `ForEach` / `Any` / `All` |
+| `Set<T>` | `Filter` / `ForEach` / `Any` / `All` |
+
+```c
+// Chains work left-to-right (each capturing HOF open-coded on its own)
+auto q = nums.Where((int x) => x > thr).Take(10);
+```
+
+**Rules (v1):**
+
+- Capture is **only** for a lambda that is the **direct** argument of a HOF above
+  (`xs.Where((int x) => x > thr)` ✅).
+- Non-capturing lambdas keep working as ordinary C function pointers.
+- Assigning / returning a **capturing** lambda is a hard error with a hint:
+
+```c
+int thr = 5;
+auto pred = (int x) => x > thr;   // ERROR — not a HOF argument
+// hint: use xs.Where((int x) => x > thr) inline, or a non-capturing function
+```
+
+- No `[=]` / `[&]` syntax; free vars resolve lexically like nested blocks.
+- Predicate HOFs that capture should use an **expression body** or a single
+  `return expr;` (multi-return blocks deferred).
+- **Not** for stored UI callbacks / `std::function`-style escape (`button.callback([this]{…})`).
+  That needs fat closures later; collection pipelines do not.
+
+Details & design: **[LAMBDA-CAPTURE.md](LAMBDA-CAPTURE.md)**.  Tests:
+`cy-validate/val-042-lambda-capture.cy`, `examples/classy-lambda.cy`,
+`examples/classy-docsearch.cy` (`search_docs` min-score filter).
 
 #### Ownership: `.owns()` auto-frees pointer elements
 
@@ -887,7 +954,8 @@ Look in the `examples/` directory:
 | `classy-string-split-join.cy` | `String.equals`, `String.split` → `List<String>*`, and `List<String>.join` |
 | `classy-auto.c`            | `auto` + dict/array disambiguation |
 | `classy-generics.c`        | Generic `List<T>` (30 methods, brace-init `{a,b,c}`) |
-| `classy-lambda.c`          | Typed lambdas for map/filter/sort/etc. |
+| `classy-lambda.cy`         | Typed non-capturing lambdas (thin C function pointers) |
+| `classy-docsearch.cy`      | Doc search TUI — capturing `Where` with local `min_score` (no `g_*`) |
 | `test-list-stdlib.c`       | Full stdlib List<T> validation |
 | `test-array-to-list.cy`    | Array/slice `.ToList()`, `auto` deduction, `List(T*)` ctor |
 | `test-list-conversions.cy` | `List<T>` → array/`dict`: `ToArray`, `CopyTo`, `ToJsonArray`, `ToDictBy` |
@@ -1134,12 +1202,14 @@ The runtime support for String methods and dict operations lives in small C help
 
 ClassyC is a pragmatic, evolving experiment in "C but pleasant". It already delivers a delightful developer experience for data-heavy systems code (proxies, config-driven services, CLIs, embedded scripting).
 
-Shipped since the early roadmap: typed lambdas, generics (`List<T>` and
-user-defined collections, plus **generic functions** with call-site type
-inference), `interface`/`Any<I>` erasure, default-on exceptions + safety
-guards, array/slice → `List<T>` conversion with lengths flowing into
-generics, **typed JSON binding** (`(T) d` / `(T)? d` for class or struct,
-with `KeyException` on missing required fields — including **collection
+Shipped since the early roadmap: typed lambdas (thin C function pointers),
+**capturing lambdas as direct HOF args** (open-coded `Where`/`Filter`/… — see
+`LAMBDA-CAPTURE.md`), generics (`List<T>` and user-defined collections, plus
+**generic functions** with call-site type inference), value-returning
+List/Map/Set transforms (RAII shells), `interface`/`Any<I>` erasure, default-on
+exceptions + safety guards, array/slice → `List<T>` conversion with lengths
+flowing into generics, **typed JSON binding** (`(T) d` / `(T)? d` for class or
+struct, with `KeyException` on missing required fields — including **collection
 fields** (`List<T>*` / `Set<T>*` from a JSON array), Phase 2), a lightweight
 **SQLite wrapper** (`include/sqlite.h`) with `dict`-row binding and
 `List<dict>` result sets, and a **gunicorn-style HTTP server** library
@@ -1174,6 +1244,7 @@ Contributions, bug reports, and wild ideas are welcome!
 - Stack value-construction works for plain classes (including those with constructor arguments): `Point p = Point(1, 2);` runs the constructor in place and `~Point()` at scope exit. It is the **generic collections** (`List<T>` / `Set<T>` / `Map<K,V>`) that are reference types only — instantiate them with `new` (a bare `Map<K,V> m = ...` value expression does not parse).
 - Exception names are resolved only at compile time. Runtime stores integer IDs only; there is no symbolic pretty-printing or `nameof`-style reflection for exceptions. The prelude ships `KeyException = 8` and `TypeException = 7` (used by the typed JSON binder); user code can extend the set with `enum { MyErr = 100 }`.
 - `List<T>.Sort` / `Set<T>` and a few other methods have minor edge-case limitations documented in the headers.
+- **Lambdas / capture:** non-capturing lambdas lower to thin C function pointers. Capturing free locals is allowed **only** as a direct argument to List/Map/Set HOFs (`Where`/`Filter`/`Map`/`ForEach`/`Any`/`All`) via call-site open-coding — not as stored callbacks (`auto f = (int x) => x > thr` is an error). No fat closures / `std::function`-style escape yet. Capturing `Find`/`Sort`/`Select<U>` and array `.filter`/`.map` are deferred. See **[LAMBDA-CAPTURE.md](LAMBDA-CAPTURE.md)**.
 - **Generic functions** (`T Max<T>(T a, T b)`) work with call-site type inference and multi-parameter templates, but two gaps remain: (1) **self-referential signatures** — a generic function whose return type or parameter type is itself a generic class instantiated on the function's own type param (`List<T>* Sort<T>(List<T>* xs)`) does not yet parse, because the `<T>` in the signature is not resolved as a placeholder the way it is inside generic class bodies; (2) **explicit type arguments at the call site** (`Max<int>(3, 5)`) are not yet supported — use inference (`Max(3, 5)`) or cast the arguments to disambiguate. These are the blockers for writing collection-level algorithms (`Sort`/`Distinct`/`GroupBy`/`Reduce`) as free generic functions; the value-level primitives (`Max`/`Cmp`/`Eq`/`First`/`Second`) already work.
 
 ### Want-to-have features (prioritized)
@@ -1195,6 +1266,7 @@ Contributions, bug reports, and wild ideas are welcome!
 - ~~Lightweight SQLite wrapper (`include/sqlite.h`) with automatic binding of `dict` rows and `List<dict>` result sets~~ **(landed)** — `Sqlite.open()`, `db->execute(sql, fmt, ...)`, `db->query(sql, fmt, ...) -> List<dict>*`, `db->prepare()` returning a real `Statement*` with overloaded `bind(int|long|double|const char*)`, RAII `Transaction*` for commit/rollback, `db->lastInsertRowId()`, and `SqliteError` exceptions on failure. SQL `NULL` round-trips as JSON `null` so `(T) row` bind-casts behave correctly. See `examples/classy-customers-rest.cy` for a Flask-style REST controller backed by an in-memory SQLite database.
 - ~~Simple gunicorn-style HTTP server library~~ **(landed)** — `include/httpserve.h` plus `examples/http-serve.c` / `examples/classy-http-app.c` implement a shared `Request`/`Response` server with routing helpers; the two TUs link into one program (the driver enables MIR func-redef for ODR-style inline linkage across the boundary).
 - **Generic function improvements**: (1) self-referential signatures (`List<T>* Sort<T>(List<T>* xs)`) — extend the placeholder-resolution path already used by generic class bodies to function signatures, unlocking collection-level algorithms; (2) explicit type arguments at the call site (`Max<int>(3, 5)`) — parse-time detection with check-time materialization, mirroring the inference path. These two close the gap between value-level generic primitives and the sort/map/reduce/hash/equality utilities the foundation is meant to enable.
+- **Escaping closures** (optional later): fat `{fn,env}` or capture-as-args helpers for stored UI callbacks (`button.callback([this]{…})`). Collection HOF capture is already open-coded (Strategy A); this is only for plugins / event systems that need to *return* or *store* a capturing callable. See **[LAMBDA-CAPTURE.md](LAMBDA-CAPTURE.md)** §16.
 - Optional pretty-printing / symbolic names for user-defined exceptions at debug time.
 
 ## Linking Shared Libraries (`-l` / `-L`)

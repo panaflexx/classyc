@@ -16404,7 +16404,13 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         int nfree;
         MIR_alloc_t alloc;
 
-        if (r->attr != NULL) break; /* already instantiated */
+        /* Re-check of an already-instantiated lambda: reuse attr and set outer
+           `e` so the post-switch recovery path does not stamp TP_INT over a
+           good func-ptr (Select/GroupBy pre-check args more than once). */
+        if (r->attr != NULL) {
+          e = r->attr;
+          break;
+        }
         alloc = c2m_alloc (c2m_ctx);
         VARR_CREATE (cstr_t, free_names, alloc, 4);
         lambda_collect_free_vars (c2m_ctx, r, free_names);

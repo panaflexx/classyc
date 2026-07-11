@@ -923,6 +923,22 @@ List<Hit> search_docs(List<Doc*>* corpus, Map<String, Term*>* inv, const char* q
     free(title_hit);
 
     hits.Sort(ByScoreDesc);
+
+    /* Capturing Where (Strategy A): free local min_score lives in this frame
+     * (no g_* threshold, no fat closure).  When many hits and the query is
+     * long enough, prefer high-confidence matches (title/multi-term ≥ 1000).
+     * If that empties the view, fall back to Take. */
+    if (hits.Count() > MAX_SHOW && qlen >= 3) {
+        int min_score = 1000;
+        auto strong = hits.Where((Hit h) => h.score >= min_score);
+        if (strong.Count() > 0) {
+            if (strong.Count() > MAX_SHOW) {
+                auto top = strong.Take(MAX_SHOW);
+                return move top;
+            }
+            return move strong;
+        }
+    }
     if (hits.Count() > MAX_SHOW) {
         auto top = hits.Take(MAX_SHOW);
         return move top;
@@ -1894,15 +1910,7 @@ int main(int argc, char** argv) {
                 printf("   %d. %-28s  [%s] score=%d\n",
                        h + 1, d.title, d.section, hit.score);
             }
-            if (hits.Count() == 0) {
-                printf("   (none)\n");
-            } else if (hits.Count() >= 2) {
-                /* Capturing Where on Hit list — local score floor (no g_*). */
-                int floor = hits.Get(0).score;
-                auto elite = hits.Where((Hit h) => h.score >= floor);
-                printf("   capturing Where(score >= %d) → %d peer(s) at top rank\n",
-                       floor, elite.Count());
-            }
+            if (hits.Count() == 0) printf("   (none)\n");
             printf("\n");
         }
         term_print_ok("batch docsearch complete");
