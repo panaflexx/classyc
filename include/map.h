@@ -52,14 +52,15 @@
  * TryGet(k, &out), or try/catch when absence is expected.  Contains(k) /
  * ContainsKey(k) test presence without throwing.
  *
- * Memory: Caller owns via `defer delete` (or `owned` / `defer delete ownsValues()`).
- * Copy()/Merge() return new heap maps the caller must free.  Keys()/Values()
- * return new List* the caller must free.  For Map<…, MyClass*> the map owns
- * only the pointers unless ownsValues()/ownsKeys() was used.
+ * Memory: Caller owns via `owned auto` / `defer delete`.
+ * Copy() is always a shallow non-owning map (does not copy ownsKeys/ownsValues).
+ * Keys()/Values() return new List* the caller must free.
+ * For Map<…, MyClass*> the map owns only the pointers after ownsValues()/ownsKeys().
  *
- * List grouping: free `GroupBy(list, keyFn)` (UFCS: `list->GroupBy(keyFn)`)
- * lives here to avoid a list.h↔map.h include cycle.  ListGroupBy is a compat
- * alias of the same free function.
+ * List/Map GroupBy results own the List* bucket values automatically
+ * (ownsValues). Element ownership inside each bucket is still non-owning.
+ * Free form `GroupBy(list, keyFn)` / UFCS `list->GroupBy(keyFn)` / ListGroupBy
+ * live here to avoid a list.h↔map.h include cycle.
  *
  * Thread safety: None.
  */
@@ -151,25 +152,32 @@ class Map<K, V> {
 
     /* ───────────────────── Internal helpers ───────────────────── */
 
-    /* Find the table slot for `key`: either the slot already holding an equal
-     * key, or the first empty slot at which it would be inserted.  The table
-     * never reaches 100% occupancy, so an empty (-1) slot always exists and the
-     * probe loop terminates. */
+    /* Find the table slot for `key`:
+     *   · if the key is present, the slot whose table entry indexes it
+     *   · otherwise the first empty slot (-1), or the first tombstone (-2)
+     *     along the probe chain (so inserts can reuse tombstones)
+     * Load factor is capped below 1, so a free/tomb slot always exists. */
     int find_slot(K key) const {
         uint64_t h = MAP_HASH(key);
         int mask = this->table_cap - 1;
         int i = (int)(h & (uint64_t)mask);
         int step = 1;
+        int first_tomb = -1;
         for (;;) {
             int idx = this->table[i];
-            if (idx == -1) return i;                                /* empty */
-            if (idx >= 0 && MAP_EQ(this->keys[idx], key)) return i; /* found */
+            if (idx == -1)
+                return first_tomb >= 0 ? first_tomb : i;            /* free */
+            if (idx == -2) {
+                if (first_tomb < 0) first_tomb = i;                 /* reusable */
+            } else if (MAP_EQ(this->keys[idx], key)) {
+                return i;                                          /* found */
+            }
             i = (i + step) & mask;                                  /* triangular probe */
             step++;
         }
     }
 
-    /* Dense index of `key`, or -1 if absent. */
+    /* Dense index of `key`, or a negative sentinel if absent (-1 empty / -2 tomb). */
     int find_index(K key) const {
         if (this->table_cap == 0) return -1;
         int slot = this->find_slot(key);
@@ -367,8 +375,10 @@ class Map<K, V> {
         this->vals[n] = val;
         this->count++;
 
+        /* idx is -1 (empty) or -2 (tombstone).  `used` counts live+tomb:
+         * reclaiming a tomb does not change used; claiming empty does. */
         this->table[slot] = n;
-        this->used++;
+        if (idx == -1) this->used++;
         return 1;
     }
 
@@ -391,17 +401,33 @@ class Map<K, V> {
         this->destroy_key_at(idx);
         this->destroy_val_at(idx);
 
-        /* Swap-remove from the dense arrays and repoint the moved entry's slot. */
+        /* Swap-remove from the dense arrays and repoint the moved entry's slot.
+         *
+         * IMPORTANT: after keys[idx] = keys[last], find_slot(moved_key) can hit
+         * `slot` first (keys[idx] already equals the moved key) and return the
+         * entry we're about to tombstone — losing the survivor.  Probe for the
+         * dense index `last` instead of matching by key equality. */
         int last = this->count - 1;
         if (idx != last) {
             this->keys[idx] = this->keys[last];
             this->vals[idx] = this->vals[last];
-            int slot2 = this->find_slot(this->keys[last]);
-            this->table[slot2] = idx;
+
+            uint64_t h = MAP_HASH(this->keys[idx]);
+            int mask = this->table_cap - 1;
+            int i = (int)(h & (uint64_t)mask);
+            int step = 1;
+            for (;;) {
+                if (this->table[i] == last) {
+                    this->table[i] = idx;
+                    break;
+                }
+                i = (i + step) & mask;
+                step++;
+            }
         }
         this->count--;
 
-        this->table[slot] = -2;   /* tombstone */
+        this->table[slot] = -2;   /* tombstone (used already counted this slot) */
         return 1;
     }
 
@@ -443,14 +469,16 @@ class Map<K, V> {
     /* ───────────────────── Bulk / functional ───────────────────── */
 
     /* Copy all entries of `other` into this map (overwriting on key clash).
-     * Returns this for chaining. */
+     * Returns this for chaining.  NULL `other` is a no-op. */
     Map<K, V>* Merge(Map<K, V>* other) {
+        if (!other) return this;
         for (int i = 0; i < other->Count(); i++)
             this->Set(other->KeyAt(i), other->ValAt(i));
         return this;
     }
 
-    /* Return a new heap map with the same entries.  Caller must `delete`. */
+    /* Return a new heap map with the same entries (shallow).  Does not copy
+     * ownsKeys/ownsValues flags — the result is non-owning.  Caller must `delete`. */
     Map<K, V>* Copy() const {
         Map<K, V>* r = new Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
@@ -502,6 +530,9 @@ class Map<K, V> {
             r->Set(fn(this->keys[i], this->vals[i]), this->vals[i]);
         return r;
     }
+    /* Group values by keySelector(k,v).  The result map owns the bucket
+     * List<V>* values (auto ownsValues) so `delete result` frees every bucket.
+     * Element ownership inside each List is unchanged (still non-owning). */
     Map<G, List<V>*>* GroupBy<G>(G(*keySelector)(K, V)) const __attribute__((da_ignore)) {
         Map<G, List<V>*>* result = new Map<G, List<V>*>();
         for (int i = 0; i < this->count; i++) {
@@ -513,6 +544,7 @@ class Map<K, V> {
             }
             bucket->Add(this->vals[i]);
         }
+        result->ownsValues();  /* buckets freed with map; return is the same ptr */
         return result;
     }
 
@@ -616,43 +648,50 @@ class Map<K, V> {
  * list.h cannot return Map from a method without #including map.h (cycle:
  * map.h already includes list.h for Keys/Values).  Call either way:
  *   Map<int, List<int>*>* g = nums->GroupBy(parity);     // UFCS method form
- *   Map<int, List<int>*>* g = GroupBy(nums, parity);     // free form
- *   Map<int, List<int>*>* g = ListGroupBy(nums, parity); // compat alias
- *   defer delete g->ownsValues();
+ *   Map<int, List<int>*>* g = GroupBy(nums, keyFn);     // free form
+ *   Map<int, List<int>*>* g = ListGroupBy(nums, keyFn); // compat alias
+ *   defer delete g;   // buckets are ownsValues() already
  * Map<K,V>::GroupBy stays the instance method on maps (same name, method wins).
+ *
+ * Result always owns the List<T>* bucket values (not the list elements).
  */
 Map<G, List<T>*>* GroupBy<T, G>(List<T>* self, G(*keySelector)(T))
     __attribute__((da_ignore)) {
     Map<G, List<T>*>* result = new Map<G, List<T>*>();
-    if (!self) return result;
-    for (int i = 0; i < self->Count(); i++) {
-        T item = self->Get(i);
-        G gk = keySelector(item);
-        List<T>* bucket;
-        if (!result->TryGet(gk, &bucket)) {
-            bucket = new List<T>();
-            result->Set(gk, bucket);
+    if (self) {
+        for (int i = 0; i < self->Count(); i++) {
+            T item = self->Get(i);
+            G gk = keySelector(item);
+            List<T>* bucket;
+            if (!result->TryGet(gk, &bucket)) {
+                bucket = new List<T>();
+                result->Set(gk, bucket);
+            }
+            bucket->Add(item);
         }
-        bucket->Add(item);
     }
+    result->ownsValues();  /* buckets freed with map; return is the same ptr */
     return result;
 }
 
 /* Compat alias of GroupBy (pre-UFCS name). */
 Map<G, List<T>*>* ListGroupBy<T, G>(List<T>* self, G(*keySelector)(T))
     __attribute__((da_ignore)) {
+    /* Open-coded body (do not call GroupBy — free generic forward refs are flaky). */
     Map<G, List<T>*>* result = new Map<G, List<T>*>();
-    if (!self) return result;
-    for (int i = 0; i < self->Count(); i++) {
-        T item = self->Get(i);
-        G gk = keySelector(item);
-        List<T>* bucket;
-        if (!result->TryGet(gk, &bucket)) {
-            bucket = new List<T>();
-            result->Set(gk, bucket);
+    if (self) {
+        for (int i = 0; i < self->Count(); i++) {
+            T item = self->Get(i);
+            G gk = keySelector(item);
+            List<T>* bucket;
+            if (!result->TryGet(gk, &bucket)) {
+                bucket = new List<T>();
+                result->Set(gk, bucket);
+            }
+            bucket->Add(item);
         }
-        bucket->Add(item);
     }
+    result->ownsValues();
     return result;
 }
 

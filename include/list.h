@@ -23,14 +23,15 @@
  *   // to the same List(T* items, int count) constructor below:
  *   List<String>* lst2 = arr.ToList();
  *
- * Memory: Caller owns heap-allocated List<T> instances. Use `defer delete` for
-* scope-bound cleanup. Slice() and Copy() return new heap allocations that the
-* caller must also free. Filter() similarly returns a new heap list.
-*
-* Pointer ownership:
-*   - List<T> (by-value): __destroy auto-runs ~T() on each element
-*   - List<T*>(): non-owning, you must delete each T* manually
-*   - List<T*>::MakeOwning(): owning, auto-deletes each T* on list delete
+ * Memory: Caller owns heap-allocated List<T> instances (`owned auto` / `defer delete`).
+ * Slice/Copy/Filter/Where/Select/Plus return new heap lists the caller must free.
+ * Those results are always non-owning — they never copy the source `.owns()` flag.
+ *
+ * Pointer ownership:
+ *   - List<T> (by-value): __destroy auto-runs ~T() on each element
+ *   - List<T*>(): non-owning by default
+ *   - List<T*>().owns(): owning — delete frees each pointer element
+ *   - Pop() transfers the last element out (no list-side destroy/delete)
 *
 * Thread safety: None. External synchronization required for shared access.
  */
@@ -174,7 +175,7 @@ class List<T> {
     /* Ensure capacity >= min. Doubles until satisfied; preserves elements. */
     void EnsureCapacity(int min) __attribute__((da_ignore)) {
         if (min <= this->capacity) return;
-        int newCap = this->capacity;
+        int newCap = this->capacity > 0 ? this->capacity : 1;
         while (newCap < min) newCap = newCap * 2;
         T* newData = (T*) malloc(sizeof(T) * newCap);
         for (int i = 0; i < this->length; i++) newData[i] = this->data[i];
@@ -237,7 +238,14 @@ class List<T> {
         this->length++;
     }
 
-    T Pop() { if(length==0) throw(OutOfBoundsException, "Pop empty"); length--; return data[length]; }
+    /* Remove and return the last element. Ownership transfers to the caller:
+     * for .owns() pointer lists the pointer is NOT deleted here; for by-value T
+     * the list no longer runs __destroy on that slot (return value holds it). */
+    T Pop() {
+        if (this->length == 0) throw(OutOfBoundsException, "Pop empty");
+        this->length--;
+        return this->data[this->length];
+    }
 
     void RemoveAt(int index) { if(index<0||index>=length) throw(OutOfBoundsException, "RemoveAt oob"); if(_owns_ptrs && is_pointer<T>()) delete data[index]; else __destroy(data[index]); for(int i=index;i<length-1;i++) data[i]=data[i+1]; length--; }
 
@@ -313,7 +321,7 @@ class List<T> {
     }
 
     /* Return new heap list with [start, start+count). Clamps to valid range.
-     * Caller must `delete` the result. */
+     * Always non-owning (does not copy .owns()). Caller must `delete`. */
     List<T>* Slice(int start, int count) __attribute__((da_ignore)) {
         if (start < 0)                   start = 0;
         if (start >= this->length)       count = 0;
@@ -324,7 +332,7 @@ class List<T> {
         return result;
     }
 
-    /* Return shallow copy. Caller must `delete`. */
+    /* Shallow copy. Always non-owning (does not copy .owns()). Caller must `delete`. */
     List<T>* Copy() __attribute__((da_ignore)) {
         List<T>* c = new List<T>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++)
@@ -356,7 +364,7 @@ class List<T> {
             action(this->data[i]);
     }
 
-    /* Return new heap list containing elements where pred(item) != 0.
+    /* New heap list of elements where pred(item) != 0. Always non-owning.
      * Caller must `delete`. */
     List<T>* Filter(int(*pred)(T)) __attribute__((da_ignore)) {
         List<T>* result = new List<T>();
@@ -375,6 +383,7 @@ class List<T> {
         return result;
     }
 
+    /* Where == Filter. Always non-owning view. Caller must `delete`. */
     List<T>* Where(int(*pred)(T)) __attribute__((da_ignore)) {
         List<T>* result = new List<T>();
         for (int i = 0; i < this->length; i++)
