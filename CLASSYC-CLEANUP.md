@@ -94,7 +94,9 @@ Concrete primitives, pointers, by-value classes, and nested collection specialis
 
 ### `dict` — you have JSON-like but not JS-like
 
-* Safe nav `?.`, nullish `??`, spread `...`, array literals in dict: **NOT FIXED** (parser).
+* Safe nav `?.`, nullish `??`: **FIXED** (val-035).
+* Array literals in dict brace-init (`"k": [1,2,3]`, nested objects/arrays, `[]` vs `{}`): **FIXED** (val-004 C4).
+* Spread `...` in dict: **NOT FIXED** (parser).
 * Prefer `v.json()` (method) over free `json(v)` for serialize; bare `v.json` is a **key** named `"json"` (same idea as `v.length` vs `v.length()`).
 
 ### Static methods & Object model

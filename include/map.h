@@ -449,9 +449,11 @@ class Map<K, V> {
         this->Set(key, fallback);
         return fallback;
     }
+    /* True if any value equals `val`.  String values compare by content (MAP_EQ),
+     * matching key equality and C# Dictionary.ContainsValue for strings. */
     bool ContainsValue(V val) const __attribute__((da_ignore)) {
         for (int i = 0; i < this->count; i++)
-            if (this->vals[i] == val) return true;
+            if (MAP_EQ(this->vals[i], val)) return true;
         return false;
     }
     int AddOrUpdate(K key, V val, V(*updater)(V)) __attribute__((da_ignore)) {

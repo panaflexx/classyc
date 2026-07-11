@@ -11,8 +11,10 @@
  *       char* (the object-key convention); for a typed element use the two-var
  *       form or the typed for-in `for (int x in d.arr)`.
  *
- * Still unimplemented:
- *   · array *literal* assignment `d.k = [...]` (C1 in the doc).
+ * Array literals in dict brace-init:
+ *   dict d = { "nums": [10, 20, 30], "empty": [], "rows": [ {"a":1} ] };
+ * Unkeyed braces still work:  { "a": {1, 2, 3} }  → array value.
+ * Empty nested `{}` is an empty *object*; empty `[]` is an empty *array*.
  *
  * Run:  ./bin/classyc -g -I include cy-validate/val-004-dict-arrays.cy -eg
  */
@@ -100,6 +102,31 @@ int main() {
     }
     check(objs == 2,                                "C3: for-in over array-of-objects runs 2x");
     check(name_a_seen == 1,                         "C3: chained x.name access on array element");
+
+    /* C4: square-bracket array literals inside dict brace-init */
+    dict lit = {
+        "nums": [10, 20, 30],
+        "tags": ["a", "b"],
+        "empty": [],
+        "obj": {},
+        "rows": [ { "v": 1 }, { "v": 2 } ],
+        "nested": [ [1, 2], [3] ]
+    };
+    check((int)lit.nums.length() == 3 && (int)lit.nums[1] == 20,
+          "C4: [10,20,30] brace-init array");
+    check(strcmp((char*)lit.tags[0], "a") == 0,     "C4: string array element");
+    check((int)lit.empty.length() == 0,             "C4: empty [] is array len 0");
+    check((int)lit.obj.length() == 0,               "C4: empty {} is object (0 keys)");
+    check((int)lit.rows[1].v == 2,                  "C4: array of objects");
+    check((int)lit.nested[0][1] == 2,               "C4: nested arrays");
+    check(strcmp((char*)json(lit.nums), "[10,20,30]") == 0,
+          "C4: json() of brace array literal");
+
+    /* Assignment form */
+    dict m = {};
+    m = { "powers": [1, 2, 3, 4] };
+    check((int)m.powers.length() == 4 && (int)m.powers[3] == 4,
+          "C4: assign dict = { \"k\": [...] }");
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed;

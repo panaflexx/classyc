@@ -8299,11 +8299,35 @@ D (typedef_name) {
   return err_node;
 }
 
+/* Marker on N_LIST nodes that came from `[ e1, e2, ... ]` dict/array literals
+   (as opposed to unkeyed brace lists or object `{ "k": v }` lists).  Used by
+   gen_dict_init_list so empty `[]` stays an array while empty nested `{}` is an
+   object. */
+#define DICT_INIT_ARRAY_MARK ((void *) (intptr_t) 0xD1C7A77Au)
+
 D (initializer) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   node_t r;
 
-  if (!M ('{')) {
+  if (M ('[')) {
+    /* Dict/JSON array literal: [ e1, e2, ... ]  →  N_LIST of N_INIT with empty
+       designators, marked DICT_INIT_ARRAY_MARK.  Nested objects/arrays recurse
+       through P(initializer).  Used as a value in dict brace-init:
+         { "powers": [1, 2, 3], "rows": [ { "a": 1 }, { "a": 2 } ] } */
+    node_t list = new_node (c2m_ctx, N_LIST);
+    list->attr = DICT_INIT_ARRAY_MARK;
+    if (!C (']')) {
+      for (;;) {
+        node_t empty_des = new_node (c2m_ctx, N_LIST);
+        P (initializer);
+        op_append (c2m_ctx, list, new_node2 (c2m_ctx, N_INIT, empty_des, r));
+        if (!M (',')) break;
+        if (C (']')) break;
+      }
+    }
+    PT (']');
+    return list;
+  } else if (!M ('{')) {
     P (assign_expr);
   } else {
     P (initializer_list);
@@ -23544,15 +23568,66 @@ static MIR_op_t gen_dict_key_op (c2m_ctx_t c2m_ctx, const char *key_str, size_t 
   return MIR_new_ref_op (ctx, str_item);
 }
 
-/* Forward declaration */
+/* Forward declarations (mutual recursion: object keys → nested arrays/objects) */
 static op_t gen_dict_value_for_init (c2m_ctx_t c2m_ctx, node_t value);
+static op_t gen_dict_from_init_list (c2m_ctx_t c2m_ctx, node_t value);
+static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initializer);
+
+/* True if an N_LIST initializer should lower to DICT_ARRAY rather than DICT_OBJECT.
+   Square-bracket literals (`[1,2]`, `[]`) are marked DICT_INIT_ARRAY_MARK.
+   Unkeyed brace lists (`{1,2,3}`) are arrays; keyed brace (`{ "k": v }`) and
+   empty nested `{}` are objects. */
+static int dict_init_list_is_array_p (node_t value) {
+  node_t inner_init, inner_des_list, inner_des;
+  if (value == NULL || value->code != N_LIST) return 0;
+  if (value->attr == DICT_INIT_ARRAY_MARK) return 1;
+  inner_init = NL_HEAD (value->u.ops);
+  if (inner_init == NULL) return 0; /* empty `{}` → empty object */
+  if (inner_init->code != N_INIT) return 0;
+  inner_des_list = NL_HEAD (inner_init->u.ops);
+  inner_des = inner_des_list != NULL ? NL_HEAD (inner_des_list->u.ops) : NULL;
+  return (inner_des == NULL || inner_des->code != N_FIELD_ID);
+}
+
+/* Materialise a DICT_ARRAY or DICT_OBJECT from an N_LIST of N_INIT children. */
+static op_t gen_dict_from_init_list (c2m_ctx_t c2m_ctx, node_t value) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+
+  if (value == NULL || value->code != N_LIST) return gen_dict_create_object (c2m_ctx);
+
+  if (dict_init_list_is_array_p (value)) {
+    op_t arr = gen_rt_call (c2m_ctx, dict_create_array_proto, dict_create_array_item, 0, NULL);
+    for (node_t elem_init = NL_HEAD (value->u.ops); elem_init != NULL; elem_init = NL_NEXT (elem_init)) {
+      node_t elem_des_list, elem_value;
+      op_t elem_op;
+      if (elem_init->code != N_INIT) continue;
+      elem_des_list = NL_HEAD (elem_init->u.ops);
+      elem_value = NL_NEXT (elem_des_list);
+      if (elem_value == NULL) continue;
+      if (elem_value->code == N_LIST)
+        elem_op = gen_dict_from_init_list (c2m_ctx, elem_value);
+      else
+        elem_op = gen_dict_value_for_init (c2m_ctx, elem_value);
+      {
+        MIR_op_t append_args[2] = {arr.mir_op, elem_op.mir_op};
+        gen_rt_call_void (c2m_ctx, dict_array_append_proto, dict_array_append_item, 2, append_args);
+      }
+    }
+    return arr;
+  }
+
+  {
+    op_t child = gen_dict_create_object (c2m_ctx);
+    gen_dict_init_list (c2m_ctx, child.mir_op, value);
+    return child;
+  }
+}
 
 /* Recursively generate dict initializer code.
    obj_op is the MIR register holding the parent dict object pointer.
    initializer is the N_LIST node containing N_INIT children. */
 static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initializer) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  MIR_context_t ctx = c2m_ctx->ctx;
 
   if (initializer->code != N_LIST) return;
   for (node_t init = NL_HEAD (initializer->u.ops); init != NULL; init = NL_NEXT (init)) {
@@ -23566,37 +23641,12 @@ static void gen_dict_init_list (c2m_ctx_t c2m_ctx, MIR_op_t obj_op, node_t initi
     const char *key_str = key_node->u.s.s;
     MIR_op_t key_op = gen_dict_key_op (c2m_ctx, key_str, strlen (key_str) + 1);
 
-    if (value->code == N_LIST) {
-      node_t inner_init = NL_HEAD (value->u.ops);
-      node_t inner_des_list = inner_init != NULL ? NL_HEAD (inner_init->u.ops) : NULL;
-      node_t inner_des = inner_des_list != NULL ? NL_HEAD (inner_des_list->u.ops) : NULL;
-      if (inner_des == NULL || inner_des->code != N_FIELD_ID) {
-        /* array-like list: [ { ... }, { ... } ]  ->  DICT_ARRAY */
-        op_t arr = gen_rt_call (c2m_ctx, dict_create_array_proto, dict_create_array_item, 0, NULL);
-        for (node_t elem_init = NL_HEAD (value->u.ops); elem_init != NULL; elem_init = NL_NEXT (elem_init)) {
-          if (elem_init->code != N_INIT) continue;
-          node_t elem_des_list = NL_HEAD (elem_init->u.ops);
-          node_t elem_value = NL_NEXT (elem_des_list);
-          op_t elem_op;
-          if (elem_value->code == N_LIST) {
-            op_t nested = gen_dict_create_object (c2m_ctx);
-            gen_dict_init_list (c2m_ctx, nested.mir_op, elem_value);
-            elem_op = nested;
-          } else {
-            elem_op = gen_dict_value_for_init (c2m_ctx, elem_value);
-          }
-          MIR_op_t append_args[2] = {arr.mir_op, elem_op.mir_op};
-          gen_rt_call_void (c2m_ctx, dict_array_append_proto, dict_array_append_item, 2, append_args);
-        }
-        gen_dict_object_set (c2m_ctx, obj_op, key_op, arr.mir_op);
-      } else {
-        /* nested object: { "key": { ... } } */
-        op_t child = gen_dict_create_object (c2m_ctx);
-        gen_dict_init_list (c2m_ctx, child.mir_op, value);
-        gen_dict_object_set (c2m_ctx, obj_op, key_op, child.mir_op);
-      }
+    if (value != NULL && value->code == N_LIST) {
+      /* Nested object `{ "k": v }`, array `{1,2}` / `[1,2]`, or empty `{}` / `[]`. */
+      op_t child = gen_dict_from_init_list (c2m_ctx, value);
+      gen_dict_object_set (c2m_ctx, obj_op, key_op, child.mir_op);
     } else {
-      /* scalar value */
+      /* scalar / expression value */
       op_t wrapped = gen_dict_value_for_init (c2m_ctx, value);
       gen_dict_object_set (c2m_ctx, obj_op, key_op, wrapped.mir_op);
     }

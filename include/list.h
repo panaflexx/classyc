@@ -44,6 +44,25 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Content-aware element equality (mirrors Map MAP_EQ):
+ *   String  → strcmp (C# string / content equality)
+ *   else    → memcmp of the raw T bits (scalars, pointers, by-value types)
+ * Using bare `==` on String compares pointers and makes Contains/IndexOf of
+ * string *literals* silently fail ("AURORA" vs heap copy of "AURORA"). */
+static inline int list_eq_bytes(const void* a, const void* b, size_t n) {
+    return memcmp(a, b, n) == 0;
+}
+static inline int list_eq_str(const void* a, const void* b, size_t n) {
+    (void)n;
+    const char* x = *(const char* const*)a;
+    const char* y = *(const char* const*)b;
+    if (x == y)                 return 1;
+    if (x == NULL || y == NULL) return 0;
+    return strcmp(x, y) == 0;
+}
+#define LIST_EQ(a, b) \
+    (_Generic((a), String: list_eq_str, default: list_eq_bytes)(&(a), &(b), sizeof(a)))
+
 /* ── Runtime dict helpers (resolved at link / JIT time) ────────────────────
  * Declared with the ClassyC `dict` type on purpose.  A value produced by these
  * (`dict d = dict_create_object()`) must keep its dict identity; declaring them
@@ -197,23 +216,24 @@ class List<T> {
 
     /* ═════════════════════════ Search ══════════════════════════════════ */
 
-    /* Index of first element equal to item via ==, or -1. */
+    /* Index of first element equal to item (String = content, else bytes), or -1. */
     int IndexOf(T item) __attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++)
-            if (this->data[i] == item) return i;
+            if (LIST_EQ(this->data[i], item)) return i;
         return -1;
     }
 
-    /* Index of last element equal to item via ==, or -1. */
+    /* Index of last element equal to item (String = content, else bytes), or -1. */
     int LastIndexOf(T item) __attribute__((da_ignore)) {
         int i = this->length - 1;
         while (i >= 0) {
-            if (this->data[i] == item) return i;
+            if (LIST_EQ(this->data[i], item)) return i;
             i--;
         }
         return -1;
     }
 
+    /* True if item is present.  String compares by content (C# string.Contains-style). */
     int Contains(T item) { return this->IndexOf(item) >= 0; }
     int FindIndex(int(*pred)(T)) __attribute__((da_ignore)) { for(int i=0;i<length;i++) if(pred(data[i])) return i; return -1; }
 
@@ -353,23 +373,43 @@ class List<T> {
 
     T* ToArray() { int n=length>0?length:1; T* array=(T*)malloc(sizeof(T)*n); for(int i=0;i<length;i++) array[i]=data[i]; return array; }
     void CopyTo(T* destination) __attribute__((da_ignore)) { for(int i=0;i<length;i++) destination[i]=data[i]; }
-    int Equals(List<T>* other) __attribute__((da_ignore)) { if(!other||other->Count()!=length) return 0; for(int i=0;i<length;i++) if(data[i]!=other->Get(i)) return 0; return 1; }
-    List<T>* Distinct() __attribute__((da_ignore)) { List<T>* r=new List<T>(length>0?length:4); for(int i=0;i<length;i++) if(r->IndexOf(data[i])<0) r->Add(data[i]); return r; }
+    /* Element-wise equality; String elements use content compare via LIST_EQ. */
+    int Equals(List<T>* other) __attribute__((da_ignore)) {
+        if (!other || other->Count() != length) return 0;
+        for (int i = 0; i < length; i++) {
+            T a = data[i], b = other->Get(i);
+            if (!LIST_EQ(a, b)) return 0;
+        }
+        return 1;
+    }
+    /* Unique elements; String uniqueness is by content (via IndexOf/LIST_EQ). */
+    List<T>* Distinct() __attribute__((da_ignore)) {
+        List<T>* r = new List<T>(length > 0 ? length : 4);
+        for (int i = 0; i < length; i++)
+            if (r->IndexOf(data[i]) < 0) r->Add(data[i]);
+        return r;
+    }
 
     /* ═════════════════════════ Higher-order ═══════════════════════════ */
 
     /* Call action(item) for each element in order. */
     void ForEach(void(*action)(T)) __attribute__((da_ignore)) {
-        for (int i = 0; i < this->length; i++)
-            action(this->data[i]);
+        for (int i = 0; i < this->length; i++) {
+            T item = this->Get(i);
+            action(item);
+        }
     }
 
     /* New heap list of elements where pred(item) != 0. Always non-owning.
      * Caller must `delete`. */
     List<T>* Filter(int(*pred)(T)) __attribute__((da_ignore)) {
         List<T>* result = new List<T>();
-        for (int i = 0; i < this->length; i++)
-            if (pred(this->data[i])) result->Add(this->data[i]);
+        for (int i = 0; i < this->length; i++) {
+            /* Use Get(i) not data[i]: by-value class elements (esp. with enums)
+               need proper value load into a temporary before Add / pred. */
+            T item = this->Get(i);
+            if (pred(item)) result->Add(item);
+        }
         return result;
     }
 
@@ -377,17 +417,21 @@ class List<T> {
 	     * Same-type transform (T -> T), so it chains with Filter:
 	     *   nums->Filter(p)->Map(f).  Caller must `delete` the result. */
 	    List<T>* Map(T(*fn)(T)) __attribute__((da_ignore)) {
-        List<T>* result = new List<T>(this->length > 0 ? this->length : 1);
-        for (int i = 0; i < this->length; i++)
-            result->Add(fn(this->data[i]));
-        return result;
-    }
+	        List<T>* result = new List<T>(this->length > 0 ? this->length : 1);
+	        for (int i = 0; i < this->length; i++) {
+	            T item = this->Get(i);
+	            result->Add(fn(item));
+	        }
+	        return result;
+	    }
 
-    /* Where == Filter. Always non-owning view. Caller must `delete`. */
+    /* Where == Filter. Always non-owning view for T*; by-value T is copied. */
     List<T>* Where(int(*pred)(T)) __attribute__((da_ignore)) {
         List<T>* result = new List<T>();
-        for (int i = 0; i < this->length; i++)
-            if (pred(this->data[i])) result->Add(this->data[i]);
+        for (int i = 0; i < this->length; i++) {
+            T item = this->Get(i);
+            if (pred(item)) result->Add(item);
+        }
         return result;
     }
 
@@ -396,8 +440,10 @@ class List<T> {
      * inferred from fn's return type.  Caller must delete/own the result. */
     List<U>* Select<U>(U(*fn)(T)) __attribute__((da_ignore)) {
         List<U>* result = new List<U>(this->length > 0 ? this->length : 1);
-        for (int i = 0; i < this->length; i++)
-            result->Add(fn(this->data[i]));
+        for (int i = 0; i < this->length; i++) {
+            T item = this->Get(i);
+            result->Add(fn(item));
+        }
         return result;
     }
 
@@ -408,8 +454,10 @@ class List<T> {
      * another generic-method monomorphization during method-body check. */
     List<String>* SelectString(String(*fn)(T)) __attribute__((da_ignore)) {
         List<String>* result = new List<String>(this->length > 0 ? this->length : 4);
-        for (int i = 0; i < this->length; i++)
-            result->Add(fn(this->data[i]));
+        for (int i = 0; i < this->length; i++) {
+            T item = this->Get(i);
+            result->Add(fn(item));
+        }
         return result;
     }
 
@@ -420,28 +468,36 @@ class List<T> {
      * Prefer Map.GroupBy when the source is already a map. */
 
     int Any(int(*pred)(T)) __attribute__((da_ignore)) {
-        for (int i = 0; i < this->length; i++)
-            if (pred(this->data[i])) return 1;
+        for (int i = 0; i < this->length; i++) {
+            T item = this->Get(i);
+            if (pred(item)) return 1;
+        }
         return 0;
     }
 
     int All(int(*pred)(T)) __attribute__((da_ignore)) {
-        for (int i = 0; i < this->length; i++)
-            if (!pred(this->data[i])) return 0;
+        for (int i = 0; i < this->length; i++) {
+            T item = this->Get(i);
+            if (!pred(item)) return 0;
+        }
         return 1;
     }
 
     T Find(int(*pred)(T)) __attribute__((da_ignore)) {
-        for (int i = 0; i < this->length; i++)
-            if (pred(this->data[i])) return this->data[i];
+        for (int i = 0; i < this->length; i++) {
+            T item = this->Get(i);
+            if (pred(item)) return item;
+        }
         T z;
         memset((void*)&z, 0, sizeof(T));
         return z;
     }
 
     T FindOr(T fb, int(*pred)(T)) __attribute__((da_ignore)) {
-        for (int i = 0; i < this->length; i++)
-            if (pred(this->data[i])) return this->data[i];
+        for (int i = 0; i < this->length; i++) {
+            T item = this->Get(i);
+            if (pred(item)) return item;
+        }
         return fb;
     }
 

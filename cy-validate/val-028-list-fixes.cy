@@ -200,6 +200,22 @@ int main() {
     String j = jt->ToString();
     check(strcmp(j, "[1,2,3]") == 0, "5p  ToString() returns JSON array string");
 
+    /* String content equality (not pointer ==) for Contains/IndexOf/Distinct/Equals */
+    List<String>* tags = new List<String>();
+    defer delete tags;
+    tags->Add("AURORA");
+    tags->Add("RIVEN");
+    tags->Add("AURORA");
+    check(tags->Contains("AURORA") == 1, "5q  List<String>.Contains literal by content");
+    check(tags->Contains("NOPE") == 0,   "5r  Contains miss");
+    check(tags->IndexOf("RIVEN") == 1,   "5s  IndexOf content");
+    List<String>* utags = tags->Distinct();
+    defer delete utags;
+    check(utags->Count() == 2,            "5t  Distinct String by content");
+    List<String>* t2 = new List<String>{"AURORA", "RIVEN"};
+    defer delete t2;
+    check(utags->Equals(t2) == 1,         "5u  Equals String lists by content");
+
     /* ── 6. Copy correctness ──────────────────────────────────────── */
     printf("\n-- 6. Copy correctness --\n");
     List<int>* orig = new List<int>{ 7, 8, 9 };
