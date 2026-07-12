@@ -71,8 +71,7 @@ int main() {
     /* ── 3. String set ──────────────────────────────────────────────── */
     printf("\n-- 3. String set --\n");
 
-    Set<String>* names = new Set<String>{"alice", "bob", "alice"};
-    defer delete names;
+    auto names = new Set<String>{"alice", "bob", "alice"};
 
     check(names->Count() == 2,              "3a  String set Count");
     check(names->Contains("bob") == 1,      "3b  Contains String");
@@ -86,35 +85,30 @@ int main() {
     defer delete a;
     defer delete b;
 
-    Set<int>* un = a->Union(b);
-    defer delete un;
-    check(un->Count() == 6,                 "4a  Union Count");
-    check(un->Contains(1) && un->Contains(6), "4b  Union elements");
+    auto un = a->Union(b);
+    check(un.Count() == 6,                 "4a  Union Count");
+    check(un.Contains(1) && un.Contains(6), "4b  Union elements");
 
-    Set<int>* inter = a->Intersect(b);
-    defer delete inter;
-    check(inter->Count() == 2,              "4c  Intersect Count");
-    check(inter->Contains(3) && inter->Contains(4), "4d  Intersect elems");
+    auto inter = a->Intersect(b);
+    check(inter.Count() == 2,              "4c  Intersect Count");
+    check(inter.Contains(3) && inter.Contains(4), "4d  Intersect elems");
 
-    Set<int>* diff = a->Difference(b);
-    defer delete diff;
-    check(diff->Count() == 2,               "4e  Difference Count");
-    check(diff->Contains(1) && diff->Contains(2), "4f  Difference elems");
+    auto diff = a->Difference(b);
+    check(diff.Count() == 2,               "4e  Difference Count");
+    check(diff.Contains(1) && diff.Contains(2), "4f  Difference elems");
 
-    check(a->IsSubsetOf(un) == 1,           "4g  IsSubsetOf true");
-    check(b->IsSubsetOf(inter) == 0,        "4h  IsSubsetOf false");
+    check(a->IsSubsetOf(&un) == 1,          "4g  IsSubsetOf true");
+    check(b->IsSubsetOf(&inter) == 0,       "4h  IsSubsetOf false");
 
-    Set<int>* a2 = new Set<int>{1, 2, 3, 4};
-    defer delete a2;
+    auto a2 = new Set<int>{1, 2, 3, 4};
     check(a->Equals(a2) == 1,               "4i  Equals true");
     check(a->Equals(b) == 0,                "4j  Equals false");
 
     /* ── 5. Higher-order & for-in ───────────────────────────────────── */
     printf("\n-- 5. ForEach, Filter, for-in --\n");
 
-    Set<int>* evens = a->Filter(is_even);
-    defer delete evens;
-    check(evens->Count() == 2,              "5a  Filter Count");
+    auto evens = a->Filter(is_even);
+    check(evens.Count() == 2,              "5a  Filter Count");
 
     int sum = 0;
     for (auto v in a) sum += v;
@@ -123,8 +117,7 @@ int main() {
     /* ── 6. Capacity & growth ───────────────────────────────────────── */
     printf("\n-- 6. Capacity ctor & growth --\n");
 
-    Set<int>* big = new Set<int>(128);
-    defer delete big;
+    auto big = new Set<int>(128);
     check(big->Capacity() >= 4,             "6a  capacity ctor");
 
     for (int i = 0; i < 100; i++) big->Add(i);

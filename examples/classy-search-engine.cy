@@ -220,7 +220,7 @@ int main() {
 
     /* Show the most widely-shared terms (highest document frequency). The
      * document frequency is the count of distinct docIds in a term's postings. */
-    List<Term*>* common = index->Filter((Term* t) => {
+    auto common = index->Filter((Term* t) => {
         int df = 0, last = -1;
         for (int k = 0; k < t->docIds->Count(); k++) {
             int id = t->docIds->Get(k);
@@ -231,8 +231,7 @@ int main() {
     printf("\nTerms appearing in >= 4 documents: ");
     for (auto t in common) printf("%s ", t->word);
     printf("\n");
-    delete common;   /* non-owning view: frees only the container, not the Terms
-                      * (those are owned by `index`) */
+    /* common is a by-value Filter shell — RAII; Terms still owned by index. */
 
     /* ── QUERY ──────────────────────────────────────────────────────────── */
     run_query(corpus, index, "fast systems language");

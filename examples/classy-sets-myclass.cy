@@ -100,12 +100,10 @@ class WordBag {
      * `defer delete` co-locates cleanup with allocation, so the temporary sets
      * are freed on every exit path (including any future early return/throw). */
     int SimilarityPct(WordBag* other) {
-        Set<String>* inter = this->words->Intersect(other->Words());
-        defer delete inter;
-        Set<String>* uni   = this->words->Union(other->Words());
-        defer delete uni;
-        int i = inter->Count();
-        int u = uni->Count();
+        auto inter = this->words->Intersect(other->Words());
+        auto uni = this->words->Union(other->Words());
+        int i = inter.Count();
+        int u = uni.Count();
         return u == 0 ? 0 : (i * 100) / u;
     }
 };
@@ -174,33 +172,31 @@ int main() {
     Set<String>* stop = new Set<String>{
         "the", "a", "an", "and", "as", "is", "on", "in", "of", "that", "to"
     };
-    Set<String>* content = cats->Words()->Difference(stop);
+    auto content = cats->Words()->Difference(stop);
     printf("   %s: %d unique -> %d content words after dropping %d stop words\n",
-           cats->Name(), cats->Unique(), content->Count(), stop->Count());
-    List<String>* contentSorted = to_sorted_list(content);
+           cats->Name(), cats->Unique(), content.Count(), stop->Count());
+    List<String>* contentSorted = to_sorted_list(&content);
     print_words("content words", contentSorted, 100);
     delete contentSorted;
-    delete content;
     delete stop;
 
     /* ── document diff + similarity (set algebra) ───────────────────────── */
     printf("\n-- diff & similarity (set algebra) --\n");
-    Set<String>* shared = cats->Words()->Intersect(dogs->Words());
-    Set<String>* onlyCats = cats->Words()->Difference(dogs->Words());
-    Set<String>* onlyDogs = dogs->Words()->Difference(cats->Words());
-    Set<String>* allWords = cats->Words()->Union(dogs->Words());
+    auto shared = cats->Words()->Intersect(dogs->Words());
+    auto onlyCats = cats->Words()->Difference(dogs->Words());
+    auto onlyDogs = dogs->Words()->Difference(cats->Words());
+    auto allWords = cats->Words()->Union(dogs->Words());
 
-    List<String>* sharedSorted = to_sorted_list(shared);
-    List<String>* onlyCatsSorted = to_sorted_list(onlyCats);
-    List<String>* onlyDogsSorted = to_sorted_list(onlyDogs);
+    List<String>* sharedSorted = to_sorted_list(&shared);
+    List<String>* onlyCatsSorted = to_sorted_list(&onlyCats);
+    List<String>* onlyDogsSorted = to_sorted_list(&onlyDogs);
     print_words("shared",        sharedSorted,   100);
     print_words("only in cats",  onlyCatsSorted, 100);
     print_words("only in dogs",  onlyDogsSorted, 100);
-    printf("   combined vocabulary: %d words\n", allWords->Count());
+    printf("   combined vocabulary: %d words\n", allWords.Count());
     printf("   Jaccard similarity : %d%%\n", cats->SimilarityPct(dogs));
 
     delete sharedSorted; delete onlyCatsSorted; delete onlyDogsSorted;
-    delete shared; delete onlyCats; delete onlyDogs; delete allWords;
 
     /* ── tidy up the scratch files ──────────────────────────────────────── */
     File.remove_file(path1);

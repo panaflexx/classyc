@@ -1,4 +1,6 @@
-/* test-entity-ops.cy — Verify generic EntityOps works */
+/* test-entity-ops.cy — Verify generic EntityOps works
+ * @expect: skip   (needs examples/Data.cy sibling + multi-file build)
+ */
 
 #include "Data.cy"
 

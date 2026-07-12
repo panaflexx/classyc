@@ -1,5 +1,8 @@
 /* webmain.cy — the ASP.NET-style web application entry point.
  *
+ * @expect: skip   (multi-TU app: needs http-serve.c + controllers linked together;
+ *                  cannot run alone via examples/run-examples.sh)
+ *
  * Controllers self-register their routes via `[[registry("routes")]]` (see the
  * ROUTE() macro in httpserve.h); this file is the ONLY place with app_handle()
  * and main().  It never mentions any controller by name — routes are gathered

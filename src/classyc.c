@@ -13024,8 +13024,15 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
                            && char_type_p (left->u.ptr_type)))) {
           /* A built-in String is a char*; accept it wherever char*, const char*,
              or void* is expected (strcmp, strlen, free, memcpy, ...). */
-        } else if (right->mode == TM_CLASS) {
-            printf("Accepting TM_PTR -> TM_CLASS\n");
+        } else if (right->mode == TM_CLASS || right->mode == TM_STRUCT
+                   || right->mode == TM_UNION) {
+            /* Map/List Copy() returns a by-value collection — do not assign to T*. */
+            msg = (code == N_CALL
+                     ? "cannot pass a by-value class where a pointer is expected"
+                   : code == N_RETURN
+                     ? "cannot return a by-value class for a pointer result"
+                     : "cannot assign a by-value class to a pointer (use `auto x = f.Copy()`)");
+            error (c2m_ctx, POS (assign_node), "%s", msg);
         } else if (right->mode != TM_PTR
                    || !(compatible_types_p (left->u.ptr_type, right->u.ptr_type, TRUE)
                         || (void_ptr_p (left) || void_ptr_p (right))
@@ -22665,7 +22672,23 @@ static op_t force_val (c2m_ctx_t c2m_ctx, op_t op, int arr_p) {
   int sh;
 
   if (arr_p && op.mir_op.mode == MIR_OP_MEM) {
-    /* an array -- use a pointer: */
+    /* True array lvalue: decay to a pointer via address-of the storage.
+
+       Adjusted array parameters (`T a[]` / `T a[N]` in a param list) are a
+       different animal: `adjust_param_type` rewrites them to `T *` but keeps
+       `type->arr_type` so sizeof/decay metadata survive.  Their stack (or
+       register) slot already holds the *pointer value* passed by the caller —
+       taking the slot's address would turn e.g. `char *argv[]` into `&argv`
+       (a `char ***` bit pattern) and corrupt every `argv[i]` / `(void*)argv`.
+
+       That path only appears when the parameter is forced into memory
+       (`reg_p = 0`), which `try` does so values survive setjmp/longjmp.  With
+       `reg_p = 1` the operand is a REG and this branch is skipped, which is
+       why `main(argc, argv)` worked until a `try` was added in the same
+       function. */
+    if (op.decl != NULL && op.decl->decl_spec.type != NULL
+        && op.decl->decl_spec.type->mode == TM_PTR)
+      return op; /* MEM of a pointer value: keep as loadable rvalue */
     return mem_to_address (c2m_ctx, op, FALSE);
   }
   if (op.decl == NULL || op.decl->bit_offset < 0) return op;
@@ -27429,9 +27452,19 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     if (el_type->mode == TM_PTR && el_type->arr_type != NULL) { /* elem is an array */
       size = type_size (c2m_ctx, el_type->arr_type);
     }
-    if (arr_type->mode == TM_PTR && arr_type->arr_type != NULL) { /* indexing an array */
-      op1 = force_reg_or_mem (c2m_ctx, op1, MIR_T_I64);
-      assert (op1.mir_op.mode == MIR_OP_REG || op1.mir_op.mode == MIR_OP_MEM); /*???*/
+    if (arr_type->mode == TM_PTR && arr_type->arr_type != NULL) {
+      /* Indexing a decayed/adjusted array.  Always materialize the base pointer
+         value in a register before building the element mem op.
+
+         force_reg_or_mem used to allow a raw MEM base, which is correct when
+         that MEM is *array storage* (true local/global arrays after address
+         arithmetic lands as a reg anyway).  For adjusted parameters forced
+         into the frame by `try` (`char *argv[]` → stack slot of a `char **`),
+         the MEM is the slot holding the pointer — keeping it as the base would
+         index the stack frame (`&argv[i]`) instead of the pointed-to array
+         (`argv[i]`).  Loading the pointer with force_reg fixes both shapes. */
+      op1 = force_reg (c2m_ctx, op1, MIR_T_I64);
+      assert (op1.mir_op.mode == MIR_OP_REG);
     } else {
       op1 = force_reg (c2m_ctx, op1, MIR_T_I64);
       assert (op1.mir_op.mode == MIR_OP_REG);

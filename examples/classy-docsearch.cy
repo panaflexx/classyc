@@ -44,6 +44,8 @@
  *   DOCSEARCH_CDB=/tmp/docindex.cdb DOCSEARCH_MAX=500 ... -eg
  *   DOCSEARCH_BATCH=1        non-interactive sample queries + exit
  *
+ * Harness: examples/run-examples.sh sets DOCSEARCH_BATCH=1 DOCSEARCH_MAX=80.
+ *
  * Keys in the TUI:
  *   type          search as you type (query focus)
  *   "phrase"      exact substring (title/path/body)

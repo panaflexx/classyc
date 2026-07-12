@@ -15,7 +15,7 @@
 
 #include <stdio.h>
 #include <string.h>
-#include "include/map.h"
+#include "map.h"
 
 int passed = 0;
 int failed = 0;
@@ -129,13 +129,13 @@ int main() {
     defer delete base;
     base["x"] = 1; base["y"] = 2;
 
-    Map<String, int>* dup = base->Copy();
-    defer delete dup;
+    /* Copy() returns Map by value (RAII shell) — do not assign to Map*. */
+    auto dup = base->Copy();
     dup["z"] = 3;                     /* mutate the copy only */
     check(base->Count() == 2,         "6a  Copy is independent (original unchanged)");
-    check(dup->Count() == 3,          "6b  copy mutated separately");
+    check(dup.Count() == 3,           "6b  copy mutated separately");
 
-    base->Merge(dup);                 /* pull dup's entries into base */
+    base->Merge(&dup);                /* pull dup's entries into base */
     check(base->Count() == 3,         "6c  Merge adds new key");
     check(base["z"] == 3,             "6d  Merge brought value across");
 

@@ -16,13 +16,11 @@ int main() {
     /* ── List<T>.FromJson(dict array) — reverse of ToJsonArray ──────────── */
     dict d = json("{\"xs\":[10,20,30],\"tags\":[\"a\",\"bb\",\"ccc\"]}");
 
-    List<int>* xs = List<int>.FromJson(d.xs);
-    defer delete xs;
+    auto xs = List<int>.FromJson(d.xs);
     check(xs->Count() == 3 && xs->Get(0) == 10 && xs->Get(2) == 30,
           "List<int>.FromJson(dict array)");
 
-    List<String>* tags = List<String>.FromJson(d.tags);
-    defer delete tags;
+    auto tags = List<String>.FromJson(d.tags);
     check(tags->Count() == 3 && strcmp(tags->Get(1), "bb") == 0,
           "List<String>.FromJson(dict array)");
 
@@ -30,8 +28,7 @@ int main() {
     check(strcmp(xs->ToJson(), "[10,20,30]") == 0, "List<int>.ToJson()");
     check(strcmp(tags->ToJson(), "[\"a\",\"bb\",\"ccc\"]") == 0, "List<String>.ToJson()");
 
-    List<double>* ds = new List<double>{ 1.5, 2.5 };
-    defer delete ds;
+    auto ds = new List<double>{ 1.5, 2.5 };
     check(strcmp(ds->ToJson(), "[1.5,2.5]") == 0, "List<double>.ToJson()");
 
     /* ── Map<String,V> conversions ──────────────────────────────────────── */
@@ -52,15 +49,13 @@ int main() {
           "Map<String,String>.ToJson()");
 
     /* Keys() / Values() -> List<T> */
-    List<String>* ks = ages->Keys();
-    defer delete ks;
-    List<int>* vs = ages->Values();
-    defer delete vs;
-    check(ks->Count() == 2 && strcmp(ks->Get(0), "ada") == 0, "Map.Keys() -> List<K>");
-    check(vs->Count() == 2 && vs->Get(0) == 36, "Map.Values() -> List<V>");
+    auto ks = ages->Keys();
+    auto vs = ages->Values();
+    check(ks.Count() == 2 && strcmp(ks.Get(0), "ada") == 0, "Map.Keys() -> List<K>");
+    check(vs.Count() == 2 && vs.Get(0) == 36, "Map.Values() -> List<V>");
 
     /* Values() feeds straight back into a List converter */
-    check(strcmp(vs->ToJson(), "[36,41]") == 0, "Map.Values()->ToJson() chains");
+    check(strcmp(vs.ToJson(), "[36,41]") == 0, "Map.Values()->ToJson() chains");
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed;

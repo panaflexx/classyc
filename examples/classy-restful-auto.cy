@@ -33,6 +33,9 @@
 #include <map.h>
 #include "list.h"
 
+int row_is_active(dict r) { return (int)(long)r.active != 0; }
+String col_eq_placeholder(String k) { return detach (k + "=?"); }
+
 /* ── value class for (User) cast binding ─────────────────────────────── */
 class User {
     int     id;
@@ -215,7 +218,7 @@ class UsersController {
         /* Pythonic: Filter lambda selects active rows in-memory after SQL pagination.
            GAP: dict int fields still need the (int)(long) double-cast in the lambda.
            In production push active=1 to SQL; here it demonstrates ->Filter(). */
-        owned List<dict>* data = rows->Filter((dict r) => (int)(long)r.active != 0);
+        auto data = rows->Filter(row_is_active);
         for (auto r in data) printf("  row: %s\n", r.json());
 
         try {
@@ -223,7 +226,7 @@ class UsersController {
                 "total": total,
                 "page":  page,
                 "limit": limit,
-                "data":  data->ToDict()
+                "data":  data.ToDict()
             };
             return resp_ok(env.json());
         }
@@ -306,9 +309,9 @@ class UsersController {
            detach is required: the concatenation is allocated in Map's arena,
            which is reclaimed when Map returns — detach escapes it to the heap
            so the strings survive in `parts` for the join() below. */
-        owned List<String>* parts = keys->Map((String k) => detach (k + "=?"));
+        auto parts = keys->Map(col_eq_placeholder);
 
-        String sql = "UPDATE users SET " + parts->join(",") + " WHERE id=?";
+        String sql = "UPDATE users SET " + parts.join(",") + " WHERE id=?";
         owned Statement* stmt = this.db->prepare((char*)sql);
 
         int idx = 1;

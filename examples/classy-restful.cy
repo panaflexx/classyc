@@ -33,6 +33,9 @@
 #include <map.h>
 #include "list.h"
 
+int row_is_active(dict r) { return (int)(long)r.active != 0; }
+String col_eq_placeholder(String k) { return detach (k + "=?"); }
+
 /* ── value class for (User) cast binding ─────────────────────────────── */
 class User {
     int     id;
@@ -74,8 +77,7 @@ Map<String, String>* parse_query(String qs) {
 
     /* Pythonic: split on "&", iterate pairs — replaces manual while+find loop.
        s.split(delim) -> List<String>* (heap); defer delete cleans it up. */
-    List<String>* pairs = qs.split("&");
-    defer delete pairs;
+    auto pairs = qs.split("&");
     for (auto pair in pairs) {
         int eq = (int) pair.find("=");
         if (eq >= 0) {
@@ -215,8 +217,9 @@ class UsersController {
         /* Pythonic: Filter lambda selects active rows in-memory after SQL pagination.
            GAP: dict int fields still need the (int)(long) double-cast in the lambda.
            In production push active=1 to SQL; here it demonstrates ->Filter(). */
-        List<dict>* data = rows->Filter((dict r) => (int)(long)r.active != 0);
-        defer delete data;
+        /* Non-capturing free function works in method bodies; fat-arrow HOFs
+           inside methods still have parser gaps on some dialects. */
+        auto data = rows->Filter(row_is_active);
         for (auto r in data) printf("  row: %s\n", r.json());
 
         try {
@@ -224,7 +227,7 @@ class UsersController {
                 "total": total,
                 "page":  page,
                 "limit": limit,
-                "data":  data->ToDict()
+                "data":  data.ToDict()
             };
             return resp_ok(env.json());
         }
@@ -305,10 +308,8 @@ class UsersController {
 
         /* Iterate body dict, collecting only the non-null fields.
            Parallel lists keep keys and values in the same insertion order. */
-        List<String>* keys = new List<String>();
-        defer delete keys;
-        List<dict>* vals = new List<dict>();
-        defer delete vals;
+        auto keys = new List<String>();
+        auto vals = new List<dict>();
         for (auto k, v in req->body)
             if (v != 0) { keys->Add(k); vals->Add(v); }
         if (keys->IsEmpty()) return resp_bad("no fields to update");
@@ -317,10 +318,9 @@ class UsersController {
            detach is required: the concatenation is allocated in Map's arena,
            which is reclaimed when Map returns — detach escapes it to the heap
            so the strings survive in `parts` for the join() below. */
-        List<String>* parts = keys->Map((String k) => detach (k + "=?"));
-        defer delete parts;
+        auto parts = keys->Map(col_eq_placeholder);
 
-        String sql = "UPDATE users SET " + parts->join(",") + " WHERE id=?";
+        String sql = "UPDATE users SET " + parts.join(",") + " WHERE id=?";
         Statement* stmt = this.db->prepare((char*)sql);
         defer delete stmt;
 

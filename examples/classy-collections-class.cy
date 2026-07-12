@@ -110,8 +110,8 @@ int main() {
      * It is non-owning by default, so deleting it frees only the container —
      * the Track objects keep living under `library`'s ownership. */
     auto epics = library->Filter((Track* t) => t->duration() > 360);
-    defer delete epics;     // ← frees the view's container only (no Track dtors)
-    print_list("\nEpics (> 6:00)", epics);
+    /* Filter returns a by-value List shell (non-owning of Track*). */
+    print_list("\nEpics (> 6:00)", &epics);
 
     /* ── Set<Track*> views: identity sets that also SHARE library's pointers ─ */
     auto favorites = new Set<Track*>();   // non-owning (default)
@@ -133,17 +133,15 @@ int main() {
            favorites->Contains(t_beatles) ? "yes" : "no");
 
     /* Set algebra returns more non-owning views over the same shared pointers. */
+    /* Union/Intersect/Difference return by-value Set shells (non-owning). */
     auto loved_and_fresh = favorites->Intersect(recent);   /* favourite AND recent */
     auto neglected       = favorites->Difference(recent);  /* favourite, not recent */
     auto active          = favorites->Union(recent);       /* either                */
-    defer delete loved_and_fresh;   // ← all container-only frees
-    defer delete neglected;
-    defer delete active;
 
     printf("\n");
-    print_set("Loved & freshly played (favorites ∩ recent)", loved_and_fresh);
-    print_set("Neglected favorites (favorites − recent)",    neglected);
-    printf("Active rotation (favorites ∪ recent): %d tracks\n", active->Count());
+    print_set("Loved & freshly played (favorites ∩ recent)", &loved_and_fresh);
+    print_set("Neglected favorites (favorites − recent)",    &neglected);
+    printf("Active rotation (favorites ∪ recent): %d tracks\n", active.Count());
 
     /* ── No manual cleanup loop! ─────────────────────────────────────────
      * At scope exit the `defer delete`s run in reverse order: the non-owning

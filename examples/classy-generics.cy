@@ -506,34 +506,33 @@ int main() {
 
     List<int>* src = new List<int>{ 10, 20, 30, 40, 50, 60 };
 
-    List<int>* sl1 = src->Slice(1, 3);     /* [20, 30, 40] */
-    check(sl1->Count() == 3,   "10a  Slice(1,3): Count==3");
-    check(sl1->Get(0)  == 20,  "10b  Slice: Get(0)==20");
-    check(sl1->Get(2)  == 40,  "10c  Slice: Get(2)==40");
+    auto sl1 = src->Slice(1, 3);     /* [20, 30, 40] */
+    check(sl1.Count() == 3,   "10a  Slice(1,3): Count==3");
+    check(sl1.Get(0)  == 20,  "10b  Slice: Get(0)==20");
+    check(sl1.Get(2)  == 40,  "10c  Slice: Get(2)==40");
 
     src->Set(1, 99);                       /* mutate source → slice is independent */
-    check(sl1->Get(0)  == 20,  "10d  Slice is a copy (independent of source)");
+    check(sl1.Get(0)  == 20,  "10d  Slice is a copy (independent of source)");
 
-    List<int>* sl2 = src->Slice(0, 1);    /* single element */
-    check(sl2->Count() == 1,   "10e  Slice single element");
+    auto sl2 = src->Slice(0, 1);    /* single element */
+    check(sl2.Count() == 1,   "10e  Slice single element");
 
-    List<int>* sl3 = src->Slice(100, 3);  /* OOB start → empty */
-    check(sl3->Count() == 0,   "10f  Slice OOB start → empty");
+    auto sl3 = src->Slice(100, 3);  /* OOB start → empty */
+    check(sl3.Count() == 0,   "10f  Slice OOB start → empty");
 
-    delete src; delete sl1; delete sl2; delete sl3;
-
-    /* ── 11. Copy ────────────────────────────────────────────────────────── */
+    delete src; /* ── 11. Copy ────────────────────────────────────────────────────────── */
     printf("\n-- 11. Copy --\n");
 
     List<int>* orig = new List<int>{ 7, 8, 9 };
-    List<int>* cpy  = orig->Copy();
-    check(cpy->Count()   == 3,  "11a  Copy: Count==3");
-    check(cpy->Get(0)    == 7,  "11b  Copy: Get(0)==7");
-    check(orig->Equals(cpy),    "11c  Copy Equals original");
+    auto cpy = orig->Copy();   /* by-value List shell */
+    check(cpy.Count()   == 3,  "11a  Copy: Count==3");
+    check(cpy.Get(0)    == 7,  "11b  Copy: Get(0)==7");
+    check(orig->Count() == cpy.Count() && orig->Get(0) == cpy.Get(0)
+          && orig->Get(2) == cpy.Get(2), "11c  Copy matches original elements");
     orig->Set(0, 100);
-    check(cpy->Get(0)    == 7,  "11d  Copy is independent of original");
-    check(orig->Equals(cpy) == 0, "11e  After mutating orig, Equals→0");
-    delete orig; delete cpy;
+    check(cpy.Get(0)    == 7,   "11d  Copy is independent of original");
+    check(orig->Equals(&cpy) == 0, "11e  After mutating orig, Equals→0");
+    delete orig;
 
     /* ── 12. Equals ──────────────────────────────────────────────────────── */
     printf("\n-- 12. Equals --\n");
@@ -571,63 +570,55 @@ int main() {
 
     List<int>* nums = new List<int>{ 1, 2, 3, 4, 5, 6, 7, 8 };
 
-    List<int>* evens = nums->Filter((int x) => x % 2 == 0);
-    check(evens->Count() == 4,  "14a  Filter evens: Count==4");
-    check(evens->Get(0)  == 2,  "14b  Filter evens: Get(0)==2");
-    check(evens->Get(3)  == 8,  "14c  Filter evens: Get(3)==8");
+    auto evens = nums->Filter((int x) => x % 2 == 0);
+    check(evens.Count() == 4,  "14a  Filter evens: Count==4");
+    check(evens.Get(0)  == 2,  "14b  Filter evens: Get(0)==2");
+    check(evens.Get(3)  == 8,  "14c  Filter evens: Get(3)==8");
 
-    List<int>* big = nums->Filter((int x) => x > 5);
-    check(big->Count() == 3,    "14d  Filter >5: Count==3");
-    check(big->Get(0)  == 6,    "14e  Filter >5: Get(0)==6");
+    auto big = nums->Filter((int x) => x > 5);
+    check(big.Count() == 3,    "14d  Filter >5: Count==3");
+    check(big.Get(0)  == 6,    "14e  Filter >5: Get(0)==6");
 
-    List<int>* none = nums->Filter((int x) => x > 100);
-    check(none->Count() == 0,   "14f  Filter no-match: Count==0");
+    auto none = nums->Filter((int x) => x > 100);
+    check(none.Count() == 0,   "14f  Filter no-match: Count==0");
 
-    delete nums; delete evens; delete big; delete none;
-
-    /* String Filter: keep words starting with 'a' */
+    delete nums; /* String Filter: keep words starting with 'a' */
     List<String>* fruit = new List<String>{ "apple", "banana", "avocado", "cherry", "apricot" };
-    List<String>* awords = fruit->Filter((String s) => ((char*)s)[0] == 'a');
-    check(awords->Count() == 3,                   "14g  String filter 'a*': Count==3");
-    check(strcmp(awords->Get(0), "apple")   == 0, "14h  String filter: Get(0)=='apple'");
-    check(strcmp(awords->Get(2), "apricot") == 0, "14i  String filter: Get(2)=='apricot'");
-    delete fruit; delete awords;
-
-    /* ── 15. Composition ─────────────────────────────────────────────────── */
+    auto awords = fruit->Filter((String s) => ((char*)s)[0] == 'a');
+    check(awords.Count() == 3,                   "14g  String filter 'a*': Count==3");
+    check(strcmp(awords.Get(0), "apple")   == 0, "14h  String filter: Get(0)=='apple'");
+    check(strcmp(awords.Get(2), "apricot") == 0, "14i  String filter: Get(2)=='apricot'");
+    delete fruit; /* ── 15. Composition ─────────────────────────────────────────────────── */
     printf("\n-- 15. Composition --\n");
 
     /* Sort → Reverse → Slice */
     List<int>* comp = new List<int>{ 5, 1, 8, 3, 9, 2, 7, 4, 6 };
     comp->Sort((int a, int b) => a < b ? -1 : a > b ? 1 : 0);  /* 1..9 */
     comp->Reverse();                                              /* 9..1 */
-    List<int>* top3 = comp->Slice(0, 3);                         /* 9,8,7 */
-    check(top3->Count() == 3,  "15a  Sort→Reverse→Slice: Count==3");
-    check(top3->Get(0)  == 9,  "15b  top3: Get(0)==9");
-    check(top3->Get(2)  == 7,  "15c  top3: Get(2)==7");
-    delete comp; delete top3;
-
-    /* Filter → Sort → ForEach */
+    auto top3 = comp->Slice(0, 3);                         /* 9,8,7 */
+    check(top3.Count() == 3,  "15a  Sort→Reverse→Slice: Count==3");
+    check(top3.Get(0)  == 9,  "15b  top3: Get(0)==9");
+    check(top3.Get(2)  == 7,  "15c  top3: Get(2)==7");
+    delete comp; /* Filter → Sort → ForEach */
     List<int>* mixed = new List<int>{ -2, 5, -8, 3, -1, 9, 4 };
-    List<int>* pos   = mixed->Filter((int x) => x > 0);  /* 5,3,9,4 */
-    pos->Sort((int a, int b) => a < b ? -1 : a > b ? 1 : 0);
+    auto pos = mixed->Filter((int x) => x > 0);  /* 5,3,9,4 */
+    pos.Sort((int a, int b) => a < b ? -1 : a > b ? 1 : 0);
     g_sum = 0;
-    pos->ForEach(int_accum);
+    pos.ForEach(int_accum);
     check(g_sum == 21,        "15d  Filter>0 → Sort → ForEach sum==21");
-    check(pos->Get(0) == 3,   "15e  sorted positives: Get(0)==3");
-    check(pos->Get(3) == 9,   "15f  sorted positives: Get(3)==9");
-    delete mixed; delete pos;
-
-    /* Copy → Concat → TrimExcess → Equals */
+    check(pos.Get(0) == 3,   "15e  sorted positives: Get(0)==3");
+    check(pos.Get(3) == 9,   "15f  sorted positives: Get(3)==9");
+    delete mixed; /* Copy → Concat → TrimExcess → Equals */
     List<int>* base = new List<int>{ 1, 2, 3 };
     List<int>* ext  = new List<int>{ 4, 5, 6 };
-    List<int>* full = base->Copy();
-    full->Concat(ext);
-    full->TrimExcess();
+    auto full = base->Copy();
+    full.Concat(ext);
+    full.TrimExcess();
     List<int>* expected = new List<int>{ 1, 2, 3, 4, 5, 6 };
-    check(full->Count()         == 6, "15g  Copy→Concat→Trim: Count==6");
-    check(full->Capacity()      == 6, "15h  TrimExcess: Capacity==6");
-    check(full->Equals(expected),     "15i  result Equals expected");
-    delete base; delete ext; delete full; delete expected;
+    check(full.Count()         == 6, "15g  Copy→Concat→Trim: Count==6");
+    check(full.Capacity()      == 6, "15h  TrimExcess: Capacity==6");
+    check(full.Equals(expected),     "15i  result Equals expected");
+    delete base; delete ext; delete expected;
 
     printf("\n=== results: %d passed, %d failed ===\n", passed, failed);
     return failed;

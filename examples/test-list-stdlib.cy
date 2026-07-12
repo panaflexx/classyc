@@ -102,11 +102,10 @@ int main() {
     check(data->Contains(0)    == 0,       "2d  Contains(0)==0");
 
     /* Reverse */
-    List<int>* rev = data->Copy();
-    defer delete rev;
-    rev->Reverse();
-    check(rev->Get(0) == 3,                "2e  Reverse: first element was last");
-    check(rev->Last() == 7,                "2f  Reverse: last element was first");
+    auto rev = data->Copy();
+    rev.Reverse();
+    check(rev.Get(0) == 3,                 "2e  Reverse: first element was last");
+    check(rev.Last() == 7,                 "2f  Reverse: last element was first");
 
     /* Sort */
     data->Sort((int a, int b) => a < b ? -1 : a > b ? 1 : 0);
@@ -119,29 +118,26 @@ int main() {
     check(braced->Count() == 4,           "2h  Concat adds 2 more elements");
     check(braced->Last()  == 20,          "2i  Last after Concat==20");
 
-    /* Slice */
-    List<int>* slc = data->Slice(1, 3);
-    defer delete slc;
-    check(slc->Count() == 3,            "2j  Slice count==3");
-    check(slc->Get(0)  == 3,            "2k  Slice data independent copy");
+    /* Slice / Filter return by-value List shells */
+    auto slc = data->Slice(1, 3);
+    check(slc.Count() == 3,             "2j  Slice count==3");
+    check(slc.Get(0)  == 3,             "2k  Slice data independent copy");
 
     /* Copy + Equals */
-    List<int>* eq = data->Copy();
-    defer delete eq;
-    check(data->Equals(eq),               "2l  Copy .Equals original");
+    auto eq = data->Copy();
+    check(data->Equals(&eq),              "2l  Copy .Equals original");
 
     /* ForEach / Filter — must run while data is still {1,3,3,3,7,9} */
     g_sum = 0;
     data->ForEach(int_accum);
     check(g_sum == 26,                    "2p  ForEach sum");
 
-    List<int>* filtred = data->Filter(is_even);
-    defer delete filtred;
-    check(filtred->Count() == 0,           "2q  Filter even from {1,3,3,3,7,9} — all odd");
+    auto filtred = data->Filter(is_even);
+    check(filtred.Count() == 0,           "2q  Filter even from {1,3,3,3,7,9} — all odd");
 
     /* Now mutate — safe, nothing reads sorted state after here */
     data->Set(0, -1);
-    check(data->Equals(eq) == 0,          "2m  mutated orig no longer equals");
+    check(data->Equals(&eq) == 0,         "2m  mutated orig no longer equals");
 
     /* Trim / Clear */
     braced->TrimExcess();
@@ -159,11 +155,10 @@ int main() {
     check(d->Get(0) > 3.13 && d->Get(0) < 3.15,      "3a  Get(0)=3.14");
     check(d->IsEmpty() == 0,                          "3b  non-empty");
 
-    List<double>* dc = d->Copy();
-    defer delete dc;
+    auto dc = d->Copy();
     d->Set(1, -999.0);
     /* Copy should be independent of the source */
-    check(dc->Get(1) < -0.4 && dc->Get(1) > -0.6,     "3c  Copy independence");
+    check(dc.Get(1) < -0.4 && dc.Get(1) > -0.6,      "3c  Copy independence");
 
     List<double>* db = new List<double>();
     defer delete db;
