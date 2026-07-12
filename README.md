@@ -133,23 +133,40 @@ and works with any key type. String keys are hashed by **content**, scalars by
 ```c
 #include "map.h"
 
-Map<String, int> *ages = new Map<String, int>();
-ages["Ada"] = 36;                       // subscript write  ->  Set(key, val)
-ages["Ada"] = ages["Ada"] + 1;          // subscript read   ->  Get(key)
-if (ages->Contains("Ada")) { /* ... */ }
+// Stack Map (preferred) — ~ages at scope exit
+auto ages = Map<String, int>();
+ages["Ada"] = 36;                       // write → Set(key, val)
+ages["Ada"] = ages["Ada"] + 1;          // read  → Get (or GetMut lvalue for classes)
+if (ages.Contains("Ada")) { /* ... */ }
 
-for (auto name, age in ages)            // (key, value) iteration, like dict
+for (auto name, age in ages)            // (key, value) — V may be a by-value class
     printf("%s is %d\n", name, age);
 
-// string -> object mapping
-Map<String, Track*> *lib = new Map<String, Track*>();
-lib["Kashmir"] = new Track("Kashmir", 508);
-for (auto title, track in lib) track->play();
+// By-value class values (happy path)
+auto wing = Map<String, Ship>();
+wing["AURORA"] = Ship(1, "AURORA", core, 88, 142);
+wing["AURORA"].Boost(5);                // [] → GetMut lvalue, mutates buffer
+for (auto callsign, s in wing)
+    printf("%s heat=%d\n", callsign, s.heat);
 
-defer delete ages;
+// Pointer values when you need shared identity / .ownsValues()
+auto lib = Map<String, Track*>();
+lib.ownsValues();
+lib["Kashmir"] = new Track("Kashmir", 508);
 ```
 
-`Map<K, V>` plugs into the same language sugar as `List<T>` / `Set<T>`: subscript (`m[k]` / `m[k] = v`) lowers to `Get`/`Set`, and `for (auto k in m)` / `for (auto k, v in m)` iterate keys and key/value pairs in insertion order (the same `Count()` / `KeyAt(int)` / `ValAt(int)` protocol the compiler duck-types over). See `examples/classy-map.cy` for the full tour and `examples/classy-map-bench.cy` for a 100k-entry throughput benchmark.
+`Map<K, V>` plugs into the same language sugar as `List<T>` / `Set<T>`:
+- **Subscript** `m[k]` / `m[k] = v` → `Get`/`Set`; when `GetMut(K)` exists, **read
+  `m[k]` is a true lvalue** into the dense value array so `m[k].Method()` mutates
+  storage (not a temporary copy).
+- **for-in** `for (auto k in m)` / `for (auto k, v in m)` — keys and key/value pairs
+  in insertion order (`Count` / `KeyAt` / `ValAt`). **`V` (and `K`) may be by-value
+  classes**, same as `List.Get` for-in; loop vars are stack slots each iteration.
+- **Mut helpers:** `m.GetMut(k)` / `m.ValMut(i)` return `V*` when you want an explicit
+  pointer (invalidated by rehash).
+
+See `examples/classy-map.cy`, `examples/classy-aurora-ops.cy`, and
+`cy-validate/val-044-map-class-forin.cy`.
 
 #### `dict` / JSON conversions
 A `Map<String, V>` converts straight to a JSON `dict` or String. `ToDict()`
@@ -195,6 +212,14 @@ auto doubled = evens.Map((int x) => x * 2);
 auto top3    = nums.Take(3);                 // chain-friendly
 auto silver  = nums.Skip(1).Take(1);
 
+// By-value class elements (happy path — no *)
+auto fleet = List<Ship>();
+fleet.Add(Ship(1, "AURORA", core, 88, 142));
+fleet[0].Boost(5).Boost(2);                  // [] → GetMut lvalue (mutates buffer)
+//  fleet.Get(0).Boost(5);                   // WRONG: Get copies; Boost is lost
+auto hot = fleet.Where((Ship s) => s.IsHot());
+Ship deep = fleet.Find((Ship s) => s.IsDeep());  // miss = zero-init; use s.Alive()
+
 auto files = List<String>();
 files.Add("a.txt"); files.Add("b.pdf"); files.Add("c.txt");
 auto txt = files.Where((String f) => f.ends_with(".txt"));
@@ -212,14 +237,22 @@ printf("unique tags: %d\n", tags.Count());   // 2
 ```
 
 > `List<T>` provides `Filter`/`Where`, `Map`, `Select<U>`, `Take`/`Skip`,
-> `Copy`/`Slice`/`Plus`/`Distinct`, and `ForEach`. Transform methods return
-> **value** shells (C++ `vector`-style). Bare assign of `List`/`Map`/`Set` is
-> banned (would double-free); transfer with `move`, or bind a by-value return.
+> `Copy`/`Slice`/`Plus`/`Distinct`, `ForEach`, `Find`/`FindOr`, and `Sort`.
+> Transform methods return **value** shells (C++ `vector`-style). Bare assign of
+> `List`/`Map`/`Set` is banned (would double-free); transfer with `move`, or bind
+> a by-value return.
 
-> **Element types & memory** — collections hold scalars, `String`, pointers
-> (`List<MyClass*>`), and POD/DTO classes by value (`List<LapSample>`). Domain
-> objects with real destructors stay `List<T*>.owns()`. Full picture:
-> **[GENERICSMEM.md](GENERICSMEM.md)**, **[BY-VALUE.md](BY-VALUE.md)**.
+> **Element types & memory (product stance):**
+> - **Happy path:** scalars, `String`, and **by-value classes** (`List<Ship>`,
+>   `List<Signal>`). Prefer this for everyday domain types.
+> - **In-place mutation:** `list[i]` / `map[k]` lower to **`GetMut`** when present
+>   and yield a true buffer lvalue — `list[i].Method()` mutates storage. Explicit
+>   helpers: `GetMut` / `FirstMut` / `LastMut` (List), `GetMut` / `ValMut` (Map).
+> - **Advanced / identity:** `List<T*>.owns()` for shared graphs, C interop, or
+>   non-copyable resources. Views from `Where`/`Copy`/`Take` never steal `.owns()`.
+>
+> Full picture: **[GENERICSMEM.md](GENERICSMEM.md)**, **[BY-VALUE.md](BY-VALUE.md)**.
+> Showcase: `examples/classy-aurora-ops.cy`. Tests: `cy-validate/val-043-list-getmut.cy`.
 
 #### Lambdas (typed, thin C, capturing HOF args)
 
@@ -287,14 +320,23 @@ Details & design: **[LAMBDA-CAPTURE.md](LAMBDA-CAPTURE.md)**.  Tests:
 `cy-validate/val-042-lambda-capture.cy`, `examples/classy-lambda.cy`,
 `examples/classy-docsearch.cy` (`search_docs` min-score filter).
 
-#### Ownership: `.owns()` auto-frees pointer elements
+#### Ownership: by-value first; `.owns()` for pointer graphs
 
-A collection of pointers (`List<Track*>`, `Set<Track*>`, `Map<String, Track*>`)
-stores the pointers but, by default, does **not** own the pointed-to objects.
-Add `.owns()` so destroying the collection also deletes pointees.
+**Default for app code:** store **values** in the list/map buffer. No `new`, no
+`.owns()`, no stars in lambdas.
 
 ```c
-// OWNING stack list — pointees deleted in ~List
+auto fleet = List<Ship>();
+fleet.Add(Ship(1, "AURORA", core, 88, 142));
+fleet[0].Boost(5);                            // mutates buffer via GetMut
+auto deep = fleet.Find((Ship s) => s.IsDeep());
+```
+
+**When you need identity / shared graphs / C interop:** use pointers and mark
+ownership so `~List` / `delete` frees pointees.
+
+```c
+// OWNING stack list of pointers — pointees deleted in ~List
 auto library = List<Track*>();
 library.owns();
 library.Add(new Track("Kashmir", 508));
@@ -305,17 +347,18 @@ library.Add(new Track("Africa", 295));
 auto epics = library.Where((Track* t) => t.seconds > 360);
 // ~epics frees only its buffer; Tracks still owned by library
 
-// Set and Map have the same protocol:
-auto favs = List<Track*>();   // or Set
 auto byId = Map<int, Track*>();
 byId.ownsValues();
 ```
 
 Rules of thumb:
 - **Shell first:** stack `auto xs = List<T>();` for locals; `owned`/`new` to escape.
+- **Values by default** (`List<Ship>`). **Pointers** for shared identity or FFI.
 - **Exactly one owner per object** for `T*`. Views from `Where`/`Copy`/`Take`
   never steal `.owns()`.
-- **By-value elements** (`List<LapSample>`) already destroy via `__destroy`.
+- **By-value elements** already destroy via `__destroy` (no `.owns()`).
+- Prefer **quiet** destructors on types stored by value (side-effect `printf`/`free`
+  in `~T` multiplies under `Copy`/`Where`).
 
 See `include/list.h`, `set.h`, and `map.h`.
 

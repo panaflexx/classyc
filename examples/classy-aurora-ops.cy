@@ -7,19 +7,19 @@
  *
  * Weave (see also classy-neon-grid.cy, cy-validate/, BY-VALUE.md):
  *
- *   Domain   · Ship* owning stack List  · Signal by-value List (POD DTO)
- *            · fluent Boost · named ctor args · enums + nameof
+ *   Domain   · List<Ship> by value (happy path)  · Signal POD List
+ *            · GetMut for in-place Boost  · named ctor args · enums + nameof
  *   Memory   · stack List/Map RAII · value-returning Where/Take/Skip/Copy
- *            · List<Ship*>.owns() for domain pointees · move-only containers
- *            · helpers return List by value (`return move r` / implicit move)
- *   LINQ     · Where / Select / Any / All / Find / FindOr
- *            · First / Last / Take / Skip · OrderBy helpers · ForEach
+ *            · no owns()/new for fleet — elements live in the List buffer
+ *            · GetMut(i) when mutation must hit storage (not a Get() copy)
+ *   LINQ     · Where / Select / Any / All / Find / FindOr (values, not T*)
+ *            · First / Last / Take / Skip · Sort(lambda) · ForEach
  *            · Range · Plus · Slice · Distinct — all by-value local shells
  *   Map      · stack Map · subscript m[k] · TryAdd / GetOr / Where
  *   String   · equals / contains / starts_with / split / join · f-strings
  *   Generics · free Max<T> inference · Select method generic
  *   JSON     · dict brace-init · (T) d / (T)? d bind
- *   Style    · `.` auto-deref · `?.` / `??` · value chains · for-in
+ *   Style    · value lambdas (Ship s) · id!=0 for Find miss · for-in
  *
  * Usage (from project root):
  *   ./bin/classyc -I include examples/classy-aurora-ops.cy -eg
@@ -65,15 +65,16 @@ class Ship {
         this.range_ly = range_ly;
     }
 
-    ~Ship() {
-        printf("      ~Ship #%d %s decommissioned\n", id, callsign);
-    }
+    /* Quiet dtor — by-value Lists copy elements; no printf spam / double-free. */
+    ~Ship() {}
 
     int IsHot()     { return heat >= 50; }
     int IsDeep()    { return range_ly >= 120; }
+    int Alive()     { return id != 0; }   /* Find miss is zero-init Ship */
     Alert Level()   { return AlertOf(heat); }
     int SectorKey() { return (int)sector; }
 
+    /* Return this for fluent chains on GetMut / FirstMut pointers. */
     Ship* Boost(int delta) {
         this.heat += delta;
         return this;
@@ -95,24 +96,12 @@ class Ship {
     void Banner() { printf("   ▶  %s\n", ToString()); }
 };
 
-int ByHeatDesc(Ship* a, Ship* b) { return b.heat - a.heat; }
-int ByRange(Ship* a, Ship* b)    { return a.range_ly - b.range_ly; }
-int ByIntAsc(int a, int b)       { return a - b; }
+int ByIntAsc(int a, int b) { return a - b; }
 
-/* Helpers return List by value — no heap shell at the call site. */
-List<Ship*> OrderByHeat(List<Ship*>* src) {
-    auto r = src.Copy();
-    r.Sort(ByHeatDesc);
-    return move r;
-}
+void print_banner(Ship s) { s.Banner(); }
 
-List<Ship*> OrderByRange(List<Ship*>* src) {
-    auto r = src.Copy();
-    r.Sort(ByRange);
-    return r;                          /* implicit move of local */
-}
-
-void print_banner(Ship* p) { p.Banner(); }
+/* Empty sentinel for FindOr misses (id==0 ⇒ !Alive()). */
+Ship NoShip() { return Ship(0, "", core, 0, 0); }
 
 /* POD DTO — by-value in List (no user dtor). */
 class Signal {
@@ -142,19 +131,19 @@ void hr(const char* title) {
     printf("════════════════════════════════════════════════════════════\n");
 }
 
-void SeedFleet(List<Ship*>* fleet) {
-    fleet.Add(new Ship(1, "AURORA",  core, 88, 142));
-    fleet.Add(new Ship(2, "VEILRUN", veil, 61,  98));
-    fleet.Add(new Ship(3, "RIMSPARK", rim, 44, 165));
-    fleet.Add(new Ship(id=4, callsign="KITE", sector=core, heat=73, range_ly=110));
-    fleet.Add(new Ship(5, "NEXUS",   veil, 91,  76));
-    fleet.Add(new Ship(6, "EMBER",   rim,  35, 188));
-    fleet.Add(new Ship(7, "SOLACE",  core, 55, 130));
-    fleet.Add(new Ship(8, "GLITCH",  veil, 22,  54));
+void SeedFleet(List<Ship>* fleet) {
+    fleet.Add(Ship(1, "AURORA",  core, 88, 142));
+    fleet.Add(Ship(2, "VEILRUN", veil, 61,  98));
+    fleet.Add(Ship(3, "RIMSPARK", rim, 44, 165));
+    fleet.Add(Ship(4, "KITE", core, 73, 110));
+    fleet.Add(Ship(5, "NEXUS",   veil, 91,  76));
+    fleet.Add(Ship(6, "EMBER",   rim,  35, 188));
+    fleet.Add(Ship(7, "SOLACE",  core, 55, 130));
+    fleet.Add(Ship(8, "GLITCH",  veil, 22,  54));
 }
 
-void FillHeatMap(Map<String, int>* board, List<Ship*>* ships) {
-    for (auto p in ships) board[p.callsign] = p.heat;
+void FillHeatMap(Map<String, int>* board, List<Ship>* ships) {
+    for (auto s in ships) board[s.callsign] = s.heat;
 }
 
 /* ───────────────────────── main ─────────────────────────── */
@@ -169,7 +158,7 @@ int main() {
     printf("   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝\n");
     printf("              constellation ops · by-value List/Map idiom\n");
     printf("   types: %s · %s · %s\n",
-           nameof<Sector>(), nameof<Alert>(), typeof<Ship*>());
+           nameof<Sector>(), nameof<Alert>(), typeof<Ship>());
 
     dict cfg_json = {
         "board_name": "AURORA OPS",
@@ -178,38 +167,44 @@ int main() {
         "sectors": [0, 1, 2]
     };
     OpsConfig cfg = (OpsConfig) cfg_json;
-    OpsConfig soft = (OpsConfig)? { "board_name": "warmup" };
+    OpsConfig soft = (OpsConfig) ? { "board_name": "warmup" };
     printf("   config: %s  hot≥%d  wing≤%d  (lenient name=%s thr=%d)\n",
            cfg.board_name, cfg.hot_threshold, cfg.max_wing,
            soft.board_name, soft.hot_threshold);
 
-    /* ═══ 1. Fleet — stack List of owning pointers ═══════════════════════════ */
-    hr("1 · FLEET  (stack List.owns · Seed · ForEach · First/Last · Max)");
+    /* ═══ 1. Fleet — by-value List<Ship> (no new / owns) ═══════════════════════ */
+    hr("1 · FLEET  (List<Ship> by value · GetMut · Seed · ForEach · Max)");
 
-    auto fleet = List<Ship*>();
-    fleet.owns();
+    auto fleet = List<Ship>();
     SeedFleet(&fleet);
 
-    fleet.Get(0).Boost(5).Boost(2);       /* AURORA 88 → 95 */
+    /* [] is a true buffer lvalue (GetMut under the hood) — no Get() copy. */
+    fleet[0].Boost(5).Boost(2);              /* AURORA 88 → 95 */
 
     int peak = fleet.First().heat;
-    for (auto p in fleet) peak = Max(peak, p.heat);
+    for (auto s in fleet) peak = Max(peak, s.heat);
+    /* Bind First/Last — chaining .callsign off a prvalue temp can dangle String. */
+    Ship first_ship = fleet.First();
+    Ship last_ship  = fleet.Last();
     printf("  %d ships · first=%s · last=%s · peak heat=%d (Max<T>)\n",
-           fleet.Count(), fleet.First().callsign, fleet.Last().callsign, peak);
+           fleet.Count(), first_ship.callsign, last_ship.callsign, peak);
     fleet.ForEach(print_banner);
 
-    auto roster = fleet.Copy();           /* by-value List shell */
+    auto roster = fleet.Copy();           /* by-value List shell (copies Ships) */
 
     /* ═══ 2. Sortie board ════════════════════════════════════════════════════ */
-    hr("2 · SORTIE  (Where · OrderBy · Select · Find · ?. ?? · no owned)");
+    hr("2 · SORTIE  (Where · Copy+Sort · Select · Find — value Ships)");
 
-    auto hot_raw = fleet.Where((Ship* p) => p.IsHot());
-    auto hot     = OrderByHeat(&hot_raw);
+    auto hot_raw = fleet.Where((Ship s) => s.IsHot());
+    auto hot     = hot_raw.Copy();
+    hot.Sort((Ship a, Ship b) => b.heat - a.heat);
+    Ship hot_top = hot.First();
+    Ship hot_low = hot.Last();
     printf("  hot ranked: %d  (top %s · floor %s)\n",
-           hot.Count(), hot.First().callsign, hot.Last().callsign);
+           hot.Count(), hot_top.callsign, hot_low.callsign);
     hot.ForEach(print_banner);
 
-    auto hot_names = hot.Select<String>((Ship* p) => p.callsign);
+    auto hot_names = hot.Select<String>((Ship s) => s.callsign);
     printf("  hot callsigns: %s\n", hot_names.ToJson());
 
     String sample = hot_names.First();
@@ -222,28 +217,29 @@ int main() {
     owned auto bits = tag.split("-");     /* String.split still heap List* */
     printf("  split/join: %s → %s\n", tag, bits.join("/"));
 
-    auto heats = roster.Select((Ship* p) => p.heat);
+    auto heats = roster.Select((Ship s) => s.heat);
     heats.Sort(ByIntAsc);
     printf("  heat ladder: %s\n", heats.ToJson());
 
-    printf("  Any(IsHot)=%s  All(live)=%s  Any(IsDeep)=%s\n",
-           fleet.Any((Ship* p) => p.IsHot())  ? "true" : "false",
-           fleet.All((Ship* p) => p != NULL)  ? "true" : "false",
-           fleet.Any((Ship* p) => p.IsDeep()) ? "true" : "false");
+    printf("  Any(IsHot)=%s  All(Alive)=%s  Any(IsDeep)=%s\n",
+           fleet.Any((Ship s) => s.IsHot())  ? "true" : "false",
+           fleet.All((Ship s) => s.Alive())  ? "true" : "false",
+           fleet.Any((Ship s) => s.IsDeep()) ? "true" : "false");
 
-    Ship* deep = fleet.Find((Ship* p) => p.IsDeep());
-    Ship* ghost = fleet.FindOr(NULL, (Ship* p) => p.heat > 99999);
+    /* Find returns Ship by value; miss is zero-init (id==0). */
+    Ship deep  = fleet.Find((Ship s) => s.IsDeep());
+    Ship ghost = fleet.FindOr(NoShip(), (Ship s) => s.heat > 99999);
 
-    String deep_name = deep?.callsign ?? (String)"?";
-    String ghost_name = ghost?.callsign ?? (String)"(none)";
+    String deep_name = deep.Alive() ? deep.callsign : (String)"?";
+    String ghost_name = ghost.Alive() ? ghost.callsign : (String)"(none)";
     printf("  deepest scout: %s\n",
-           deep?.ToString() ?? (String)"(no deep-range ship)");
-    if (deep) {
+           deep.Alive() ? deep.ToString() : (String)"(no deep-range ship)");
+    if (deep.Alive()) {
         Sector ds = deep.sector;
         Alert da = deep.Level();
         printf("  nameof: sector=%s alert=%s\n", ds.nameof(), da.nameof());
     }
-    printf("  FindOr miss → %s · ?? name=%s\n", ghost_name, deep_name);
+    printf("  FindOr miss → %s · deep name=%s\n", ghost_name, deep_name);
 
     /* ═══ 3. Windows — all value transforms ══════════════════════════════════ */
     hr("3 · WINDOWS  (Range · Plus · Slice · Distinct · Skip/Take chains)");
@@ -276,15 +272,16 @@ int main() {
     /* ═══ 4. Sector briefing ═════════════════════════════════════════════════ */
     hr("4 · SECTOR BRIEFING  (GroupBy · Set watchlist · enum nameof)");
 
-    owned auto by_sector = roster.GroupBy((Ship* p) => p.SectorKey());
+    owned auto by_sector = roster.GroupBy((Ship s) => s.SectorKey());
     printf("  %d sectors (%s)\n", by_sector.Count(), nameof<Sector>());
 
     for (auto bucket, group in by_sector) {
         Sector sec = (Sector)bucket;
-        group.Sort(ByHeatDesc);
+        group.Sort((Ship a, Ship b) => b.heat - a.heat);
+        Ship leader = group.First();
         printf("\n  ▸ %s sector (%d)  leader=%s\n",
                ((String)sec.nameof()).upper(), group.Count(),
-               group.First().callsign);
+               leader.callsign);
         group.ForEach(print_banner);
     }
 
@@ -382,33 +379,33 @@ int main() {
            signals.First().ToString(), signals.Last().ToString());
 
     /* ═══ 8. Wing / podium — pure value pipeline ═════════════════════════════ */
-    hr("8 · WING  (OrderByRange · Take · Skip chain · stack Map)");
+    hr("8 · WING  (Copy+Sort · Take · Skip chain · stack Map)");
 
-    auto by_range = OrderByRange(&fleet);
+    auto by_range = fleet.Copy();
+    by_range.Sort((Ship a, Ship b) => a.range_ly - b.range_ly);
     auto top3     = by_range.Take(3);
     auto silver   = by_range.Skip(1).Take(1);
 
     printf("  silver: %s\n", silver.First().ToString());
 
-    auto wing = Map<String, Ship*>();
+    auto wing = Map<String, Ship>();   /* by-value class values */
     int place = 1;
-    for (auto p in top3) {
-        wing[p.callsign] = p;
-        printf("  #%d  %s\n", place, p.ToString());
+    for (auto s in top3) {
+        wing[s.callsign] = s;
+        printf("  #%d  %s\n", place, s.ToString());
         place++;
     }
-    printf("  for (auto k, v in wing):\n");
-    for (auto sign, p in wing) {
+    printf("  for (auto k, v in wing) — class V for-in:\n");
+    for (auto sign, s in wing) {
         printf("    [%s] %s heat=%d range=%s\n",
-               sign, p.sector.nameof(), p.heat, p.RangeLabel());
+               sign, s.sector.nameof(), s.heat, s.RangeLabel());
     }
 
     /* ═══ 9. Uplink ══════════════════════════════════════════════════════════ */
     hr("9 · UPLINK  (dict DTO · f-strings · config bind)");
 
-    String scout = deep?.callsign ?? (String)"?";
-    Ship* silver_p = silver.IsEmpty() ? NULL : silver.First();
-    String silver_name = silver_p?.callsign ?? (String)"?";
+    String scout = deep.Alive() ? deep.callsign : (String)"?";
+    String silver_name = silver.IsEmpty() ? (String)"?" : silver.First().callsign;
     dict uplink = {
         "board": cfg.board_name,
         "ships": fleet.Count(),
@@ -433,7 +430,7 @@ int main() {
     printf("  nameof: %s · %s.nameof()=%s · Max sample=%d\n",
            nameof(core), nameof(red), red.nameof(), Max(3, 5));
 
-    hr("SHUTDOWN  (~fleet owns every Ship · stack List/Map free buffers)");
+    hr("SHUTDOWN  (~fleet destroys value Ships · stack List/Map free buffers)");
     printf("  dropping scope…\n");
     return 0;
 }

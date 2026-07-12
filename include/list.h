@@ -2,7 +2,7 @@
  *
  * Provides a production-ready List<T> with 30 methods covering:
  *   · Constructors (default, capacity, singleton, array-view)
- *   · Accessors    (Count, Capacity, IsEmpty, Get, First, Last)
+ *   · Accessors    (Count, Capacity, IsEmpty, Get, GetMut, First, FirstMut, Last)
  *   · Capacity     (EnsureCapacity, TrimExcess)
  *   · Mutation     (Set, Add, Insert, Pop, RemoveAt, Remove, Clear)
  *   · Search       (IndexOf, LastIndexOf, Contains)
@@ -192,10 +192,30 @@ class List<T> {
         return this;
     }
 
+    /* Get returns T by value (a copy).  Prefer GetMut for in-place mutation of
+     * by-value class elements so Boost/set-field hits the list buffer. */
     T Get(int index) { if (index < 0 || index >= this->length) throw(OutOfBoundsException, "List.Get oob"); return this->data[index]; }
 
+    /* Pointer into the backing store — advanced escape for mutation without
+     * re-Set.  Invalidated by reallocation (Add/EnsureCapacity that grows).
+     * Prefer the [] sugar:  list[i].field = …  /  list[i].Method()  already
+     * lower to GetMut and yield a true element lvalue (not a Get() copy). */
+    T* GetMut(int index) __attribute__((da_ignore)) {
+        if (index < 0 || index >= this->length)
+            throw(OutOfBoundsException, "List.GetMut oob");
+        return &this->data[index];
+    }
+
     T First() { if (this->length == 0) throw(OutOfBoundsException, "First empty"); return this->data[0]; }
+    T* FirstMut() __attribute__((da_ignore)) {
+        if (this->length == 0) throw(OutOfBoundsException, "FirstMut empty");
+        return &this->data[0];
+    }
     T Last() { if (this->length == 0) throw(OutOfBoundsException, "Last empty"); return this->data[this->length - 1]; }
+    T* LastMut() __attribute__((da_ignore)) {
+        if (this->length == 0) throw(OutOfBoundsException, "LastMut empty");
+        return &this->data[this->length - 1];
+    }
     T GetOr(int index, T fb){ if(index<0||index>=length) return fb; return data[index]; }
     bool TryGet(int index, T* out){ if(!out) return false; if(index<0||index>=length) return false; *out=data[index]; return true; }
     T FirstOr(T fb){ if(length==0) return fb; return data[0]; }

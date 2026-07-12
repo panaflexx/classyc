@@ -12,8 +12,15 @@
  *   Map      · stack Map for O(1) term → Term*  · title-path scan fallback
  *   String   · equals / contains / starts_with · f-strings
  *   I/O      · zcat for .gz  · man -l to open pages  · strip HTML / light MD
- *   Persist  · SQLite inverted index  · --reindex rebuild  · instant reopen
+ *   Persist  · binary docindex.cdb (whole-index dump)  · --reindex rebuild
+ *   Search   · 2-stage: inverted terms → refine "phrase" / a+b on title|path|body
  *   TUI      · raw termios  · type-to-search  · Tab into list  · Enter open
+ *
+ * Query syntax:
+ *   words          bag-of-words via inverted index (broad recall)
+ *   "exact phrase"  stage-2 filter: substring in title / path / body (if loaded)
+ *   word1+word2    stage-2 filter: adjacent tokens (any non-alnum separator)
+ *   mix            index OR of all words, then all "…" and + clauses must pass
  *
  * What it indexes by default (Google mode — unlimited):
  *   /usr/share/man/**          all sections (man1…man8, man3type, …)
@@ -21,8 +28,8 @@
  *   /usr/local/share/{man,doc} if present
  *   DOCSEARCH_MAX=0 (default) indexes every candidate; set a number to cap
  *
- * SQLite cache (default ~/.cache/classy-docsearch/index.db):
- *   tables  meta / docs / postings(term,doc_id,tf)
+ * Binary cache (default ~/.cache/classy-docsearch/docindex.cdb):
+ *   compact little-endian dump of docs + inverted postings (search is in-RAM)
  *   first run builds + saves; later runs load unless --reindex
  *
  * Key handling:
@@ -31,14 +38,16 @@
  *   3. HTML           — pure-C tag strip for index (legible); pandoc -t plain
  *                       for view when present, else stripped text in less
  *
- * Build / run (needs libsqlite3):
- *   ./bin/classyc -I include -l sqlite3 examples/classy-docsearch.cy -eg
- *   ./bin/classyc -I include -l sqlite3 examples/classy-docsearch.cy -eg -- --reindex
- *   DOCSEARCH_DB=/tmp/idx.db DOCSEARCH_MAX=500 ... -eg
+ * Build / run:
+ *   ./bin/classyc -I include examples/classy-docsearch.cy -eg
+ *   ./bin/classyc -I include examples/classy-docsearch.cy -eg -- --reindex
+ *   DOCSEARCH_CDB=/tmp/docindex.cdb DOCSEARCH_MAX=500 ... -eg
  *   DOCSEARCH_BATCH=1        non-interactive sample queries + exit
  *
  * Keys in the TUI:
  *   type          search as you type (query focus)
+ *   "phrase"      exact substring (title/path/body)
+ *   a+b           adjacent terms (token neighborhood)
  *   Tab / ↓       focus result list
  *   ↑ ↓  j k      move selection (list focus)
  *   Enter         open selected manpage / document in pager
@@ -61,11 +70,11 @@
 #include <signal.h>
 #include <time.h>
 #include <errno.h>
+#include <stdint.h>
 #include "list.h"
 #include "map.h"
 #include "term.h"
 #include "file.h"
-#include "sqlite.h"
 
 /* ───────────────────────── config / limits ───────────────────────── */
 
@@ -147,12 +156,12 @@ int g_files_seen = 0;
 int g_files_indexed = 0;
 long g_bytes_indexed = 0;
 int g_batch = 0;                 /* 1 = non-interactive smoke */
-int g_reindex = 0;               /* 1 = force SQLite rebuild */
-int g_from_db = 0;               /* 1 if corpus loaded from sqlite */
+int g_reindex = 0;               /* 1 = force binary index rebuild */
+int g_from_cdb = 0;              /* 1 if corpus loaded from docindex.cdb */
 int g_tui_mode = 0;              /* 1 = alt-screen TUI is up (loading or live) */
 int g_index_ready = 0;           /* 0 while loading; search waits until ready */
 int g_want_quit = 0;             /* Esc/Ctrl-C while loading */
-char g_db_path[MAX_PATH];
+char g_cdb_path[MAX_PATH];
 char g_ui_status[240];           /* live status under the query bar */
 Focus g_ui_focus = focus_query;  /* focus during load-time input */
 int   g_ui_selected = 0;         /* list selection during load-time input */
@@ -813,6 +822,12 @@ int by_priority(String a, String b) {
 
 /* ───────────────────────── query / rank ───────────────────────── */
 
+#define MAX_Q_TERMS   32
+#define MAX_Q_PHRASES  8
+#define MAX_Q_PLUS     8
+#define MAX_PLUS_WORDS 8
+#define DOC_TEXT_MAX   (MAX_TITLE + MAX_PATH + 512)
+
 void lower_copy(const char* in, char* out, int out_max) {
     int i = 0;
     if (!in) { out[0] = 0; return; }
@@ -823,7 +838,100 @@ void lower_copy(const char* in, char* out, int out_max) {
     out[i] = 0;
 }
 
-/* Rank docs for free-text query.  Returns value List<Hit> (RAII). */
+/* Stage-2 haystack: title + path + body (body often empty after cdb load). */
+void doc_search_text(Doc* doc, char* out, int out_max) {
+    if (!out || out_max <= 0) return;
+    out[0] = 0;
+    if (!doc) return;
+    char t[MAX_TITLE], p[MAX_PATH], b[512];
+    lower_copy(doc.title, t, MAX_TITLE);
+    lower_copy(doc.path, p, MAX_PATH);
+    lower_copy(doc.body, b, (int)sizeof(b));
+    snprintf(out, (size_t)out_max, "%s\n%s\n%s", t, p, b);
+}
+
+/* True if `needle` occurs as a literal substring of lowered haystack. */
+int text_has_phrase(const char* hay, const char* phrase) {
+    if (!hay || !phrase || !phrase[0]) return 0;
+    return strstr(hay, phrase) != NULL;
+}
+
+/*
+ * True if words[0..nwords) appear as consecutive alphanumeric tokens in hay
+ * (any non-alnum separators).  Used for a+b+c adjacency filters.
+ */
+int text_has_adjacent(const char* hay, char words[][40], int nwords) {
+    if (!hay || nwords <= 0) return 0;
+    if (nwords == 1) {
+        /* single token: whole-word preferred, substring fallback */
+        const char* p = hay;
+        int wlen = (int)strlen(words[0]);
+        if (wlen <= 0) return 0;
+        while (*p) {
+            while (*p && !isalnum((unsigned char)*p)) p++;
+            if (!*p) break;
+            const char* s = p;
+            while (*p && isalnum((unsigned char)*p)) p++;
+            int len = (int)(p - s);
+            if (len == wlen && strncmp(s, words[0], (size_t)wlen) == 0) return 1;
+        }
+        return strstr(hay, words[0]) != NULL;
+    }
+
+    /* Scan tokens; try to match the full chain starting at each position. */
+    const char* p = hay;
+    while (*p) {
+        while (*p && !isalnum((unsigned char)*p)) p++;
+        if (!*p) break;
+        const char* save = p;
+        int wi = 0;
+        const char* q = p;
+        while (wi < nwords) {
+            while (*q && !isalnum((unsigned char)*q)) q++;
+            if (!*q) break;
+            const char* s = q;
+            while (*q && isalnum((unsigned char)*q)) q++;
+            int len = (int)(q - s);
+            int wlen = (int)strlen(words[wi]);
+            if (len != wlen || strncmp(s, words[wi], (size_t)wlen) != 0) break;
+            wi++;
+        }
+        if (wi == nwords) return 1;
+        /* advance one token from save */
+        p = save;
+        while (*p && isalnum((unsigned char)*p)) p++;
+    }
+    return 0;
+}
+
+/* Stage-1: add inverted-index postings for one word into tf/matched. */
+void inv_add_word(Map<String, Term*>* inv, const char* word, int nDocs,
+                  int* tf, int* matched) {
+    if (!word || !word[0] || !inv || !tf || !matched) return;
+    int len = (int)strlen(word);
+    if (len < 1 || len > 32) return;
+    String w = intern_word(word, len);
+    Term* t = NULL;
+    if (!(inv.TryGet(w, &t) && t != NULL)) return;
+    int last = -1;
+    for (auto docId in t.docIds) {
+        if (docId < 0 || docId >= nDocs) continue;
+        tf[docId] = tf[docId] + 1;
+        if (docId != last) {
+            matched[docId] = matched[docId] + 1;
+            last = docId;
+        }
+    }
+}
+
+/*
+ * Two-stage ranker:
+ *   Stage 1 — inverted terms (free words + words inside "…" / a+b) for recall
+ *   Stage 2 — "phrase" substring + a+b adjacency on title|path|body (unindexed)
+ *
+ * Operators refine candidates; they are not bag-of-words.  Body is only present
+ * when the doc was crawled in this process (cdb loads leave body empty).
+ */
 List<Hit> search_docs(List<Doc*>* corpus, Map<String, Term*>* inv, const char* query) {
     auto hits = List<Hit>();
     int nDocs = corpus.Count();
@@ -831,28 +939,148 @@ List<Hit> search_docs(List<Doc*>* corpus, Map<String, Term*>* inv, const char* q
 
     char qbuf[MAX_QUERY];
     lower_copy(query, qbuf, MAX_QUERY);
-    /* trim */
     char* q = qbuf;
     while (*q == ' ') q++;
     int qlen = (int)strlen(q);
     while (qlen > 0 && q[qlen - 1] == ' ') { q[--qlen] = 0; }
 
     if (qlen == 0) {
-        /* empty query → first MAX_SHOW docs as score=0 browse list */
         int n = nDocs < MAX_SHOW ? nDocs : MAX_SHOW;
         for (int i = 0; i < n; i++) hits.Add(Hit(i, 0));
         return move hits;
     }
 
+    /* ── parse: free terms, "phrases", plus-chains ─────────────────────── */
+    char terms[MAX_Q_TERMS][40];
+    int n_terms = 0;
+    char phrases[MAX_Q_PHRASES][MAX_QUERY];
+    int n_phrases = 0;
+    char plus_words[MAX_Q_PLUS][MAX_PLUS_WORDS][40];
+    int plus_len[MAX_Q_PLUS];
+    int n_plus = 0;
+
+    int qi = 0;
+    while (q[qi]) {
+        if (q[qi] == '"') {
+            qi++;
+            int start = qi;
+            while (q[qi] && q[qi] != '"') qi++;
+            int len = qi - start;
+            if (len > 0 && n_phrases < MAX_Q_PHRASES) {
+                if (len >= MAX_QUERY) len = MAX_QUERY - 1;
+                memcpy(phrases[n_phrases], q + start, (size_t)len);
+                phrases[n_phrases][len] = 0;
+                /* strip outer spaces inside the quotes */
+                char* ps = phrases[n_phrases];
+                while (*ps == ' ') ps++;
+                int pl = (int)strlen(ps);
+                while (pl > 0 && ps[pl - 1] == ' ') ps[--pl] = 0;
+                if (ps != phrases[n_phrases]) memmove(phrases[n_phrases], ps, (size_t)pl + 1);
+                if (phrases[n_phrases][0]) n_phrases++;
+            }
+            if (q[qi] == '"') qi++;
+            continue;
+        }
+        if (isalnum((unsigned char)q[qi])) {
+            /* word or word+word+… chain */
+            char chain[MAX_PLUS_WORDS][40];
+            int nc = 0;
+            for (;;) {
+                int start = qi;
+                while (q[qi] && isalnum((unsigned char)q[qi])) qi++;
+                int len = qi - start;
+                if (len >= 1 && len <= 32 && nc < MAX_PLUS_WORDS) {
+                    memcpy(chain[nc], q + start, (size_t)len);
+                    chain[nc][len] = 0;
+                    nc++;
+                } else if (len > 32) {
+                    /* skip oversized token */
+                }
+                if (q[qi] == '+') {
+                    qi++;
+                    continue;   /* next word of chain */
+                }
+                break;
+            }
+            if (nc == 1) {
+                if (n_terms < MAX_Q_TERMS) {
+                    memcpy(terms[n_terms], chain[0], 40);
+                    n_terms++;
+                }
+            } else if (nc > 1 && n_plus < MAX_Q_PLUS) {
+                plus_len[n_plus] = nc;
+                for (int k = 0; k < nc; k++)
+                    memcpy(plus_words[n_plus][k], chain[k], 40);
+                n_plus++;
+            }
+            continue;
+        }
+        qi++;
+    }
+
+    /* Words inside phrases also feed stage-1 recall. */
+    for (int pi = 0; pi < n_phrases; pi++) {
+        const char* s = phrases[pi];
+        int j = 0;
+        while (s[j]) {
+            if (isalnum((unsigned char)s[j])) {
+                int start = j;
+                while (s[j] && isalnum((unsigned char)s[j])) j++;
+                int len = j - start;
+                if (len >= 1 && len <= 32 && n_terms < MAX_Q_TERMS) {
+                    memcpy(terms[n_terms], s + start, (size_t)len);
+                    terms[n_terms][len] = 0;
+                    n_terms++;
+                }
+            } else {
+                j++;
+            }
+        }
+    }
+    for (int pi = 0; pi < n_plus; pi++) {
+        for (int k = 0; k < plus_len[pi]; k++) {
+            if (n_terms < MAX_Q_TERMS) {
+                memcpy(terms[n_terms], plus_words[pi][k], 40);
+                n_terms++;
+            }
+        }
+    }
+
     int* tf = (int*)calloc((size_t)nDocs, sizeof(int));
     int* matched = (int*)calloc((size_t)nDocs, sizeof(int));
     int* title_hit = (int*)calloc((size_t)nDocs, sizeof(int));
-    if (!tf || !matched || !title_hit) {
-        free(tf); free(matched); free(title_hit);
+    int* stage2_ok = (int*)calloc((size_t)nDocs, sizeof(int));
+    if (!tf || !matched || !title_hit || !stage2_ok) {
+        free(tf); free(matched); free(title_hit); free(stage2_ok);
         return move hits;
     }
 
-    /* Title / path boosts (partial words while typing — as-you-type UX). */
+    /* As-you-type title/path boosts on the raw query strip (ignore quotes/+). */
+    char bare[MAX_QUERY];
+    {
+        int bi = 0;
+        for (int i = 0; q[i] && bi < MAX_QUERY - 1; i++) {
+            char c = q[i];
+            if (c == '"' || c == '+') continue;
+            bare[bi++] = c;
+        }
+        bare[bi] = 0;
+        /* collapse double spaces */
+        int w = 0;
+        int sp = 1;
+        for (int r = 0; bare[r]; r++) {
+            if (bare[r] == ' ') {
+                if (!sp) { bare[w++] = ' '; sp = 1; }
+            } else {
+                bare[w++] = bare[r];
+                sp = 0;
+            }
+        }
+        while (w > 0 && bare[w - 1] == ' ') w--;
+        bare[w] = 0;
+    }
+    int bare_len = (int)strlen(bare);
+
     for (int d = 0; d < nDocs; d++) {
         Doc* doc = corpus.Get(d);
         char tbuf[MAX_TITLE];
@@ -860,7 +1088,6 @@ List<Hit> search_docs(List<Doc*>* corpus, Map<String, Term*>* inv, const char* q
         lower_copy(doc.title, tbuf, MAX_TITLE);
         lower_copy(doc.path, pbuf, MAX_PATH);
 
-        /* name before '(' — "gzip(1)" → "gzip" */
         char name[MAX_TITLE];
         int ni = 0;
         while (tbuf[ni] && tbuf[ni] != '(' && ni < MAX_TITLE - 1) {
@@ -869,65 +1096,95 @@ List<Hit> search_docs(List<Doc*>* corpus, Map<String, Term*>* inv, const char* q
         }
         name[ni] = 0;
 
-        if (strcmp(name, q) == 0) {
-            title_hit[d] = 100;        /* exact man name */
-        } else if (strncmp(name, q, qlen) == 0 && qlen >= 2) {
-            title_hit[d] = 40;         /* prefix of name (typing "gz" → gzip) */
-        } else if (strstr(tbuf, q) != NULL) {
-            title_hit[d] = 8;          /* substring in full title */
-        } else if (strstr(pbuf, q) != NULL) {
-            title_hit[d] = 3;          /* path only */
+        if (bare_len > 0) {
+            if (strcmp(name, bare) == 0) {
+                title_hit[d] = 100;
+            } else if (strncmp(name, bare, bare_len) == 0 && bare_len >= 2) {
+                title_hit[d] = 40;
+            } else if (strstr(tbuf, bare) != NULL) {
+                title_hit[d] = 8;
+            } else if (strstr(pbuf, bare) != NULL) {
+                title_hit[d] = 3;
+            }
+        }
+        /* Phrase hits on title alone get a strong title boost too. */
+        for (int pi = 0; pi < n_phrases; pi++) {
+            if (strstr(tbuf, phrases[pi]) != NULL) {
+                if (title_hit[d] < 80) title_hit[d] = 80;
+            } else if (strstr(pbuf, phrases[pi]) != NULL) {
+                if (title_hit[d] < 20) title_hit[d] = 20;
+            }
         }
     }
 
-    /* Token pass → inverted index (body + title tokens already mapped). */
-    int qi = 0;
-    int n_terms = 0;
-    while (q[qi]) {
-        if (isalnum((unsigned char)q[qi])) {
-            int start = qi;
-            while (q[qi] && isalnum((unsigned char)q[qi])) qi++;
-            int len = qi - start;
-            if (len >= 1 && len <= 32) {
-                String w = intern_word(q + start, len);
-                n_terms++;
-                Term* t = NULL;
-                if (inv.TryGet(w, &t) && t != NULL) {
-                    int last = -1;
-                    for (auto docId in t.docIds) {
-                        if (docId < 0 || docId >= nDocs) continue;
-                        tf[docId] = tf[docId] + 1;
-                        if (docId != last) {
-                            matched[docId] = matched[docId] + 1;
-                            last = docId;
-                        }
-                    }
-                }
-            }
-        } else {
-            qi++;
+    /* ── Stage 1: inverted index (recall) ──────────────────────────────── */
+    for (int ti = 0; ti < n_terms; ti++)
+        inv_add_word(inv, terms[ti], nDocs, tf, matched);
+
+    int need_stage2 = (n_phrases > 0 || n_plus > 0);
+
+    /* Mark every doc that stage-1 or title touched as a stage-2 candidate.
+     * If the query is only operators and stage-1 found nothing, fall back to
+     * scanning all docs for title/path (small enough corpora; still O(n)). */
+    int any_cand = 0;
+    for (int d = 0; d < nDocs; d++) {
+        if (tf[d] > 0 || matched[d] > 0 || title_hit[d] > 0) {
+            stage2_ok[d] = 1;
+            any_cand = 1;
         }
+    }
+    if (need_stage2 && !any_cand) {
+        for (int d = 0; d < nDocs; d++) stage2_ok[d] = 1;
+        any_cand = 1;
+    }
+
+    /* ── Stage 2: unindexed phrase / adjacency refine ─────────────────── */
+    if (need_stage2) {
+        char hay[DOC_TEXT_MAX];
+        for (int d = 0; d < nDocs; d++) {
+            if (!stage2_ok[d]) continue;
+            Doc* doc = corpus.Get(d);
+            doc_search_text(doc, hay, DOC_TEXT_MAX);
+
+            int ok = 1;
+            for (int pi = 0; pi < n_phrases && ok; pi++) {
+                if (!text_has_phrase(hay, phrases[pi])) ok = 0;
+            }
+            for (int pi = 0; pi < n_plus && ok; pi++) {
+                if (!text_has_adjacent(hay, plus_words[pi], plus_len[pi])) ok = 0;
+            }
+            stage2_ok[d] = ok;
+            if (ok) {
+                /* Refine bonus: each satisfied operator pays out. */
+                if (n_phrases > 0) title_hit[d] += 50 * n_phrases;
+                if (n_plus > 0) title_hit[d] += 30 * n_plus;
+            }
+        }
+    } else {
+        for (int d = 0; d < nDocs; d++) stage2_ok[d] = 1;
     }
 
     for (int d = 0; d < nDocs; d++) {
+        if (!stage2_ok[d]) continue;
         int score = 0;
         if (tf[d] > 0)
             score = matched[d] * 1000 + tf[d];
         if (title_hit[d] > 0)
             score += title_hit[d] * 1000;
+        /* Operator-only queries: stage-2 pass with no index tf still counts. */
+        if (need_stage2 && score == 0 && stage2_ok[d])
+            score = 500;
         if (score > 0) hits.Add(Hit(d, score));
     }
 
     free(tf);
     free(matched);
     free(title_hit);
+    free(stage2_ok);
 
     hits.Sort(ByScoreDesc);
 
-    /* Capturing Where (Strategy A): free local min_score lives in this frame
-     * (no g_* threshold, no fat closure).  When many hits and the query is
-     * long enough, prefer high-confidence matches (title/multi-term ≥ 1000).
-     * If that empties the view, fall back to Take. */
+    /* Capturing Where (Strategy A): free local min_score lives in this frame. */
     if (hits.Count() > MAX_SHOW && qlen >= 3) {
         int min_score = 1000;
         auto strong = hits.Where((Hit h) => h.score >= min_score);
@@ -1102,7 +1359,7 @@ void draw_ui(List<Doc*>* corpus, List<Hit>* hits, const char* query,
     for (int i = 0; i < box_w; i++) printf("═");
     printf("╗\033[K\n");
     used++;
-    printf("║  CLASSY DOCSEARCH · man+md+html · inverted index");
+    printf("║   CLASSY DOCSEARCH · man+md+html · inverted index");
     {
         int inner = 50;
         int pad = box_w - inner;
@@ -1121,7 +1378,7 @@ void draw_ui(List<Doc*>* corpus, List<Hit>* hits, const char* query,
            term_bright_green(), corpus ? corpus.Count() : 0, term_reset(),
            term_bright_green(), n_terms, term_reset(),
            term_bright_green(), g_bytes_indexed / 1024, term_reset());
-    if (g_from_db) printf(" %s[sqlite]%s", term_dim(), term_reset());
+    if (g_from_cdb) printf(" %s[cdb]%s", term_dim(), term_reset());
     if (!g_index_ready) printf("  %sloading…%s", term_bold_yellow(), term_reset());
     fputs("\033[K\n", stdout);
     used++;
@@ -1156,8 +1413,8 @@ void draw_ui(List<Doc*>* corpus, List<Hit>* hits, const char* query,
     }
     used++;
 
-    /* blank separator */
-    fputs("\033[K\n", stdout);
+    /* blank separator — force default SGR so stats greens never tint the list */
+    printf("%s\033[K\n", term_reset());
     used++;
 
     /* results: one line each — never extra path row (that blew past rows) */
@@ -1171,7 +1428,7 @@ void draw_ui(List<Doc*>* corpus, List<Hit>* hits, const char* query,
         draw_line(&used, rows, "  %s⏳  loading index — type to search the corpus as it fills%s",
                   term_dim(), term_reset());
         draw_line(&used, rows, "  %s    %s%s",
-                  term_dim(), g_db_path, term_reset());
+                  term_dim(), g_cdb_path, term_reset());
     } else if (n == 0) {
         draw_line(&used, rows, "  %s(no documents matched%s)%s",
                   term_dim(),
@@ -1198,24 +1455,35 @@ void draw_ui(List<Doc*>* corpus, List<Hit>* hits, const char* query,
             if (!title) title = "?";
             if (!section) section = "";
 
-            if (sel) printf("%s%s", term_bold(), term_bright_cyan());
+            /* Always open/close each row with reset so SGR never leaks to the
+             * next line (score used to leave dim on; selection left cyan on). */
+            printf("%s", term_reset());
+            if (sel)
+                printf("%s%s", term_bold(), term_bright_cyan());
+
             printf("  %s ", sel ? "▶" : " ");
             int twidth = cols - 28;
             if (twidth < 12) twidth = 12;
             if (twidth > 36) twidth = 36;
             printf("%-*.*s", twidth, twidth, title);
             printf(" %-5.5s", section);
-            printf(" %-8.8s", d.KindLabel());
-            if (h.score > 0)
-                printf(" %s%d%s", term_dim(), h.score, sel ? term_bold() : "");
-            if (sel) printf("%s", term_reset());
-            fputs("\033[K\n", stdout);
+            printf(" %-8.8s", (const char*)d.KindLabel());
+            if (h.score > 0) {
+                /* Dim score only: re-assert selection color after the dim
+                 * segment so we do not rely on partial SGR stacking. */
+                printf(" %s%d", term_dim(), h.score);
+                if (sel)
+                    printf("%s%s%s", term_reset(), term_bold(), term_bright_cyan());
+                else
+                    printf("%s", term_reset());
+            }
+            printf("%s\033[K\n", term_reset());
             used++;
         }
     }
 
     /* Footer pinned to last screen row — no trailing newline (avoids scroll). */
-    printf("\033[%d;1H%s  type · Tab · ↑↓/jk · Enter open · Ctrl-U clear · Esc quit%s\033[K",
+    printf("\033[%d;1H%s  type · \"phrase\" · a+b · Tab · ↑↓/jk · Enter · Ctrl-U · Esc%s\033[K",
            rows, term_dim(), term_reset());
     fflush(stdout);
 }
@@ -1378,9 +1646,30 @@ void ui_clear_status(void) {
     g_ui_status[0] = 0;
 }
 
-/* ───────────────────────── SQLite index persist ───────────────────────── */
+/* ───────────────────────── binary index (docindex.cdb) ─────────────────────
+ *
+ * Classy Docsearch Binary v1 — whole-index dump for RAM search (not on-disk FTS).
+ * Little-endian fixed layout:
+ *
+ *   header (64 bytes)
+ *     magic[4] = 'C','D','B','1'
+ *     u32 version = 1
+ *     u32 n_docs, n_terms, n_posts
+ *     i64 bytes_indexed
+ *     i32 max_files
+ *     i64 indexed_at
+ *     u8  reserved[24]
+ *   docs[n_docs]:
+ *     i32 id · u32 kind · str title · str path · str section
+ *       (str = u32 len + len bytes, no NUL)
+ *   terms[n_terms]:
+ *     str term · u32 n_pairs · {u32 doc_id, u32 tf} × n_pairs
+ */
 
-#define DEFAULT_DB_NAME "index.db"
+#define CDB_MAGIC "CDB1"
+#define CDB_VERSION 1u
+#define CDB_HEADER_SIZE 64
+#define DEFAULT_CDB_NAME "docindex.cdb"
 
 int env_int(const char* key, int defv) {
     const char* s = getenv(key);
@@ -1396,291 +1685,408 @@ void ensure_parent_dir(const char* file_path) {
     char* slash = strrchr(dir, '/');
     if (!slash || slash == dir) return;
     *slash = 0;
-    /* recursive mkdir via shell — portable enough for a cache path */
     if (!path_safe(dir)) return;
     char cmd[MAX_PATH + 32];
     snprintf(cmd, sizeof(cmd), "mkdir -p -- '%s' 2>/dev/null", dir);
     system(cmd);
 }
 
-/* Resolve DB path: --db / DOCSEARCH_DB / ~/.cache/classy-docsearch/index.db */
-void resolve_db_path(const char* override_path) {
+/* Resolve path: --db / DOCSEARCH_CDB|DOCSEARCH_DB / ~/.cache/.../docindex.cdb */
+void resolve_cdb_path(const char* override_path) {
     if (override_path && override_path[0]) {
-        snprintf(g_db_path, sizeof(g_db_path), "%s", override_path);
+        snprintf(g_cdb_path, sizeof(g_cdb_path), "%s", override_path);
         return;
     }
-    const char* env = getenv("DOCSEARCH_DB");
+    const char* env = getenv("DOCSEARCH_CDB");
+    if (!env || !env[0]) env = getenv("DOCSEARCH_DB");
     if (env && env[0]) {
-        snprintf(g_db_path, sizeof(g_db_path), "%s", env);
+        snprintf(g_cdb_path, sizeof(g_cdb_path), "%s", env);
         return;
     }
     const char* home = getenv("HOME");
     if (home && home[0]) {
-        snprintf(g_db_path, sizeof(g_db_path),
-                 "%s/.cache/classy-docsearch/%s", home, DEFAULT_DB_NAME);
+        snprintf(g_cdb_path, sizeof(g_cdb_path),
+                 "%s/.cache/classy-docsearch/%s", home, DEFAULT_CDB_NAME);
         return;
     }
-    snprintf(g_db_path, sizeof(g_db_path), "./%s", DEFAULT_DB_NAME);
+    snprintf(g_cdb_path, sizeof(g_cdb_path), "./%s", DEFAULT_CDB_NAME);
 }
 
-void schema_init(Sqlite* db) {
-    db.execute("PRAGMA journal_mode=WAL");
-    db.execute("PRAGMA synchronous=NORMAL");
-    db.execute("PRAGMA temp_store=MEMORY");
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS meta ("
-        "  key   TEXT PRIMARY KEY,"
-        "  value TEXT NOT NULL)"
-    );
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS docs ("
-        "  id      INTEGER PRIMARY KEY,"
-        "  title   TEXT NOT NULL,"
-        "  path    TEXT NOT NULL UNIQUE,"
-        "  section TEXT,"
-        "  kind    INTEGER NOT NULL)"
-    );
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS postings ("
-        "  term   TEXT    NOT NULL,"
-        "  doc_id INTEGER NOT NULL,"
-        "  tf     INTEGER NOT NULL,"
-        "  PRIMARY KEY (term, doc_id))"
-    );
-    db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_postings_term ON postings(term)"
-    );
+int cdb_write_u32(FILE* f, uint32_t v) {
+    unsigned char b[4];
+    b[0] = (unsigned char)(v);
+    b[1] = (unsigned char)(v >> 8);
+    b[2] = (unsigned char)(v >> 16);
+    b[3] = (unsigned char)(v >> 24);
+    return fwrite(b, 1, 4, f) == 4;
 }
 
-int db_has_index(Sqlite* db) {
-    try {
-        dict row = db.query_one(
-            "SELECT COUNT(*) AS n FROM docs");
-        if (!row) return 0;
-        long n = (long)row.n;
-        return n > 0;
-    } catch (SqliteError e) {
-        (void)e;
-        return 0;
-    }
+int cdb_write_i32(FILE* f, int32_t v) {
+    return cdb_write_u32(f, (uint32_t)v);
 }
 
-void meta_set(Sqlite* db, const char* key, const char* value) {
-    db.execute(
-        "INSERT INTO meta(key,value) VALUES(?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        "ss", (char*)key, (char*)value);
+int cdb_write_i64(FILE* f, int64_t v) {
+    uint64_t u = (uint64_t)v;
+    unsigned char b[8];
+    for (int i = 0; i < 8; i++) b[i] = (unsigned char)(u >> (8 * i));
+    return fwrite(b, 1, 8, f) == 8;
 }
 
-/* Wipe + rewrite full index from in-memory corpus + inverted map. */
-int save_index(Sqlite* db, List<Doc*>* corpus, Map<String, Term*>* inv) {
-    ui_set_status("writing SQLite → %s …", g_db_path);
+int cdb_write_bytes(FILE* f, const void* p, uint32_t n) {
+    if (n == 0) return 1;
+    return fwrite(p, 1, n, f) == n;
+}
+
+int cdb_write_str(FILE* f, const char* s) {
+    if (!s) s = "";
+    uint32_t n = (uint32_t)strlen(s);
+    if (!cdb_write_u32(f, n)) return 0;
+    return cdb_write_bytes(f, s, n);
+}
+
+int cdb_read_u32(FILE* f, uint32_t* out) {
+    unsigned char b[4];
+    if (fread(b, 1, 4, f) != 4) return 0;
+    *out = (uint32_t)b[0]
+         | ((uint32_t)b[1] << 8)
+         | ((uint32_t)b[2] << 16)
+         | ((uint32_t)b[3] << 24);
+    return 1;
+}
+
+int cdb_read_i32(FILE* f, int32_t* out) {
+    uint32_t u = 0;
+    if (!cdb_read_u32(f, &u)) return 0;
+    *out = (int32_t)u;
+    return 1;
+}
+
+int cdb_read_i64(FILE* f, int64_t* out) {
+    unsigned char b[8];
+    if (fread(b, 1, 8, f) != 8) return 0;
+    uint64_t u = 0;
+    for (int i = 0; i < 8; i++) u |= ((uint64_t)b[i]) << (8 * i);
+    *out = (int64_t)u;
+    return 1;
+}
+
+/* Read length-prefixed string into malloc'd NUL-terminated buffer (caller frees). */
+char* cdb_read_str_raw(FILE* f) {
+    uint32_t n = 0;
+    if (!cdb_read_u32(f, &n)) return NULL;
+    if (n > 8 * 1024 * 1024u) return NULL;   /* hard cap against corrupt files */
+    char* s = (char*)malloc((size_t)n + 1);
+    if (!s) return NULL;
+    if (n > 0 && fread(s, 1, n, f) != n) { free(s); return NULL; }
+    s[n] = 0;
+    return s;
+}
+
+int cdb_probe(const char* path) {
+    if (!path || !path[0]) return 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char hdr[16];
+    size_t got = fread(hdr, 1, 16, f);
+    fclose(f);
+    if (got < 16) return 0;
+    if (hdr[0] != 'C' || hdr[1] != 'D' || hdr[2] != 'B' || hdr[3] != '1') return 0;
+    uint32_t ver = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8)
+                 | ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
+    uint32_t n_docs = (uint32_t)hdr[8] | ((uint32_t)hdr[9] << 8)
+                    | ((uint32_t)hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
+    return ver == CDB_VERSION && n_docs > 0;
+}
+
+/* Atomic-ish write: stream to path.tmp then rename over destination. */
+int save_index(List<Doc*>* corpus, Map<String, Term*>* inv) {
+    ui_set_status("writing cdb → %s …", g_cdb_path);
     if (!g_tui_mode) {
-        printf("  writing SQLite index → %s\n", g_db_path);
+        printf("  writing binary index → %s\n", g_cdb_path);
         fflush(stdout);
     }
 
-    try {
-        db.execute("DROP TABLE IF EXISTS postings");
-        db.execute("DROP TABLE IF EXISTS docs");
-        db.execute("DROP TABLE IF EXISTS meta");
-        schema_init(db);
+    ensure_parent_dir(g_cdb_path);
 
-        Transaction* tx = db.begin();
-        defer delete tx;
-
-        Statement* ins_doc = db.prepare(
-            "INSERT INTO docs(id, title, path, section, kind) VALUES (?,?,?,?,?)");
-        defer delete ins_doc;
-
-        for (auto d in corpus) {
-            const char* title = d.title;
-            const char* path = d.path;
-            const char* section = d.section;
-            if (!title) title = "";
-            if (!path) path = "";
-            if (!section) section = "";
-            ins_doc.bind(1, d.id);
-            ins_doc.bind(2, title);
-            ins_doc.bind(3, path);
-            ins_doc.bind(4, section);
-            ins_doc.bind(5, (int)d.kind);
-            ins_doc.execute();
-        }
-
-        Statement* ins_post = db.prepare(
-            "INSERT INTO postings(term, doc_id, tf) VALUES (?,?,?)");
-        defer delete ins_post;
-
-        int n_posts = 0;
-        for (auto term, t in inv) {
-            if (!t || !t.docIds) continue;
-            const char* w = term;
-            if (!w || !w[0]) continue;
-
-            /* Aggregate multiplicity in docIds → tf per doc_id. */
-            auto tf_map = Map<int, int>();
-            for (auto docId in t.docIds) {
-                int c = tf_map.GetOr(docId, 0);
-                tf_map.Set(docId, c + 1);
-            }
-            for (auto docId, tf in tf_map) {
-                if (tf <= 0) continue;
-                ins_post.bind(1, w);
-                ins_post.bind(2, docId);
-                ins_post.bind(3, tf);
-                ins_post.execute();
-                n_posts++;
-                if ((n_posts % 25000) == 0)
-                    ui_set_status("saving postings… %d rows", n_posts);
-            }
-        }
-
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%d", corpus.Count());
-        meta_set(db, "doc_count", buf);
-        snprintf(buf, sizeof(buf), "%d", inv.Count());
-        meta_set(db, "term_count", buf);
-        snprintf(buf, sizeof(buf), "%d", n_posts);
-        meta_set(db, "posting_count", buf);
-        snprintf(buf, sizeof(buf), "%ld", g_bytes_indexed);
-        meta_set(db, "bytes_indexed", buf);
-        snprintf(buf, sizeof(buf), "%d", g_max_files);
-        meta_set(db, "max_files", buf);
-
-        time_t now = time(NULL);
-        snprintf(buf, sizeof(buf), "%ld", (long)now);
-        meta_set(db, "indexed_at", buf);
-
-        tx.commit();
-        ui_set_status("saved %d docs · %d terms · %d postings", corpus.Count(), inv.Count(), n_posts);
-        if (!g_tui_mode)
-            fprintf(stderr, "\r  saved %d docs · %d terms · %d postings                 \n",
-                    corpus.Count(), inv.Count(), n_posts);
-        return 1;
-    } catch (SqliteError e) {
-        if (g_tui_mode) ui_set_status("SQLite save failed: %s", e.msg ? e.msg : "?");
-        else printf("  %sSQLite save failed:%s %s\n",
-                    term_bold_red(), term_reset(), e.msg ? e.msg : "?");
+    char tmp[MAX_PATH + 8];
+    if (strlen(g_cdb_path) + 5 >= sizeof(tmp)) {
+        if (g_tui_mode) ui_set_status("cdb path too long");
+        else printf("  %scdb path too long%s\n", term_bold_red(), term_reset());
         return 0;
     }
+    snprintf(tmp, sizeof(tmp), "%s.tmp", g_cdb_path);
+
+    FILE* f = fopen(tmp, "wb");
+    if (!f) {
+        if (g_tui_mode) ui_set_status("cannot create %s", tmp);
+        else printf("  %scannot create%s %s\n", term_bold_red(), term_reset(), tmp);
+        return 0;
+    }
+
+    /* Count only terms we will actually emit (non-empty word + postings). */
+    uint32_t n_terms_w = 0;
+    uint32_t n_posts = 0;
+    for (auto term, t in inv) {
+        if (!t || !t.docIds) continue;
+        const char* w = term;
+        if (!w || !w[0] || t.docIds.Count() == 0) continue;
+        auto seen = Map<int, int>();
+        for (auto docId in t.docIds) {
+            int c = seen.GetOr(docId, 0);
+            if (c == 0) n_posts++;
+            seen.Set(docId, c + 1);
+        }
+        if (seen.Count() > 0) n_terms_w++;
+    }
+
+    /* Header */
+    if (fwrite(CDB_MAGIC, 1, 4, f) != 4
+        || !cdb_write_u32(f, CDB_VERSION)
+        || !cdb_write_u32(f, (uint32_t)corpus.Count())
+        || !cdb_write_u32(f, n_terms_w)
+        || !cdb_write_u32(f, n_posts)
+        || !cdb_write_i64(f, (int64_t)g_bytes_indexed)
+        || !cdb_write_i32(f, (int32_t)g_max_files)
+        || !cdb_write_i64(f, (int64_t)time(NULL))) {
+        fclose(f); unlink(tmp);
+        if (g_tui_mode) ui_set_status("cdb header write failed");
+        else printf("  %scdb header write failed%s\n", term_bold_red(), term_reset());
+        return 0;
+    }
+    /* Fixed header is 64 bytes: 40 used above + 24 reserved. */
+    unsigned char pad[24];
+    memset(pad, 0, sizeof(pad));
+    if (fwrite(pad, 1, 24, f) != 24) {
+        fclose(f); unlink(tmp);
+        return 0;
+    }
+
+    for (int di = 0; di < corpus.Count(); di++) {
+        Doc* d = corpus.Get(di);
+        if (!d) continue;
+        /* Cast through String → char* explicitly (same idiom as map_doc_into). */
+        const char* title = (const char*)d.title;
+        const char* path = (const char*)d.path;
+        const char* section = (const char*)d.section;
+        if (!title) title = "";
+        if (!path) path = "";
+        if (!section) section = "";
+        int wok = 1;
+        if (!cdb_write_i32(f, (int32_t)d.id)) wok = 0;
+        if (wok && !cdb_write_u32(f, (uint32_t)d.kind)) wok = 0;
+        if (wok && !cdb_write_str(f, title)) wok = 0;
+        if (wok && !cdb_write_str(f, path)) wok = 0;
+        if (wok && !cdb_write_str(f, section)) wok = 0;
+        if (!wok) {
+            fclose(f); unlink(tmp);
+            if (g_tui_mode) ui_set_status("cdb doc write failed");
+            else printf("  %scdb doc write failed%s\n", term_bold_red(), term_reset());
+            return 0;
+        }
+    }
+
+    int written_terms = 0;
+    int written_posts = 0;
+    for (auto term, t in inv) {
+        if (!t || !t.docIds) continue;
+        const char* w = term;
+        if (!w || !w[0] || t.docIds.Count() == 0) continue;
+
+        auto tf_map = Map<int, int>();
+        for (auto docId in t.docIds) {
+            int c = tf_map.GetOr(docId, 0);
+            tf_map.Set(docId, c + 1);
+        }
+        uint32_t np = (uint32_t)tf_map.Count();
+        if (np == 0) continue;
+        if (!cdb_write_str(f, w) || !cdb_write_u32(f, np)) {
+            fclose(f); unlink(tmp);
+            if (g_tui_mode) ui_set_status("cdb term write failed");
+            else printf("  %scdb term write failed%s\n", term_bold_red(), term_reset());
+            return 0;
+        }
+        written_terms++;
+        for (auto docId, tf in tf_map) {
+            if (tf <= 0) continue;
+            if (!cdb_write_u32(f, (uint32_t)docId) || !cdb_write_u32(f, (uint32_t)tf)) {
+                fclose(f); unlink(tmp);
+                if (g_tui_mode) ui_set_status("cdb posting write failed");
+                else printf("  %scdb posting write failed%s\n", term_bold_red(), term_reset());
+                return 0;
+            }
+            written_posts++;
+            if ((written_posts % 25000) == 0)
+                ui_set_status("saving postings… %d rows", written_posts);
+        }
+    }
+
+    if ((uint32_t)written_terms != n_terms_w || (uint32_t)written_posts != n_posts) {
+        fclose(f); unlink(tmp);
+        if (g_tui_mode) ui_set_status("cdb count mismatch");
+        else printf("  %scdb count mismatch%s (terms %d/%u posts %d/%u)\n",
+                    term_bold_red(), term_reset(),
+                    written_terms, n_terms_w, written_posts, n_posts);
+        return 0;
+    }
+
+    if (fflush(f) != 0) {
+        fclose(f); unlink(tmp);
+        return 0;
+    }
+    fclose(f);
+
+    if (rename(tmp, g_cdb_path) != 0) {
+        unlink(tmp);
+        if (g_tui_mode) ui_set_status("cdb rename failed: %s", strerror(errno));
+        else printf("  %scdb rename failed:%s %s\n",
+                    term_bold_red(), term_reset(), strerror(errno));
+        return 0;
+    }
+
+    ui_set_status("saved %d docs · %d terms · %d postings",
+                  corpus.Count(), written_terms, written_posts);
+    if (!g_tui_mode)
+        fprintf(stderr, "\r  saved %d docs · %d terms · %d postings                 \n",
+                corpus.Count(), written_terms, written_posts);
+    return 1;
 }
 
-/* Load docs + postings into empty corpus/inv.  Returns 1 on success. */
-int load_index(Sqlite* db, List<Doc*>* corpus, Map<String, Term*>* inv) {
-    ui_set_status("loading docs from SQLite…");
+int load_index(List<Doc*>* corpus, Map<String, Term*>* inv) {
+    ui_set_status("loading cdb ← %s …", g_cdb_path);
     if (!g_tui_mode) {
-        printf("  loading SQLite index ← %s\n", g_db_path);
+        printf("  loading binary index ← %s\n", g_cdb_path);
         fflush(stdout);
     }
 
-    try {
-        List<dict>* drows = db.query(
-            "SELECT id, title, path, section, kind FROM docs ORDER BY id");
-        if (!drows) return 0;
-        defer delete drows;
-
-        int nd = 0;
-        for (auto r in drows) {
-            int id = (int)(long)r.id;
-            String title = str_dup_c((char*)r.title);
-            String path = str_dup_c((char*)r.path);
-            String section = str_dup_c((char*)r.section);
-            DocKind kind = (DocKind)(int)(long)r.kind;
-            String body = str_dup_c("");
-            Doc* d = new Doc(id, title, path, section, kind, body);
-            corpus.Add(d);
-            nd++;
-            if ((nd % 2000) == 0)
-                ui_set_status("loading docs… %d", nd);
-        }
-        g_ui_n_terms = 0;
-        ui_set_status("loading postings… (%d docs)", corpus.Count());
-
-        /* Stream postings with the raw C API so we don't materialise millions of dicts. */
-        sqlite3* h = 0;
-        if (sqlite3_open(g_db_path, &h) != SQLITE_OK) {
-            if (h) sqlite3_close(h);
-            if (!g_tui_mode) term_print_err("cannot reopen db for postings stream");
-            else ui_set_status("cannot reopen db for postings");
-            return 0;
-        }
-        sqlite3_stmt* st = 0;
-        const char* sql = "SELECT term, doc_id, tf FROM postings";
-        if (sqlite3_prepare_v2(h, sql, -1, &st, 0) != SQLITE_OK) {
-            sqlite3_close(h);
-            if (!g_tui_mode) term_print_err("prepare postings failed");
-            else ui_set_status("prepare postings failed");
-            return 0;
-        }
-
-        int n_posts = 0;
-        int rc;
-        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-            const char* term = (const char*)sqlite3_column_text(st, 0);
-            int doc_id = sqlite3_column_int(st, 1);
-            int tf = sqlite3_column_int(st, 2);
-            if (!term || !term[0] || tf <= 0) continue;
-
-            String w = str_dup_c(term);
-            Term* t = NULL;
-            if (inv.TryGet(w, &t) && t != NULL) {
-                for (int k = 0; k < tf; k++) t.docIds.Add(doc_id);
-            } else {
-                t = new Term(w);
-                for (int k = 0; k < tf; k++) t.docIds.Add(doc_id);
-                inv.Set(w, t);
-            }
-            n_posts++;
-            if ((n_posts % 50000) == 0) {
-                g_ui_n_terms = inv.Count();
-                ui_set_status("loading postings… %d rows · %d terms",
-                              n_posts, inv.Count());
-                if (g_want_quit) break;
-            }
-        }
-        if (g_want_quit) {
-            sqlite3_finalize(st);
-            sqlite3_close(h);
-            return 0;
-        }
-        sqlite3_finalize(st);
-        sqlite3_close(h);
-
-        if (rc != SQLITE_DONE) {
-            if (!g_tui_mode) term_print_err("postings step failed");
-            else ui_set_status("postings step failed");
-            return 0;
-        }
-
-        dict mc = db.query_one("SELECT value AS v FROM meta WHERE key='bytes_indexed'");
-        if (mc) g_bytes_indexed = atol((char*)mc.v);
-
-        g_files_indexed = corpus.Count();
-        g_ui_n_terms = inv.Count();
-        g_from_db = 1;
-        ui_set_status("ready — %d docs · %d terms · %d postings",
-                      corpus.Count(), inv.Count(), n_posts);
-        if (!g_tui_mode)
-            fprintf(stderr, "\r  loaded %d docs · %d terms · %d posting rows            \n",
-                    corpus.Count(), inv.Count(), n_posts);
-        return corpus.Count() > 0;
-    } catch (SqliteError e) {
-        if (g_tui_mode) ui_set_status("SQLite load failed: %s", e.msg ? e.msg : "?");
-        else printf("  %sSQLite load failed:%s %s\n",
-                    term_bold_red(), term_reset(), e.msg ? e.msg : "?");
+    FILE* f = fopen(g_cdb_path, "rb");
+    if (!f) {
+        if (g_tui_mode) ui_set_status("cannot open %s", g_cdb_path);
+        else printf("  %scannot open%s %s\n", term_bold_red(), term_reset(), g_cdb_path);
         return 0;
     }
+
+    unsigned char magic[4];
+    if (fread(magic, 1, 4, f) != 4
+        || magic[0] != 'C' || magic[1] != 'D' || magic[2] != 'B' || magic[3] != '1') {
+        fclose(f);
+        if (g_tui_mode) ui_set_status("bad cdb magic");
+        else printf("  %sbad cdb magic%s\n", term_bold_red(), term_reset());
+        return 0;
+    }
+
+    uint32_t version = 0, n_docs = 0, n_terms = 0, n_posts = 0;
+    int64_t bytes_indexed = 0, indexed_at = 0;
+    int32_t max_files = 0;
+    if (!cdb_read_u32(f, &version) || version != CDB_VERSION
+        || !cdb_read_u32(f, &n_docs) || !cdb_read_u32(f, &n_terms)
+        || !cdb_read_u32(f, &n_posts)
+        || !cdb_read_i64(f, &bytes_indexed)
+        || !cdb_read_i32(f, &max_files)
+        || !cdb_read_i64(f, &indexed_at)) {
+        fclose(f);
+        if (g_tui_mode) ui_set_status("cdb header corrupt");
+        else printf("  %scdb header corrupt%s\n", term_bold_red(), term_reset());
+        return 0;
+    }
+    if (fseek(f, CDB_HEADER_SIZE, SEEK_SET) != 0) {
+        fclose(f);
+        return 0;
+    }
+
+    g_bytes_indexed = (long)bytes_indexed;
+
+    for (uint32_t i = 0; i < n_docs; i++) {
+        if (g_want_quit) { fclose(f); return 0; }
+        int32_t id = 0;
+        uint32_t kind = 0;
+        if (!cdb_read_i32(f, &id) || !cdb_read_u32(f, &kind)) {
+            fclose(f);
+            if (g_tui_mode) ui_set_status("cdb docs truncated");
+            else printf("  %scdb docs truncated%s\n", term_bold_red(), term_reset());
+            return 0;
+        }
+        unowned char* title = cdb_read_str_raw(f);
+        unowned char* path = cdb_read_str_raw(f);
+        unowned char* section = cdb_read_str_raw(f);
+        if (!title || !path || !section) {
+            free(title); free(path); free(section);
+            fclose(f);
+            if (g_tui_mode) ui_set_status("cdb doc strings truncated");
+            else printf("  %scdb doc strings truncated%s\n", term_bold_red(), term_reset());
+            return 0;
+        }
+        String st = str_dup_c(title);
+        String sp = str_dup_c(path);
+        String ss = str_dup_c(section);
+        free(title); free(path); free(section);
+        String body = str_dup_c("");
+        Doc* d = new Doc((int)id, st, sp, ss, (DocKind)kind, body);
+        corpus.Add(d);
+        if (((int)i % 2000) == 0)
+            ui_set_status("loading docs… %u / %u", i + 1, n_docs);
+    }
+
+    g_ui_n_terms = 0;
+    ui_set_status("loading postings… (%u docs · %u terms)", n_docs, n_terms);
+
+    uint32_t loaded_posts = 0;
+    for (uint32_t ti = 0; ti < n_terms; ti++) {
+        if (g_want_quit) { fclose(f); return 0; }
+        unowned char* term = cdb_read_str_raw(f);
+        uint32_t np = 0;
+        if (!term || !cdb_read_u32(f, &np)) {
+            free(term);
+            fclose(f);
+            if (g_tui_mode) ui_set_status("cdb terms truncated");
+            else printf("  %scdb terms truncated%s\n", term_bold_red(), term_reset());
+            return 0;
+        }
+        String w = str_dup_c(term);
+        free(term);
+        Term* t = new Term(w);
+        for (uint32_t k = 0; k < np; k++) {
+            uint32_t doc_id = 0, tf = 0;
+            if (!cdb_read_u32(f, &doc_id) || !cdb_read_u32(f, &tf)) {
+                delete t;
+                fclose(f);
+                if (g_tui_mode) ui_set_status("cdb postings truncated");
+                else printf("  %scdb postings truncated%s\n", term_bold_red(), term_reset());
+                return 0;
+            }
+            if (tf == 0) continue;
+            /* Expand tf into multiset of doc ids (matches map_doc_into / search_docs). */
+            for (uint32_t r = 0; r < tf; r++) t.docIds.Add((int)doc_id);
+            loaded_posts++;
+        }
+        inv.Set(w, t);
+        if ((ti % 2000) == 0 || (loaded_posts % 50000) == 0) {
+            g_ui_n_terms = inv.Count();
+            ui_set_status("loading postings… %u terms · %u pairs",
+                          ti + 1, loaded_posts);
+        }
+    }
+
+    fclose(f);
+
+    g_files_indexed = corpus.Count();
+    g_ui_n_terms = inv.Count();
+    g_from_cdb = 1;
+    ui_set_status("ready — %d docs · %d terms · %u postings",
+                  corpus.Count(), inv.Count(), loaded_posts);
+    if (!g_tui_mode)
+        fprintf(stderr, "\r  loaded %d docs · %d terms · %u posting pairs            \n",
+                corpus.Count(), inv.Count(), loaded_posts);
+    return corpus.Count() > 0;
 }
 
 void print_usage(void) {
     printf("Usage: classy-docsearch [options] [root-dirs…]\n");
-    printf("  --reindex, -r     rebuild index (ignore existing SQLite cache)\n");
-    printf("  --db PATH         index database (default ~/.cache/classy-docsearch/index.db)\n");
+    printf("  --reindex, -r     rebuild index (ignore existing docindex.cdb)\n");
+    printf("  --db PATH         index file (default ~/.cache/classy-docsearch/docindex.cdb)\n");
     printf("  --help, -h        this help\n");
     printf("  root dirs         crawl roots (default: /usr/share/man + /usr/share/doc)\n");
-    printf("Env: DOCSEARCH_DB, DOCSEARCH_MAX, DOCSEARCH_REINDEX=1, DOCSEARCH_BATCH=1\n");
-    printf("Link: classyc -I include -l sqlite3 examples/classy-docsearch.cy -eg\n");
+    printf("Env: DOCSEARCH_CDB (or DOCSEARCH_DB), DOCSEARCH_MAX, DOCSEARCH_REINDEX=1, DOCSEARCH_BATCH=1\n");
+    printf("Link: classyc -I include examples/classy-docsearch.cy -eg\n");
 }
 
 /* ───────────────────────── main ───────────────────────── */
@@ -1719,8 +2125,8 @@ int main(int argc, char** argv) {
         roots.Add((String)a);
     }
 
-    resolve_db_path(db_override);
-    ensure_parent_dir(g_db_path);
+    resolve_cdb_path(db_override);
+    ensure_parent_dir(g_cdb_path);
 
     auto corpus = List<Doc*>();
     corpus.owns();
@@ -1764,7 +2170,7 @@ int main(int argc, char** argv) {
         g_ui_qlen = &qlen;
         g_ui_n_terms = 0;
         term_enter_raw();
-        ui_set_status("opening %s …", g_db_path);
+        ui_set_status("opening %s …", g_cdb_path);
         if (g_want_quit) { term_leave_raw(); return 0; }
     } else {
         printf("\n");
@@ -1775,37 +2181,28 @@ int main(int argc, char** argv) {
             printf("  max files: unlimited\n");
         else
             printf("  max files: %d\n", g_max_files);
-        printf("  index db: %s\n", g_db_path);
+        printf("  index cdb: %s\n", g_cdb_path);
         if (g_reindex) printf("  mode: REINDEX\n");
         printf("\n");
     }
 
-    Sqlite* db = Sqlite.open(g_db_path);
-    if (!db) {
-        if (interactive) {
-            ui_set_status("cannot open SQLite db: %s", g_db_path);
-            /* brief pause so the message is visible */
-            sleep(2);
-            term_leave_raw();
-        }
-        term_print_err("cannot open SQLite index database");
-        printf("  path: %s\n", g_db_path);
-        return 1;
-    }
-    defer delete db;
-
     int loaded = 0;
     if (!g_reindex) {
-        try {
-            schema_init(db);
-            if (db_has_index(db)) {
-                loaded = load_index(db, &corpus, &inv);
-            } else {
-                ui_set_status("no cache yet — will crawl & build index…");
+        if (cdb_probe(g_cdb_path)) {
+            loaded = load_index(&corpus, &inv);
+            if (!loaded) {
+                ui_set_status("cache unreadable — will reindex…");
+                /* drop any partial corpus from a failed load */
+                corpus = List<Doc*>();
+                corpus.owns();
+                inv = Map<String, Term*>();
+                inv.ownsValues();
+                g_ui_corpus = &corpus;
+                g_ui_inv = &inv;
+                g_from_cdb = 0;
             }
-        } catch (SqliteError e) {
-            ui_set_status("cache unreadable — reindexing (%s)", e.msg ? e.msg : "?");
-            loaded = 0;
+        } else {
+            ui_set_status("no cache yet — will crawl & build index…");
         }
         if (g_want_quit) {
             term_leave_raw();
@@ -1820,7 +2217,7 @@ int main(int argc, char** argv) {
         g_files_indexed = 0;
         g_bytes_indexed = 0;
         g_files_seen = 0;
-        g_from_db = 0;
+        g_from_cdb = 0;
 
         auto corpus2 = List<Doc*>();
         corpus2.owns();
@@ -1872,7 +2269,7 @@ int main(int argc, char** argv) {
         }
 
         g_ui_n_terms = inv2.Count();
-        save_index(db, &corpus2, &inv2);
+        save_index(&corpus2, &inv2);
         corpus = move corpus2;
         inv = move inv2;
         g_ui_corpus = &corpus;
@@ -1898,7 +2295,9 @@ int main(int argc, char** argv) {
     /* ── batch smoke: run a few canned queries and exit ── */
     if (!interactive) {
         const char* samples[] = {
-            "ls", "gzip", "strncmp", "malloc", "printf", "memory", "README", NULL
+            "ls", "gzip", "malloc", "memory",
+            "\"ls\"", "share+man", "\"man1\"",
+            NULL
         };
         for (int i = 0; samples[i]; i++) {
             auto hits = search_docs(&corpus, &inv, samples[i]);

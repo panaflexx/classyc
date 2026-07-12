@@ -10668,6 +10668,8 @@ struct expr {
      Defaults 0, so any site the pass didn't classify (or when -fno-ownership is
      set) keeps its guard. */
   unsigned int own_deref_class : 2;
+  /* class[i] / map[k] uses GetMut → true element lvalue (not Get by-value copy). */
+  unsigned int mut_sub_p : 1;
   union {
     node_t lvalue_node;       /* for id, str, field, deref field, ind, deref, compound literal */
     node_t label_addr_target; /* for label address */
@@ -15547,6 +15549,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       e->const_p = e->const_addr_p = e->builtin_call_p = FALSE;
       e->bind_p = e->lenient_p = FALSE;
       e->own_deref_class = DEREF_GUARD_DEFAULT;
+      e->mut_sub_p = 0;
       e->c.i_val = 0;
       return e;
     }
@@ -16979,7 +16982,22 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
               if (!ok)
                 error (c2m_ctx, POS (r), "class subscript key has incompatible type");
             }
-            e->def_node = get_def; /* stash for gen to find the method */
+            /* Prefer GetMut for *by-value class/struct/union* elements only:
+               list[i].Method() / map[k].Method() mutate the buffer (not a Get
+               copy).  Scalars and pointer elements keep Get — missing Map keys
+               must still throw, and Map.GetMut would return NULL → crash on MEM. */
+            {
+              node_t getmut_def
+                = find_class_protocol_method (c2m_ctx, cls->u.tag_type, "GetMut", 1, POS (r));
+              int agg_el = (e->type->mode == TM_CLASS || e->type->mode == TM_STRUCT
+                            || e->type->mode == TM_UNION);
+              if (getmut_def != NULL && agg_el) {
+                e->mut_sub_p = 1;
+                e->def_node = getmut_def;
+              } else {
+                e->def_node = get_def; /* stash Get for gen */
+              }
+            }
           }
         } else if (t1->mode != TM_PTR && t1->mode != TM_ARR) {
           error (c2m_ctx, POS (r), "subscripted value is neither array nor pointer");
@@ -17473,7 +17491,8 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           struct type *el_type = NULL;
 
           if (cls_name == NULL) cls_name = "?";
-          if (count_def != NULL && keyat_def != NULL && valat_def != NULL) {
+          int map_forin = (count_def != NULL && keyat_def != NULL && valat_def != NULL);
+          if (map_forin) {
             /* ---- Keyed (map) protocol: KeyAt(i)->K, ValAt(i)->V ---- */
             decl_t cd = count_def->attr, kd = keyat_def->attr, vd = valat_def->attr;
             struct type *kt = kd->decl_spec.type->u.func_type->ret_type;
@@ -17482,15 +17501,23 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
             if (!integer_type_p (cd->decl_spec.type->u.func_type->ret_type))
               error (c2m_ctx, POS (r),
                      "for-in: 'Count()' of class '%s' must return an integer type", cls_name);
-            if (kt == NULL || !scalar_type_p (kt)) {
+            /* KeyAt/ValAt may return scalars, pointers, or by-value class/struct
+               (same rules as List.Get — aggregate loop vars are stack slots). */
+            if (kt == NULL
+                || (!scalar_type_p (kt) && kt->mode != TM_CLASS && kt->mode != TM_STRUCT
+                    && kt->mode != TM_UNION)) {
               error (c2m_ctx, POS (r),
-                     "for-in: 'KeyAt(int)' of class '%s' must return a scalar or pointer type",
+                     "for-in: 'KeyAt(int)' of class '%s' must return a scalar, pointer, or "
+                     "by-value class/struct type",
                      cls_name);
               kt = create_basic_type (c2m_ctx, TP_INT);
             }
-            if (vt == NULL || !scalar_type_p (vt)) {
+            if (vt == NULL
+                || (!scalar_type_p (vt) && vt->mode != TM_CLASS && vt->mode != TM_STRUCT
+                    && vt->mode != TM_UNION)) {
               error (c2m_ctx, POS (r),
-                     "for-in: 'ValAt(int)' of class '%s' must return a scalar or pointer type",
+                     "for-in: 'ValAt(int)' of class '%s' must return a scalar, pointer, or "
+                     "by-value class/struct type",
                      cls_name);
               vt = create_basic_type (c2m_ctx, TP_INT);
             }
@@ -17533,21 +17560,24 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
               el_type = gft->ret_type;
             }
           }
-          /* On protocol errors fall back to int so the body check can proceed. */
-          if (el_type == NULL) el_type = create_basic_type (c2m_ctx, TP_INT);
-          if (val_id->code == N_ID) {
-            /* Two-variable form: key_id = index, val_id = element */
-            struct type *idx_type = create_basic_type (c2m_ctx, TP_INT);
-            idx_type->pos_node = key_id;
-            FORIN_DECL_VAR (key_id, idx_type);
-            struct type *el_copy = create_type (c2m_ctx, NULL);
-            *el_copy = *el_type; el_copy->pos_node = val_id;
-            FORIN_DECL_VAR (val_id, el_copy);
-          } else {
-            /* Single-variable form: key_id = element */
-            struct type *el_copy = create_type (c2m_ctx, NULL);
-            *el_copy = *el_type; el_copy->pos_node = key_id;
-            FORIN_DECL_VAR (key_id, el_copy);
+          /* Indexed (List/Set) protocol only — map vars were already declared. */
+          if (!map_forin) {
+            /* On protocol errors fall back to int so the body check can proceed. */
+            if (el_type == NULL) el_type = create_basic_type (c2m_ctx, TP_INT);
+            if (val_id->code == N_ID) {
+              /* Two-variable form: key_id = index, val_id = element */
+              struct type *idx_type = create_basic_type (c2m_ctx, TP_INT);
+              idx_type->pos_node = key_id;
+              FORIN_DECL_VAR (key_id, idx_type);
+              struct type *el_copy = create_type (c2m_ctx, NULL);
+              *el_copy = *el_type; el_copy->pos_node = val_id;
+              FORIN_DECL_VAR (val_id, el_copy);
+            } else {
+              /* Single-variable form: key_id = element */
+              struct type *el_copy = create_type (c2m_ctx, NULL);
+              *el_copy = *el_type; el_copy->pos_node = key_id;
+              FORIN_DECL_VAR (key_id, el_copy);
+            }
           }
         } else {
           /* Dict: key_id = char* , value_id = TM_DICT */
@@ -27312,7 +27342,24 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       op_t idx_op = val_gen (c2m_ctx, NL_EL (r->u.ops, 1));
       if (integer_type_p (((struct expr *) NL_EL (r->u.ops, 1)->attr)->type))
         idx_op = cast (c2m_ctx, idx_op, MIR_T_I64, FALSE);
-      /* Call: result = this->Get(index) */
+      /* GetMut path: true lvalue into the dense buffer (fleet[0].Boost mutates). */
+      if (((struct expr *) r->attr)->mut_sub_p) {
+        op_t ptr_op = gen_class_method_call (c2m_ctx, get_def, this_type, this_op, &idx_op, 1);
+        ptr_op = force_reg (c2m_ctx, ptr_op, MIR_T_I64);
+        {
+          MIR_type_t el_mir = get_mir_type (c2m_ctx, el_type);
+          if (el_type->mode == TM_CLASS || el_type->mode == TM_STRUCT
+              || el_type->mode == TM_UNION) {
+            res = new_op (NULL,
+                          MIR_new_alias_mem_op (ctx, MIR_T_UNDEF, 0, ptr_op.mir_op.u.reg, 0, 1,
+                                                get_type_alias (c2m_ctx, el_type), 0));
+          } else {
+            res = new_op (NULL, MIR_new_mem_op (ctx, el_mir, 0, ptr_op.mir_op.u.reg, 0, 1));
+          }
+        }
+        break;
+      }
+      /* Call: result = this->Get(index)  (by-value copy) */
       res = gen_class_method_call (c2m_ctx, get_def, this_type, this_op, &idx_op, 1);
       break;
       }
@@ -29912,12 +29959,24 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       } while (0)
 
       if (map_proto) {
-        /* Keyed: key_id = coll->KeyAt(i); [val_id = coll->ValAt(i)] */
-        op_t k_res = gen_class_method_call (c2m_ctx, keyat_def, this_type, this_reg, &i_reg, 1);
-        STORE_FORIN_VAR (key_id, k_res);
+        /* Keyed: key_id = coll->KeyAt(i); [val_id = coll->ValAt(i)].
+           Aggregate K or V (by-value class) go into loop-var stack slots via
+           gen_class_method_call_dest — same as List.Get for-in. */
+        {
+          op_t k_agg; struct type *k_vty; int k_is_agg;
+          FORIN_AGG_DEST (key_id, k_agg, k_vty, k_is_agg);
+          op_t k_res = k_is_agg
+            ? gen_class_method_call_dest (c2m_ctx, keyat_def, this_type, this_reg, &i_reg, 1, &k_agg)
+            : gen_class_method_call (c2m_ctx, keyat_def, this_type, this_reg, &i_reg, 1);
+          if (!k_is_agg) STORE_FORIN_VAR (key_id, k_res);
+        }
         if (val_id->code == N_ID) {
-          op_t v_res = gen_class_method_call (c2m_ctx, valat_def, this_type, this_reg, &i_reg, 1);
-          STORE_FORIN_VAR (val_id, v_res);
+          op_t v_agg; struct type *v_vty; int v_is_agg;
+          FORIN_AGG_DEST (val_id, v_agg, v_vty, v_is_agg);
+          op_t v_res = v_is_agg
+            ? gen_class_method_call_dest (c2m_ctx, valat_def, this_type, this_reg, &i_reg, 1, &v_agg)
+            : gen_class_method_call (c2m_ctx, valat_def, this_type, this_reg, &i_reg, 1);
+          if (!v_is_agg) STORE_FORIN_VAR (val_id, v_res);
         }
       } else {
         /* elem = coll->Get(i).  For an aggregate element type, construct the

@@ -51,6 +51,8 @@
  *   map[k] = v    -> map.Set(k, v)
  *   for (auto k in map)        -> k over keys, in insertion order
  *   for (auto k, v in map)     -> k = key, v = value
+ *     K and V may be by-value classes (same as List.Get for-in); loop vars are
+ *     stack slots filled each iteration.  Mutate storage with GetMut/ValMut.
  *
  * Missing keys: Get(k) **throws KeyException**.  Prefer GetOr(k, fallback),
  * TryGet(k, &out), or try/catch when absence is expected.  Contains(k) /
@@ -342,6 +344,22 @@ class Map<K, V> {
         if (index < 0 || index >= this->count)
             throw(OutOfBoundsException, "Map.ValAt oob");
         return this->vals[index];
+    }
+
+    /* Pointer into the dense value array — mutate class values in place
+     * (Get/ValAt return copies).  Invalidated by rehash/growth. */
+    V* ValMut(int index) __attribute__((da_ignore)) {
+        if (index < 0 || index >= this->count)
+            throw(OutOfBoundsException, "Map.ValMut oob");
+        return &this->vals[index];
+    }
+
+    /* Lookup + mut pointer.  Throws KeyException if missing (same as Get) so
+     * [] GetMut-lvalue never builds a MEM op from a null pointer. */
+    V* GetMut(K key) __attribute__((da_ignore)) {
+        int idx = this->find_index(key);
+        if (idx < 0) throw(KeyException, "Map.GetMut missing key");
+        return &this->vals[idx];
     }
 
     /* Destroy one key slot (by-value dtor or owned pointer delete). */
