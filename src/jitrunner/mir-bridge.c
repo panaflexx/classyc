@@ -142,6 +142,10 @@ void jit_gen_init(void *ctx){ MIR_gen_init((MIR_context_t)ctx); }
 void jit_gen_finish(void *ctx){ MIR_gen_finish((MIR_context_t)ctx); }
 void jit_link(void *ctx,int mode){
     MIR_context_t mctx=(MIR_context_t)ctx;
+    /* Interp/debug path: keep real CALL/RET so step-over can track call_depth.
+       MIR's process_inlines() would otherwise bake callees into the caller. */
+    if(mode==2) MIR_set_no_inlines(1);
+    else MIR_set_no_inlines(0);
     switch(mode){ case 1: MIR_link(mctx,MIR_set_gen_interface,import_resolver); break; case 2: MIR_link(mctx,MIR_set_interp_interface,import_resolver); break; default: MIR_link(mctx,MIR_set_lazy_gen_interface,import_resolver); break; }
 }
 void *jit_get_func_addr(void *item){ if(!item) return NULL; return ((MIR_item_t)item)->addr; }
@@ -195,6 +199,7 @@ extern int dap_logger_fd;
 
 struct JIT_interp_dbg_state{
     JIT_breakpoint *bps; int num_bps; int cap_bps;
+    /* step_mode: 0=off  1=step-in (every line)  2=step-over (depth-limited) */
     int step_mode; int next_depth; int call_depth; int paused;
     /* Suppress re-breaking on the same source line until execution leaves it.
        Without this, continue after a BP immediately re-fires on the same insn. */
@@ -231,17 +236,27 @@ static int interp_line_hook(void *func_item,void *insn_ptr,void *user){
        is allowed when sf is unknown (file[0] empty check already; when sf is
        NULL we treat file match as satisfied so line-only BPs still work). */
 
-    /* Once we leave the line we last stopped on, allow breakpoints again. */
+    /* Stay quiet on the same source line until execution leaves it.
+       Applies to both continue (avoid re-hitting same BP) and step
+       (advance to a different source line). */
     if (st->suppress_same_line) {
         if (fid != st->last_break_fid || line != st->last_break_line)
             st->suppress_same_line = 0;
-        else if (!st->step_mode)
-            return 0; /* still on same BP line after continue */
+        else
+            return 0;
     }
 
     int should=0;
-    if(st->step_mode){
-        if(st->next_depth==0||st->call_depth<=st->next_depth) should=1;
+    int stop_reason_step=0;
+    if(st->step_mode==1){
+        /* step-in: stop on every new source line */
+        should=1; stop_reason_step=1;
+    } else if(st->step_mode==2){
+        /* step-over: only stop once we are back at or above the step frame */
+        if(st->call_depth <= st->next_depth){ should=1; stop_reason_step=1; }
+        else if (getenv("CLASSYC_DEBUG_STEP"))
+            fprintf(stderr, "step-over skip line=%d depth=%d next_depth=%d\n",
+                    line, st->call_depth, st->next_depth);
     } else {
         for(int i=0;i<st->num_bps;i++){
             JIT_breakpoint *bp=&st->bps[i];
@@ -258,18 +273,100 @@ static int interp_line_hook(void *func_item,void *insn_ptr,void *user){
     /* Clear step intent BEFORE the callback so a resume that re-enables
        step (stepIn/next) is not wiped by this function after on_break. */
     if(st->step_mode){ st->step_mode=0; _mir_interp_set_step_mode(0); st->next_depth=0; }
+    /* Tag step stops for the parent (different marker line prefix). */
+    if (stop_reason_step)
+        st->paused = 2; /* 2 = stepped (reused as flag for on_break via g_active) */
     if(st->on_break) st->on_break(st->cb_user, it ? (void*)it : func_item, fid, line, col);
     st->paused=0; g_in_hook=0; return 0;
 }
+extern void _mir_interp_set_call_depth_hook(void *hook, void *user);
+static void call_depth_hook(int delta, void *user){
+    (void)user;
+    if(!g_active) return;
+    g_active->call_depth += delta;
+    if(g_active->call_depth < 0) g_active->call_depth = 0;
+    if (getenv("CLASSYC_DEBUG_STEP") && dap_logger_fd < 0)
+        fprintf(stderr, "call_depth delta=%d now=%d step_mode=%d next_depth=%d\n",
+                delta, g_active->call_depth, g_active->step_mode, g_active->next_depth);
+    if (dap_logger_fd >= 0)
+        dprintf(dap_logger_fd, "call_depth delta=%d now=%d step_mode=%d next_depth=%d\n",
+                delta, g_active->call_depth, g_active->step_mode, g_active->next_depth);
+}
+
 JIT_interp_dbg_state_t *jit_interp_dbg_new(void){ return calloc(1,sizeof(JIT_interp_dbg_state_t)); }
-void jit_interp_dbg_free(JIT_interp_dbg_state_t *st){ if(!st) return; free(st->bps); free(st); if(g_active==st){ _mir_interp_set_debug_hook(NULL,NULL); _mir_interp_set_step_mode(0); g_active=NULL; } }
-void jit_interp_dbg_set_state(JIT_interp_dbg_state_t *st){ g_active=st; _mir_interp_set_debug_hook((void*)interp_line_hook,st); _mir_interp_set_step_mode(st && st->step_mode?1:0); }
-int jit_interp_dbg_add_bp(JIT_interp_dbg_state_t *st,const char *file,int line){ if(!st||!file) return -1; if(st->num_bps>=st->cap_bps){ int nc=st->cap_bps?st->cap_bps*2:16; void *nb=realloc(st->bps,nc*sizeof(JIT_breakpoint)); if(!nb) return -1; st->bps=nb; st->cap_bps=nc; } JIT_breakpoint *bp=&st->bps[st->num_bps++]; strncpy(bp->file,file,sizeof(bp->file)-1); bp->file[sizeof(bp->file)-1]='\0'; bp->line=line; bp->enabled=1; return 0; }
+void jit_interp_dbg_free(JIT_interp_dbg_state_t *st){
+    if(!st) return; free(st->bps); free(st);
+    if(g_active==st){
+        _mir_interp_set_debug_hook(NULL,NULL);
+        _mir_interp_set_step_mode(0);
+        _mir_interp_set_call_depth_hook(NULL,NULL);
+        g_active=NULL;
+    }
+}
+void jit_interp_dbg_set_state(JIT_interp_dbg_state_t *st){
+    g_active=st;
+    _mir_interp_set_debug_hook((void*)interp_line_hook,st);
+    _mir_interp_set_step_mode(st && st->step_mode?1:0);
+    _mir_interp_set_call_depth_hook(st ? (void*)call_depth_hook : NULL, NULL);
+}
+
+/* Scan loaded MIR for nearest executable source line >= requested (same file). */
+int jit_nearest_source_line(JIT_context ctx, const char *file, int line){
+    if(!ctx||!file||line<=0) return line;
+    int best_ge = -1; /* smallest line >= requested */
+    int best_any = -1; /* closest overall */
+    for(void *mod=jit_first_module(ctx); mod; mod=jit_next_module(mod)){
+        for(void *item=jit_first_item(mod); item; item=jit_next_item(item)){
+            if(!jit_item_is_func(item)) continue;
+            MIR_item_t it=(MIR_item_t)item;
+            MIR_func_t fn=it->u.func;
+            for(MIR_insn_t insn=DLIST_HEAD(MIR_insn_t,fn->insns); insn; insn=DLIST_NEXT(MIR_insn_t,insn)){
+                if(insn->source_line==0) continue;
+                const char *sf=NULL;
+                MIR_module_t m=it->module;
+                if(m && insn->source_file_id>=0 && (uint32_t)insn->source_file_id<=m->num_source_files)
+                    sf=m->source_files[insn->source_file_id];
+                if(sf && !suffix_match(sf,file)) continue;
+                int L=(int)insn->source_line;
+                if(L==line) return line; /* exact */
+                if(L>line && (best_ge<0 || L<best_ge)) best_ge=L;
+                {
+                    int d1 = L>line ? L-line : line-L;
+                    int d0 = best_any<0 ? 0x7fffffff : (best_any>line ? best_any-line : line-best_any);
+                    if(best_any<0 || d1<d0) best_any=L;
+                }
+            }
+        }
+    }
+    if(best_ge>0) return best_ge;
+    if(best_any>0) return best_any;
+    return line;
+}
+
+int jit_interp_dbg_add_bp(JIT_interp_dbg_state_t *st,const char *file,int line){
+    if(!st||!file) return -1;
+    if(st->num_bps>=st->cap_bps){
+        int nc=st->cap_bps?st->cap_bps*2:16;
+        void *nb=realloc(st->bps,nc*sizeof(JIT_breakpoint));
+        if(!nb) return -1; st->bps=nb; st->cap_bps=nc;
+    }
+    JIT_breakpoint *bp=&st->bps[st->num_bps++];
+    strncpy(bp->file,file,sizeof(bp->file)-1); bp->file[sizeof(bp->file)-1]='\0';
+    bp->line=line; bp->enabled=1;
+    return 0;
+}
+/* Like add_bp, but remap line to nearest executable loc in ctx first. */
+int jit_interp_dbg_add_bp_resolved(JIT_interp_dbg_state_t *st, JIT_context ctx, const char *file, int line){
+    int resolved = jit_nearest_source_line(ctx, file, line);
+    if (dap_logger_fd>=0 && resolved!=line)
+        dprintf(dap_logger_fd, "BP resolve %s:%d → %d\n", file, line, resolved);
+    return jit_interp_dbg_add_bp(st, file, resolved);
+}
 void jit_interp_dbg_clear_bps(JIT_interp_dbg_state_t *st){ if(st) st->num_bps=0; }
 void jit_interp_dbg_set_break_cb(JIT_interp_dbg_state_t *st,void (*cb)(void*,void*,int,int,int),void *user){ if(!st) return; st->on_break=cb; st->cb_user=user; }
-void jit_interp_dbg_continue(JIT_interp_dbg_state_t *st){ if(!st) return; st->step_mode=0; st->paused=0; _mir_interp_set_step_mode(0); }
+void jit_interp_dbg_continue(JIT_interp_dbg_state_t *st){ if(!st) return; st->step_mode=0; st->paused=0; st->next_depth=0; _mir_interp_set_step_mode(0); }
 void jit_interp_dbg_step_in(JIT_interp_dbg_state_t *st){ if(!st) return; st->step_mode=1; st->paused=0; st->next_depth=0; _mir_interp_set_step_mode(1); }
-void jit_interp_dbg_next(JIT_interp_dbg_state_t *st){ if(!st) return; st->step_mode=1; st->next_depth=st->call_depth; st->paused=0; _mir_interp_set_step_mode(1); }
+void jit_interp_dbg_next(JIT_interp_dbg_state_t *st){ if(!st) return; st->step_mode=2; st->next_depth=st->call_depth; st->paused=0; _mir_interp_set_step_mode(1); }
 int jit_interp_dbg_current(JIT_interp_dbg_state_t *st,char *out_file,int file_cap,int *out_line,int *out_col,char **out_func_name){
     if(!st) return -1; if(out_line) *out_line=g_cur_line; if(out_col) *out_col=g_cur_col;
     if(out_func_name){ MIR_item_t cur=(MIR_item_t)g_cur_func; *out_func_name=cur&&cur->item_type==MIR_func_item?(char*)cur->u.func->name:NULL; }
@@ -278,13 +375,61 @@ int jit_interp_dbg_current(JIT_interp_dbg_state_t *st,char *out_file,int file_ca
 
 int g_interp_child_ctrl_fd_from_env=-1;
 int g_dap_ctrl_write_fd=-1;
+
+/* Safe byte write for the parent→child debug control pipe.
+   Kept in plain C so ClassyC cannot collide with File::write. */
+int dap_ctrl_write_byte(int fd, int byte){
+    if (fd < 0) return -1;
+    unsigned char b = (unsigned char)byte;
+    for (;;) {
+        ssize_t n = write(fd, &b, 1);
+        if (n == 1) return 0;
+        if (n < 0) {
+            int e = errno;
+            if (e == EINTR) continue;
+            if (dap_logger_fd >= 0) dprintf(dap_logger_fd, "dap_ctrl_write_byte fd=%d errno=%d\n", fd, e);
+            return -1;
+        }
+        /* n==0: treat as error */
+        return -1;
+    }
+}
+
 void interp_child_on_break_simple(void *user, void *func_item, int file_id, int line, int col){
  void *ctx=user; char fb[1024]; fb[0]='\0';
  void *mod=jit_first_module(ctx);
  while(mod){ int n=jit_module_num_source_files(mod); if(file_id>=0 && file_id<=n){ const char *sf=jit_module_source_file(mod,file_id); if(sf){ strncpy(fb,sf,sizeof(fb)-1); break; } } mod=jit_next_module(mod); }
- fprintf(stderr,"__DAP_BRK__ %s:%d:%d\n", fb[0]?fb:"?", line, col); fflush(stderr);
- if (dap_logger_fd>=0) dprintf(dap_logger_fd, "CHILD BREAK %s:%d ctrl=%d\n", fb, line, g_interp_child_ctrl_fd_from_env);
+ /* paused==2 means this stop came from step_mode (set above in the hook). */
+ int is_step = (g_active && g_active->paused == 2) ? 1 : 0;
+ fprintf(stderr,"%s %s:%d:%d\n", is_step ? "__DAP_STEP__" : "__DAP_BRK__",
+         fb[0]?fb:"?", line, col); fflush(stderr);
+ if (dap_logger_fd>=0) dprintf(dap_logger_fd, "CHILD %s %s:%d ctrl=%d\n",
+                                is_step?"STEP":"BREAK", fb, line, g_interp_child_ctrl_fd_from_env);
  int ctrl_fd=g_interp_child_ctrl_fd_from_env; if(ctrl_fd<0){ char *s=getenv("CLASSYC_DEBUG_CTRL_FD"); if(s&&s[0]) ctrl_fd=atoi(s); }
  if (dap_logger_fd>=0) dprintf(dap_logger_fd, "CHILD waiting ctrl_fd=%d\n", ctrl_fd);
- if(ctrl_fd>=0){ char cmd=0; while(1){ long r=read(ctrl_fd,&cmd,1); if (dap_logger_fd>=0) dprintf(dap_logger_fd, "CHILD read ret=%ld cmd=%c\n", r, cmd); if(r==1) break; if(r==0) break; int e=*__errno_location(); if(e==4||e==11){ usleep(1000); continue; } break; } if(cmd=='s'||cmd=='n'){ _mir_interp_set_step_mode(1);} else { _mir_interp_set_step_mode(0);} if (dap_logger_fd>=0) dprintf(dap_logger_fd, "CHILD resuming cmd=%c\n", cmd); }
+ if(ctrl_fd>=0){
+   char cmd=0;
+   while(1){
+     long r=read(ctrl_fd,&cmd,1);
+     if (dap_logger_fd>=0) dprintf(dap_logger_fd, "CHILD read ret=%ld cmd=%c\n", r, cmd);
+     if(r==1) break;
+     if(r==0) break;
+     int e=*__errno_location();
+     if(e==4||e==11){ usleep(1000); continue; }
+     break;
+   }
+   /* Apply resume mode to g_active — the line hook checks st->step_mode,
+      not only the global MIR flag. */
+   if (cmd=='s') {
+     jit_interp_dbg_step_in(g_active);
+   } else if (cmd=='n') {
+     jit_interp_dbg_next(g_active);
+   } else {
+     jit_interp_dbg_continue(g_active);
+   }
+   if (dap_logger_fd>=0)
+     dprintf(dap_logger_fd, "CHILD resuming cmd=%c step_mode=%d next_depth=%d call_depth=%d\n",
+             cmd, g_active?g_active->step_mode:0,
+             g_active?g_active->next_depth:0, g_active?g_active->call_depth:0);
+ }
 }

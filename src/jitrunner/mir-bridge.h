@@ -93,12 +93,18 @@ JIT_interp_dbg_state_t *jit_interp_dbg_new(void);
 void  jit_interp_dbg_free(JIT_interp_dbg_state_t *st);
 void  jit_interp_dbg_set_state(JIT_interp_dbg_state_t *st);
 int   jit_interp_dbg_add_bp(JIT_interp_dbg_state_t *st, const char *file, int line);
+/* Remap BP line to nearest executable source loc in ctx before storing. */
+int   jit_interp_dbg_add_bp_resolved(JIT_interp_dbg_state_t *st, JIT_context ctx, const char *file, int line);
+int   jit_nearest_source_line(JIT_context ctx, const char *file, int line);
 void  jit_interp_dbg_clear_bps(JIT_interp_dbg_state_t *st);
 void  jit_interp_dbg_set_break_cb(JIT_interp_dbg_state_t *st, void (*cb)(void *user, void *func_item, int file_id, int line, int col), void *user);
 void  jit_interp_dbg_continue(JIT_interp_dbg_state_t *st);
-void  jit_interp_dbg_step_in(JIT_interp_dbg_state_t *st);
-void  jit_interp_dbg_next(JIT_interp_dbg_state_t *st);
+void  jit_interp_dbg_step_in(JIT_interp_dbg_state_t *st);  /* step into callees */
+void  jit_interp_dbg_next(JIT_interp_dbg_state_t *st);     /* step over (depth-aware) */
 int   jit_interp_dbg_current(JIT_interp_dbg_state_t *st, char *out_file, int file_cap, int *out_line, int *out_col, char **out_func_name);
 void  interp_child_on_break_simple(void *user, void *func_item, int file_id, int line, int col);
+
+/* Parent → child resume byte on the debug control pipe (plain C write). */
+int   dap_ctrl_write_byte(int fd, int byte);
 
 #endif

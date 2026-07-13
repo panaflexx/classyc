@@ -173,10 +173,27 @@ def main():
         assert ev, "no initialized event"
         print("<- initialized event")
 
-        # 2. setBreakpoints on a line that survives MIR link inlining.
-        #    `add`'s return (line 8) is optimized away when add is inlined into
-        #    main, so break on the computation line instead (line 7).
-        bp_line = 7
+        # Zed/VS Code order: launch first (must NOT start yet), then breakpoints,
+        # then configurationDone (only then may the program run).
+        bp_line = 7  # survives MIR inlining of add()
+
+        s = client.send_request(
+            "launch", {"program": "examples/debug-sample.bmir", "noDebug": False}
+        )
+        resp = client.wait_for_response(s)
+        assert resp and resp.get("success"), f"launch failed: {resp}"
+        print("<- launch ok (should not run until configurationDone)")
+
+        # Guard: program must not have terminated before we set breakpoints
+        time.sleep(0.15)
+        early = [
+            m
+            for m in client.received_messages
+            if m.get("type") == "event"
+            and m.get("event") in ("exited", "terminated", "output")
+        ]
+        assert not early, f"program started before configurationDone: {early}"
+
         s = client.send_request(
             "setBreakpoints",
             {
@@ -194,21 +211,12 @@ def main():
         print(f"<- setBreakpoints: {bps}")
         assert bps, "expected at least one verified breakpoint"
 
-        # 3. configurationDone
         s = client.send_request("configurationDone")
         resp = client.wait_for_response(s)
         assert resp and resp.get("success"), f"configurationDone failed: {resp}"
-        print("<- configurationDone ok")
+        print("<- configurationDone ok; waiting for stopped...")
 
-        # 4. launch
-        s = client.send_request(
-            "launch", {"program": "examples/debug-sample.bmir", "noDebug": False}
-        )
-        resp = client.wait_for_response(s)
-        assert resp and resp.get("success"), f"launch failed: {resp}"
-        print("<- launch ok; waiting for stopped...")
-
-        # 5. expect stopped (or fall through if no line maps — still fail clearly)
+        # expect stopped (or fail clearly if BP missed)
         stopped = None
         deadline = time.time() + 20.0
         while time.time() < deadline and stopped is None:
@@ -226,7 +234,12 @@ def main():
         assert stopped, "never received stopped event"
         print(f"<- stopped: {stopped.get('body')}")
 
-        # 6. stackTrace should report the BP line
+        # 6. Zed-like probes while stopped: threads / stackTrace / scopes
+        s = client.send_request("threads")
+        resp = client.wait_for_response(s, timeout=5.0)
+        assert resp and resp.get("success"), f"threads failed: {resp}"
+        print("<- threads ok")
+
         s = client.send_request(
             "stackTrace", {"threadId": 1, "startFrame": 0, "levels": 20}
         )
@@ -241,10 +254,46 @@ def main():
                 f"unexpected stop line {line}, wanted ~{bp_line}"
             )
 
-        # 7. continue
+        s = client.send_request("scopes", {"frameId": 1})
+        resp = client.wait_for_response(s, timeout=5.0)
+        assert resp and resp.get("success"), f"scopes failed: {resp}"
+        assert resp.get("command") == "scopes", f"bad scopes command field: {resp}"
+        print(f"<- scopes ok body={resp.get('body')}")
+
+        s = client.send_request("variables", {"variablesReference": 1})
+        resp = client.wait_for_response(s, timeout=5.0)
+        assert resp and resp.get("success"), f"variables failed: {resp}"
+        print("<- variables ok")
+
+        # 7. stepIn once — should stop on a later source line (reason=step)
+        s = client.send_request("stepIn", {"threadId": 1})
+        resp = client.wait_for_response(s, timeout=5.0)
+        assert resp and resp.get("success"), f"stepIn failed: {resp}"
+        print("<- stepIn ok; waiting for step stop...")
+
+        step_stopped = None
+        deadline = time.time() + 10.0
+        while time.time() < deadline and step_stopped is None:
+            try:
+                msg = client.msg_queue.get(timeout=0.3)
+                if msg.get("type") == "event" and msg.get("event") == "stopped":
+                    step_stopped = msg
+                elif msg.get("type") == "event" and msg.get("event") == "terminated":
+                    print("FAIL: terminated during stepIn — stepped off end without stop")
+                    return 1
+            except queue.Empty:
+                continue
+        assert step_stopped, "never received stopped after stepIn"
+        reason = (step_stopped.get("body") or {}).get("reason")
+        print(f"<- stopped after step: reason={reason}")
+        # Prefer "step"; accept "breakpoint" if another BP lands first
+        assert reason in ("step", "breakpoint"), f"unexpected stop reason {reason}"
+
+        # 8. continue to finish
         s = client.send_request("continue", {"threadId": 1})
         resp = client.wait_for_response(s, timeout=5.0)
         assert resp and resp.get("success"), f"continue failed: {resp}"
+        assert resp.get("command") == "continue", f"bad continue response: {resp}"
         print("<- continue ok; waiting for terminated...")
 
         term = None

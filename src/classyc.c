@@ -31851,6 +31851,8 @@ static void init_include_dirs (c2m_ctx_t c2m_ctx) {
 #if defined(__APPLE__) || defined(__unix__)
   VARR_PUSH (char_ptr_t, system_headers, "/usr/include");
 #endif
+// FIXME: Hardcoded user path
+  VARR_PUSH (char_ptr_t, system_headers, "/home/rdavenpo/src/MIR/classyc/include");
   VARR_PUSH (char_ptr_t, system_headers, NULL);
   header_dirs = (const char **) VARR_ADDR (char_ptr_t, headers);
   system_header_dirs = (const char **) VARR_ADDR (char_ptr_t, system_headers);

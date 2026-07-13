@@ -129,6 +129,7 @@ void hr(const char* title) {
     printf("\n════════════════════════════════════════════════════════════\n");
     printf("  %s\n", title);
     printf("════════════════════════════════════════════════════════════\n");
+    fflush(stdout);
 }
 
 void SeedFleet(List<Ship>* fleet) {
@@ -148,7 +149,7 @@ void FillHeatMap(Map<String, int>* board, List<Ship>* ships) {
 
 /* ───────────────────────── main ─────────────────────────── */
 
-int main() {
+main() {
     printf("\n");
     printf("    █████╗ ██╗   ██╗██████╗  ██████╗ ██████╗  █████╗ \n");
     printf("   ██╔══██╗██║   ██║██╔══██╗██╔═══██╗██╔══██╗██╔══██╗\n");
@@ -159,6 +160,7 @@ int main() {
     printf("              constellation ops · by-value List/Map idiom\n");
     printf("   types: %s · %s · %s\n",
            nameof<Sector>(), nameof<Alert>(), typeof<Ship>());
+    fflush(stdout);
 
     dict cfg_json = {
         "board_name": "AURORA OPS",
@@ -214,7 +216,7 @@ int main() {
            sample.contains("ORA") ? "true" : "false");
 
     String tag = "VEIL-RUN";
-    owned auto bits = tag.split("-");     /* String.split still heap List* */
+    auto bits = tag.split("-");     /* String.split still heap List* */
     printf("  split/join: %s → %s\n", tag, bits.join("/"));
 
     auto heats = roster.Select((Ship s) => s.heat);

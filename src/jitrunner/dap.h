@@ -150,6 +150,10 @@ class DapServer {
     int    stop_line;
     int    stop_col;
     int    is_stopped;
+    /* DAP handshake flags — do NOT start the debuggee until both are set.
+       Clients may send launch before or after setBreakpoints/configurationDone. */
+    int    launch_received;
+    int    config_done_received;
 
     DapServer(int port) {
         this.listen_fd    = -1;
@@ -165,6 +169,13 @@ class DapServer {
         this.stop_line    = 0;
         this.stop_col     = 0;
         this.is_stopped   = 0;
+        this.launch_received = 0;
+        this.config_done_received = 0;
+    }
+
+    /* True once launch + configurationDone have both arrived. */
+    int ready_to_run() {
+        return this.launch_received && this.config_done_received;
     }
 
     ~DapServer() {
@@ -284,7 +295,14 @@ class DapServer {
                 "success": true
             };
             dap_send_dict(this.write_fp, resp);
-            this.state = 3;
+            /* Acknowledge launch, but do NOT start the program yet.
+               DAP clients (Zed/VS Code) send setBreakpoints after launch
+               and then configurationDone — only then may we run. */
+            this.launch_received = 1;
+            if (dap_logger_fd >= 0)
+                dprintf(dap_logger_fd,
+                        "launch received (program=%s) waiting for configurationDone=%d\n",
+                        (char *)this.program_path, this.config_done_received);
         }
 
     void handle_configuration_done(int req_seq) {
@@ -296,7 +314,11 @@ class DapServer {
                 "success": true
             };
             dap_send_dict(this.write_fp, resp);
-            this.state = 2;
+            this.config_done_received = 1;
+            if (dap_logger_fd >= 0)
+                dprintf(dap_logger_fd,
+                        "configurationDone received (launch_received=%d)\n",
+                        this.launch_received);
         }
 
     void handle_threads(int req_seq) {
@@ -347,33 +369,79 @@ class DapServer {
             }
             if (f) fclose(f);
             if (dap_logger_fd>=0) dprintf(dap_logger_fd, "setBreakpoints src=%s count=%d first=%d raw=%.200s\n", src_path, count, first_line, raw_json);
-            char json_buf[4096];
-            if (count>0) {
-                /* report each verified breakpoint line (first is enough for many clients) */
-                snprintf(json_buf, sizeof(json_buf),
-                    "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"setBreakpoints\",\"success\":true,\"body\":{\"breakpoints\":[{\"id\":1,\"verified\":true,\"line\":%d}]}}",
-                    this->next_seq(), req_seq, first_line>0?first_line:2);
-            } else {
-                snprintf(json_buf, sizeof(json_buf),
-                    "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"setBreakpoints\",\"success\":true,\"body\":{\"breakpoints\":[]}}",
-                    this->next_seq(), req_seq);
+            /* Echo every requested line as verified.  Child resolves to nearest
+               executable MIR loc at load time (blank lines / no-code lines
+               still stop). */
+            char json_buf[8192];
+            int pos = 0;
+            pos += snprintf(json_buf + pos, sizeof(json_buf) - pos,
+                "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"setBreakpoints\",\"success\":true,\"body\":{\"breakpoints\":[",
+                this->next_seq(), req_seq);
+            /* Re-scan raw for lines to list in response */
+            {
+                char *p2 = raw_json;
+                int id = 1;
+                int first = 1;
+                while ((p2 = strstr(p2, "\"line\"")) != NULL && pos < (int)sizeof(json_buf) - 80) {
+                    p2 += 6;
+                    char *c = strchr(p2, ':');
+                    if (!c) break;
+                    p2 = c + 1;
+                    while (*p2 == ' ' || *p2 == '\t') p2++;
+                    int l = atoi(p2);
+                    if (l > 0) {
+                        if (!first) { json_buf[pos] = ','; pos = pos + 1; }
+                        first = 0;
+                        pos += snprintf(json_buf + pos, sizeof(json_buf) - pos,
+                            "{\"id\":%d,\"verified\":true,\"line\":%d}", id, l);
+                        id = id + 1;
+                    }
+                }
             }
+            pos += snprintf(json_buf + pos, sizeof(json_buf) - pos, "]}}");
             dap_send_message(this->write_fp, json_buf);
         }
 
         void handle_continue(int req_seq) {
-            dict body = { "allThreadsContinued": true };
-            dict resp = {
-                "seq": this->next_seq(),
-                "type": "response",
-                "request_seq": req_seq,
-                "command": "continue",
-                "success": true
-            };
-            resp.body = body;
-            dap_send_dict(this.write_fp, resp);
+            /* Raw JSON — dict + true can mis-serialize in edge cases */
+            char json_buf[256];
+            snprintf(json_buf, sizeof(json_buf),
+                "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"continue\",\"success\":true,"
+                "\"body\":{\"allThreadsContinued\":true}}",
+                this->next_seq(), req_seq);
+            dap_send_message(this->write_fp, json_buf);
             this.state = 3;
             this.is_stopped = 0;
+        }
+
+        void handle_step(int req_seq, char *command) {
+            char json_buf[256];
+            /* next/stepIn/stepOut — empty success body is fine for clients */
+            snprintf(json_buf, sizeof(json_buf),
+                "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"%s\",\"success\":true}",
+                this->next_seq(), req_seq, command ? command : "next");
+            dap_send_message(this->write_fp, json_buf);
+            this.state = 3;
+            this.is_stopped = 0;
+        }
+
+        void handle_scopes(int req_seq) {
+            char json_buf[512];
+            /* Empty locals/args until var inspection is wired */
+            snprintf(json_buf, sizeof(json_buf),
+                "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"scopes\",\"success\":true,"
+                "\"body\":{\"scopes\":[{\"name\":\"Locals\",\"variablesReference\":1,\"expensive\":false}]}}",
+                this->next_seq(), req_seq);
+            dap_send_message(this->write_fp, json_buf);
+        }
+
+        void handle_variables(int req_seq) {
+            char json_buf[256];
+            snprintf(json_buf, sizeof(json_buf),
+                "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"variables\",\"success\":true,"
+                "\"body\":{\"variables\":[]}}",
+                this->next_seq(), req_seq);
+            dap_send_message(this->write_fp, json_buf);
         }
 
         void handle_stack_trace(int req_seq) {
@@ -398,7 +466,7 @@ class DapServer {
             dap_send_message(this->write_fp, json_buf);
         }
 
-        /* Record stop location from a "__DAP_BRK__ file:line:col" child note */
+        /* Record stop location from a "__DAP_BRK__/__DAP_STEP__ file:line:col" note */
         void record_stop_from_break_text(char *txt) {
             this.is_stopped = 1;
             this.stop_line = 0;
@@ -406,8 +474,13 @@ class DapServer {
             this.stop_file = "";
             if (!txt) return;
             char *p = strstr(txt, "__DAP_BRK__");
+            int skip = 11;
+            if (!p) {
+                p = strstr(txt, "__DAP_STEP__");
+                skip = 12;
+            }
             if (!p) return;
-            p = p + 11; /* skip marker */
+            p = p + skip;
             while (*p == ' ' || *p == '\t') p++;
             char filebuf[1024];
             int i = 0;
@@ -466,18 +539,37 @@ class DapServer {
                 this->handle_set_breakpoints_raw(req_seq, json_str);
             } else if (strcmp(command, "continue") == 0) {
                 this->handle_continue(req_seq);
+            } else if (strcmp(command, "next") == 0
+                       || strcmp(command, "stepIn") == 0
+                       || strcmp(command, "stepOut") == 0
+                       || strcmp(command, "stepOver") == 0) {
+                this->handle_step(req_seq, command);
             } else if (strcmp(command, "stackTrace") == 0) {
                 this->handle_stack_trace(req_seq);
+            } else if (strcmp(command, "scopes") == 0) {
+                this->handle_scopes(req_seq);
+            } else if (strcmp(command, "variables") == 0) {
+                this->handle_variables(req_seq);
             } else {
-                /* Unknown command — send success anyway (be lenient) */
-                dict resp = {
-                    "seq": this->next_seq(),
-                    "type": "response",
-                    "request_seq": req_seq,
-                    "command": command,
-                    "success": true
-                };
-                dap_send_dict(this.write_fp, resp);
+                /* Unknown command — raw JSON so `command` is never a dangling ptr */
+                char json_buf[384];
+                char safe_cmd[64];
+                int i = 0;
+                while (command[i] && i < 63) {
+                    char ch = command[i];
+                    /* keep alnum only for JSON safety */
+                    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+                        || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-')
+                        safe_cmd[i] = ch;
+                    else
+                        safe_cmd[i] = '_';
+                    i = i + 1;
+                }
+                safe_cmd[i] = '\0';
+                snprintf(json_buf, sizeof(json_buf),
+                    "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"%s\",\"success\":true}",
+                    this->next_seq(), req_seq, safe_cmd);
+                dap_send_message(this->write_fp, json_buf);
             }
 
             return 0;

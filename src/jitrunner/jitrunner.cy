@@ -266,7 +266,47 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb,
         }
 
         jit_gen_init(ctx);
-        if(jit_mode==2){ char *bp=getenv("CLASSYC_DEBUG_BPS"); if(bp&&bp[0]){ extern void *jit_interp_dbg_new(void); extern int jit_interp_dbg_add_bp(void *st,char *file,int line); extern void jit_interp_dbg_set_state(void *st); extern void jit_interp_dbg_set_break_cb(void *st,void *cb,void *user); extern void interp_child_on_break_simple(void *u,void *f,int fid,int l,int c); int fd=open(bp,0,0); if(fd>=0){ void *dbg=jit_interp_dbg_new(); char bbuf[8192]; long rn=read(fd,bbuf,sizeof(bbuf)-1); if (dap_logger_fd>=0) dprintf(dap_logger_fd,"CHILD loading bps file %s fd=%d\n", bp, fd); close(fd); if(rn>0){ bbuf[rn]='\0'; char *q=bbuf; while(*q){ char *nl=strchr(q,'\n'); if(nl) *nl='\0'; char *cc=strrchr(q,':'); if(cc){ *cc='\0'; int ll=atoi(cc+1); if(ll>0){ if(dap_logger_fd>=0) dprintf(dap_logger_fd,"CHILD add bp %s:%d\n", q, ll); jit_interp_dbg_add_bp(dbg,q,ll); }} if(!nl) break; q=nl+1; } } jit_interp_dbg_set_break_cb(dbg,(void*)interp_child_on_break_simple,(void*)ctx); jit_interp_dbg_set_state(dbg); } } }
+        if(jit_mode==2){
+            char *bp=getenv("CLASSYC_DEBUG_BPS");
+            if(bp&&bp[0]){
+                extern void *jit_interp_dbg_new(void);
+                extern int jit_interp_dbg_add_bp_resolved(void *st, void *ctx, char *file, int line);
+                extern void jit_interp_dbg_set_state(void *st);
+                extern void jit_interp_dbg_set_break_cb(void *st, void *cb, void *user);
+                extern void interp_child_on_break_simple(void *u, void *f, int fid, int l, int c);
+                int fd=open(bp,0,0);
+                if(fd>=0){
+                    void *dbg=jit_interp_dbg_new();
+                    char bbuf[8192];
+                    long rn=read(fd,bbuf,sizeof(bbuf)-1);
+                    if (dap_logger_fd>=0) dprintf(dap_logger_fd,"CHILD loading bps file %s fd=%d\n", bp, fd);
+                    close(fd);
+                    if(rn>0){
+                        bbuf[rn]='\0';
+                        char *q=bbuf;
+                        while(*q){
+                            char *nl=strchr(q,'\n');
+                            if(nl) *nl='\0';
+                            char *cc=strrchr(q,':');
+                            if(cc){
+                                *cc='\0';
+                                int ll=atoi(cc+1);
+                                if(ll>0){
+                                    if(dap_logger_fd>=0) dprintf(dap_logger_fd,"CHILD add bp %s:%d (resolving)\n", q, ll);
+                                    /* Map to nearest line that actually has MIR loc —
+                                       blank lines / expressions w/o own locs still break. */
+                                    jit_interp_dbg_add_bp_resolved(dbg, ctx, q, ll);
+                                }
+                            }
+                            if(!nl) break;
+                            q=nl+1;
+                        }
+                    }
+                    jit_interp_dbg_set_break_cb(dbg,(void*)interp_child_on_break_simple,(void*)ctx);
+                    jit_interp_dbg_set_state(dbg);
+                }
+            }
+        }
         jit_link(ctx, jit_mode);
 
         void *addr = jit_get_func_addr(main_func);
@@ -501,23 +541,21 @@ extern int open(char *path, int flags, ...);
 extern char *getenv(char *name);
 extern int setenv(char *name, char *value, int overwrite);
 extern int unsetenv(char *name);
-/* POSIX write(2) — named carefully so ClassyC doesn't collide with File::write */
-extern long write(int fd, void *buf, long count);
+/* Plain-C helper in mir-bridge.c (avoids File::write name clash) */
+extern int dap_ctrl_write_byte(int fd, int byte);
 
 /* Write a single resume command to the waiting debuggee child.
    cmd: 'c' continue, 's' stepIn, 'n' next/stepOver. */
 static void dap_signal_child_resume(char cmd) {
-    if (g_dap_ctrl_write_fd < 0) return;
-    char c = cmd;
-    while (1) {
-        long n = write(g_dap_ctrl_write_fd, (void *)&c, 1);
-        if (n == 1) break;
-        if (n < 0) {
-            int e = *__errno_location();
-            if (e == 4 /* EINTR */) continue;
-        }
-        break;
+    if (g_dap_ctrl_write_fd < 0) {
+        if (dap_logger_fd >= 0)
+            dprintf(dap_logger_fd, "dap_signal_child_resume: no ctrl write fd (cmd=%c)\n", cmd);
+        return;
     }
+    int rc = dap_ctrl_write_byte(g_dap_ctrl_write_fd, (int)cmd);
+    if (dap_logger_fd >= 0)
+        dprintf(dap_logger_fd, "dap_signal_child_resume cmd=%c fd=%d rc=%d\n",
+                cmd, g_dap_ctrl_write_fd, rc);
 }
 
 /* Clear leftover breakpoint state at the start of a DAP session. */
@@ -540,8 +578,9 @@ static int dap_has_breakpoints(void) {
 static char dap_resume_cmd_for(char *command) {
     if (!command) return 'c';
     if (strcmp(command, "next") == 0) return 'n';
-    if (strcmp(command, "stepIn") == 0) return 's';
     if (strcmp(command, "stepOver") == 0) return 'n';
+    if (strcmp(command, "stepIn") == 0) return 's';
+    /* stepOut: no full support yet — continue to next BP */
     return 'c';
 }
 
@@ -550,12 +589,20 @@ static char dap_resume_cmd_for(char *command) {
    then blocks reading DAP until the client continues / steps / disconnects. */
 static void dap_out_cb(void *u, char *cat, char *txt) {
     DapServer *d = (DapServer *)u;
-    if (txt && strstr(txt, "__DAP_BRK__")) {
+    int is_step = (txt && strstr(txt, "__DAP_STEP__")) ? 1 : 0;
+    int is_brk  = (txt && strstr(txt, "__DAP_BRK__"))  ? 1 : 0;
+    if (is_step || is_brk) {
         d->record_stop_from_break_text(txt);
-        dict body = { "reason": "breakpoint", "threadId": 1 };
-        d->send_event("stopped", body);
+        /* Raw event — reason must be the correct DAP string */
+        char json_buf[256];
+        snprintf(json_buf, sizeof(json_buf),
+            "{\"seq\":%d,\"type\":\"event\",\"event\":\"stopped\","
+            "\"body\":{\"reason\":\"%s\",\"threadId\":1}}",
+            d->next_seq(), is_step ? "step" : "breakpoint");
+        dap_send_message(d->write_fp, json_buf);
         if (dap_logger_fd >= 0)
-            dprintf(dap_logger_fd, "DAP stopped at %s:%d waiting for resume\n",
+            dprintf(dap_logger_fd, "DAP stopped (%s) at %s:%d waiting for resume\n",
+                    is_step ? "step" : "breakpoint",
                     (char *)d->stop_file, d->stop_line);
         while (1) {
             char *m = dap_read_message(d->client_fd);
@@ -564,16 +611,30 @@ static void dap_out_cb(void *u, char *cat, char *txt) {
                 dap_signal_child_resume('c');
                 break;
             }
+            /* Copy command name BEFORE dispatch/free — json() strings may
+               alias into the message buffer and free(m) would UAF. */
+            char cmd_copy[64];
+            cmd_copy[0] = '\0';
             dict pp = json(m);
-            char *cc = 0;
-            if (pp != 0) cc = (char *)pp.command;
+            if (pp != 0) {
+                char *cc = (char *)pp.command;
+                if (cc) {
+                    int i = 0;
+                    while (cc[i] && i < 63) {
+                        cmd_copy[i] = cc[i];
+                        i = i + 1;
+                    }
+                    cmd_copy[i] = '\0';
+                }
+            }
             int rr = d->dispatch_message(m);
             free(m);
-            if (cc && (strcmp(cc, "continue") == 0
-                       || strcmp(cc, "next") == 0
-                       || strcmp(cc, "stepIn") == 0
-                       || strcmp(cc, "stepOver") == 0)) {
-                dap_signal_child_resume(dap_resume_cmd_for(cc));
+            if (cmd_copy[0] && (strcmp(cmd_copy, "continue") == 0
+                       || strcmp(cmd_copy, "next") == 0
+                       || strcmp(cmd_copy, "stepIn") == 0
+                       || strcmp(cmd_copy, "stepOver") == 0
+                       || strcmp(cmd_copy, "stepOut") == 0)) {
+                dap_signal_child_resume(dap_resume_cmd_for(cmd_copy));
                 break;
             }
             if (rr == 1) { /* disconnect */
@@ -662,35 +723,30 @@ int dap_main(RunConfig *cfg) {
         dap_clear_bp_file();
         dap->seq = 1;
         dap->is_stopped = 0;
+        dap->launch_received = 0;
+        dap->config_done_received = 0;
 
-        /* ── DAP handshake: process messages until we get 'launch' ── */
-        int launched = 0;
-        while (!launched && dap->state != 5) {
+        /* ── DAP handshake: wait for launch AND configurationDone ──
+           Order varies by client:
+             Zed/VS Code: launch → setBreakpoints → configurationDone
+             some tests:  configurationDone → launch
+           Either way we must not start the debuggee early. */
+        while (!dap->ready_to_run() && dap->state != 5) {
             char *msg = dap_read_message(dap->client_fd);
             if (!msg) {
                 term_print_warn("DAP client disconnected during handshake");
                 break;
             }
 
-            /* Peek at the command to detect 'launch' */
-            dict parsed = json(msg);
-            char *command = (char *)0;
-            if (parsed != 0)
-                command = (char *)parsed.command;
-
             int result = dap->dispatch_message(msg);
             free(msg);
 
             if (result < 0 || result == 1)
                 break;  /* error or disconnect */
-
-            /* After 'launch' is handled, the program path is set */
-            if (command && strcmp(command, "launch") == 0)
-                launched = 1;
         }
 
-        if (!launched) {
-            /* Client disconnected before launching — reset and wait */
+        if (!dap->ready_to_run()) {
+            /* Client disconnected before launch+configDone — reset and wait */
             dap->state = 0;
             continue;
         }
@@ -930,30 +986,30 @@ int dap_stdio_main(RunConfig *cfg) {
     dap->verbose = cfg->verbose;
     dap->init_stdio(dap_out);
     dap_clear_bp_file();
+    dap->launch_received = 0;
+    dap->config_done_received = 0;
 
-    /* DAP handshake: process messages until we get 'launch' */
-    int launched = 0;
-    while (!launched && dap->state != 5) {
+    /* DAP handshake: wait for BOTH launch and configurationDone.
+       Clients set breakpoints between these; starting early skips them. */
+    while (!dap->ready_to_run() && dap->state != 5) {
         char *msg = dap_read_message(0);  /* read from stdin */
         if (!msg) break;
-
-        dict parsed = json(msg);
-        char *command = (char *)0;
-        if (parsed != 0)
-            command = (char *)parsed.command;
 
         int result = dap->dispatch_message(msg);
         free(msg);
 
         if (result < 0 || result == 1) break;
-
-        if (command && strcmp(command, "launch") == 0)
-            launched = 1;
     }
+
+    if (dap_logger_fd >= 0)
+        dprintf(dap_logger_fd,
+                "stdio handshake done: ready=%d launch=%d configDone=%d state=%d\n",
+                dap->ready_to_run(), dap->launch_received,
+                dap->config_done_received, dap->state);
 
     int exit_code = 0;
 
-    if (!launched) {
+    if (!dap->ready_to_run()) {
         exit_code = 1;
     } else {
         /* Run the program */
