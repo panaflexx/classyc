@@ -145,6 +145,11 @@ class DapServer {
     int   verbose;
     int   stdio_p;     /* 1 = stdin/stdout mode (no TCP)            */
     String program_path;
+    /* Last stop location (from __DAP_BRK__ child notification) */
+    String stop_file;
+    int    stop_line;
+    int    stop_col;
+    int    is_stopped;
 
     DapServer(int port) {
         this.listen_fd    = -1;
@@ -156,6 +161,10 @@ class DapServer {
         this.verbose      = 0;
         this.stdio_p      = 0;
         this.program_path = "";
+        this.stop_file    = "";
+        this.stop_line    = 0;
+        this.stop_col     = 0;
+        this.is_stopped   = 0;
     }
 
     ~DapServer() {
@@ -291,16 +300,12 @@ class DapServer {
         }
 
     void handle_threads(int req_seq) {
-            dict body = { "threads": 0 };
-            dict resp = {
-                "seq": this->next_seq(),
-                "type": "response",
-                "request_seq": req_seq,
-                "command": "threads",
-                "success": true
-            };
-            resp.body = body;
-            dap_send_dict(this.write_fp, resp);
+            /* Emit a real threads array via raw JSON (dict has no array type) */
+            char json_buf[512];
+            snprintf(json_buf, sizeof(json_buf),
+                "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"threads\",\"success\":true,\"body\":{\"threads\":[{\"id\":1,\"name\":\"main\"}]}}",
+                this->next_seq(), req_seq);
+            dap_send_message(this->write_fp, json_buf);
         }
 
         void handle_disconnect(int req_seq) {
@@ -313,19 +318,47 @@ class DapServer {
             };
             dap_send_dict(this.write_fp, resp);
             this.state = 5;
+            this.is_stopped = 0;
         }
 
         void handle_set_breakpoints(int req_seq) {
-            dict body = { "breakpoints": 0 };
-            dict resp = {
-                "seq": this->next_seq(),
-                "type": "response",
-                "request_seq": req_seq,
-                "command": "setBreakpoints",
-                "success": true
-            };
-            resp.body = body;
-            dap_send_dict(this.write_fp, resp);
+            FILE *ff = fopen("/tmp/classyc-dap-bps.txt","w");
+            if (ff) fclose(ff);
+            char json_buf[256];
+            snprintf(json_buf, sizeof(json_buf),
+                "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"setBreakpoints\",\"success\":true,\"body\":{\"breakpoints\":[]}}",
+                this->next_seq(), req_seq);
+            dap_send_message(this->write_fp, json_buf);
+        }
+
+        void handle_set_breakpoints_raw(int req_seq, char *raw_json) {
+            char src_path[1024]; src_path[0]='\0';
+            /* crude parse: find "path":"..." */
+            char *pp = strstr(raw_json, "\"path\"");
+            if (pp) { char *colon = strchr(pp, ':'); if (colon) { char *q1=strchr(colon,'"'); if(q1){ char *q2=strchr(q1+1,'"'); if(q2){ int len=q2-(q1+1); if(len>0 && len<1023){ strncpy(src_path, q1+1, len); src_path[len]='\0'; } } } } }
+            FILE *f = fopen("/tmp/classyc-dap-bps.txt","w");
+            int count=0;
+            int first_line=0;
+            /* find all "line":<num> */
+            char *p = raw_json;
+            while ((p = strstr(p, "\"line\"")) != NULL) {
+                p+=6;
+                char *c=strchr(p, ':'); if(!c) break; p=c+1; while(*p==' '||*p=='\t') p++; int l=atoi(p); if(l>0){ if(f) fprintf(f,"%s:%d\n", src_path[0]?src_path:"?", l); if(count==0) first_line=l; count++; }
+            }
+            if (f) fclose(f);
+            if (dap_logger_fd>=0) dprintf(dap_logger_fd, "setBreakpoints src=%s count=%d first=%d raw=%.200s\n", src_path, count, first_line, raw_json);
+            char json_buf[4096];
+            if (count>0) {
+                /* report each verified breakpoint line (first is enough for many clients) */
+                snprintf(json_buf, sizeof(json_buf),
+                    "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"setBreakpoints\",\"success\":true,\"body\":{\"breakpoints\":[{\"id\":1,\"verified\":true,\"line\":%d}]}}",
+                    this->next_seq(), req_seq, first_line>0?first_line:2);
+            } else {
+                snprintf(json_buf, sizeof(json_buf),
+                    "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"setBreakpoints\",\"success\":true,\"body\":{\"breakpoints\":[]}}",
+                    this->next_seq(), req_seq);
+            }
+            dap_send_message(this->write_fp, json_buf);
         }
 
         void handle_continue(int req_seq) {
@@ -340,20 +373,57 @@ class DapServer {
             resp.body = body;
             dap_send_dict(this.write_fp, resp);
             this.state = 3;
+            this.is_stopped = 0;
         }
 
         void handle_stack_trace(int req_seq) {
-            dict body = { "stackFrames": 0, "totalFrames": 0 };
-            dict resp = {
-                "seq": this->next_seq(),
-                "type": "response",
-                "request_seq": req_seq,
-                "command": "stackTrace",
-                "success": true
-            };
-            resp.body = body;
-            fprintf(stderr, f"{(String)body}");
-            dap_send_dict(this.write_fp, resp);
+            char json_buf[2048];
+            if (this.is_stopped && this.stop_line > 0) {
+                char *sf = (char *)this.stop_file;
+                if (!sf) sf = "";
+                /* Escape only what we need — paths rarely contain quotes */
+                snprintf(json_buf, sizeof(json_buf),
+                    "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"stackTrace\",\"success\":true,"
+                    "\"body\":{\"stackFrames\":[{\"id\":1,\"name\":\"main\",\"line\":%d,\"column\":%d,"
+                    "\"source\":{\"name\":\"%s\",\"path\":\"%s\"}}],\"totalFrames\":1}}",
+                    this->next_seq(), req_seq, this.stop_line,
+                    this.stop_col > 0 ? this.stop_col : 1,
+                    sf, sf);
+            } else {
+                snprintf(json_buf, sizeof(json_buf),
+                    "{\"seq\":%d,\"type\":\"response\",\"request_seq\":%d,\"command\":\"stackTrace\",\"success\":true,"
+                    "\"body\":{\"stackFrames\":[],\"totalFrames\":0}}",
+                    this->next_seq(), req_seq);
+            }
+            dap_send_message(this->write_fp, json_buf);
+        }
+
+        /* Record stop location from a "__DAP_BRK__ file:line:col" child note */
+        void record_stop_from_break_text(char *txt) {
+            this.is_stopped = 1;
+            this.stop_line = 0;
+            this.stop_col = 0;
+            this.stop_file = "";
+            if (!txt) return;
+            char *p = strstr(txt, "__DAP_BRK__");
+            if (!p) return;
+            p = p + 11; /* skip marker */
+            while (*p == ' ' || *p == '\t') p++;
+            char filebuf[1024];
+            int i = 0;
+            while (*p && *p != ':' && i < 1023) {
+                filebuf[i] = *p;
+                i = i + 1;
+                p = p + 1;
+            }
+            filebuf[i] = '\0';
+            if (*p == ':') {
+                p = p + 1;
+                this.stop_line = atoi(p);
+                char *c2 = strchr(p, ':');
+                if (c2) this.stop_col = atoi(c2 + 1);
+            }
+            if (filebuf[0]) this.stop_file = filebuf;
         }
 
     /* ── Dispatch ────────────────────────────────────────────────── */
@@ -393,7 +463,7 @@ class DapServer {
                 this->handle_disconnect(req_seq);
                 return 1;
             } else if (strcmp(command, "setBreakpoints") == 0) {
-                this->handle_set_breakpoints(req_seq);
+                this->handle_set_breakpoints_raw(req_seq, json_str);
             } else if (strcmp(command, "continue") == 0) {
                 this->handle_continue(req_seq);
             } else if (strcmp(command, "stackTrace") == 0) {

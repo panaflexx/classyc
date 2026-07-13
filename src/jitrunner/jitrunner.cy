@@ -91,6 +91,10 @@ extern void        jit_link(JIT_context ctx, int mode);
 extern void       *jit_get_func_addr(JIT_item item);
 extern void       *jit_gen_func(JIT_context ctx, JIT_item item);
 
+/* Cooperative interp debug control-pipe endpoints (defined in mir-bridge.c) */
+extern int g_interp_child_ctrl_fd_from_env;
+extern int g_dap_ctrl_write_fd;
+
 /* ═══════════════════════════════════════════════════════════════════════
    RunConfig — parsed command-line options
    ═══════════════════════════════════════════════════════════════════════ */
@@ -200,6 +204,19 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb,
     }
 
     if (pid == 0) {
+        /* child - log env for debugging */
+        {
+            char *e = getenv("CLASSYC_DEBUG_BPS");
+            char *e2 = getenv("CLASSYC_DEBUG_CTRL_FD");
+            fprintf(stderr, "CHILD ENV BPS=%s CTRL=%s mode=%d\n", e?e:"NULL", e2?e2:"NULL", jit_mode); fflush(stderr);
+            if (dap_logger_fd>=0) dprintf(dap_logger_fd, "CHILD ENV BPS=%s CTRL=%s mode=%d\n", e?e:"NULL", e2?e2:"NULL", jit_mode);
+        }
+        /* Child only needs the control-pipe READ end.  Closing the write
+           end ensures parent-death → EOF on the child's read. */
+        if (g_dap_ctrl_write_fd >= 0) {
+            close(g_dap_ctrl_write_fd);
+            g_dap_ctrl_write_fd = -1;
+        }
         /* ── child process ──────────────── */
         if (out_cb) {
             /* Redirect stdout(1)/stderr(2) to the pipe write ends so the parent
@@ -249,6 +266,7 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb,
         }
 
         jit_gen_init(ctx);
+        if(jit_mode==2){ char *bp=getenv("CLASSYC_DEBUG_BPS"); if(bp&&bp[0]){ extern void *jit_interp_dbg_new(void); extern int jit_interp_dbg_add_bp(void *st,char *file,int line); extern void jit_interp_dbg_set_state(void *st); extern void jit_interp_dbg_set_break_cb(void *st,void *cb,void *user); extern void interp_child_on_break_simple(void *u,void *f,int fid,int l,int c); int fd=open(bp,0,0); if(fd>=0){ void *dbg=jit_interp_dbg_new(); char bbuf[8192]; long rn=read(fd,bbuf,sizeof(bbuf)-1); if (dap_logger_fd>=0) dprintf(dap_logger_fd,"CHILD loading bps file %s fd=%d\n", bp, fd); close(fd); if(rn>0){ bbuf[rn]='\0'; char *q=bbuf; while(*q){ char *nl=strchr(q,'\n'); if(nl) *nl='\0'; char *cc=strrchr(q,':'); if(cc){ *cc='\0'; int ll=atoi(cc+1); if(ll>0){ if(dap_logger_fd>=0) dprintf(dap_logger_fd,"CHILD add bp %s:%d\n", q, ll); jit_interp_dbg_add_bp(dbg,q,ll); }} if(!nl) break; q=nl+1; } } jit_interp_dbg_set_break_cb(dbg,(void*)interp_child_on_break_simple,(void*)ctx); jit_interp_dbg_set_state(dbg); } } }
         jit_link(ctx, jit_mode);
 
         void *addr = jit_get_func_addr(main_func);
@@ -273,6 +291,12 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb,
     /* ── parent process ───────────────────────── */
     int out_r = out_pipe[0];
     int err_r = err_pipe[0];
+
+    /* Parent only needs the control-pipe WRITE end. */
+    if (g_interp_child_ctrl_fd_from_env >= 0) {
+        close(g_interp_child_ctrl_fd_from_env);
+        g_interp_child_ctrl_fd_from_env = -1;
+    }
 
     if (out_cb) {
         /* Close the write ends in the parent so the read ends see EOF once the
@@ -470,11 +494,159 @@ void print_run_result(RunResult *r);
      5. On disconnect: close the client, go back to step 2
    ═══════════════════════════════════════════════════════════════════════ */
 
+extern int open(char *path, int flags, ...);
+#define O_WRONLY_J 1
+#define O_CREAT_J 64
+#define O_APPEND_J 1024
+extern char *getenv(char *name);
+extern int setenv(char *name, char *value, int overwrite);
+extern int unsetenv(char *name);
+/* POSIX write(2) — named carefully so ClassyC doesn't collide with File::write */
+extern long write(int fd, void *buf, long count);
+
+/* Write a single resume command to the waiting debuggee child.
+   cmd: 'c' continue, 's' stepIn, 'n' next/stepOver. */
+static void dap_signal_child_resume(char cmd) {
+    if (g_dap_ctrl_write_fd < 0) return;
+    char c = cmd;
+    while (1) {
+        long n = write(g_dap_ctrl_write_fd, (void *)&c, 1);
+        if (n == 1) break;
+        if (n < 0) {
+            int e = *__errno_location();
+            if (e == 4 /* EINTR */) continue;
+        }
+        break;
+    }
+}
+
+/* Clear leftover breakpoint state at the start of a DAP session. */
+static void dap_clear_bp_file(void) {
+    FILE *f = fopen("/tmp/classyc-dap-bps.txt", "w");
+    if (f) fclose(f);
+}
+
+/* True if /tmp/classyc-dap-bps.txt contains at least one breakpoint. */
+static int dap_has_breakpoints(void) {
+    FILE *bf = fopen("/tmp/classyc-dap-bps.txt", "r");
+    if (!bf) return 0;
+    char t[2];
+    int has = (fread(t, 1, 1, bf) > 0) ? 1 : 0;
+    fclose(bf);
+    return has;
+}
+
+/* Map a DAP resume command name to the single-byte child control code. */
+static char dap_resume_cmd_for(char *command) {
+    if (!command) return 'c';
+    if (strcmp(command, "next") == 0) return 'n';
+    if (strcmp(command, "stepIn") == 0) return 's';
+    if (strcmp(command, "stepOver") == 0) return 'n';
+    return 'c';
+}
+
+/* Output callback used while a DAP session is running a program.
+   Intercepts __DAP_BRK__ lines from the child, emits 'stopped',
+   then blocks reading DAP until the client continues / steps / disconnects. */
+static void dap_out_cb(void *u, char *cat, char *txt) {
+    DapServer *d = (DapServer *)u;
+    if (txt && strstr(txt, "__DAP_BRK__")) {
+        d->record_stop_from_break_text(txt);
+        dict body = { "reason": "breakpoint", "threadId": 1 };
+        d->send_event("stopped", body);
+        if (dap_logger_fd >= 0)
+            dprintf(dap_logger_fd, "DAP stopped at %s:%d waiting for resume\n",
+                    (char *)d->stop_file, d->stop_line);
+        while (1) {
+            char *m = dap_read_message(d->client_fd);
+            if (!m) {
+                /* client gone — wake child so it can exit */
+                dap_signal_child_resume('c');
+                break;
+            }
+            dict pp = json(m);
+            char *cc = 0;
+            if (pp != 0) cc = (char *)pp.command;
+            int rr = d->dispatch_message(m);
+            free(m);
+            if (cc && (strcmp(cc, "continue") == 0
+                       || strcmp(cc, "next") == 0
+                       || strcmp(cc, "stepIn") == 0
+                       || strcmp(cc, "stepOver") == 0)) {
+                dap_signal_child_resume(dap_resume_cmd_for(cc));
+                break;
+            }
+            if (rr == 1) { /* disconnect */
+                dap_signal_child_resume('c');
+                break;
+            }
+        }
+        return;
+    }
+    d->send_output(cat, txt);
+}
+
+/* Run a .bmir under an active DAP session, optionally with breakpoints.
+   Returns heap RunResult* (caller deletes).  Mutates cfg->jit_mode to
+   interp when breakpoints are active. */
+static RunResult *dap_run_program(DapServer *dap, RunConfig *cfg, char *bmir_path) {
+    int ctrl_pipe[2];
+    ctrl_pipe[0] = -1;
+    ctrl_pipe[1] = -1;
+    int has_bps = dap_has_breakpoints();
+    if (dap_logger_fd >= 0)
+        dprintf(dap_logger_fd, "DAP has_bps=%d mode=%d\n", has_bps, cfg->jit_mode);
+
+    if (has_bps && pipe(ctrl_pipe) == 0) {
+        /* Close write end in child / read end in parent is soft hygiene;
+           we keep the full dual open across fork and just wire globals. */
+        g_interp_child_ctrl_fd_from_env = ctrl_pipe[0];
+        g_dap_ctrl_write_fd = ctrl_pipe[1];
+        char fd_str[32];
+        sprintf(fd_str, "%d", ctrl_pipe[0]);
+        int r1 = setenv("CLASSYC_DEBUG_BPS", "/tmp/classyc-dap-bps.txt", 1);
+        int r2 = setenv("CLASSYC_DEBUG_CTRL_FD", fd_str, 1);
+        if (dap_logger_fd >= 0)
+            dprintf(dap_logger_fd,
+                    "DAP setenv BPS=%d CTRL=%d fd_str=%s read=%d write=%d\n",
+                    r1, r2, fd_str, ctrl_pipe[0], ctrl_pipe[1]);
+        /* Breakpoints require the MIR interpreter path */
+        if (cfg->jit_mode != 2) cfg->jit_mode = 2;
+    } else {
+        unsetenv("CLASSYC_DEBUG_BPS");
+        unsetenv("CLASSYC_DEBUG_CTRL_FD");
+        g_interp_child_ctrl_fd_from_env = -1;
+        g_dap_ctrl_write_fd = -1;
+    }
+
+    dap->on_pre_run(bmir_path);
+    RunResult *result = run_bmir(bmir_path, cfg->jit_mode, cfg->verbose,
+                                 dap_out_cb, (void *)dap);
+
+    /* run_bmir parent path may already have closed the read end and
+       cleared g_interp_child_ctrl_fd_from_env — avoid double-close. */
+    if (ctrl_pipe[0] >= 0 && g_interp_child_ctrl_fd_from_env == ctrl_pipe[0])
+        close(ctrl_pipe[0]);
+    g_interp_child_ctrl_fd_from_env = -1;
+    if (ctrl_pipe[1] >= 0) {
+        if (g_dap_ctrl_write_fd == ctrl_pipe[1]) close(ctrl_pipe[1]);
+        g_dap_ctrl_write_fd = -1;
+    }
+    unsetenv("CLASSYC_DEBUG_BPS");
+    unsetenv("CLASSYC_DEBUG_CTRL_FD");
+    dap->is_stopped = 0;
+    return result;
+}
+
 int dap_main(RunConfig *cfg) {
+    char *logp = getenv("CLASSYC_DAP_LOG");
+    if (!logp && cfg->verbose) logp = "dapdebug.log";
+    if (logp) { int fd=open(logp, O_WRONLY_J|O_CREAT_J|O_APPEND_J, 420); if(fd>=0){ dap_logger_fd=fd; dprintf(fd,"\n=== DAP start port=%d ===\n", cfg->dap_port);} }
     DapServer *dap = new DapServer(cfg->dap_port);
     defer delete dap;
 
     dap->verbose = cfg->verbose;
+    dap_clear_bp_file();
 
     if (dap->start() < 0)
         return 1;
@@ -485,6 +657,11 @@ int dap_main(RunConfig *cfg) {
             term_print_err("failed to accept DAP client");
             continue;
         }
+
+        /* Fresh session: drop leftover breakpoints from a prior client */
+        dap_clear_bp_file();
+        dap->seq = 1;
+        dap->is_stopped = 0;
 
         /* ── DAP handshake: process messages until we get 'launch' ── */
         int launched = 0;
@@ -520,6 +697,11 @@ int dap_main(RunConfig *cfg) {
 
         /* ── Run the program ─────────────────────────────────────── */
         char *bmir_path = (char *)dap->program_path;
+        /* Fall back to CLI-provided path if launch omitted "program" */
+        if ((!bmir_path || strlen(bmir_path) == 0) && strlen(cfg->bmir_path) > 0) {
+            dap->program_path = cfg->bmir_path;
+            bmir_path = (char *)dap->program_path;
+        }
 
         /* If program_path is empty, nothing to run */
         if (!bmir_path || strlen(bmir_path) == 0) {
@@ -529,31 +711,18 @@ int dap_main(RunConfig *cfg) {
 
             dap->send_event("exited", exit_body);
             dap->send_event_simple("terminated");
+        } else if (!File.exists(bmir_path)) {
+            String errmsg = f"[jitrunner] error: {bmir_path} not found\n";
+            dap->send_output("stderr", (char *)errmsg);
+            dict exit_body2 = {"exitCode": 1};
+
+            dap->send_event("exited", exit_body2);
+            dap->send_event_simple("terminated");
         } else {
-            /* Check the file exists */
-            if (!File.exists(bmir_path)) {
-                String errmsg = f"[jitrunner] error: {bmir_path} not found\n";
-                dap->send_output("stderr", (char *)errmsg);
-                dict exit_body2 = {"exitCode": 1};
-
-                dap->send_event("exited", exit_body2);
-                dap->send_event_simple("terminated");
-            } else {
-                dap->on_pre_run(bmir_path);
-
-                /* Fork + JIT + run */
-                RunResult *result = run_bmir(bmir_path, cfg->jit_mode, cfg->verbose,
-                    (void *u, char *cat, char *txt) => { ((DapServer*)u)->send_output(cat, txt); },
-                    (void *)dap);
-
-                /* Print locally too */
-                print_run_result(result);
-
-                /* Send DAP events */
-                dap->on_post_run(result->exit_code, result->signal_num);
-
-                delete result;
-            }
+            RunResult *result = dap_run_program(dap, cfg, bmir_path);
+            print_run_result(result);
+            dap->on_post_run(result->exit_code, result->signal_num);
+            delete result;
         }
 
         /* ── Post-run: drain remaining messages (disconnect, etc.) ── */
@@ -731,6 +900,21 @@ RunConfig *parse_args(int argc, char **argv) {
    ═════════════════════════════════════════════════════════════════════ */
 
 int dap_stdio_main(RunConfig *cfg) {
+    /* Prefer CLASSYC_DAP_LOG; open only if not already opened by main(). */
+    if (dap_logger_fd < 0) {
+        char *logp2 = getenv("CLASSYC_DAP_LOG");
+        if (!logp2 && cfg->verbose) logp2 = "dapdebug.log";
+        if (logp2) {
+            int fd = open(logp2, O_WRONLY_J | O_CREAT_J | O_APPEND_J, 420);
+            if (fd >= 0) {
+                dap_logger_fd = fd;
+                dprintf(fd, "\n=== DAP stdio start ===\n");
+            }
+        }
+    } else {
+        dprintf(dap_logger_fd, "\n=== DAP stdio start ===\n");
+    }
+
     /* Save original stdout for DAP output, then redirect stdout
        to stderr so any printf/child output doesn't corrupt DAP. */
     int dap_out_fd = dup(1);
@@ -745,6 +929,7 @@ int dap_stdio_main(RunConfig *cfg) {
     DapServer *dap = new DapServer(0);
     dap->verbose = cfg->verbose;
     dap->init_stdio(dap_out);
+    dap_clear_bp_file();
 
     /* DAP handshake: process messages until we get 'launch' */
     int launched = 0;
@@ -773,6 +958,10 @@ int dap_stdio_main(RunConfig *cfg) {
     } else {
         /* Run the program */
         char *bmir_path = (char *)dap->program_path;
+        if ((!bmir_path || strlen(bmir_path) == 0) && strlen(cfg->bmir_path) > 0) {
+            dap->program_path = cfg->bmir_path;
+            bmir_path = (char *)dap->program_path;
+        }
 
         if (!bmir_path || strlen(bmir_path) == 0) {
             dap->send_output("stderr",
@@ -791,10 +980,7 @@ int dap_stdio_main(RunConfig *cfg) {
             dap->send_event_simple("terminated");
             exit_code = 1;
         } else {
-            dap->on_pre_run(bmir_path);
-            RunResult *result = run_bmir(bmir_path, cfg->jit_mode, cfg->verbose,
-                (void *u, char *cat, char *txt) => { ((DapServer*)u)->send_output(cat, txt); },
-                (void *)dap);
+            RunResult *result = dap_run_program(dap, cfg, bmir_path);
             dap->on_post_run(result->exit_code, result->signal_num);
             exit_code = result->exit_code;
             delete result;
@@ -860,12 +1046,14 @@ int main(int argc, char **argv) {
     /* Skip the banner — stdout is the DAP channel, not a terminal. */
 
     if (cfg->dap_stdio) {
-        /* Open a debug log for all DAP wire traffic (both directions) */
-        dap_logger_fd = open("dapdebug.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (dap_logger_fd < 0) {
-            /* non-fatal: continue without logging */
-            dap_logger_fd = -1;
-        } else {
+        /* Optional debug log for wire traffic.  Always-on default path keeps
+           editor sessions inspectable; override/disable with CLASSYC_DAP_LOG="".
+           Use the same open flags as the rest of the DAP code. */
+        char *logp = getenv("CLASSYC_DAP_LOG");
+        if (!logp) logp = "dapdebug.log";
+        if (logp[0]) {
+            dap_logger_fd = open(logp, O_WRONLY_J | O_CREAT_J | O_APPEND_J, 0644);
+            if (dap_logger_fd < 0) dap_logger_fd = -1;
         }
         return dap_stdio_main(cfg);
     }
