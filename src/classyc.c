@@ -3048,6 +3048,11 @@ static void find_args (c2m_ctx_t c2m_ctx, macro_call_t mc) { /* we have just rea
       VARR_DESTROY (token_t, temp_arr);
     }
     error (c2m_ctx, t->pos, "too many args for call of macro %s", m->id->repr);
+  } else if (VARR_LENGTH (token_arr_t, args) == params_len - 1 && params_len > 0
+             && VARR_GET (token_t, m->params, params_len - 1)->code == T_DOTS) {
+    /* GCC: allow empty __VA_ARGS__ when the only missing arg is ... */
+    VARR_CREATE (token_t, arg, alloc, 16);
+    VARR_PUSH (token_arr_t, args, arg);
   } else if (VARR_LENGTH (token_arr_t, args) < params_len) {
     for (; VARR_LENGTH (token_arr_t, args) < params_len;) {
       VARR_CREATE (token_t, arg, alloc, 16);
@@ -3068,6 +3073,12 @@ static token_t token_concat (c2m_ctx_t c2m_ctx, token_t t1, token_t t2) {
   set_string_stream (c2m_ctx, VARR_ADDR (char, temp_string), t1->pos, NULL);
   t = get_next_pptoken (c2m_ctx);
   next = get_next_pptoken (c2m_ctx);
+  /* GCC: if ## does not form a single valid token (e.g. ,##_rc → "," + "_rc"),
+     return NULL so do_concat just drops the ## (paste-failed but kept tokens). */
+  if (next->code != T_EOU && next->code != T_EOFILE) {
+    t = NULL;
+    next = get_next_pptoken (c2m_ctx);
+  }
   while (next->code == T_EOU) next = get_next_pptoken (c2m_ctx);
   if (next->code != T_EOFILE) {
     error (c2m_ctx, t1->pos, "wrong result of ##: %s", reverse (temp_string));
@@ -3123,6 +3134,8 @@ static VARR (token_t) * do_concat (c2m_ctx_t c2m_ctx, VARR (token_t) * tokens) {
         j++;
       if (VARR_GET (token_t, tokens, k)->code == ' ' || VARR_GET (token_t, tokens, k)->code == '\n')
         k--;
+      if (k < 0) error (c2m_ctx, t->pos, "## requires token before");
+      if (j >= len) error (c2m_ctx, t->pos, "## requires token after");
       assert (k >= 0 && j < len);
       empty_j_p = VARR_GET (token_t, tokens, j)->code == T_PLM;
       empty_k_p = VARR_GET (token_t, tokens, k)->code == T_PLM;
@@ -3148,8 +3161,13 @@ static VARR (token_t) * do_concat (c2m_ctx_t c2m_ctx, VARR (token_t) * tokens) {
         }
       } else {
         t = token_concat (c2m_ctx, VARR_GET (token_t, tokens, k), VARR_GET (token_t, tokens, j));
-        del_tokens (tokens, k + 1, j - k);
-        VARR_SET (token_t, tokens, k, t);
+        /* NULL: paste did not form one token — drop ## only (GCC-style). */
+        if (t == NULL) {
+          del_tokens (tokens, i, 1);
+        } else {
+          del_tokens (tokens, k + 1, j - k);
+          VARR_SET (token_t, tokens, k, t);
+        }
       }
       i = k;
       len = (int) VARR_LENGTH (token_t, tokens);
@@ -3162,10 +3180,12 @@ static void process_replacement (c2m_ctx_t c2m_ctx, macro_call_t mc) {
   macro_t m;
   token_t t, *m_repl;
   VARR (token_t) * arg;
-  int i, m_repl_len, sharp_pos, copy_p;
+  int i, m_repl_len, sharp_pos, copy_p, comma_pos, sharp_sharp_pos;
 
   m = mc->macro;
   sharp_pos = -1;
+  comma_pos = -1;
+  sharp_sharp_pos = -1;
   m_repl = VARR_ADDR (token_t, m->replacement);
   m_repl_len = (int) VARR_LENGTH (token_t, m->replacement);
   for (;;) {
@@ -3200,6 +3220,13 @@ static void process_replacement (c2m_ctx_t c2m_ctx, macro_call_t mc) {
             VARR_POP (token_t, arg);
           t = token_stringify (c2m_ctx, mc->macro->id, arg);
           copy_p = FALSE;
+        } else if (sharp_sharp_pos >= 0 && comma_pos >= 0 && sharp_sharp_pos > comma_pos
+                   && VARR_LENGTH (token_t, m->params) > 0
+                   && VARR_LAST (token_t, m->params)->code == T_DOTS
+                   && VARR_LENGTH (token_t, arg) == 0) {
+          /* GCC: empty ,##__VA_ARGS__ eats the preceding comma. */
+          del_tokens (mc->repl_buffer, comma_pos, -1);
+          continue;
         } else if ((mc->repl_pos >= 2 && m_repl[mc->repl_pos - 2]->code == T_RDBLNO)
                    || (mc->repl_pos >= 3 && m_repl[mc->repl_pos - 2]->code == ' '
                        && m_repl[mc->repl_pos - 3]->code == T_RDBLNO)
@@ -3229,10 +3256,20 @@ static void process_replacement (c2m_ctx_t c2m_ctx, macro_call_t mc) {
           return;
         }
       }
+    } else if (t->code == ',') {
+      comma_pos = (int) VARR_LENGTH (token_t, mc->repl_buffer);
+      sharp_pos = -1;
+      sharp_sharp_pos = -1;
+    } else if (t->code == T_RDBLNO) {
+      sharp_sharp_pos = (int) VARR_LENGTH (token_t, mc->repl_buffer);
+      sharp_pos = -1;
     } else if (t->code == '#') {
       sharp_pos = (int) VARR_LENGTH (token_t, mc->repl_buffer);
+      sharp_sharp_pos = -1;
     } else if (t->code != ' ') {
       sharp_pos = -1;
+      sharp_sharp_pos = -1;
+      comma_pos = -1;
     }
     if (copy_p) t = copy_token (c2m_ctx, t, mc->pos);
     add_token (mc->repl_buffer, t);
