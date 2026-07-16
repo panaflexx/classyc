@@ -392,3 +392,37 @@ Flags: `GEN_SAFE_SKIP_NULL` / `GEN_SAFE_SKIP_OOB` on
 
 Validate: **52 / 0 / 0**. list-sum MIR ~2526 insns / 420 calls (slight drop from
 fewer null checks on stack `Count`/for-in).
+
+---
+
+## 12. Phase F — method-level midopt (no whole-class expand) (2026-07-16)
+
+Replaced **whole-class expand** (kept every method of a live monomorph) with:
+
+1. Free-func seed → worklist (same-class name fill-in)  
+2. Gen protocol stamps: for-in (skip if dense open-code), `class[i]` Get/GetMut,
+   `class[i]=` Set  
+3. Helper fill on live monomorphs only: `EnsureCapacity`, `init_storage`,
+   `grow_table`, `ensure_table`, `find_slot`, `find_index`, `destroy_*`, `Copy`,
+   `Clear`, `owns*`  
+4. Keep **all ctors/dtors** of any class that has ≥1 keep (delete/RAII paths)  
+5. **No** whole-class public-API expand  
+
+### list-sum impact (same machine)
+
+| Config | funcs | insns | calls | `.bmir` | methods kept/dead |
+|--------|------:|------:|------:|--------:|-------------------:|
+| **Starting** (`-fno-midopt`) | 147 | ~4728 | ~860 | **27 975** | all |
+| Phase B–E (class expand) | 81 | ~2529 | ~421 | ~18 6xx | 72 / 66 |
+| **Phase F (method-level)** | **22** | **507** | **59** | **5 252** | **13 / 125** |
+
+vs starting: **~6.7× fewer funcs**, **~9× fewer insns**, **~14× fewer calls**,
+**~5.3× smaller BMIR**.
+
+vs class-expand midopt: **~3.7× fewer funcs**, **~5× fewer insns**, **~7× fewer
+calls**, **~3.5× smaller BMIR**.
+
+Validate: **52 / 0 / 0**.
+
+ST2000 ticks/sec still noise-flat vs `-fno-midopt` (hot path uses many live
+methods). Compile/JIT graph size is the clear win.

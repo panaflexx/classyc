@@ -1,7 +1,7 @@
 /* src/midopt.c — Mid-level optimizer (check → gen) for ClassyC.
  *
- * STATUS: Phase B+C of GEN-OPT.md — method-level dead pruning, accessor
- * inline marks, P1 guard elision.
+ * STATUS: Phase B–E of GEN-OPT.md — method-level dead pruning (no whole-class
+ * expand), gen protocol stamps, accessor inline marks, P1 guard elision.
  *
  * Single-TU build model: this file is `#include`d from `src/classyc.c`
  * next to `ownership.c`, so it sees internal types (`c2m_ctx_t`, `node_t`,
@@ -13,9 +13,12 @@
  *                                 ^^^^^^^^
  *                                 this file
  *
- * Goals (Phase B):
+ * Goals:
  *   P0 — Mark unreachable *class methods* `midopt_dead_p` so gen skips
  *        bodies and MIR forwards. Free functions always stay (C linkage).
+ *        Reachability is method-level (free-func seed → worklist) plus
+ *        gen-time protocol stamps (for-in, class[i], helpers).  Whole-class
+ *        expand is NOT used (it pinned entire monomorph public APIs).
  *   P1 — Stamp `elide_oob_p` / expand `own_deref_class = SAFE` where
  *        trivial static facts make safety traps redundant.
  *
@@ -199,13 +202,16 @@ static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
       midopt_collect_uses (c2m_ctx, d->auto_release_call, class_tag);
   }
 
-  /* for-in over classes uses Count/Get (or KeyAt/ValAt) resolved only at gen
-     time — stamp them here so midopt does not prune the protocol. */
+  /* for-in over classes: gen may call Count/Get or KeyAt/ValAt, or open-code
+     dense field loads (List/Set data+length/dense+count, Map keys+vals+count).
+     Only stamp protocol methods when gen will actually call them. */
   if (n->code == N_FORIN) {
     node_t coll = NL_EL (n->u.ops, 3);
     struct expr *ce;
     struct type *ct, *cls;
     node_t tag, m;
+    decl_t arr_f, len_f, keys_f, vals_f, count_f;
+    int dense_list, dense_map;
 
     if (coll != NULL && coll->attr != NULL) {
       ce = (struct expr *) coll->attr;
@@ -220,15 +226,78 @@ static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
           cls = NULL;
         if (cls != NULL && cls->u.tag_type != NULL) {
           tag = cls->u.tag_type;
-          m = find_class_protocol_method (c2m_ctx, tag, "Count", 0, POS (n));
-          if (m) midopt_mark_keep (m);
-          m = find_class_protocol_method (c2m_ctx, tag, "Get", 1, POS (n));
-          if (m) midopt_mark_keep (m);
-          m = find_class_protocol_method (c2m_ctx, tag, "KeyAt", 1, POS (n));
-          if (m) midopt_mark_keep (m);
-          m = find_class_protocol_method (c2m_ctx, tag, "ValAt", 1, POS (n));
+          keys_f = find_class_field_by_name (tag, "keys");
+          vals_f = find_class_field_by_name (tag, "vals");
+          count_f = find_class_field_by_name (tag, "count");
+          dense_map = (count_f != NULL && keys_f != NULL && vals_f != NULL
+                       && keys_f->decl_spec.type != NULL
+                       && keys_f->decl_spec.type->mode == TM_PTR
+                       && vals_f->decl_spec.type != NULL
+                       && vals_f->decl_spec.type->mode == TM_PTR);
+          dense_list = !dense_map && find_dense_buffer_fields (tag, &arr_f, &len_f, NULL);
+          if (dense_list || dense_map) {
+            /* gen open-codes for-in — no Count/Get/KeyAt/ValAt MIR needed. */
+          } else {
+            m = find_class_protocol_method (c2m_ctx, tag, "Count", 0, POS (n));
+            if (m) midopt_mark_keep (m);
+            m = find_class_protocol_method (c2m_ctx, tag, "Get", 1, POS (n));
+            if (m) midopt_mark_keep (m);
+            m = find_class_protocol_method (c2m_ctx, tag, "KeyAt", 1, POS (n));
+            if (m) midopt_mark_keep (m);
+            m = find_class_protocol_method (c2m_ctx, tag, "ValAt", 1, POS (n));
+            if (m) midopt_mark_keep (m);
+          }
+        }
+      }
+    }
+  }
+
+  /* class[i] / class[k] lowers at gen to Get or GetMut (def_node / protocol). */
+  if (n->code == N_IND && n->attr != NULL && n->attr != (void *) ((intptr_t) -1)) {
+    struct expr *e = (struct expr *) n->attr;
+    node_t def = e->def_node;
+    if (def != NULL && def != (node_t) (intptr_t) 1 && def != (node_t) (intptr_t) 2
+        && def->code == N_FUNC_DEF)
+      midopt_mark_keep (def);
+    else if (e->type != NULL) {
+      node_t arr = NL_HEAD (n->u.ops);
+      struct expr *ae = arr != NULL ? arr->attr : NULL;
+      struct type *at = ae != NULL ? ae->type : NULL;
+      struct type *cls = NULL;
+      if (at != NULL && at->mode == TM_CLASS)
+        cls = at;
+      else if (at != NULL && at->mode == TM_PTR && at->u.ptr_type != NULL
+               && at->u.ptr_type->mode == TM_CLASS)
+        cls = at->u.ptr_type;
+      if (cls != NULL && cls->u.tag_type != NULL) {
+        node_t m;
+        const char *proto = e->mut_sub_p ? "GetMut" : "Get";
+        m = find_class_protocol_method (c2m_ctx, cls->u.tag_type, proto, 1, POS (n));
+        if (m) midopt_mark_keep (m);
+        if (e->mut_sub_p) {
+          m = find_class_protocol_method (c2m_ctx, cls->u.tag_type, "Get", 1, POS (n));
           if (m) midopt_mark_keep (m);
         }
+      }
+    }
+  }
+
+  /* class[i] = v / map[k] = v → Set protocol at gen. */
+  if (n->code == N_ASSIGN) {
+    node_t lhs = NL_HEAD (n->u.ops);
+    if (lhs != NULL && lhs->code == N_IND) {
+      node_t arr = NL_HEAD (lhs->u.ops);
+      struct expr *ae = arr != NULL ? arr->attr : NULL;
+      struct type *at = ae != NULL ? ae->type : NULL;
+      struct type *cls = NULL;
+      if (at != NULL && at->mode == TM_CLASS)
+        cls = at;
+      else if (at != NULL && at->mode == TM_PTR && at->u.ptr_type != NULL
+               && at->u.ptr_type->mode == TM_CLASS)
+        cls = at->u.ptr_type;
+      if (cls != NULL && cls->u.tag_type != NULL) {
+        node_t m = find_class_protocol_method (c2m_ctx, cls->u.tag_type, "Set", 2, POS (n));
+        if (m) midopt_mark_keep (m);
       }
     }
   }
@@ -333,11 +402,41 @@ static void midopt_elide_walk (c2m_ctx_t c2m_ctx, node_t n) {
     midopt_elide_walk (c2m_ctx, c);
 }
 
-/* Class-level completeness for monomorphs that already have ≥1 keep.
-   Method-level worklist is the seed; expand closes incomplete this→sibling
-   graphs that residual monomorph AST still emits.  Unused monomorphs stay
-   fully dead. */
-static void midopt_expand_class_keeps (c2m_ctx_t c2m_ctx, node_t n) {
+/* Private/collection helpers often lack def_node on monomorph paths.  When a
+   monomorph already has ≥1 kept method, keep known helper names so Add/Set/…
+   do not call midopt-dead MIR items.  Does NOT keep the whole public API. */
+static const char *const midopt_helper_names[] = {
+  "EnsureCapacity", "init_storage", "grow_table", "ensure_table", "find_slot",
+  "find_index", "destroy_key_at", "destroy_val_at", "Copy", "Clear", "owns",
+  "ownsValues", "ownsKeys", NULL
+};
+
+static void midopt_keep_helpers_on_class (c2m_ctx_t c2m_ctx, node_t class_tag, pos_t pos) {
+  size_t i;
+  if (class_tag == NULL || class_tag->code != N_CLASS) return;
+  for (i = 0; midopt_helper_names[i] != NULL; i++)
+    midopt_mark_named_on_class (c2m_ctx, class_tag, midopt_helper_names[i], pos);
+}
+
+/* Keep every constructor and destructor of a live class (delete / RAII / new
+   overload paths often miss def_node on sibling ctors/dtors). */
+static void midopt_keep_ctors_dtors_on_class (node_t class_tag) {
+  node_t id, decl_list;
+  if (class_tag == NULL || class_tag->code != N_CLASS) return;
+  id = NL_HEAD (class_tag->u.ops);
+  decl_list = id != NULL ? NL_NEXT (id) : NULL;
+  if (decl_list == NULL || decl_list->code != N_LIST) return;
+  for (node_t m = NL_HEAD (decl_list->u.ops); m != NULL; m = NL_NEXT (m)) {
+    const char *nm;
+    if (m->code != N_FUNC_DEF || !midopt_class_method_p (m)) continue;
+    nm = midopt_func_name (m);
+    if (nm == NULL) continue;
+    if (strncmp (nm, "__ctor_", 7) == 0 || strncmp (nm, "__dtor_", 7) == 0)
+      midopt_mark_keep (m);
+  }
+}
+
+static void midopt_keep_helpers_for_live (c2m_ctx_t c2m_ctx, node_t n) {
   if (n == NULL) return;
 
   if (n->code == N_CLASS && n->attr != (void *) ((intptr_t) -1)) {
@@ -353,17 +452,15 @@ static void midopt_expand_class_keeps (c2m_ctx_t c2m_ctx, node_t n) {
         }
       }
       if (any_keep) {
-        for (node_t m = NL_HEAD (decl_list->u.ops); m != NULL; m = NL_NEXT (m)) {
-          if (m->code == N_FUNC_DEF && midopt_class_method_p (m))
-            midopt_mark_keep (m);
-        }
+        midopt_keep_helpers_on_class (c2m_ctx, n, id != NULL ? POS (id) : no_pos);
+        midopt_keep_ctors_dtors_on_class (n);
       }
     }
   }
 
   if (!midopt_node_has_ops (n->code)) return;
   for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
-    midopt_expand_class_keeps (c2m_ctx, c);
+    midopt_keep_helpers_for_live (c2m_ctx, c);
 }
 
 /* Enumerate all class methods; mark those not in keep set as dead. */
@@ -477,20 +574,33 @@ static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
   }
 
   if (midopt_verbose_p)
-    fprintf (stderr, "  [midopt] method-level keep=%lu before class-expand\n",
+    fprintf (stderr, "  [midopt] method-level keep=%lu before helper-fill\n",
              (unsigned long) VARR_LENGTH (node_t, midopt_keep));
 
-  /* 3) Class-expand live monomorphs once (completeness for residual MIR). */
-  midopt_expand_class_keeps (c2m_ctx, module);
+  /* 3) Keep collection helpers on live monomorphs (not the whole public API). */
+  midopt_keep_helpers_for_live (c2m_ctx, module);
 
-  /* 3b) Drain callees of expanded methods (e.g. List_int.SelectString →
-     List_String.Add) without a second whole-class expand. */
+  /* 3b) Drain callees of newly kept helpers / methods. */
   while (wi < VARR_LENGTH (node_t, midopt_work)) {
     node_t f = VARR_GET (node_t, midopt_work, wi++);
     midopt_collect_uses_body (c2m_ctx, f);
   }
 
-  /* 3c) Safety net: zero keeps → do not prune (P1 elision still runs). */
+  /* 3c) One more helper fill + drain (helpers may pull siblings). */
+  {
+    size_t before = VARR_LENGTH (node_t, midopt_keep);
+    midopt_keep_helpers_for_live (c2m_ctx, module);
+    while (wi < VARR_LENGTH (node_t, midopt_work)) {
+      node_t f = VARR_GET (node_t, midopt_work, wi++);
+      midopt_collect_uses_body (c2m_ctx, f);
+    }
+    if (midopt_verbose_p)
+      fprintf (stderr, "  [midopt] after helper-fill keep=%lu (was %lu)\n",
+               (unsigned long) VARR_LENGTH (node_t, midopt_keep),
+               (unsigned long) before);
+  }
+
+  /* 3d) Safety net: zero keeps → do not prune (P1 elision still runs). */
   if (VARR_LENGTH (node_t, midopt_keep) == 0) {
     if (midopt_verbose_p)
       fprintf (stderr, "  [midopt] no method keeps found — skip dead pruning\n");

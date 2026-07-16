@@ -30781,7 +30781,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
          insn != NULL; insn = DLIST_NEXT(MIR_insn_t, insn)) {
       for (size_t i = 0; i < insn->nops; i++) {
         if (insn->ops[i].mode == MIR_OP_REF && insn->ops[i].u.ref == NULL) {
-          warning(c2m_ctx, no_pos, "Unresolved function reference in MIR generation");
+          warning(c2m_ctx, no_pos,
+                  "Unresolved function reference in MIR generation (in %s)",
+                  curr_func != NULL && curr_func->u.func != NULL ? curr_func->u.func->name : "?");
           break;
         }
       }
