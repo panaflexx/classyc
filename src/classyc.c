@@ -81,6 +81,21 @@ typedef struct c2m_ctx *c2m_ctx_t;
 
 int c2m_pending_extra_gt = 0;
 
+/* Include-guard recognition (clang/gcc MultipleIncludeOpt):
+   IG_EXPECT_IFNDEF → first content must be #ifndef GUARD
+   IG_EXPECT_DEFINE → next directive must be #define GUARD
+   IG_IN_BODY       → matching #endif at stream-start if-depth
+   IG_AFTER_ENDIF   → only whitespace until EOF → record guard
+   IG_FAILED / IG_OFF → not a simple guarded header */
+enum {
+  IG_OFF = 0,
+  IG_EXPECT_IFNDEF,
+  IG_EXPECT_DEFINE,
+  IG_IN_BODY,
+  IG_AFTER_ENDIF,
+  IG_FAILED
+};
+
 typedef struct stream {
   FILE *f;                        /* the current file, NULL for top-level or string stream */
   const char *fname;              /* NULL only for preprocessor string stream */
@@ -90,6 +105,8 @@ typedef struct stream {
   fpos_t fpos;                    /* file pos to resume file stream */
   const char *start, *curr;       /* non NULL only for string stream  */
   int ifs_length_at_stream_start; /* length of ifs at the stream start */
+  int ig_state;                   /* include-guard FSM (IG_*) */
+  const char *ig_macro;           /* interned guard macro name, or NULL */
 } *stream_t;
 
 DEF_VARR (stream_t);
@@ -1186,6 +1203,8 @@ static stream_t new_stream (MIR_alloc_t alloc, FILE *f, const char *fname, int (
   s->ifs_length_at_stream_start = 0;
   s->start = s->curr = NULL;
   s->getc_func = getc_func;
+  s->ig_state = IG_OFF;
+  s->ig_macro = NULL;
   return s;
 }
 
@@ -2364,11 +2383,21 @@ typedef struct macro_call {
 
 DEF_VARR (macro_call_t);
 
+/* Recorded include-guard: if `guard` is still #defined, re-#include of
+   `fname` is a no-op.  Both pointers are uniq_cstr / macro-repr interned. */
+typedef struct {
+  const char *fname;
+  const char *guard;
+} include_guard_t;
+
+DEF_HTAB (include_guard_t);
+
 struct pre_ctx {
   VARR (char_ptr_t) * once_include_files;
   VARR (token_t) * temp_tokens;
   HTAB (macro_t) * macro_tab;
   VARR (macro_t) * macros;
+  HTAB (include_guard_t) * include_guard_tab;
   VARR (ifstate_t) * ifs; /* stack of ifstates */
   int no_out_p;           /* don't output lexs -- put them into buffer */
   int skip_if_part_p;
@@ -2387,6 +2416,7 @@ struct pre_ctx {
 #define temp_tokens pre_ctx->temp_tokens
 #define macro_tab pre_ctx->macro_tab
 #define macros pre_ctx->macros
+#define include_guard_tab pre_ctx->include_guard_tab
 #define ifs pre_ctx->ifs
 #define no_out_p pre_ctx->no_out_p
 #define skip_if_part_p pre_ctx->skip_if_part_p
@@ -2402,6 +2432,62 @@ struct pre_ctx {
 #define actual_pre_pos pre_ctx->actual_pre_pos
 #define pptokens_num pre_ctx->pptokens_num
 #define pre_out_token_func pre_ctx->pre_out_token_func
+
+static int include_guard_eq (include_guard_t a, include_guard_t b, void *arg MIR_UNUSED) {
+  return a.fname == b.fname;
+}
+
+static htab_hash_t include_guard_hash (include_guard_t g, void *arg MIR_UNUSED) {
+  return (htab_hash_t) mir_hash64 ((uint64_t) (uintptr_t) g.fname, 0x9e);
+}
+
+static int macro_name_defined_p (c2m_ctx_t c2m_ctx, const char *repr) {
+  pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
+  struct token id_tok;
+  struct macro macro_struct;
+  macro_t tab_macro;
+
+  if (repr == NULL) return FALSE;
+  memset (&id_tok, 0, sizeof (id_tok));
+  id_tok.code = T_ID;
+  id_tok.repr = repr;
+  macro_struct.id = &id_tok;
+  return HTAB_DO (macro_t, macro_tab, &macro_struct, HTAB_FIND, tab_macro);
+}
+
+static void record_include_guard (c2m_ctx_t c2m_ctx, const char *fname, const char *guard) {
+  pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
+  include_guard_t g, tab_g;
+
+  if (fname == NULL || guard == NULL || include_guard_tab == NULL) return;
+  g.fname = fname;
+  g.guard = guard;
+  if (HTAB_DO (include_guard_t, include_guard_tab, g, HTAB_FIND, tab_g)) {
+    /* Update guard name if re-recorded after #undef (same path). */
+    if (tab_g.guard != guard) {
+      HTAB_DO (include_guard_t, include_guard_tab, g, HTAB_REPLACE, tab_g);
+    }
+    return;
+  }
+  HTAB_DO (include_guard_t, include_guard_tab, g, HTAB_INSERT, tab_g);
+}
+
+static void ig_fail (stream_t s) {
+  if (s != NULL && s->ig_state != IG_OFF && s->ig_state != IG_FAILED) {
+    s->ig_state = IG_FAILED;
+    s->ig_macro = NULL;
+  }
+}
+
+/* Non-whitespace content before a complete guard (or after #endif) spoils
+   the simple include-guard pattern. */
+static void ig_note_significant_token (stream_t s, token_t t) {
+  if (s == NULL || t == NULL) return;
+  if (t->code == ' ' || t->code == '\n') return;
+  if (s->ig_state == IG_EXPECT_IFNDEF || s->ig_state == IG_EXPECT_DEFINE
+      || s->ig_state == IG_AFTER_ENDIF)
+    ig_fail (s);
+}
 
 static int pre_skip_if_part_p (c2m_ctx_t c2m_ctx) {
   pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
@@ -2428,7 +2514,11 @@ static int macro_eq (macro_t macro1, macro_t macro2, void *arg MIR_UNUSED) {
 }
 
 static htab_hash_t macro_hash (macro_t macro, void *arg MIR_UNUSED) {
-  return (htab_hash_t) mir_hash (macro->id->repr, strlen (macro->id->repr), 0x42);
+  /* id->repr is always uniq_cstr-interned (see new_id_token); pointer
+     identity matches macro_eq and avoids strlen + string hash on every
+     identifier's macro lookup. */
+  uintptr_t p = (uintptr_t) macro->id->repr;
+  return (htab_hash_t) mir_hash64 ((uint64_t) p, 0x42);
 }
 
 static macro_t new_macro (c2m_ctx_t c2m_ctx, token_t id, VARR (token_t) * params,
@@ -2557,6 +2647,8 @@ static void pre_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (char_ptr_t, once_include_files, alloc, 64);
   VARR_CREATE (token_t, temp_tokens, alloc, 128);
   VARR_CREATE (token_t, output_buffer, alloc, 2048);
+  HTAB_CREATE (include_guard_t, include_guard_tab, alloc, 256, include_guard_hash, include_guard_eq,
+               NULL);
   init_macros (c2m_ctx);
   VARR_CREATE (ifstate_t, ifs, alloc, 512);
   VARR_CREATE (macro_call_t, macro_call_stack, alloc, 512);
@@ -2569,6 +2661,7 @@ static void pre_finish (c2m_ctx_t c2m_ctx) {
   if (once_include_files != NULL) VARR_DESTROY (char_ptr_t, once_include_files);
   if (temp_tokens != NULL) VARR_DESTROY (token_t, temp_tokens);
   if (output_buffer != NULL) VARR_DESTROY (token_t, output_buffer);
+  if (include_guard_tab != NULL) HTAB_DESTROY (include_guard_t, include_guard_tab);
   finish_macros (c2m_ctx);
   if (ifs != NULL) {
     while (VARR_LENGTH (ifstate_t, ifs) != 0) pop_ifstate (c2m_ctx);
@@ -2586,10 +2679,20 @@ static void add_include_stream (c2m_ctx_t c2m_ctx, const char *fname, const char
                                 pos_t err_pos) {
   pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
   FILE *f;
+  include_guard_t g, tab_g;
 
   for (size_t i = 0; i < VARR_LENGTH (char_ptr_t, once_include_files); i++)
     if (strcmp (fname, VARR_GET (char_ptr_t, once_include_files, i)) == 0) return;
   assert (fname != NULL);
+  /* MultipleIncludeOpt: if this path was previously a simple
+     #ifndef G / #define G / ... / #endif header and G is still defined,
+     skip re-opening and re-tokenizing the file. */
+  g.fname = fname;
+  g.guard = NULL;
+  if (include_guard_tab != NULL
+      && HTAB_DO (include_guard_t, include_guard_tab, g, HTAB_FIND, tab_g)
+      && macro_name_defined_p (c2m_ctx, tab_g.guard))
+    return;
   if (content == NULL && (f = fopen (fname, "rb")) == NULL) {
     if (c2m_options->message_file != NULL)
       error (c2m_ctx, err_pos, "error in opening file %s", fname);
@@ -2600,6 +2703,8 @@ static void add_include_stream (c2m_ctx_t c2m_ctx, const char *fname, const char
   else
     add_string_stream (c2m_ctx, fname, content);
   cs->ifs_length_at_stream_start = (int) VARR_LENGTH (ifstate_t, ifs);
+  cs->ig_state = IG_EXPECT_IFNDEF;
+  cs->ig_macro = NULL;
 }
 
 static void skip_nl (c2m_ctx_t c2m_ctx, token_t t,
@@ -2726,31 +2831,44 @@ static void define (c2m_ctx_t c2m_ctx) {
   }
   name = id->repr;
   macro_struct.id = id;
-  if (!HTAB_DO (macro_t, macro_tab, &macro_struct, HTAB_FIND, m)) {
-    if (strcmp (name, "defined") == 0) {
-      error (c2m_ctx, id->pos, "macro definition of %s", name);
-    } else {
-      new_macro (c2m_ctx, id, params, repl);
-      params = NULL;
-    }
-  } else if (m->replacement == NULL) {
-    error (c2m_ctx, id->pos, "standard macro %s redefinition", name);
-  } else {
-    if (!params_eq_p (m->params, params) || !replacement_eq_p (m->replacement, repl)) {
-      if (c2m_options->pedantic_p) {
-        error (c2m_ctx, id->pos, "different macro redefinition of %s", name);
-        error (c2m_ctx, m->id->pos, "previous definition of %s", m->id->repr);
+  {
+    int object_like_p = (params == NULL);
+
+    if (!HTAB_DO (macro_t, macro_tab, &macro_struct, HTAB_FIND, m)) {
+      if (strcmp (name, "defined") == 0) {
+        error (c2m_ctx, id->pos, "macro definition of %s", name);
       } else {
-        VARR (token_t) * temp;
-        warning (c2m_ctx, id->pos, "different macro redefinition of %s", name);
-        warning (c2m_ctx, m->id->pos, "previous definition of %s", m->id->repr);
-        SWAP (m->params, params, temp);
-        SWAP (m->replacement, repl, temp);
+        new_macro (c2m_ctx, id, params, repl);
+        params = NULL;
       }
+    } else if (m->replacement == NULL) {
+      error (c2m_ctx, id->pos, "standard macro %s redefinition", name);
+    } else {
+      if (!params_eq_p (m->params, params) || !replacement_eq_p (m->replacement, repl)) {
+        if (c2m_options->pedantic_p) {
+          error (c2m_ctx, id->pos, "different macro redefinition of %s", name);
+          error (c2m_ctx, m->id->pos, "previous definition of %s", m->id->repr);
+        } else {
+          VARR (token_t) * temp;
+          warning (c2m_ctx, id->pos, "different macro redefinition of %s", name);
+          warning (c2m_ctx, m->id->pos, "previous definition of %s", m->id->repr);
+          SWAP (m->params, params, temp);
+          SWAP (m->replacement, repl, temp);
+        }
+      }
+      VARR_DESTROY (token_t, repl);
     }
-    VARR_DESTROY (token_t, repl);
+    if (params != NULL) VARR_DESTROY (token_t, params);
+    /* Include-guard: after #ifndef G, next directive must be object-like #define G
+       while still inside that #ifndef (if-depth == stream_start + 1). */
+    if (cs != NULL && cs->ig_state == IG_EXPECT_DEFINE && cs->ig_macro == id->repr && object_like_p
+        && (int) VARR_LENGTH (ifstate_t, ifs) == cs->ifs_length_at_stream_start + 1) {
+      cs->ig_state = IG_IN_BODY;
+    } else if (cs != NULL
+               && (cs->ig_state == IG_EXPECT_IFNDEF || cs->ig_state == IG_EXPECT_DEFINE)) {
+      ig_fail (cs);
+    }
   }
-  if (params != NULL) VARR_DESTROY (token_t, params);
 }
 
 #ifdef C2MIR_PREPRO_DEBUG
@@ -3403,6 +3521,110 @@ static void processing (c2m_ctx_t c2m_ctx, int ignore_directive_p);
 
 static struct val eval_expr (c2m_ctx_t c2m_ctx, VARR (token_t) * buffer, token_t if_token);
 
+/* Fast-scan false #if regions: skip non-directive lines without creating
+   tokens / string interning.  Handles // and block comments, simple string
+   and char literals, and backslash-newline.  On success leaves '#' as the
+   next character for get_next_pptoken.  Returns 1 if a directive '#' was
+   found, 0 if the stream hit EOF (next get_next_pptoken yields T_EOFILE). */
+static int pre_fast_skip_to_directive (c2m_ctx_t c2m_ctx) {
+  int c, c2, in_block = 0;
+
+  for (;;) {
+    if (!in_block) {
+      /* Leading whitespace on a logical line: */
+      for (;;) {
+        c = cs_get (c2m_ctx);
+        if (c == ' ' || c == '\t' || c == '\f' || c == '\v' || c == '\r') continue;
+        break;
+      }
+      if (c == EOF) return 0;
+      if (c == '\n') continue;
+      if (c == '#') {
+        cs_unget (c2m_ctx, c);
+        return 1;
+      }
+      if (c == '/') {
+        c2 = cs_get (c2m_ctx);
+        if (c2 == '/') {
+          while ((c = cs_get (c2m_ctx)) != EOF && c != '\n') {
+            if (c == '\\') {
+              c2 = cs_get (c2m_ctx);
+              if (c2 == EOF) return 0;
+              if (c2 == '\n' || c2 == '\r') continue; /* continued // comment */
+              /* else consume c2 as part of comment */
+            }
+          }
+          if (c == EOF) return 0;
+          continue;
+        } else if (c2 == '*') {
+          in_block = 1;
+          continue;
+        } else {
+          if (c2 != EOF) cs_unget (c2m_ctx, c2);
+          /* fall through: non-directive line starting with / */
+        }
+      }
+    }
+
+    /* Skip rest of line (or through block comment), tracking strings. */
+    for (;;) {
+      if (in_block) {
+        c = cs_get (c2m_ctx);
+        if (c == EOF) return 0;
+        if (c == '*') {
+          c2 = cs_get (c2m_ctx);
+          if (c2 == '/') {
+            in_block = 0;
+            break; /* resume scanning after comment (same line) */
+          }
+          if (c2 != EOF) cs_unget (c2m_ctx, c2);
+        }
+        continue;
+      }
+      c = cs_get (c2m_ctx);
+      if (c == EOF) return 0;
+      if (c == '\n') break;
+      if (c == '\\') {
+        c2 = cs_get (c2m_ctx);
+        if (c2 == EOF) return 0;
+        if (c2 == '\n' || c2 == '\r') continue; /* line splice */
+        continue;
+      }
+      if (c == '/' ) {
+        c2 = cs_get (c2m_ctx);
+        if (c2 == '/') {
+          while ((c = cs_get (c2m_ctx)) != EOF && c != '\n') {
+            if (c == '\\') {
+              c2 = cs_get (c2m_ctx);
+              if (c2 == EOF) return 0;
+            }
+          }
+          if (c == EOF) return 0;
+          break;
+        } else if (c2 == '*') {
+          in_block = 1;
+          continue;
+        } else if (c2 != EOF) {
+          cs_unget (c2m_ctx, c2);
+        }
+        continue;
+      }
+      if (c == '"' || c == '\'') {
+        int quote = c;
+        while ((c = cs_get (c2m_ctx)) != EOF && c != quote && c != '\n') {
+          if (c == '\\') {
+            c2 = cs_get (c2m_ctx);
+            if (c2 == EOF) return 0;
+          }
+        }
+        if (c == EOF) return 0;
+        if (c == '\n') break;
+        continue;
+      }
+    }
+  }
+}
+
 static const char *get_header_name (c2m_ctx_t c2m_ctx, VARR (token_t) * buffer, pos_t err_pos,
                                     const char **content) {
   size_t i;
@@ -3446,7 +3668,10 @@ static void process_directive (c2m_ctx_t c2m_ctx) {
     if (VARR_LENGTH (ifstate_t, ifs) != 0 && VARR_LAST (ifstate_t, ifs)->skip_p) {
       skip_if_part_p = true_p = TRUE;
       skip_nl (c2m_ctx, NULL, NULL);
+      if (cs != NULL && cs->ig_state == IG_EXPECT_IFNDEF) ig_fail (cs);
     } else {
+      token_t guard_id = NULL;
+
       t = get_next_pptoken (c2m_ctx);
       skip_if_part_p = FALSE;
       if (t->code == ' ') t = get_next_pptoken (c2m_ctx);
@@ -3454,6 +3679,7 @@ static void process_directive (c2m_ctx_t c2m_ctx) {
         error (c2m_ctx, t->pos, "wrong #%s", t1->repr);
       } else {
         macro.id = t;
+        guard_id = t;
         skip_if_part_p = HTAB_DO (macro_t, macro_tab, &macro, HTAB_FIND, tab_macro);
       }
       t = get_next_pptoken (c2m_ctx);
@@ -3463,6 +3689,16 @@ static void process_directive (c2m_ctx_t c2m_ctx) {
       }
       if (strcmp (t1->repr, "ifdef") == 0) skip_if_part_p = !skip_if_part_p;
       true_p = !skip_if_part_p;
+      /* First non-ws content of an include must be #ifndef GUARD for the opt. */
+      if (cs != NULL && cs->ig_state == IG_EXPECT_IFNDEF
+          && (int) VARR_LENGTH (ifstate_t, ifs) == cs->ifs_length_at_stream_start
+          && strcmp (t1->repr, "ifndef") == 0 && guard_id != NULL) {
+        cs->ig_macro = guard_id->repr;
+        cs->ig_state = IG_EXPECT_DEFINE;
+      } else if (cs != NULL
+                 && (cs->ig_state == IG_EXPECT_IFNDEF || cs->ig_state == IG_EXPECT_DEFINE)) {
+        ig_fail (cs);
+      }
     }
     VARR_PUSH (ifstate_t, ifs, new_ifstate (skip_if_part_p, true_p, FALSE, t1->pos));
   } else if (strcmp (t->repr, "endif") == 0 || strcmp (t->repr, "else") == 0) {
@@ -3477,11 +3713,20 @@ static void process_directive (c2m_ctx_t c2m_ctx) {
     else if (strcmp (t1->repr, "endif") == 0) {
       pop_ifstate (c2m_ctx);
       skip_if_part_p = VARR_LENGTH (ifstate_t, ifs) == 0 ? 0 : VARR_LAST (ifstate_t, ifs)->skip_p;
+      /* Matching #endif for the outermost #ifndef of this include file. */
+      if (cs != NULL && cs->ig_state == IG_IN_BODY
+          && (int) VARR_LENGTH (ifstate_t, ifs) == cs->ifs_length_at_stream_start)
+        cs->ig_state = IG_AFTER_ENDIF;
     } else if (VARR_LAST (ifstate_t, ifs)->else_p) {
       error (c2m_ctx, t1->pos, "repeated #else");
       VARR_LAST (ifstate_t, ifs)->skip_p = 1;
       skip_if_part_p = TRUE;
+      ig_fail (cs);
     } else {
+      /* #else at guard level breaks the simple include-guard pattern. */
+      if (cs != NULL && cs->ig_state == IG_IN_BODY
+          && (int) VARR_LENGTH (ifstate_t, ifs) == cs->ifs_length_at_stream_start + 1)
+        ig_fail (cs);
       skip_if_part_p = VARR_LAST (ifstate_t, ifs)->true_p;
       VARR_LAST (ifstate_t, ifs)->true_p = TRUE;
       VARR_LAST (ifstate_t, ifs)->skip_p = skip_if_part_p;
@@ -3489,6 +3734,13 @@ static void process_directive (c2m_ctx_t c2m_ctx) {
     }
   } else if (strcmp (t->repr, "if") == 0 || strcmp (t->repr, "elif") == 0) {
     if_id = t;
+    /* #if / #elif is never the simple include-guard opener (#ifndef only). */
+    if (cs != NULL
+        && (cs->ig_state == IG_EXPECT_IFNDEF || cs->ig_state == IG_EXPECT_DEFINE
+            || (cs->ig_state == IG_IN_BODY
+                && strcmp (t->repr, "elif") == 0
+                && (int) VARR_LENGTH (ifstate_t, ifs) == cs->ifs_length_at_stream_start + 1)))
+      ig_fail (cs);
     if (strcmp (t->repr, "elif") == 0 && VARR_LENGTH (ifstate_t, ifs) == 0) {
       error (c2m_ctx, t->pos, "#elif without #if");
     } else if (strcmp (t->repr, "elif") == 0 && VARR_LAST (ifstate_t, ifs)->else_p) {
@@ -3522,6 +3774,10 @@ static void process_directive (c2m_ctx_t c2m_ctx) {
   } else if (strcmp (t->repr, "define") == 0) {
     define (c2m_ctx);
   } else if (strcmp (t->repr, "include") == 0) {
+    if (cs != NULL
+        && (cs->ig_state == IG_EXPECT_IFNDEF || cs->ig_state == IG_EXPECT_DEFINE
+            || cs->ig_state == IG_AFTER_ENDIF))
+      ig_fail (cs);
     const char *content;
 
     t = get_next_include_pptoken (c2m_ctx);
@@ -3551,6 +3807,10 @@ static void process_directive (c2m_ctx_t c2m_ctx) {
     }
     add_include_stream (c2m_ctx, name, content, t->pos);
   } else if (strcmp (t->repr, "line") == 0) {
+    if (cs != NULL
+        && (cs->ig_state == IG_EXPECT_IFNDEF || cs->ig_state == IG_EXPECT_DEFINE
+            || cs->ig_state == IG_AFTER_ENDIF))
+      ig_fail (cs);
     skip_nl (c2m_ctx, NULL, temp_buffer);
     unget_next_pptoken (c2m_ctx, new_token (c2m_ctx, t->pos, "", T_EOP, N_IGNORE));
     push_back (c2m_ctx, temp_buffer);
@@ -4028,6 +4288,25 @@ static void processing (c2m_ctx_t c2m_ctx, int ignore_directive_p) {
   int newln_p;
 
   for (newln_p = TRUE;;) { /* Main loop. */
+    /* False #if body: skip whole lines until the next directive or EOF
+       without tokenizing identifiers (big win on system headers). */
+    if (skip_if_part_p && newln_p && !ignore_directive_p
+        && VARR_LENGTH (macro_call_t, macro_call_stack) == 0
+        && (buffered_tokens == NULL || VARR_LENGTH (token_t, buffered_tokens) == 0)) {
+      if (pre_fast_skip_to_directive (c2m_ctx)) {
+        t = get_next_pptoken (c2m_ctx);
+        if (t->code == '#') {
+          process_directive (c2m_ctx);
+          newln_p = TRUE;
+          continue;
+        }
+        /* Rare: '#' was consumed by something else — fall through. */
+      } else {
+        t = get_next_pptoken (c2m_ctx);
+        goto handle_eof_token;
+      }
+    }
+
     t = get_next_pptoken (c2m_ctx);
     if (t->code == T_EOP) return; /* end of processing */
     if (newln_p && !ignore_directive_p && t->code == '#') {
@@ -4042,11 +4321,16 @@ static void processing (c2m_ctx_t c2m_ctx, int ignore_directive_p) {
       out_token (c2m_ctx, t);
       continue;
     } else if (t->code == T_EOFILE || t->code == T_EOU) {
+    handle_eof_token:
       if ((int) VARR_LENGTH (ifstate_t, ifs)
           > (eof_s == NULL ? 0 : eof_s->ifs_length_at_stream_start)) {
         error (c2m_ctx, VARR_LAST (ifstate_t, ifs)->if_pos, "unfinished #if");
       }
       if (t->code == T_EOU) return;
+      /* Record include-guard for the stream that just ended (eof_s). */
+      if (eof_s != NULL && eof_s->ig_state == IG_AFTER_ENDIF && eof_s->ig_macro != NULL
+          && eof_s->fname != NULL)
+        record_include_guard (c2m_ctx, eof_s->fname, eof_s->ig_macro);
       while ((int) VARR_LENGTH (ifstate_t, ifs) > eof_s->ifs_length_at_stream_start)
         pop_ifstate (c2m_ctx);
       skip_if_part_p = VARR_LENGTH (ifstate_t, ifs) == 0 ? 0 : VARR_LAST (ifstate_t, ifs)->skip_p;
@@ -4058,6 +4342,7 @@ static void processing (c2m_ctx_t c2m_ctx, int ignore_directive_p) {
       continue;
     }
     newln_p = FALSE;
+    ig_note_significant_token (cs, t);
     if (t->code == T_EOR) {  // finish macro call
       pop_macro_call (c2m_ctx);
       continue;
@@ -4410,6 +4695,7 @@ static void pre (c2m_ctx_t c2m_ctx) {
   pre_out_token_func = common_pre_out;
   pptokens_num = 0;
   VARR_TRUNC (char_ptr_t, once_include_files, 0);
+  if (include_guard_tab != NULL) HTAB_CLEAR (include_guard_t, include_guard_tab);
   if (!c2m_options->no_prepro_p) {
     processing (c2m_ctx, FALSE);
   } else {
