@@ -29,6 +29,11 @@
 #include <setjmp.h>
 #include <math.h>
 #include <wchar.h>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 #include "mir-alloc.h"
 #include "mir.h"
 #include "time.h"
@@ -2392,12 +2397,36 @@ typedef struct {
 
 DEF_HTAB (include_guard_t);
 
+/* Path existence probe cache: interned absolute/full path → found (0/1).
+   Avoids repeated access()/fopen for the same probe during include search. */
+typedef struct {
+  const char *path;
+  int found;
+} path_exist_t;
+
+DEF_HTAB (path_exist_t);
+
+/* #include resolve cache: (name, quote_p, from_dir) → winning path/content.
+   Angle includes use from_dir == NULL.  Quote includes key by the including
+   file's directory so relative lookup is correct. */
+typedef struct {
+  const char *name;     /* interned include spelling */
+  const char *from_dir; /* interned dir of including file, or NULL for <> */
+  int quote_p;
+  const char *resolved; /* interned full path, or short name for builtins */
+  const char *content;  /* non-NULL → in-memory standard include body */
+} include_resolve_t;
+
+DEF_HTAB (include_resolve_t);
+
 struct pre_ctx {
   VARR (char_ptr_t) * once_include_files;
   VARR (token_t) * temp_tokens;
   HTAB (macro_t) * macro_tab;
   VARR (macro_t) * macros;
   HTAB (include_guard_t) * include_guard_tab;
+  HTAB (path_exist_t) * path_exist_tab;
+  HTAB (include_resolve_t) * include_resolve_tab;
   VARR (ifstate_t) * ifs; /* stack of ifstates */
   int no_out_p;           /* don't output lexs -- put them into buffer */
   int skip_if_part_p;
@@ -2417,6 +2446,8 @@ struct pre_ctx {
 #define macro_tab pre_ctx->macro_tab
 #define macros pre_ctx->macros
 #define include_guard_tab pre_ctx->include_guard_tab
+#define path_exist_tab pre_ctx->path_exist_tab
+#define include_resolve_tab pre_ctx->include_resolve_tab
 #define ifs pre_ctx->ifs
 #define no_out_p pre_ctx->no_out_p
 #define skip_if_part_p pre_ctx->skip_if_part_p
@@ -2439,6 +2470,26 @@ static int include_guard_eq (include_guard_t a, include_guard_t b, void *arg MIR
 
 static htab_hash_t include_guard_hash (include_guard_t g, void *arg MIR_UNUSED) {
   return (htab_hash_t) mir_hash64 ((uint64_t) (uintptr_t) g.fname, 0x9e);
+}
+
+static int path_exist_eq (path_exist_t a, path_exist_t b, void *arg MIR_UNUSED) {
+  return strcmp (a.path, b.path) == 0;
+}
+
+static htab_hash_t path_exist_hash (path_exist_t e, void *arg MIR_UNUSED) {
+  return (htab_hash_t) mir_hash (e.path, strlen (e.path), 0x51);
+}
+
+static int include_resolve_eq (include_resolve_t a, include_resolve_t b, void *arg MIR_UNUSED) {
+  return a.name == b.name && a.from_dir == b.from_dir && a.quote_p == b.quote_p;
+}
+
+static htab_hash_t include_resolve_hash (include_resolve_t e, void *arg MIR_UNUSED) {
+  uint64_t h = mir_hash_init (0x17);
+  h = mir_hash_step (h, (uint64_t) (uintptr_t) e.name);
+  h = mir_hash_step (h, (uint64_t) (uintptr_t) e.from_dir);
+  h = mir_hash_step (h, (uint64_t) (unsigned) e.quote_p);
+  return (htab_hash_t) mir_hash_finish (h);
 }
 
 static int macro_name_defined_p (c2m_ctx_t c2m_ctx, const char *repr) {
@@ -2649,6 +2700,9 @@ static void pre_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (token_t, output_buffer, alloc, 2048);
   HTAB_CREATE (include_guard_t, include_guard_tab, alloc, 256, include_guard_hash, include_guard_eq,
                NULL);
+  HTAB_CREATE (path_exist_t, path_exist_tab, alloc, 1024, path_exist_hash, path_exist_eq, NULL);
+  HTAB_CREATE (include_resolve_t, include_resolve_tab, alloc, 512, include_resolve_hash,
+               include_resolve_eq, NULL);
   init_macros (c2m_ctx);
   VARR_CREATE (ifstate_t, ifs, alloc, 512);
   VARR_CREATE (macro_call_t, macro_call_stack, alloc, 512);
@@ -2662,6 +2716,8 @@ static void pre_finish (c2m_ctx_t c2m_ctx) {
   if (temp_tokens != NULL) VARR_DESTROY (token_t, temp_tokens);
   if (output_buffer != NULL) VARR_DESTROY (token_t, output_buffer);
   if (include_guard_tab != NULL) HTAB_DESTROY (include_guard_t, include_guard_tab);
+  if (path_exist_tab != NULL) HTAB_DESTROY (path_exist_t, path_exist_tab);
+  if (include_resolve_tab != NULL) HTAB_DESTROY (include_resolve_t, include_resolve_tab);
   finish_macros (c2m_ctx);
   if (ifs != NULL) {
     while (VARR_LENGTH (ifstate_t, ifs) != 0) pop_ifstate (c2m_ctx);
@@ -2918,12 +2974,41 @@ static void copy_and_push_back (c2m_ctx_t c2m_ctx, VARR (token_t) * tokens, pos_
 #endif
 }
 
-static int file_found_p (const char *name) {
-  FILE *f;
+/* Cheap readability probe (no fopen).  Cached via path_exist_tab when a
+   c2m_ctx is available — see file_found_cached. */
+static int path_readable_p (const char *name) {
+#if defined(_WIN32)
+  return _access (name, 4 /* R_OK */) == 0;
+#else
+  return access (name, R_OK) == 0;
+#endif
+}
 
-  if ((f = fopen (name, "r")) == NULL) return FALSE;
-  fclose (f);
-  return TRUE;
+static int file_found_p (const char *name) { return path_readable_p (name); }
+
+/* Cached existence check.  FIND keys may be a temporary path (e.g.
+   temp_string from get_full_name); on INSERT we copy the path into
+   reg_memory so we do not pollute uniq_cstr with every failed probe.
+   Misses and hits are both cached — include search fails far more often
+   than it succeeds. */
+static int file_found_cached (c2m_ctx_t c2m_ctx, const char *path) {
+  pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
+  path_exist_t key, el;
+  size_t len;
+  char *copy;
+
+  if (path == NULL || path[0] == '\0') return FALSE;
+  if (path_exist_tab == NULL) return path_readable_p (path);
+  key.path = path;
+  key.found = 0;
+  if (HTAB_DO (path_exist_t, path_exist_tab, key, HTAB_FIND, el)) return el.found;
+  key.found = path_readable_p (path) ? 1 : 0;
+  len = strlen (path) + 1;
+  copy = reg_malloc (c2m_ctx, len);
+  memcpy (copy, path, len);
+  key.path = copy;
+  HTAB_DO (path_exist_t, path_exist_tab, key, HTAB_INSERT, el);
+  return key.found;
 }
 
 static const char *get_full_name (c2m_ctx_t c2m_ctx, const char *base, const char *name,
@@ -2960,34 +3045,105 @@ static const char *get_full_name (c2m_ctx_t c2m_ctx, const char *base, const cha
   return VARR_ADDR (char, temp_string);
 }
 
+/* Interned directory of `fname` (including trailing slash), or NULL. */
+static const char *include_dir_key (c2m_ctx_t c2m_ctx, const char *fname) {
+  const char *last, *last2, *slash = "/", *slash2 = NULL;
+  size_t n;
+
+  if (fname == NULL || fname[0] == '\0') return NULL;
+#ifdef _WIN32
+  slash2 = "\\";
+#endif
+  last = strrchr (fname, slash[0]);
+  last2 = slash2 != NULL ? strrchr (fname, slash2[0]) : NULL;
+  if (last2 != NULL && (last == NULL || last2 > last)) last = last2;
+  if (last == NULL) return uniq_cstr (c2m_ctx, "./").s;
+  n = (size_t) (last - fname + 1);
+  VARR_TRUNC (char, temp_string, 0);
+  for (size_t i = 0; i < n; i++) VARR_PUSH (char, temp_string, fname[i]);
+  VARR_PUSH (char, temp_string, '\0');
+  return uniq_cstr (c2m_ctx, VARR_ADDR (char, temp_string)).s;
+}
+
+static void include_resolve_store (c2m_ctx_t c2m_ctx, const char *name, const char *from_dir,
+                                   int quote_p, const char *resolved, const char *content) {
+  pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
+  include_resolve_t key, el;
+
+  if (include_resolve_tab == NULL || name == NULL || resolved == NULL) return;
+  key.name = name;
+  key.from_dir = from_dir;
+  key.quote_p = quote_p;
+  key.resolved = resolved;
+  key.content = content;
+  if (HTAB_DO (include_resolve_t, include_resolve_tab, key, HTAB_FIND, el)) return;
+  HTAB_DO (include_resolve_t, include_resolve_tab, key, HTAB_INSERT, el);
+}
+
 static const char *get_include_fname (c2m_ctx_t c2m_ctx, token_t t, const char **content) {
-  const char *fullname, *name;
+  pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
+  const char *fullname, *name, *iname, *from_dir;
+  int quote_p;
+  include_resolve_t rkey, rel;
 
   *content = NULL;
   assert (t->code == T_STR || t->code == T_HEADER);
-  if ((name = t->node->u.s.s)[0] != '/') {
-    if (t->repr[0] == '"') {
+  name = t->node->u.s.s;
+  quote_p = (t->repr[0] == '"');
+  iname = uniq_cstr (c2m_ctx, name).s;
+  from_dir = (quote_p && cs != NULL) ? include_dir_key (c2m_ctx, cs->fname) : NULL;
+
+  /* Fast path: same #include spelling from the same context already resolved. */
+  if (include_resolve_tab != NULL && name[0] != '/') {
+    rkey.name = iname;
+    rkey.from_dir = from_dir;
+    rkey.quote_p = quote_p;
+    rkey.resolved = NULL;
+    rkey.content = NULL;
+    if (HTAB_DO (include_resolve_t, include_resolve_tab, rkey, HTAB_FIND, rel)) {
+      *content = rel.content;
+      return rel.resolved;
+    }
+  }
+
+  if (name[0] != '/') {
+    if (quote_p) {
       /* Search relative to the current source dir */
       if (cs->fname != NULL) {
         fullname = get_full_name (c2m_ctx, cs->fname, name, FALSE);
-        if (file_found_p (fullname)) return uniq_cstr (c2m_ctx, fullname).s;
+        if (file_found_cached (c2m_ctx, fullname)) {
+          const char *res = uniq_cstr (c2m_ctx, fullname).s;
+          include_resolve_store (c2m_ctx, iname, from_dir, quote_p, res, NULL);
+          return res;
+        }
       }
       for (size_t i = 0; header_dirs[i] != NULL; i++) {
         fullname = get_full_name (c2m_ctx, header_dirs[i], name, TRUE);
-        if (file_found_p (fullname)) return uniq_cstr (c2m_ctx, fullname).s;
+        if (file_found_cached (c2m_ctx, fullname)) {
+          const char *res = uniq_cstr (c2m_ctx, fullname).s;
+          include_resolve_store (c2m_ctx, iname, from_dir, quote_p, res, NULL);
+          return res;
+        }
       }
     }
     for (size_t i = 0; i < sizeof (standard_includes) / sizeof (string_include_t); i++)
       if (standard_includes[i].name != NULL && strcmp (name, standard_includes[i].name) == 0) {
         *content = standard_includes[i].content;
-        return name;
+        /* Builtin headers: resolve key is name itself (angle or quote). */
+        include_resolve_store (c2m_ctx, iname, from_dir, quote_p, iname, *content);
+        return iname;
       }
     for (size_t i = 0; system_header_dirs[i] != NULL; i++) {
       fullname = get_full_name (c2m_ctx, system_header_dirs[i], name, TRUE);
-      if (file_found_p (fullname)) return uniq_cstr (c2m_ctx, fullname).s;
+      if (file_found_cached (c2m_ctx, fullname)) {
+        const char *res = uniq_cstr (c2m_ctx, fullname).s;
+        include_resolve_store (c2m_ctx, iname, from_dir, quote_p, res, NULL);
+        return res;
+      }
     }
   }
-  return name;
+  /* Absolute path or unresolved: return spelling; caller may open and fail. */
+  return name[0] == '/' ? uniq_cstr (c2m_ctx, name).s : name;
 }
 
 static int digits_p (const char *str) {
@@ -4696,6 +4852,10 @@ static void pre (c2m_ctx_t c2m_ctx) {
   pptokens_num = 0;
   VARR_TRUNC (char_ptr_t, once_include_files, 0);
   if (include_guard_tab != NULL) HTAB_CLEAR (include_guard_t, include_guard_tab);
+  /* Path/resolve caches are valid for the whole compile unit (include search
+     paths don't change mid-TU).  Keep them across a single pre() run; they are
+     created empty in pre_init and destroyed in pre_finish.  If pre() is ever
+     re-entered with a fresh pre_ctx they start empty again. */
   if (!c2m_options->no_prepro_p) {
     processing (c2m_ctx, FALSE);
   } else {
