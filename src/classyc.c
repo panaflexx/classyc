@@ -25239,8 +25239,14 @@ static void gen_dict_bind_throw_key_exception (c2m_ctx_t c2m_ctx,
 static void gen_dict_bind_into (c2m_ctx_t c2m_ctx, struct type *cls_type,
                                 op_t src_dv_op, op_t dst_addr_op,
                                 int lenient, pos_t pos);
+/* Proven-safety flags for protocol/open-code call sites (see gen_class_method_call_dest). */
+#define GEN_SAFE_SKIP_NULL 0x1 /* this already proven non-null (stack addr, prior check) */
+#define GEN_SAFE_SKIP_OOB  0x2 /* index already proven in range (for-in / seq i in [0,n)) */
 static op_t gen_class_method_call (c2m_ctx_t c2m_ctx, node_t func_def, struct type *this_type,
                                    op_t this_op, op_t *args, int n_args);
+static op_t gen_class_method_call_flags (c2m_ctx_t c2m_ctx, node_t func_def,
+                                         struct type *this_type, op_t this_op, op_t *args,
+                                         int n_args, int safe_flags);
 static op_t gen_dict_bind_collection_field (c2m_ctx_t c2m_ctx, struct type *cls_ptr_type,
                                             op_t val_dv, pos_t pos) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
@@ -27245,21 +27251,372 @@ static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_t
   return res;
 }
 
+/* Look up a simple instance field by name on CLASS_TAG (N_CLASS). */
+static decl_t find_class_field_by_name (node_t class_tag, const char *name) {
+  node_t mlist, mem, md, mid;
+  decl_t dd;
+
+  if (class_tag == NULL || name == NULL || class_tag->code != N_CLASS) return NULL;
+  mlist = TAG_MEMBER_LIST (class_tag);
+  if (mlist == NULL || mlist->code != N_LIST) return NULL;
+  for (mem = NL_HEAD (mlist->u.ops); mem != NULL; mem = NL_NEXT (mem)) {
+    if (mem->code != N_MEMBER || mem->attr == NULL) continue;
+    dd = (decl_t) mem->attr;
+    md = MEMBER_DECL (mem);
+    if (md == NULL || md->code != N_DECL) continue;
+    mid = NL_HEAD (md->u.ops);
+    if (mid != NULL && mid->code == N_ID && mid->u.s.s != NULL
+        && strcmp (mid->u.s.s, name) == 0)
+      return dd;
+  }
+  return NULL;
+}
+
+static const char *func_def_simple_name (node_t func_def) {
+  node_t declarator, id;
+  if (func_def == NULL || func_def->code != N_FUNC_DEF) return NULL;
+  declarator = FUNC_DEF_DECL (func_def);
+  if (declarator == NULL || declarator->code != N_DECL) return NULL;
+  id = NL_HEAD (declarator->u.ops);
+  if (id == NULL || id->code != N_ID) return NULL;
+  return id->u.s.s;
+}
+
+/* Resolve dense buffer fields on CLASS_TAG:
+     List:  data (T*) + length (int) [+ capacity]
+     Set:   dense (T*) + count (int) [+ capacity]
+     Map:   keys (K*) + vals (V*) + count (int)  — not a single-buffer layout
+   Returns 1 if List/Set-style single buffer found; sets *arr_out / *len_out. */
+static int find_dense_buffer_fields (node_t class_tag, decl_t *arr_out, decl_t *len_out,
+                                     decl_t *cap_out) {
+  decl_t data_f, dense_f, len_f, count_f, cap_f, keys_f, vals_f;
+  decl_t arr_f, sz_f;
+
+  if (arr_out) *arr_out = NULL;
+  if (len_out) *len_out = NULL;
+  if (cap_out) *cap_out = NULL;
+  if (class_tag == NULL || class_tag->code != N_CLASS) return 0;
+
+  data_f = find_class_field_by_name (class_tag, "data");
+  dense_f = find_class_field_by_name (class_tag, "dense");
+  len_f = find_class_field_by_name (class_tag, "length");
+  count_f = find_class_field_by_name (class_tag, "count");
+  cap_f = find_class_field_by_name (class_tag, "capacity");
+  keys_f = find_class_field_by_name (class_tag, "keys");
+  vals_f = find_class_field_by_name (class_tag, "vals");
+
+  /* Map layout wins for KeyAt/ValAt path — not a single dense buffer. */
+  if (count_f != NULL && keys_f != NULL && vals_f != NULL
+      && keys_f->decl_spec.type != NULL && keys_f->decl_spec.type->mode == TM_PTR
+      && vals_f->decl_spec.type != NULL && vals_f->decl_spec.type->mode == TM_PTR)
+    return 0;
+
+  arr_f = NULL;
+  if (data_f != NULL && data_f->decl_spec.type != NULL && data_f->decl_spec.type->mode == TM_PTR
+      && data_f->decl_spec.type->u.ptr_type != NULL)
+    arr_f = data_f;
+  else if (dense_f != NULL && dense_f->decl_spec.type != NULL
+           && dense_f->decl_spec.type->mode == TM_PTR
+           && dense_f->decl_spec.type->u.ptr_type != NULL)
+    arr_f = dense_f;
+
+  sz_f = NULL;
+  if (len_f != NULL && len_f->decl_spec.type != NULL && len_f->decl_spec.type->mode == TM_BASIC)
+    sz_f = len_f;
+  else if (count_f != NULL && count_f->decl_spec.type != NULL
+           && count_f->decl_spec.type->mode == TM_BASIC)
+    sz_f = count_f;
+
+  if (arr_f == NULL || sz_f == NULL) return 0;
+  if (arr_out) *arr_out = arr_f;
+  if (len_out) *len_out = sz_f;
+  if (cap_out
+      && cap_f != NULL && cap_f->decl_spec.type != NULL
+      && cap_f->decl_spec.type->mode == TM_BASIC)
+    *cap_out = cap_f;
+  return 1;
+}
+
+/* Pure predicate: can FUNC_DEF's body be open-coded as a dense List/Set/Map
+   accessor with N_ARGS user args?  No MIR; safe to call before evaluating
+   the receiver (N_CALL path uses this to avoid gen_class_method_call fallback). */
+static int dense_accessor_open_codeable_p (node_t func_def, int n_args) {
+  decl_t mdecl;
+  struct func_type *ft;
+  node_t class_tag;
+  const char *nm;
+  decl_t data_f, len_f, cap_f, keys_f, vals_f, count_f;
+  int list_p, map_p;
+
+  if (func_def == NULL || func_def->code != N_FUNC_DEF) return 0;
+  mdecl = func_def->attr;
+  if (mdecl == NULL || mdecl->decl_spec.type == NULL
+      || mdecl->decl_spec.type->mode != TM_FUNC)
+    return 0;
+  ft = mdecl->decl_spec.type->u.func_type;
+  if (ft == NULL || ft->class_scope == NULL || ft->class_scope->code != N_CLASS) return 0;
+  class_tag = ft->class_scope;
+  nm = func_def_simple_name (func_def);
+  if (nm == NULL) return 0;
+
+  keys_f = find_class_field_by_name (class_tag, "keys");
+  vals_f = find_class_field_by_name (class_tag, "vals");
+  count_f = find_class_field_by_name (class_tag, "count");
+  map_p = (count_f != NULL && count_f->decl_spec.type != NULL
+           && count_f->decl_spec.type->mode == TM_BASIC && keys_f != NULL
+           && keys_f->decl_spec.type != NULL && keys_f->decl_spec.type->mode == TM_PTR
+           && vals_f != NULL && vals_f->decl_spec.type != NULL
+           && vals_f->decl_spec.type->mode == TM_PTR
+           && keys_f->decl_spec.type->u.ptr_type != NULL
+           && vals_f->decl_spec.type->u.ptr_type != NULL);
+  list_p = !map_p && find_dense_buffer_fields (class_tag, &data_f, &len_f, &cap_f);
+
+  if (!list_p && !map_p) return 0;
+
+  if (list_p) {
+    if ((strcmp (nm, "Count") == 0 || strcmp (nm, "IsEmpty") == 0) && n_args == 0)
+      return 1;
+    if (strcmp (nm, "Capacity") == 0 && n_args == 0 && cap_f != NULL) return 1;
+    if ((strcmp (nm, "Get") == 0 || strcmp (nm, "GetMut") == 0) && n_args == 1) {
+      struct type *el = data_f->decl_spec.type->u.ptr_type;
+      return (el->mode != TM_CLASS && el->mode != TM_STRUCT && el->mode != TM_UNION);
+    }
+    if ((strcmp (nm, "First") == 0 || strcmp (nm, "Last") == 0
+         || strcmp (nm, "FirstMut") == 0 || strcmp (nm, "LastMut") == 0)
+        && n_args == 0) {
+      struct type *el = data_f->decl_spec.type->u.ptr_type;
+      int mut = (strcmp (nm, "FirstMut") == 0 || strcmp (nm, "LastMut") == 0);
+      /* FirstMut/LastMut return T* — OK for class/struct elements.
+         First/Last load by value — only scalar/pointer elements. */
+      return mut || (el->mode != TM_CLASS && el->mode != TM_STRUCT && el->mode != TM_UNION);
+    }
+    return 0;
+  }
+  /* map_p */
+  if ((strcmp (nm, "Count") == 0 || strcmp (nm, "IsEmpty") == 0) && n_args == 0) return 1;
+  if ((strcmp (nm, "KeyAt") == 0 || strcmp (nm, "ValAt") == 0 || strcmp (nm, "ValMut") == 0)
+      && n_args == 1) {
+    struct type *el = (strcmp (nm, "KeyAt") == 0) ? keys_f->decl_spec.type->u.ptr_type
+                                                  : vals_f->decl_spec.type->u.ptr_type;
+    if (strcmp (nm, "ValMut") == 0) return 1;
+    return (el->mode != TM_CLASS && el->mode != TM_STRUCT && el->mode != TM_UNION);
+  }
+  return 0;
+}
+
+/* Open-code dense collection accessors when layout is known:
+     List/Set:  length + data (+ capacity) → Count/IsEmpty/Capacity/Get/GetMut/
+                First/Last/FirstMut/LastMut (scalar/pointer elements only)
+     Map:       count + keys + vals       → Count/IsEmpty/KeyAt/ValAt/ValMut
+                (scalar/pointer K,V only for by-value loads)
+   SAFE_FLAGS: GEN_SAFE_SKIP_NULL / GEN_SAFE_SKIP_OOB when caller proved them.
+   Returns 1 and sets *res_out on success; 0 with no MIR emitted on failure. */
+static int try_open_code_dense_accessor (c2m_ctx_t c2m_ctx, node_t func_def, op_t this_op,
+                                         op_t *args, int n_args, op_t *agg_dest MIR_UNUSED,
+                                         op_t *res_out, int safe_flags) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  decl_t mdecl;
+  struct func_type *ft;
+  node_t class_tag;
+  const char *nm;
+  decl_t data_f, len_f, cap_f, keys_f, vals_f, count_f;
+  int list_p, map_p;
+  MIR_alias_t calias;
+  MIR_type_t ct;
+  op_t this_r, count_v, base, idx, off, addr, el;
+
+  if (res_out == NULL || !dense_accessor_open_codeable_p (func_def, n_args)) return 0;
+  /* Indexed accessors need the index op. */
+  if (n_args == 1 && args == NULL) return 0;
+
+  mdecl = func_def->attr;
+  ft = mdecl->decl_spec.type->u.func_type;
+  class_tag = ft->class_scope;
+  nm = func_def_simple_name (func_def);
+
+  keys_f = find_class_field_by_name (class_tag, "keys");
+  vals_f = find_class_field_by_name (class_tag, "vals");
+  count_f = find_class_field_by_name (class_tag, "count");
+  map_p = (count_f != NULL && keys_f != NULL && vals_f != NULL
+           && keys_f->decl_spec.type != NULL && keys_f->decl_spec.type->mode == TM_PTR
+           && vals_f->decl_spec.type != NULL && vals_f->decl_spec.type->mode == TM_PTR);
+  list_p = !map_p && find_dense_buffer_fields (class_tag, &data_f, &len_f, &cap_f);
+
+  this_r = force_reg (c2m_ctx, this_op, MIR_T_I64);
+  if (c2m_options->exceptions_p && !(safe_flags & GEN_SAFE_SKIP_NULL))
+    gen_null_check (c2m_ctx, this_r, (long) POS (func_def).lno);
+
+  if (list_p) {
+    decl_t cnt_f = len_f;
+    ct = get_mir_type (c2m_ctx, cnt_f->decl_spec.type);
+    calias = get_type_alias (c2m_ctx, cnt_f->decl_spec.type);
+
+    if (strcmp (nm, "Count") == 0) {
+      *res_out = get_new_temp (c2m_ctx, promote_mir_int_type (ct));
+      emit2 (c2m_ctx, tp_mov (ct), res_out->mir_op,
+             MIR_new_alias_mem_op (ctx, ct, (MIR_disp_t) cnt_f->offset, this_r.mir_op.u.reg, 0, 1,
+                                   calias, 0));
+      return 1;
+    }
+    if (strcmp (nm, "IsEmpty") == 0) {
+      count_v = get_new_temp (c2m_ctx, promote_mir_int_type (ct));
+      emit2 (c2m_ctx, tp_mov (ct), count_v.mir_op,
+             MIR_new_alias_mem_op (ctx, ct, (MIR_disp_t) cnt_f->offset, this_r.mir_op.u.reg, 0, 1,
+                                   calias, 0));
+      *res_out = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit3 (c2m_ctx, MIR_EQ, res_out->mir_op, count_v.mir_op, MIR_new_int_op (ctx, 0));
+      return 1;
+    }
+    if (strcmp (nm, "Capacity") == 0) {
+      MIR_type_t cpt = get_mir_type (c2m_ctx, cap_f->decl_spec.type);
+      MIR_alias_t cpalias = get_type_alias (c2m_ctx, cap_f->decl_spec.type);
+      *res_out = get_new_temp (c2m_ctx, promote_mir_int_type (cpt));
+      emit2 (c2m_ctx, tp_mov (cpt), res_out->mir_op,
+             MIR_new_alias_mem_op (ctx, cpt, (MIR_disp_t) cap_f->offset, this_r.mir_op.u.reg, 0, 1,
+                                   cpalias, 0));
+      return 1;
+    }
+
+    /* Indexed / first / last access into data[] */
+    {
+      struct type *el_type = data_f->decl_spec.type->u.ptr_type;
+      mir_size_t el_size = type_size (c2m_ctx, el_type);
+      MIR_type_t el_mir = get_mir_type (c2m_ctx, el_type);
+      MIR_alias_t dalias = get_type_alias (c2m_ctx, data_f->decl_spec.type);
+      int want_mut = (strcmp (nm, "GetMut") == 0 || strcmp (nm, "FirstMut") == 0
+                      || strcmp (nm, "LastMut") == 0);
+      int want_last = (strcmp (nm, "Last") == 0 || strcmp (nm, "LastMut") == 0);
+      int want_first = (strcmp (nm, "First") == 0 || strcmp (nm, "FirstMut") == 0);
+
+      count_v = get_new_temp (c2m_ctx, promote_mir_int_type (ct));
+      emit2 (c2m_ctx, tp_mov (ct), count_v.mir_op,
+             MIR_new_alias_mem_op (ctx, ct, (MIR_disp_t) cnt_f->offset, this_r.mir_op.u.reg, 0, 1,
+                                   calias, 0));
+      if (want_first || want_last) {
+        /* Empty → OOB.  SKIP_OOB is not used for First/Last (no index proof). */
+        if (c2m_options->exceptions_p) {
+          MIR_label_t ok = MIR_new_label (ctx);
+          emit3 (c2m_ctx, MIR_BGT, MIR_new_label_op (ctx, ok), count_v.mir_op,
+                 MIR_new_int_op (ctx, 0));
+          {
+            MIR_op_t trap_args[3];
+            safety_ensure_imports (c2m_ctx);
+            trap_args[0] = MIR_new_int_op (ctx, 1);
+            trap_args[1] = zero_op.mir_op;
+            trap_args[2] = MIR_new_int_op (ctx, (long) POS (func_def).lno);
+            gen_rt_call_void (c2m_ctx, safety_trap_proto, safety_trap_item, 3, trap_args);
+          }
+          emit_label_insn_opt (c2m_ctx, ok);
+        }
+        if (want_last) {
+          idx = get_new_temp (c2m_ctx, MIR_T_I64);
+          emit3 (c2m_ctx, MIR_SUB, idx.mir_op, count_v.mir_op, MIR_new_int_op (ctx, 1));
+        } else {
+          idx = get_new_temp (c2m_ctx, MIR_T_I64);
+          emit2 (c2m_ctx, MIR_MOV, idx.mir_op, MIR_new_int_op (ctx, 0));
+        }
+      } else {
+        idx = force_reg (c2m_ctx, args[0], MIR_T_I64);
+        if (c2m_options->exceptions_p && !(safe_flags & GEN_SAFE_SKIP_OOB))
+          gen_oob_check (c2m_ctx, idx, count_v.mir_op, (long) POS (func_def).lno);
+      }
+      base = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, base.mir_op,
+             MIR_new_alias_mem_op (ctx, MIR_T_I64, (MIR_disp_t) data_f->offset, this_r.mir_op.u.reg,
+                                   0, 1, dalias, 0));
+      off = get_new_temp (c2m_ctx, MIR_T_I64);
+      addr = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit3 (c2m_ctx, MIR_MUL, off.mir_op, idx.mir_op, MIR_new_int_op (ctx, (long long) el_size));
+      emit3 (c2m_ctx, MIR_ADD, addr.mir_op, base.mir_op, off.mir_op);
+      if (want_mut) {
+        *res_out = addr;
+        return 1;
+      }
+      el = get_new_temp (c2m_ctx, promote_mir_int_type (el_mir));
+      emit2 (c2m_ctx, tp_mov (el_mir), el.mir_op,
+             MIR_new_mem_op (ctx, el_mir, 0, addr.mir_op.u.reg, 0, 1));
+      *res_out = el;
+      return 1;
+    }
+  }
+
+  /* Map layout: count + keys + vals */
+  {
+    ct = get_mir_type (c2m_ctx, count_f->decl_spec.type);
+    calias = get_type_alias (c2m_ctx, count_f->decl_spec.type);
+    if (strcmp (nm, "Count") == 0) {
+      *res_out = get_new_temp (c2m_ctx, promote_mir_int_type (ct));
+      emit2 (c2m_ctx, tp_mov (ct), res_out->mir_op,
+             MIR_new_alias_mem_op (ctx, ct, (MIR_disp_t) count_f->offset, this_r.mir_op.u.reg, 0, 1,
+                                   calias, 0));
+      return 1;
+    }
+    if (strcmp (nm, "IsEmpty") == 0) {
+      count_v = get_new_temp (c2m_ctx, promote_mir_int_type (ct));
+      emit2 (c2m_ctx, tp_mov (ct), count_v.mir_op,
+             MIR_new_alias_mem_op (ctx, ct, (MIR_disp_t) count_f->offset, this_r.mir_op.u.reg, 0, 1,
+                                   calias, 0));
+      *res_out = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit3 (c2m_ctx, MIR_EQ, res_out->mir_op, count_v.mir_op, MIR_new_int_op (ctx, 0));
+      return 1;
+    }
+    {
+      int is_key = (strcmp (nm, "KeyAt") == 0);
+      int is_mut = (strcmp (nm, "ValMut") == 0);
+      decl_t arr_f = is_key ? keys_f : vals_f;
+      struct type *el_type = arr_f->decl_spec.type->u.ptr_type;
+      mir_size_t el_size = type_size (c2m_ctx, el_type);
+      MIR_type_t el_mir = get_mir_type (c2m_ctx, el_type);
+      MIR_alias_t aalias = get_type_alias (c2m_ctx, arr_f->decl_spec.type);
+
+      count_v = get_new_temp (c2m_ctx, promote_mir_int_type (ct));
+      emit2 (c2m_ctx, tp_mov (ct), count_v.mir_op,
+             MIR_new_alias_mem_op (ctx, ct, (MIR_disp_t) count_f->offset, this_r.mir_op.u.reg, 0, 1,
+                                   calias, 0));
+      idx = force_reg (c2m_ctx, args[0], MIR_T_I64);
+      if (c2m_options->exceptions_p && !(safe_flags & GEN_SAFE_SKIP_OOB))
+        gen_oob_check (c2m_ctx, idx, count_v.mir_op, (long) POS (func_def).lno);
+      base = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit2 (c2m_ctx, MIR_MOV, base.mir_op,
+             MIR_new_alias_mem_op (ctx, MIR_T_I64, (MIR_disp_t) arr_f->offset, this_r.mir_op.u.reg,
+                                   0, 1, aalias, 0));
+      off = get_new_temp (c2m_ctx, MIR_T_I64);
+      addr = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit3 (c2m_ctx, MIR_MUL, off.mir_op, idx.mir_op, MIR_new_int_op (ctx, (long long) el_size));
+      emit3 (c2m_ctx, MIR_ADD, addr.mir_op, base.mir_op, off.mir_op);
+      if (is_mut) {
+        *res_out = addr;
+        return 1;
+      }
+      el = get_new_temp (c2m_ctx, promote_mir_int_type (el_mir));
+      emit2 (c2m_ctx, tp_mov (el_mir), el.mir_op,
+             MIR_new_mem_op (ctx, el_mir, 0, addr.mir_op.u.reg, 0, 1));
+      *res_out = el;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* Emit a direct call THIS_OP->method(args...) for a check-resolved class
    method FUNC_DEF.  Used by the brace-init protocol (new T{...} → Add calls),
    the for-in Count/Get iteration protocol, and filter/map/reduce over class
    receivers, where no N_CALL node exists in the AST.  THIS_TYPE is the
    receiver pointer type, ARGS holds N_ARGS already-evaluated user argument
-   values.  Aggregate return types are rejected during check. */
+   values.  SAFE_FLAGS elides null/OOB when the caller has already proved them.
+   Aggregate return types are rejected during check. */
 #define GEN_METHOD_MAX_ARGS 8
 static op_t gen_class_method_call_dest (c2m_ctx_t c2m_ctx, node_t func_def,
                                         struct type *this_type MIR_UNUSED, op_t this_op,
-                                        op_t *args, int n_args, op_t *agg_dest) {
+                                        op_t *args, int n_args, op_t *agg_dest, int safe_flags) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
   decl_t mdecl;
   struct func_type *ft;
   MIR_item_t proto;
   op_t all_args[GEN_METHOD_MAX_ARGS + 1];
+  op_t res = zero_op;
 
   assert (func_def != NULL && func_def->code == N_FUNC_DEF);
   mdecl = func_def->attr;
@@ -27267,24 +27624,37 @@ static op_t gen_class_method_call_dest (c2m_ctx_t c2m_ctx, node_t func_def,
           && mdecl->decl_spec.type->mode == TM_FUNC);
   ft = mdecl->decl_spec.type->u.func_type;
   assert (ft != NULL);
+
+  /* Prefer open-coded dense List/Set/Map accessors over a real call. */
+  if (try_open_code_dense_accessor (c2m_ctx, func_def, this_op, args, n_args, agg_dest, &res,
+                                    safe_flags))
+    return res;
+
   proto = gen_func_proto_item (c2m_ctx, ft);
 
   assert (n_args <= GEN_METHOD_MAX_ARGS);
-  /* One null check on the receiver at the call site.  Method bodies treat
-     `this` as DEREF_GUARD_SAFE so they do not re-check on every field access. */
-  if (c2m_options->exceptions_p) {
+  /* One null check on the receiver at the call site (unless proven).  Method
+     bodies treat `this` as DEREF_GUARD_SAFE so they do not re-check fields. */
+  if (c2m_options->exceptions_p && !(safe_flags & GEN_SAFE_SKIP_NULL)) {
     this_op = force_reg (c2m_ctx, this_op, MIR_T_I64);
     gen_null_check (c2m_ctx, this_op, (long) POS (func_def).lno);
   }
   all_args[0] = this_op; /* 'this' is the first parameter of the method */
-  for (int i = 0; i < n_args; i++) all_args[i + 1] = args[i];
+  for (int j = 0; j < n_args; j++) all_args[j + 1] = args[j];
   return gen_funcptr_call (c2m_ctx, proto, ft, MIR_new_ref_op (ctx, mdecl->u.item), all_args,
                            n_args + 1, agg_dest);
 }
 
+static op_t gen_class_method_call_flags (c2m_ctx_t c2m_ctx, node_t func_def,
+                                         struct type *this_type, op_t this_op, op_t *args,
+                                         int n_args, int safe_flags) {
+  return gen_class_method_call_dest (c2m_ctx, func_def, this_type, this_op, args, n_args, NULL,
+                                     safe_flags);
+}
+
 static op_t gen_class_method_call (c2m_ctx_t c2m_ctx, node_t func_def, struct type *this_type,
                                    op_t this_op, op_t *args, int n_args) {
-  return gen_class_method_call_dest (c2m_ctx, func_def, this_type, this_op, args, n_args, NULL);
+  return gen_class_method_call_dest (c2m_ctx, func_def, this_type, this_op, args, n_args, NULL, 0);
 }
 
 /* ---- Sequence lambda methods: MIR lowering ----
@@ -27340,13 +27710,21 @@ static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm
       op_t cv = val_gen (c2m_ctx, obj);
       emit2 (c2m_ctx, MIR_MOV, this_reg.mir_op, cv.mir_op);
       this_type = obj_type;
-    } else { /* class lvalue: use its address */
+    } else { /* class lvalue: use its address — never null */
       op_t cv = gen (c2m_ctx, obj, NULL, NULL, FALSE, NULL, NULL);
       if (cv.mir_op.mode == MIR_OP_MEM) cv = mem_to_address (c2m_ctx, cv, TRUE);
       emit2 (c2m_ctx, MIR_MOV, this_reg.mir_op, cv.mir_op);
       this_type = create_ptr_type (c2m_ctx, sr.cls_type);
     }
-    cnt = gen_class_method_call (c2m_ctx, sr.count_def, this_type, this_reg, NULL, 0);
+    /* One null check for pointer receivers; stack address is non-null. */
+    {
+      int seq_sf = GEN_SAFE_SKIP_NULL;
+      if (obj_type->mode == TM_PTR && c2m_options->exceptions_p) {
+        gen_null_check (c2m_ctx, force_reg (c2m_ctx, this_reg, MIR_T_I64), (long) POS (r).lno);
+      }
+      cnt = gen_class_method_call_flags (c2m_ctx, sr.count_def, this_type, this_reg, NULL, 0,
+                                         seq_sf);
+    }
     emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, cnt.mir_op);
   }
 
@@ -27475,10 +27853,11 @@ static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm
   emit_label_insn_opt (c2m_ctx, loop_label);
   emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (ctx, end_label), i_reg.mir_op, n_save.mir_op);
 
-  /* el = recv[i] */
+  /* el = recv[i]  — for class: i proven in [0,n) by loop; this already checked. */
   op_t el_op;
   if (sr.kind == SEQ_RECV_CLASS) {
-    el_op = gen_class_method_call (c2m_ctx, sr.get_def, this_type, this_reg, &i_reg, 1);
+    el_op = gen_class_method_call_flags (c2m_ctx, sr.get_def, this_type, this_reg, &i_reg, 1,
+                                         GEN_SAFE_SKIP_NULL | GEN_SAFE_SKIP_OOB);
   } else {
     op_t addr = get_new_temp (c2m_ctx, MIR_T_I64);
     emit3 (c2m_ctx, MIR_MUL, addr.mir_op, i_reg.mir_op, MIR_new_int_op (ctx, (long) el_size));
@@ -29283,6 +29662,58 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         goto finish;
       }
     }
+    /* Safe dense-accessor open-code for N_CALL: only intercept when the
+       receiver class has a dense List/Map layout *and* the method is open-
+       codeable.  Evaluate receiver/args once, open-code, never fall through
+       (which would re-evaluate and break GetMut chaining).  Non-dense classes
+       (Box.Count, etc.) use the normal call path — do not route them through
+       gen_class_method_call (proto/arity differs from N_CALL's proto_item). */
+    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
+      struct expr *fe = func->attr;
+      if (fe != NULL && fe->def_node != NULL && fe->def_node->code == N_FUNC_DEF
+          && fe->def_node != (node_t) (intptr_t) 1
+          && fe->def_node != (node_t) (intptr_t) 2) {
+        int na = args != NULL ? (int) NL_LENGTH (args->u.ops) : 0;
+        if (dense_accessor_open_codeable_p (fe->def_node, na)) {
+          node_t mobj = NL_HEAD (func->u.ops);
+          struct expr *obj_e = mobj != NULL ? mobj->attr : NULL;
+          op_t this_op, uargs[GEN_METHOD_MAX_ARGS], oc_res;
+          int i = 0, sflags = 0;
+          node_t arg;
+
+          if (func->code == N_DEREF_FIELD) {
+            this_op = val_gen (c2m_ctx, mobj);
+            /* Ownership/midopt may have stamped SAFE on the receiver expr. */
+            if (obj_e != NULL && obj_e->own_deref_class == DEREF_GUARD_SAFE)
+              sflags |= GEN_SAFE_SKIP_NULL;
+          } else if (obj_e != NULL && obj_e->type != NULL && obj_e->type->mode == TM_CLASS) {
+            /* Value-class receiver: `this` is &stack_slot — never null. */
+            op_t tmp = gen (c2m_ctx, mobj, NULL, NULL, FALSE, NULL, NULL);
+            if (tmp.mir_op.mode == MIR_OP_MEM)
+              this_op = mem_to_address (c2m_ctx, tmp, TRUE);
+            else
+              this_op = force_reg (c2m_ctx, tmp, MIR_T_I64);
+            sflags |= GEN_SAFE_SKIP_NULL;
+          } else {
+            this_op = val_gen (c2m_ctx, mobj);
+            if (obj_e != NULL && obj_e->own_deref_class == DEREF_GUARD_SAFE)
+              sflags |= GEN_SAFE_SKIP_NULL;
+          }
+          for (arg = (args ? NL_HEAD (args->u.ops) : NULL);
+               arg != NULL && i < GEN_METHOD_MAX_ARGS; arg = NL_NEXT (arg))
+            uargs[i++] = val_gen (c2m_ctx, arg);
+          /* Const non-negative index into a dense buffer: still need dynamic
+             length for full OOB proof — leave OOB on unless SKIP later. */
+          if (try_open_code_dense_accessor (c2m_ctx, fe->def_node, this_op, uargs, i, NULL,
+                                            &oc_res, sflags)) {
+            res = oc_res;
+            goto finish;
+          }
+          /* Predicate said open-codeable but emit failed — fall through to
+             normal N_CALL (re-eval).  Should not happen for dense layouts. */
+        }
+      }
+    }
     /* Built-in String method call: lower s.method(...) to a UTF-8 runtime call. */
 	    if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
 	      node_t mobj = NL_HEAD (func->u.ops);
@@ -30843,6 +31274,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     } else if (class_forin) {
       /* ---- Class iteration protocol for-in ----
          Index protocol (List/Set):  x = coll->Get(i)        (i in [0, Count()))
+         Dense path (List/Set with data+length fields): load length/data once,
+         then *(data + i) — no Count/Get calls (Phase C3).
          Keyed protocol (Map<K,V>):  k = coll->KeyAt(i), v = coll->ValAt(i) */
       struct type *cls_type = coll_type->mode == TM_PTR ? coll_type->u.ptr_type : coll_type;
       struct type *this_type
@@ -30856,23 +31289,106 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       node_t valat_def
         = find_class_protocol_method (c2m_ctx, cls_type->u.tag_type, "ValAt", 1, POS (r));
       int map_proto = (keyat_def != NULL && valat_def != NULL);
+      decl_t data_field = NULL, len_field = NULL;
+      int dense_list_p = 0;
 
       /* validated during check */
       assert (count_def != NULL && (map_proto || get_def != NULL));
       /* Evaluate the receiver pointer once, before the loop. */
       op_t this_reg = get_new_temp (c2m_ctx, MIR_T_I64);
+      int forin_sf = GEN_SAFE_SKIP_NULL; /* after check below (or stack) */
       if (coll_type->mode == TM_PTR) {
         op_t cv = val_gen (c2m_ctx, coll);
         emit2 (c2m_ctx, MIR_MOV, this_reg.mir_op, cv.mir_op);
-      } else { /* class lvalue: iterate over its address */
+        if (c2m_options->exceptions_p)
+          gen_null_check (c2m_ctx, force_reg (c2m_ctx, this_reg, MIR_T_I64),
+                          (long) POS (r).lno);
+      } else { /* class lvalue: iterate over its address — never null */
         op_t cv = gen (c2m_ctx, coll, NULL, NULL, FALSE, NULL, NULL);
         if (cv.mir_op.mode == MIR_OP_MEM) cv = mem_to_address (c2m_ctx, cv, TRUE);
         emit2 (c2m_ctx, MIR_MOV, this_reg.mir_op, cv.mir_op);
       }
-      /* n = coll->Count() */
-      op_t n_res = gen_class_method_call (c2m_ctx, count_def, this_type, this_reg, NULL, 0);
+
+      /* Detect List (`data`+`length`) / Set (`dense`+`count`) dense buffer. */
+      if (!map_proto && cls_type->u.tag_type != NULL)
+        dense_list_p
+          = find_dense_buffer_fields (cls_type->u.tag_type, &data_field, &len_field, NULL);
+
+      /* Dense Map: count + keys + vals arrays (insertion-ordered). */
+      decl_t map_keys_f = NULL, map_vals_f = NULL, map_cnt_f = NULL;
+      int dense_map_p = 0;
+      if (map_proto && cls_type->u.tag_type != NULL) {
+        map_keys_f = find_class_field_by_name (cls_type->u.tag_type, "keys");
+        map_vals_f = find_class_field_by_name (cls_type->u.tag_type, "vals");
+        map_cnt_f = find_class_field_by_name (cls_type->u.tag_type, "count");
+        dense_map_p = (map_cnt_f != NULL && map_cnt_f->decl_spec.type != NULL
+                       && map_cnt_f->decl_spec.type->mode == TM_BASIC && map_keys_f != NULL
+                       && map_keys_f->decl_spec.type != NULL
+                       && map_keys_f->decl_spec.type->mode == TM_PTR
+                       && map_keys_f->decl_spec.type->u.ptr_type != NULL
+                       && map_vals_f != NULL && map_vals_f->decl_spec.type != NULL
+                       && map_vals_f->decl_spec.type->mode == TM_PTR
+                       && map_vals_f->decl_spec.type->u.ptr_type != NULL);
+      }
+
       op_t n_save = get_new_temp (c2m_ctx, MIR_T_I64);
-      emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, n_res.mir_op);
+      op_t data_base = {0};
+      op_t keys_base = {0}, vals_base = {0};
+      struct type *dense_el_type = NULL;
+      mir_size_t dense_el_size = 0;
+      MIR_type_t dense_el_mir = MIR_T_I64;
+      struct type *dense_k_type = NULL, *dense_v_type = NULL;
+      mir_size_t dense_k_size = 0, dense_v_size = 0;
+      MIR_type_t dense_k_mir = MIR_T_I64, dense_v_mir = MIR_T_I64;
+
+      if (dense_list_p) {
+        /* n = this->length; data_base = this->data */
+        MIR_type_t lt = get_mir_type (c2m_ctx, len_field->decl_spec.type);
+        MIR_alias_t lalias = get_type_alias (c2m_ctx, len_field->decl_spec.type);
+        MIR_alias_t dalias = get_type_alias (c2m_ctx, data_field->decl_spec.type);
+        op_t raw_len = get_new_temp (c2m_ctx, promote_mir_int_type (lt));
+        emit2 (c2m_ctx, tp_mov (lt), raw_len.mir_op,
+               MIR_new_alias_mem_op (ctx, lt, (MIR_disp_t) len_field->offset,
+                                     this_reg.mir_op.u.reg, 0, 1, lalias, 0));
+        emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, raw_len.mir_op);
+        data_base = get_new_temp (c2m_ctx, MIR_T_I64);
+        emit2 (c2m_ctx, MIR_MOV, data_base.mir_op,
+               MIR_new_alias_mem_op (ctx, MIR_T_I64, (MIR_disp_t) data_field->offset,
+                                     this_reg.mir_op.u.reg, 0, 1, dalias, 0));
+        dense_el_type = data_field->decl_spec.type->u.ptr_type;
+        dense_el_size = type_size (c2m_ctx, dense_el_type);
+        dense_el_mir = get_mir_type (c2m_ctx, dense_el_type);
+      } else if (dense_map_p) {
+        MIR_type_t ct = get_mir_type (c2m_ctx, map_cnt_f->decl_spec.type);
+        MIR_alias_t calias = get_type_alias (c2m_ctx, map_cnt_f->decl_spec.type);
+        MIR_alias_t kalias = get_type_alias (c2m_ctx, map_keys_f->decl_spec.type);
+        MIR_alias_t valias = get_type_alias (c2m_ctx, map_vals_f->decl_spec.type);
+        op_t raw_cnt = get_new_temp (c2m_ctx, promote_mir_int_type (ct));
+        emit2 (c2m_ctx, tp_mov (ct), raw_cnt.mir_op,
+               MIR_new_alias_mem_op (ctx, ct, (MIR_disp_t) map_cnt_f->offset,
+                                     this_reg.mir_op.u.reg, 0, 1, calias, 0));
+        emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, raw_cnt.mir_op);
+        keys_base = get_new_temp (c2m_ctx, MIR_T_I64);
+        vals_base = get_new_temp (c2m_ctx, MIR_T_I64);
+        emit2 (c2m_ctx, MIR_MOV, keys_base.mir_op,
+               MIR_new_alias_mem_op (ctx, MIR_T_I64, (MIR_disp_t) map_keys_f->offset,
+                                     this_reg.mir_op.u.reg, 0, 1, kalias, 0));
+        emit2 (c2m_ctx, MIR_MOV, vals_base.mir_op,
+               MIR_new_alias_mem_op (ctx, MIR_T_I64, (MIR_disp_t) map_vals_f->offset,
+                                     this_reg.mir_op.u.reg, 0, 1, valias, 0));
+        dense_k_type = map_keys_f->decl_spec.type->u.ptr_type;
+        dense_v_type = map_vals_f->decl_spec.type->u.ptr_type;
+        dense_k_size = type_size (c2m_ctx, dense_k_type);
+        dense_v_size = type_size (c2m_ctx, dense_v_type);
+        dense_k_mir = get_mir_type (c2m_ctx, dense_k_type);
+        dense_v_mir = get_mir_type (c2m_ctx, dense_v_type);
+      } else {
+        /* n = coll->Count() — this already null-checked (or stack). */
+        op_t n_res
+          = gen_class_method_call_flags (c2m_ctx, count_def, this_type, this_reg, NULL, 0,
+                                         forin_sf);
+        emit2 (c2m_ctx, MIR_MOV, n_save.mir_op, n_res.mir_op);
+      }
 
       /* i = 0 */
       i_reg = get_new_temp (c2m_ctx, MIR_T_I64);
@@ -30917,45 +31433,114 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         }                                                                             \
       } while (0)
 
-      if (map_proto) {
-        /* Keyed: key_id = coll->KeyAt(i); [val_id = coll->ValAt(i)].
-           Aggregate K or V (by-value class) go into loop-var stack slots via
-           gen_class_method_call_dest — same as List.Get for-in. */
+      /* i proven in [0,n) by loop header → SKIP_OOB on indexed protocol calls. */
+      forin_sf |= GEN_SAFE_SKIP_OOB;
+
+      if (dense_map_p) {
+        /* Dense Map: k = keys[i]; v = vals[i] — no KeyAt/ValAt, no OOB. */
+        op_t k_off = get_new_temp (c2m_ctx, MIR_T_I64);
+        op_t k_addr = get_new_temp (c2m_ctx, MIR_T_I64);
+        op_t k_agg; struct type *k_vty; int k_is_agg;
+        FORIN_AGG_DEST (key_id, k_agg, k_vty, k_is_agg);
+        emit3 (c2m_ctx, MIR_MUL, k_off.mir_op, i_reg.mir_op,
+               MIR_new_int_op (ctx, (long long) dense_k_size));
+        emit3 (c2m_ctx, MIR_ADD, k_addr.mir_op, keys_base.mir_op, k_off.mir_op);
+        if (k_is_agg) {
+          op_t src_mem
+            = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, k_addr.mir_op.u.reg, 0, 1));
+          block_move (c2m_ctx, k_agg, src_mem, dense_k_size);
+        } else {
+          MIR_type_t load_t = promote_mir_int_type (dense_k_mir);
+          op_t k_res = get_new_temp (c2m_ctx, load_t);
+          emit2 (c2m_ctx, tp_mov (dense_k_mir), k_res.mir_op,
+                 MIR_new_mem_op (ctx, dense_k_mir, 0, k_addr.mir_op.u.reg, 0, 1));
+          STORE_FORIN_VAR (key_id, k_res);
+        }
+        if (val_id->code == N_ID) {
+          op_t v_off = get_new_temp (c2m_ctx, MIR_T_I64);
+          op_t v_addr = get_new_temp (c2m_ctx, MIR_T_I64);
+          op_t v_agg; struct type *v_vty; int v_is_agg;
+          FORIN_AGG_DEST (val_id, v_agg, v_vty, v_is_agg);
+          emit3 (c2m_ctx, MIR_MUL, v_off.mir_op, i_reg.mir_op,
+                 MIR_new_int_op (ctx, (long long) dense_v_size));
+          emit3 (c2m_ctx, MIR_ADD, v_addr.mir_op, vals_base.mir_op, v_off.mir_op);
+          if (v_is_agg) {
+            op_t src_mem
+              = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, v_addr.mir_op.u.reg, 0, 1));
+            block_move (c2m_ctx, v_agg, src_mem, dense_v_size);
+          } else {
+            MIR_type_t load_t = promote_mir_int_type (dense_v_mir);
+            op_t v_res = get_new_temp (c2m_ctx, load_t);
+            emit2 (c2m_ctx, tp_mov (dense_v_mir), v_res.mir_op,
+                   MIR_new_mem_op (ctx, dense_v_mir, 0, v_addr.mir_op.u.reg, 0, 1));
+            STORE_FORIN_VAR (val_id, v_res);
+          }
+        }
+      } else if (map_proto) {
+        /* Keyed protocol fallback (non-dense map layout). */
         {
           op_t k_agg; struct type *k_vty; int k_is_agg;
           FORIN_AGG_DEST (key_id, k_agg, k_vty, k_is_agg);
           op_t k_res = k_is_agg
-            ? gen_class_method_call_dest (c2m_ctx, keyat_def, this_type, this_reg, &i_reg, 1, &k_agg)
-            : gen_class_method_call (c2m_ctx, keyat_def, this_type, this_reg, &i_reg, 1);
+            ? gen_class_method_call_dest (c2m_ctx, keyat_def, this_type, this_reg, &i_reg, 1,
+                                          &k_agg, forin_sf)
+            : gen_class_method_call_flags (c2m_ctx, keyat_def, this_type, this_reg, &i_reg, 1,
+                                           forin_sf);
           if (!k_is_agg) STORE_FORIN_VAR (key_id, k_res);
         }
         if (val_id->code == N_ID) {
           op_t v_agg; struct type *v_vty; int v_is_agg;
           FORIN_AGG_DEST (val_id, v_agg, v_vty, v_is_agg);
           op_t v_res = v_is_agg
-            ? gen_class_method_call_dest (c2m_ctx, valat_def, this_type, this_reg, &i_reg, 1, &v_agg)
-            : gen_class_method_call (c2m_ctx, valat_def, this_type, this_reg, &i_reg, 1);
+            ? gen_class_method_call_dest (c2m_ctx, valat_def, this_type, this_reg, &i_reg, 1,
+                                          &v_agg, forin_sf)
+            : gen_class_method_call_flags (c2m_ctx, valat_def, this_type, this_reg, &i_reg, 1,
+                                           forin_sf);
           if (!v_is_agg) STORE_FORIN_VAR (val_id, v_res);
         }
-      } else {
-        /* elem = coll->Get(i).  For an aggregate element type, construct the
-           result directly into the loop variable's stack slot; otherwise store
-           the scalar/pointer result into its register. */
+      } else if (dense_list_p) {
+        /* Dense List/Set: el = *(data + i); no Get/Count calls; i in bounds. */
         node_t el_var = val_id->code == N_ID ? val_id : key_id;
         op_t agg_dst; struct type *el_vty; int el_agg;
+        op_t off = get_new_temp (c2m_ctx, MIR_T_I64);
+        op_t addr = get_new_temp (c2m_ctx, MIR_T_I64);
         FORIN_AGG_DEST (el_var, agg_dst, el_vty, el_agg);
-        op_t el_res = el_agg
-          ? gen_class_method_call_dest (c2m_ctx, get_def, this_type, this_reg, &i_reg, 1, &agg_dst)
-          : gen_class_method_call (c2m_ctx, get_def, this_type, this_reg, &i_reg, 1);
+        emit3 (c2m_ctx, MIR_MUL, off.mir_op, i_reg.mir_op,
+               MIR_new_int_op (ctx, (long long) dense_el_size));
+        emit3 (c2m_ctx, MIR_ADD, addr.mir_op, data_base.mir_op, off.mir_op);
         if (val_id->code == N_ID) {
-          /* Two-var form: key_id = i (index) */
           MIR_type_t idx_t = promote_mir_int_type (MIR_T_I32);
           const char *iname = get_reg_var_name (c2m_ctx, idx_t, key_id->u.s.s, fsn);
           reg_var_t ivar = get_reg_var (c2m_ctx, idx_t, iname, NULL);
           emit2 (c2m_ctx, tp_mov (idx_t), MIR_new_reg_op (ctx, ivar.reg), i_reg.mir_op);
         }
-        /* Aggregate elements were already materialized into the slot by
-           gen_class_method_call_dest; only scalars need the register store. */
+        if (el_agg) {
+          op_t src_mem
+            = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, addr.mir_op.u.reg, 0, 1));
+          block_move (c2m_ctx, agg_dst, src_mem, dense_el_size);
+        } else {
+          MIR_type_t load_t = promote_mir_int_type (dense_el_mir);
+          op_t el_res = get_new_temp (c2m_ctx, load_t);
+          emit2 (c2m_ctx, tp_mov (dense_el_mir), el_res.mir_op,
+                 MIR_new_mem_op (ctx, dense_el_mir, 0, addr.mir_op.u.reg, 0, 1));
+          STORE_FORIN_VAR (el_var, el_res);
+        }
+      } else {
+        /* elem = coll->Get(i) with proven this + index. */
+        node_t el_var = val_id->code == N_ID ? val_id : key_id;
+        op_t agg_dst; struct type *el_vty; int el_agg;
+        FORIN_AGG_DEST (el_var, agg_dst, el_vty, el_agg);
+        op_t el_res = el_agg
+          ? gen_class_method_call_dest (c2m_ctx, get_def, this_type, this_reg, &i_reg, 1, &agg_dst,
+                                        forin_sf)
+          : gen_class_method_call_flags (c2m_ctx, get_def, this_type, this_reg, &i_reg, 1,
+                                         forin_sf);
+        if (val_id->code == N_ID) {
+          MIR_type_t idx_t = promote_mir_int_type (MIR_T_I32);
+          const char *iname = get_reg_var_name (c2m_ctx, idx_t, key_id->u.s.s, fsn);
+          reg_var_t ivar = get_reg_var (c2m_ctx, idx_t, iname, NULL);
+          emit2 (c2m_ctx, tp_mov (idx_t), MIR_new_reg_op (ctx, ivar.reg), i_reg.mir_op);
+        }
         if (!el_agg) STORE_FORIN_VAR (el_var, el_res);
       }
       #undef STORE_FORIN_VAR

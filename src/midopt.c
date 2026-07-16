@@ -1,7 +1,7 @@
 /* src/midopt.c — Mid-level optimizer (check → gen) for ClassyC.
  *
- * STATUS: Phase B of GEN-OPT.md — P0 dead class-method pruning + P1
- * static OOB / null-guard elision stamps.
+ * STATUS: Phase B+C of GEN-OPT.md — method-level dead pruning, accessor
+ * inline marks, P1 guard elision.
  *
  * Single-TU build model: this file is `#include`d from `src/classyc.c`
  * next to `ownership.c`, so it sees internal types (`c2m_ctx_t`, `node_t`,
@@ -127,33 +127,76 @@ static int midopt_expr_node_p (node_code_t code) {
 
 static void midopt_mark_from_expr_node (node_t n) {
   struct expr *e;
+  node_t def;
 
   if (n == NULL || !midopt_expr_node_p (n->code)) return;
   if (n->attr == NULL || n->attr == (void *) ((intptr_t) -1)) return;
   e = (struct expr *) n->attr;
-  if (e->def_node != NULL && e->def_node->code == N_FUNC_DEF)
-    midopt_mark_keep (e->def_node);
+  /* After check, real exprs have a type.  Skip incomplete/error attrs. */
+  if (e->type == NULL) return;
+  def = e->def_node;
+  if (def == NULL) return;
+  /* N_DETACH stashes runtime selectors as tiny integer sentinels, not nodes:
+       (node_t)1 — string detach, (node_t)2 — object detach. */
+  if (def == (node_t) (intptr_t) 1 || def == (node_t) (intptr_t) 2) return;
+  if (def->code == N_FUNC_DEF) midopt_mark_keep (def);
+}
+
+/* Keep every overload of NAME on CLASS_TAG (same-class call-graph fill-in). */
+static void midopt_mark_named_on_class (c2m_ctx_t c2m_ctx, node_t class_tag, const char *name,
+                                       pos_t pos) {
+  symbol_t sym;
+  node_t id;
+  size_t i;
+
+  if (class_tag == NULL || name == NULL || name[0] == '\0') return;
+  id = build_id (c2m_ctx, name, pos);
+  if (!find_overload_sym (c2m_ctx, id, class_tag, &sym)) return;
+  for (i = 0; i < VARR_LENGTH (node_t, sym.defs); i++) {
+    node_t def = VARR_GET (node_t, sym.defs, i);
+    decl_t d;
+    struct func_type *ft;
+
+    if (def == NULL || def->code != N_FUNC_DEF || def->attr == NULL) continue;
+    if (def->attr == (void *) ((intptr_t) -1)) continue;
+    d = (decl_t) def->attr;
+    if (d->decl_spec.type == NULL || d->decl_spec.type->mode != TM_FUNC) continue;
+    ft = d->decl_spec.type->u.func_type;
+    if (ft == NULL || ft->class_scope != class_tag) continue;
+    midopt_mark_keep (def);
+  }
 }
 
 /* ── AST walk: collect uses / apply elisions ─────────────────────────────── */
 
-static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n);
+static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag);
 static void midopt_elide_walk (c2m_ctx_t c2m_ctx, node_t n);
 
-static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n) {
+static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) {
   if (n == NULL) return;
 
   /* Method references stashed on expression nodes only (never scopes/decls). */
   midopt_mark_from_expr_node (n);
 
+  /* Same-class call by name: this.Foo() / this->Foo() may lack def_node on
+     some monomorph paths; mark all Foo overloads on the enclosing class. */
+  if (class_tag != NULL && n->code == N_CALL) {
+    node_t func = NL_HEAD (n->u.ops);
+    if (func != NULL && (func->code == N_FIELD || func->code == N_DEREF_FIELD)) {
+      node_t mid = NL_NEXT (NL_HEAD (func->u.ops));
+      if (mid != NULL && mid->code == N_ID)
+        midopt_mark_named_on_class (c2m_ctx, class_tag, mid->u.s.s, POS (n));
+    }
+  }
+
   /* Stack RAII ctor/dtor calls on locals. */
   if (n->code == N_SPEC_DECL && n->attr != NULL
       && n->attr != (void *) ((intptr_t) -1)) {
     decl_t d = (decl_t) n->attr;
-    if (d->ctor_call != NULL) midopt_collect_uses (c2m_ctx, d->ctor_call);
-    if (d->dtor_call != NULL) midopt_collect_uses (c2m_ctx, d->dtor_call);
+    if (d->ctor_call != NULL) midopt_collect_uses (c2m_ctx, d->ctor_call, class_tag);
+    if (d->dtor_call != NULL) midopt_collect_uses (c2m_ctx, d->dtor_call, class_tag);
     if (d->auto_release_call != NULL)
-      midopt_collect_uses (c2m_ctx, d->auto_release_call);
+      midopt_collect_uses (c2m_ctx, d->auto_release_call, class_tag);
   }
 
   /* for-in over classes uses Count/Get (or KeyAt/ValAt) resolved only at gen
@@ -192,18 +235,28 @@ static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n) {
 
   if (!midopt_node_has_ops (n->code)) return;
   for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
-    midopt_collect_uses (c2m_ctx, c);
+    midopt_collect_uses (c2m_ctx, c, class_tag);
 }
 
 /* Walk only a function body (for worklist propagation). */
 static void midopt_collect_uses_body (c2m_ctx_t c2m_ctx, node_t func_def) {
   node_t block;
+  node_t class_tag = NULL;
+  decl_t d;
+  struct func_type *ft;
 
   if (func_def == NULL || func_def->code != N_FUNC_DEF) return;
+  if (func_def->attr != NULL && func_def->attr != (void *) ((intptr_t) -1)) {
+    d = (decl_t) func_def->attr;
+    if (d->decl_spec.type != NULL && d->decl_spec.type->mode == TM_FUNC) {
+      ft = d->decl_spec.type->u.func_type;
+      if (ft != NULL && ft->class_scope != NULL && ft->class_scope->code == N_CLASS)
+        class_tag = ft->class_scope;
+    }
+  }
   block = FUNC_DEF_BLOCK (func_def);
-  midopt_collect_uses (c2m_ctx, block);
-  /* Also scan param list / decls list for odd attrs. */
-  midopt_collect_uses (c2m_ctx, FUNC_DEF_DECLS (func_def));
+  midopt_collect_uses (c2m_ctx, block, class_tag);
+  midopt_collect_uses (c2m_ctx, FUNC_DEF_DECLS (func_def), class_tag);
 }
 
 /* P1: static OOB elision for arr[i] when i and length are compile-time constants. */
@@ -244,9 +297,11 @@ static void midopt_try_elide_oob (node_t n) {
   }
 }
 
-/* P1: `&obj` / stack address bases, and `this`, already handled in gen for
-   null; strengthen own_deref_class on N_DEREF / N_DEREF_FIELD when receiver is
-   `this` or ADDR of a local (conservative: only `this`). */
+/* P1: strengthen own_deref_class = SAFE when the pointer is proven non-null:
+     - `this` (method receiver)
+     - `&local` (address of stack object)
+     - N_DEREF of N_ADDR (undo of &x → x stack)
+   Gen elides gen_null_check when own_deref_class == SAFE. */
 static void midopt_try_elide_null (node_t n) {
   struct expr *e;
   node_t recv;
@@ -257,9 +312,16 @@ static void midopt_try_elide_null (node_t n) {
   if (e->type == NULL) return;
   if (e->own_deref_class == DEREF_GUARD_SAFE) return;
   recv = NL_HEAD (n->u.ops);
-  if (recv != NULL && recv->code == N_ID && recv->u.s.s != NULL
-      && strcmp (recv->u.s.s, "this") == 0)
+  if (recv == NULL) return;
+  if (recv->code == N_ID && recv->u.s.s != NULL && strcmp (recv->u.s.s, "this") == 0) {
     e->own_deref_class = DEREF_GUARD_SAFE;
+    return;
+  }
+  /* *(&x) or (&x)->field or (&x)[i]: address of an object is never null. */
+  if (recv->code == N_ADDR) {
+    e->own_deref_class = DEREF_GUARD_SAFE;
+    return;
+  }
 }
 
 static void midopt_elide_walk (c2m_ctx_t c2m_ctx, node_t n) {
@@ -271,11 +333,10 @@ static void midopt_elide_walk (c2m_ctx_t c2m_ctx, node_t n) {
     midopt_elide_walk (c2m_ctx, c);
 }
 
-/* Class-level liveness: if any method of a class is kept, keep *all* methods
-   of that class.  Intra-class calls (this->EnsureCapacity from Add, etc.) are
-   not always stamped with def_node/used_p on every path; pruning individual
-   methods leaves MIR_CALL refs with null items.  Whole-class keep is still a
-   large win vs emitting every monomorph of every unused List/Map/Set. */
+/* Class-level completeness for monomorphs that already have ≥1 keep.
+   Method-level worklist is the seed; expand closes incomplete this→sibling
+   graphs that residual monomorph AST still emits.  Unused monomorphs stay
+   fully dead. */
 static void midopt_expand_class_keeps (c2m_ctx_t c2m_ctx, node_t n) {
   if (n == NULL) return;
 
@@ -337,8 +398,9 @@ static void midopt_seed_from_free_funcs (c2m_ctx_t c2m_ctx, node_t n) {
   if (n->code == N_FUNC_DEF && n->attr != NULL
       && n->attr != (void *) ((intptr_t) -1)
       && !midopt_class_method_p (n)) {
-    /* Always "live": scan body for method refs. */
-    midopt_collect_uses_body (c2m_ctx, n);
+    /* Always "live": scan body for method refs (no enclosing class_tag). */
+    midopt_collect_uses (c2m_ctx, FUNC_DEF_BLOCK (n), NULL);
+    midopt_collect_uses (c2m_ctx, FUNC_DEF_DECLS (n), NULL);
   }
 
   if (!midopt_node_has_ops (n->code)) return;
@@ -404,34 +466,31 @@ static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
   if (midopt_verbose_p)
     fprintf (stderr, "  [midopt] start (P0 dead methods + P1 guard elision)\n");
 
-  /* 1) Seed ONLY from free functions (and nested decls/ctors in them).
-     Do not walk monomorph method bodies yet — that would mark every
-     intra-class call as a root and pin the whole specialization. */
+  /* 1) Seed ONLY from free functions (and nested decls/ctors in them). */
   midopt_seed_from_free_funcs (c2m_ctx, module);
 
-  /* 2) Fixpoint: scan newly kept method bodies for more method refs. */
+  /* 2) Method-level fixpoint (same-class name resolution for this->Foo). */
   wi = 0;
   while (wi < VARR_LENGTH (node_t, midopt_work)) {
     node_t f = VARR_GET (node_t, midopt_work, wi++);
     midopt_collect_uses_body (c2m_ctx, f);
   }
 
-  /* 3) Class-level expand once for monomorphs with ≥1 kept method. */
   if (midopt_verbose_p)
-    fprintf (stderr, "  [midopt] before class-expand kept=%lu\n",
+    fprintf (stderr, "  [midopt] method-level keep=%lu before class-expand\n",
              (unsigned long) VARR_LENGTH (node_t, midopt_keep));
+
+  /* 3) Class-expand live monomorphs once (completeness for residual MIR). */
   midopt_expand_class_keeps (c2m_ctx, module);
 
-  /* 3b) One worklist drain over expanded methods: mark any *direct* callees
-     (including other monomorphs) keep, but do not re-expand those monomorphs
-     wholesale — residual AST edges get a MIR warning in gen if still missing. */
-  wi = 0;
+  /* 3b) Drain callees of expanded methods (e.g. List_int.SelectString →
+     List_String.Add) without a second whole-class expand. */
   while (wi < VARR_LENGTH (node_t, midopt_work)) {
     node_t f = VARR_GET (node_t, midopt_work, wi++);
     midopt_collect_uses_body (c2m_ctx, f);
   }
 
-  /* 4) Safety net: zero keeps → do not prune (P1 elision still runs). */
+  /* 3c) Safety net: zero keeps → do not prune (P1 elision still runs). */
   if (VARR_LENGTH (node_t, midopt_keep) == 0) {
     if (midopt_verbose_p)
       fprintf (stderr, "  [midopt] no method keeps found — skip dead pruning\n");
@@ -448,6 +507,25 @@ static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
   }
 
   midopt_mark_dead_methods (c2m_ctx, module, &n_methods, &n_dead);
+
+  /* 4) Mark only trivial scalar accessors for MIR_INLINE.
+     Do NOT mark Get/GetMut — MIR_INLINE of methods that return pointers into
+     `this` buffers has been observed to miscompile chaining (GetMut().Boost).
+     Dense List Count/IsEmpty/Capacity are open-coded in gen instead. */
+  {
+    size_t ki;
+    for (ki = 0; ki < VARR_LENGTH (node_t, midopt_keep); ki++) {
+      node_t f = VARR_GET (node_t, midopt_keep, ki);
+      const char *nm = midopt_func_name (f);
+      decl_t d = f->attr;
+      if (nm == NULL || d == NULL) continue;
+      if (strcmp (nm, "Count") == 0 || strcmp (nm, "IsEmpty") == 0
+          || strcmp (nm, "Capacity") == 0) {
+        d->decl_spec.inline_p = TRUE;
+        if (midopt_verbose_p) fprintf (stderr, "  [midopt] inline mark %s\n", nm);
+      }
+    }
+  }
 
   /* 5) P1 safety elision stamps. */
   midopt_elide_walk (c2m_ctx, module);
