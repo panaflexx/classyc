@@ -260,7 +260,7 @@ int cy_chan_recv_park(cchan_t *c, void *msg) {
 - [ ] **Current fiber** — prefer **worker-local pointer**; mirror in `_Thread_local` for C interop once TLS works  
 - [ ] **Never** `mco_resume` a fiber on a different OS thread than it was created on (pin fibers to workers in v1)  
 - [ ] **stop → close → join** lifecycle helpers for orderly shutdown  
-- [ ] **No C11 atomics dependency** under ClassyC until atomics work — use cchan/mutexes (as in `classy-cchan-fibers.cy`)  
+- [x] **C11 atomics (Phase B)** — MIR opcodes + ClassyC `<stdatomic.h>` / `_Atomic` (seq_cst). Fiber demos may still use mutexes for channels; counters can use atomics (`CLASSY-ATOMICS.md`, `val-051-atomics.cy`)  
 - [ ] Link: JIT host already has pthread; AOT via `classyc-aot.sh` already passes `-lpthread`
 
 ### 2.4 Compiler / MIR (Phase 2)

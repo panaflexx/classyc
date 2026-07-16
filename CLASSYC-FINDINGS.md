@@ -12,7 +12,8 @@ Items marked **[measured]** / **[validated]** were reproduced on this tree;
 **[inspection]** is code reading. Product roadmap details live in
 [`CLASSYC-CLEANUP.md`](CLASSYC-CLEANUP.md) and [`BY-VALUE.md`](BY-VALUE.md).
 
-**Validate baseline:** `cy-validate` **52** `val-*.cy` files — full suite green.
+**Validate baseline:** `cy-validate` **53** `val-*.cy` files — full suite green
+(incl. **val-051** MIR/`_Atomic`/`stdatomic.h`).
 Showcases: `examples/classy-neon-grid.cy`, `examples/classy-aurora-ops.cy`.
 Bugs harness: `sh bugs/run-bugs.sh`. Pointer-arg smoke:
 `examples/test-generic-ptr-args.cy` (`List*[i]` Get/Set).
@@ -294,7 +295,7 @@ reason to treat `List*` as a C array of Lists.
 
 * mir-gen `cycle_phi_p` fix; rebuild `make classyc`  
 * bugs/001 variants PASS at -O2/-O3; bugs/009 shift PASS  
-* cy-validate: **52** `val-*.cy` files, full suite green  
+* cy-validate: **53** `val-*.cy` files, full suite green (val-051 atomics)  
   * val-038…045 — by-value / GetMut / capture / try-argv  
   * val-042 — capturing Where/Filter/Map/ForEach/Any/All/**Find/Sort/Select**  
   * val-046 stack Select (no prior `List*`)  

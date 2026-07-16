@@ -9,8 +9,9 @@
    o context pass checking context constraints and augmenting AST
    o generation pass producing MIR
 
-   The compiler implements C11 standard w/o C11  features:
-   atomic, complex, variable size arrays.
+   The compiler implements C11 standard w/o C11 features:
+   complex, variable size arrays.
+   Atomics: MIR ALOAD/ASTORE/RMW/CAS (seq_cst); see CLASSY-ATOMICS.md.
 
    o class, String, dict extensions make it Classy
    o
@@ -4433,6 +4434,17 @@ static macro_call_t try_param_macro_call (c2m_ctx_t c2m_ctx, macro_t m, token_t 
 #define PROP_SET "__builtin_prop_set"
 #define PROP_EQ "__builtin_prop_eq"
 #define PROP_NE "__builtin_prop_ne"
+/* GNU-style atomics (seq_cst; order args ignored in v1).  See CLASSY-ATOMICS.md. */
+#define ATOMIC_LOAD_N "__atomic_load_n"
+#define ATOMIC_STORE_N "__atomic_store_n"
+#define ATOMIC_EXCHANGE_N "__atomic_exchange_n"
+#define ATOMIC_FETCH_ADD "__atomic_fetch_add"
+#define ATOMIC_FETCH_SUB "__atomic_fetch_sub"
+#define ATOMIC_FETCH_AND "__atomic_fetch_and"
+#define ATOMIC_FETCH_OR "__atomic_fetch_or"
+#define ATOMIC_FETCH_XOR "__atomic_fetch_xor"
+#define ATOMIC_COMPARE_EXCHANGE_N "__atomic_compare_exchange_n"
+#define ATOMIC_THREAD_FENCE "__atomic_thread_fence"
 
 static void processing (c2m_ctx_t c2m_ctx, int ignore_directive_p) {
   MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
@@ -4600,7 +4612,17 @@ static void processing (c2m_ctx_t c2m_ctx, int ignore_directive_p) {
                        || strcmp (t->repr, MUL_OVERFLOW) == 0 || strcmp (t->repr, EXPECT) == 0
                        || strcmp (t->repr, JCALL) == 0 || strcmp (t->repr, JRET) == 0
                        || strcmp (t->repr, PROP_SET) == 0 || strcmp (t->repr, PROP_EQ) == 0
-                       || strcmp (t->repr, PROP_NE) == 0);
+                       || strcmp (t->repr, PROP_NE) == 0
+                       || strcmp (t->repr, ATOMIC_LOAD_N) == 0
+                       || strcmp (t->repr, ATOMIC_STORE_N) == 0
+                       || strcmp (t->repr, ATOMIC_EXCHANGE_N) == 0
+                       || strcmp (t->repr, ATOMIC_FETCH_ADD) == 0
+                       || strcmp (t->repr, ATOMIC_FETCH_SUB) == 0
+                       || strcmp (t->repr, ATOMIC_FETCH_AND) == 0
+                       || strcmp (t->repr, ATOMIC_FETCH_OR) == 0
+                       || strcmp (t->repr, ATOMIC_FETCH_XOR) == 0
+                       || strcmp (t->repr, ATOMIC_COMPARE_EXCHANGE_N) == 0
+                       || strcmp (t->repr, ATOMIC_THREAD_FENCE) == 0);
             }
           }
           m->ignore_p = TRUE;
@@ -19171,6 +19193,10 @@ if (base != NULL && base->code == N_ID) {
         struct type res_type;
         int builtin_call_p, alloca_p = FALSE, va_arg_p = FALSE, va_start_p = FALSE;
         int add_overflow_p = FALSE, sub_overflow_p = FALSE, mul_overflow_p = FALSE, expect_p = FALSE;
+        int atomic_load_n_p = FALSE, atomic_store_n_p = FALSE, atomic_exchange_n_p = FALSE;
+        int atomic_fetch_add_p = FALSE, atomic_fetch_sub_p = FALSE, atomic_fetch_and_p = FALSE;
+        int atomic_fetch_or_p = FALSE, atomic_fetch_xor_p = FALSE;
+        int atomic_cas_n_p = FALSE, atomic_fence_p = FALSE;
         int jcall_p = FALSE, jret_p = FALSE, prop_set_p = FALSE, prop_eq_p = FALSE, prop_ne_p = FALSE;
         int method_call_p = FALSE;
         int json_p = FALSE;
@@ -19461,6 +19487,16 @@ if (base != NULL && base->code == N_ID) {
           prop_eq_p = strcmp(op1->u.s.s, PROP_EQ) == 0;
           prop_ne_p = strcmp(op1->u.s.s, PROP_NE) == 0;
           json_p = strcmp(op1->u.s.s, BUILTIN_JSON) == 0;
+          atomic_load_n_p = strcmp (op1->u.s.s, ATOMIC_LOAD_N) == 0;
+          atomic_store_n_p = strcmp (op1->u.s.s, ATOMIC_STORE_N) == 0;
+          atomic_exchange_n_p = strcmp (op1->u.s.s, ATOMIC_EXCHANGE_N) == 0;
+          atomic_fetch_add_p = strcmp (op1->u.s.s, ATOMIC_FETCH_ADD) == 0;
+          atomic_fetch_sub_p = strcmp (op1->u.s.s, ATOMIC_FETCH_SUB) == 0;
+          atomic_fetch_and_p = strcmp (op1->u.s.s, ATOMIC_FETCH_AND) == 0;
+          atomic_fetch_or_p = strcmp (op1->u.s.s, ATOMIC_FETCH_OR) == 0;
+          atomic_fetch_xor_p = strcmp (op1->u.s.s, ATOMIC_FETCH_XOR) == 0;
+          atomic_cas_n_p = strcmp (op1->u.s.s, ATOMIC_COMPARE_EXCHANGE_N) == 0;
+          atomic_fence_p = strcmp (op1->u.s.s, ATOMIC_THREAD_FENCE) == 0;
         }
         /* Unqualified call to a method of the enclosing class: rewrite the
            callee `m(...)` to `this.m(...)` before the implicit-declaration
@@ -19768,7 +19804,10 @@ if (base != NULL && base->code == N_ID) {
         if (op1->code == N_ID && find_def(c2m_ctx, S_REGULAR, op1, curr_scope, NULL) == NULL) {
           va_arg_p = str_eq_p(op1->u.s.s, BUILTIN_VA_ARG);
           va_start_p = str_eq_p(op1->u.s.s, BUILTIN_VA_START);
-          if (!va_arg_p && !va_start_p && !alloca_p && !json_p) {
+          if (!va_arg_p && !va_start_p && !alloca_p && !json_p && !atomic_load_n_p
+              && !atomic_store_n_p && !atomic_exchange_n_p && !atomic_fetch_add_p
+              && !atomic_fetch_sub_p && !atomic_fetch_and_p && !atomic_fetch_or_p
+              && !atomic_fetch_xor_p && !atomic_cas_n_p && !atomic_fence_p) {
             warning (c2m_ctx, POS (op1),
                    "implicit declaration of function '%s' — did you forget an #include?",
                    op1->u.s.s);
@@ -19790,7 +19829,10 @@ if (base != NULL && base->code == N_ID) {
         }
         builtin_call_p = alloca_p || va_arg_p || va_start_p || add_overflow_p || sub_overflow_p
                          || mul_overflow_p || expect_p || jcall_p || jret_p || prop_set_p || prop_eq_p
-                         || prop_ne_p || json_p;
+                         || prop_ne_p || json_p || atomic_load_n_p || atomic_store_n_p
+                         || atomic_exchange_n_p || atomic_fetch_add_p || atomic_fetch_sub_p
+                         || atomic_fetch_and_p || atomic_fetch_or_p || atomic_fetch_xor_p
+                         || atomic_cas_n_p || atomic_fence_p;
         /* Capturing HOF desugar must run before call_nodes is populated (same
            reason as nameof): the node is rewritten into an N_STMTEXPR, which is
            not a call for MIR proto generation. */
@@ -19815,9 +19857,10 @@ if (base != NULL && base->code == N_ID) {
             res_type.u.ptr_type = &VOID_TYPE;
           } else {
             res_type.mode = TM_BASIC;
-            res_type.u.basic_type = (va_arg_p || add_overflow_p || sub_overflow_p || mul_overflow_p ? TP_INT
-                                    : expect_p || prop_eq_p || prop_ne_p                           ? TP_LONG
-                                                                                                   : TP_VOID);
+            res_type.u.basic_type = (va_arg_p || add_overflow_p || sub_overflow_p || mul_overflow_p
+                                        || atomic_cas_n_p
+                                      ? TP_INT
+                                    : expect_p || prop_eq_p || prop_ne_p ? TP_LONG : TP_VOID);
           }
           ret_type = &res_type;
           if (builtin_call_p
@@ -19831,7 +19874,15 @@ if (base != NULL && base->code == N_ID) {
                   || (va_arg_p && NL_LENGTH(arg_list->u.ops) != 2)
                   || (prop_set_p && NL_LENGTH(arg_list->u.ops) != 2)
                   || ((prop_eq_p || prop_ne_p) && NL_LENGTH(arg_list->u.ops) != 2)
-                  || (json_p && NL_LENGTH(arg_list->u.ops) != 1))) {
+                  || (json_p && NL_LENGTH(arg_list->u.ops) != 1)
+                  || (atomic_load_n_p && NL_LENGTH (arg_list->u.ops) != 2)
+                  || (atomic_store_n_p && NL_LENGTH (arg_list->u.ops) != 3)
+                  || (atomic_exchange_n_p && NL_LENGTH (arg_list->u.ops) != 3)
+                  || ((atomic_fetch_add_p || atomic_fetch_sub_p || atomic_fetch_and_p
+                       || atomic_fetch_or_p || atomic_fetch_xor_p)
+                      && NL_LENGTH (arg_list->u.ops) != 3)
+                  || (atomic_cas_n_p && NL_LENGTH (arg_list->u.ops) != 6)
+                  || (atomic_fence_p && NL_LENGTH (arg_list->u.ops) != 1))) {
             error(c2m_ctx, POS(op1), "wrong number of arguments in %s call", op1->u.s.s);
           } else {
             if (va_arg_p) {
@@ -19863,6 +19914,29 @@ if (base != NULL && base->code == N_ID) {
                 e2 = arg->attr;
                 if (!integer_type_p(e2->type))
                   error(c2m_ctx, POS(arg), "non-integer type of %d argument of %s call", i, EXPECT);
+              }
+            } else if (atomic_load_n_p || atomic_store_n_p || atomic_exchange_n_p || atomic_fetch_add_p
+                       || atomic_fetch_sub_p || atomic_fetch_and_p || atomic_fetch_or_p
+                       || atomic_fetch_xor_p || atomic_cas_n_p) {
+              /* Arg0: T* (often _Atomic T *).  Return T for load/exchange/fetch_*;
+                 void-ish for store; int (bool) for cas. */
+              arg = NL_HEAD (arg_list->u.ops);
+              e2 = arg->attr;
+              t2 = e2->type;
+              if (t2->mode != TM_PTR || t2->u.ptr_type == NULL
+                  || !(integer_type_p (t2->u.ptr_type) || t2->u.ptr_type->mode == TM_PTR))
+                error (c2m_ctx, POS (arg), "pointer to integer/pointer expected as 1st arg of %s",
+                       op1->u.s.s);
+              else if (atomic_load_n_p || atomic_exchange_n_p || atomic_fetch_add_p
+                       || atomic_fetch_sub_p || atomic_fetch_and_p || atomic_fetch_or_p
+                       || atomic_fetch_xor_p)
+                ret_type = t2->u.ptr_type;
+              if (atomic_cas_n_p) {
+                arg = NL_EL (arg_list->u.ops, 1);
+                e2 = arg->attr;
+                if (e2->type->mode != TM_PTR)
+                  error (c2m_ctx, POS (arg), "pointer expected as expected-value arg of %s",
+                         ATOMIC_COMPARE_EXCHANGE_N);
               }
             } else if (jret_p) {
               arg = NL_HEAD(arg_list->u.ops);
@@ -21227,7 +21301,13 @@ if (base != NULL && base->code == N_ID) {
         || str_eq_p(id->u.s.s, BUILTIN_VA_ARG) || strcmp(id->u.s.s, ADD_OVERFLOW) == 0
         || strcmp(id->u.s.s, SUB_OVERFLOW) == 0 || strcmp(id->u.s.s, MUL_OVERFLOW) == 0
         || strcmp(id->u.s.s, EXPECT) == 0 || strcmp(id->u.s.s, JCALL) == 0
-        || strcmp(id->u.s.s, JRET) == 0) {
+        || strcmp(id->u.s.s, JRET) == 0 || strcmp (id->u.s.s, ATOMIC_LOAD_N) == 0
+        || strcmp (id->u.s.s, ATOMIC_STORE_N) == 0 || strcmp (id->u.s.s, ATOMIC_EXCHANGE_N) == 0
+        || strcmp (id->u.s.s, ATOMIC_FETCH_ADD) == 0 || strcmp (id->u.s.s, ATOMIC_FETCH_SUB) == 0
+        || strcmp (id->u.s.s, ATOMIC_FETCH_AND) == 0 || strcmp (id->u.s.s, ATOMIC_FETCH_OR) == 0
+        || strcmp (id->u.s.s, ATOMIC_FETCH_XOR) == 0
+        || strcmp (id->u.s.s, ATOMIC_COMPARE_EXCHANGE_N) == 0
+        || strcmp (id->u.s.s, ATOMIC_THREAD_FENCE) == 0) {
         error(c2m_ctx, POS(id), "%s is a builtin function", id->u.s.s);
         break;
     }
@@ -23252,6 +23332,38 @@ static void emit2_noopt (c2m_ctx_t c2m_ctx, MIR_insn_code_t code, MIR_op_t op1, 
   emit_insn (c2m_ctx, MIR_new_insn (c2m_ctx->ctx, code, op1, op2));
 }
 
+static void emit3_noopt (c2m_ctx_t c2m_ctx, MIR_insn_code_t code, MIR_op_t op1, MIR_op_t op2,
+                         MIR_op_t op3) {
+  emit_insn (c2m_ctx, MIR_new_insn (c2m_ctx->ctx, code, op1, op2, op3));
+}
+
+static void emit4_noopt (c2m_ctx_t c2m_ctx, MIR_insn_code_t code, MIR_op_t op1, MIR_op_t op2,
+                         MIR_op_t op3, MIR_op_t op4) {
+  emit_insn (c2m_ctx, MIR_new_insn (c2m_ctx->ctx, code, op1, op2, op3, op4));
+}
+
+static int type_atomic_p (struct type *t) { return t != NULL && t->type_qual.atomic_p; }
+
+static int op_decl_atomic_p (op_t op) {
+  return op.decl != NULL && op.decl->decl_spec.type != NULL
+         && op.decl->decl_spec.type->type_qual.atomic_p;
+}
+
+/* Atomic load from a MIR mem operand into a new temp (seq_cst). */
+static op_t atomic_load_mem (c2m_ctx_t c2m_ctx, op_t mem, MIR_type_t t) {
+  op_t res = get_new_temp (c2m_ctx, promote_mir_int_type (t));
+  assert (mem.mir_op.mode == MIR_OP_MEM);
+  /* Keep width in the mem type so mir-gen/interp pick the right size. */
+  mem.mir_op.u.mem.type = t;
+  emit2_noopt (c2m_ctx, MIR_ALOAD, res.mir_op, mem.mir_op);
+  return res;
+}
+
+static void atomic_store_mem (c2m_ctx_t c2m_ctx, op_t mem, op_t val) {
+  assert (mem.mir_op.mode == MIR_OP_MEM);
+  emit2_noopt (c2m_ctx, MIR_ASTORE, mem.mir_op, val.mir_op);
+}
+
 static op_t cast (c2m_ctx_t c2m_ctx, op_t op, MIR_type_t t, int new_op_p) {
   op_t res, interm;
   MIR_type_t op_type;
@@ -23487,6 +23599,12 @@ static op_t force_val (c2m_ctx_t c2m_ctx, op_t op, int arr_p) {
   op_t temp_op;
   int sh;
 
+  /* Named `_Atomic` object in memory: always use ALOAD (never plain MOV). */
+  if (op.mir_op.mode == MIR_OP_MEM && op_decl_atomic_p (op)
+      && integer_type_p (op.decl->decl_spec.type)) {
+    MIR_type_t t = get_mir_type (c2m_ctx, op.decl->decl_spec.type);
+    return atomic_load_mem (c2m_ctx, op, t);
+  }
   if (arr_p && op.mir_op.mode == MIR_OP_MEM) {
     /* True array lvalue: decay to a pointer via address-of the storage.
 
@@ -23718,9 +23836,22 @@ static op_t force_reg (c2m_ctx_t c2m_ctx, op_t op, MIR_type_t t) {
   op_t res;
 
   if (op.mir_op.mode == MIR_OP_REG) return op;
+  if (op.mir_op.mode == MIR_OP_MEM && op_decl_atomic_p (op)
+      && integer_type_p (op.decl->decl_spec.type)) {
+    MIR_type_t at = get_mir_type (c2m_ctx, op.decl->decl_spec.type);
+    return atomic_load_mem (c2m_ctx, op, at);
+  }
   res = get_new_temp (c2m_ctx, promote_mir_int_type (t));
   emit2 (c2m_ctx, MIR_MOV, res.mir_op, op.mir_op);
   return res;
+}
+
+/* Build mem:T[ptr_reg] for atomic builtins from a pointer value. */
+static op_t atomic_ptr_to_mem (c2m_ctx_t c2m_ctx, op_t ptr, MIR_type_t t) {
+  MIR_context_t ctx = c2m_ctx->ctx;
+  ptr = force_reg (c2m_ctx, ptr, MIR_T_I64);
+  assert (ptr.mir_op.mode == MIR_OP_REG);
+  return new_op (NULL, MIR_new_mem_op (ctx, t, 0, ptr.mir_op.u.reg, 0, 1));
 }
 
 static op_t force_reg_or_mem (c2m_ctx_t c2m_ctx, op_t op, MIR_type_t t) {
@@ -26496,7 +26627,13 @@ static void gen_loop_body_scope_leave (c2m_ctx_t c2m_ctx,
 static void emit_scalar_assign (c2m_ctx_t c2m_ctx, op_t var, op_t *val, MIR_type_t t,
                                 int ignore_others_p) {
   if (var.decl == NULL || var.decl->bit_offset < 0) {
-    emit2_noopt (c2m_ctx, tp_mov (t), var.mir_op, val->mir_op);
+    if (var.mir_op.mode == MIR_OP_MEM && op_decl_atomic_p (var)) {
+      MIR_type_t at = get_mir_type (c2m_ctx, var.decl->decl_spec.type);
+      var.mir_op.u.mem.type = at;
+      atomic_store_mem (c2m_ctx, var, *val);
+    } else {
+      emit2_noopt (c2m_ctx, tp_mov (t), var.mir_op, val->mir_op);
+    }
   } else {
     MIR_context_t ctx = c2m_ctx->ctx;
     int width = var.decl->width;
@@ -28193,6 +28330,21 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     type = ((struct expr *) r->attr)->type2;
     t = get_mir_type (c2m_ctx, type);
     var = gen (c2m_ctx, NL_HEAD (r->u.ops), NULL, NULL, FALSE, NULL, NULL);
+    /* Atomic integer ++/--: single RMW (AADD/ASUB). */
+    if (var.mir_op.mode == MIR_OP_MEM && type_atomic_p (type) && integer_type_p (type)
+        && type->mode != TM_PTR) {
+      MIR_type_t at = t;
+      op_t delta = promote (c2m_ctx, one_op, at, FALSE);
+      op_t oldv = get_new_temp (c2m_ctx, promote_mir_int_type (at));
+      var.mir_op.u.mem.type = at;
+      delta = force_reg (c2m_ctx, delta, promote_mir_int_type (at));
+      emit3_noopt (c2m_ctx, r->code == N_POST_INC ? MIR_AADD : MIR_ASUB, oldv.mir_op, var.mir_op,
+                   delta.mir_op);
+      if (val_p || true_label != NULL) {
+        res = oldv;
+      }
+      break;
+    }
     op1 = force_val (c2m_ctx, var, FALSE);
     if (val_p || true_label != NULL) {
       res = get_new_temp (c2m_ctx, t);
@@ -28213,6 +28365,20 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     type = ((struct expr *) r->attr)->type2;
     t = get_mir_type (c2m_ctx, type);
     var = gen (c2m_ctx, NL_HEAD (r->u.ops), NULL, NULL, FALSE, NULL, NULL);
+    if (var.mir_op.mode == MIR_OP_MEM && type_atomic_p (type) && integer_type_p (type)
+        && type->mode != TM_PTR) {
+      MIR_type_t at = t;
+      op_t delta = promote (c2m_ctx, one_op, at, FALSE);
+      op_t oldv = get_new_temp (c2m_ctx, promote_mir_int_type (at));
+      var.mir_op.u.mem.type = at;
+      delta = force_reg (c2m_ctx, delta, promote_mir_int_type (at));
+      emit3_noopt (c2m_ctx, r->code == N_INC ? MIR_AADD : MIR_ASUB, oldv.mir_op, var.mir_op,
+                   delta.mir_op);
+      t = promote_mir_int_type (at);
+      res = get_new_temp (c2m_ctx, t);
+      emit3 (c2m_ctx, r->code == N_INC ? MIR_ADD : MIR_SUB, res.mir_op, oldv.mir_op, delta.mir_op);
+      break;
+    }
     val = promote (c2m_ctx, force_val (c2m_ctx, var, FALSE), t, TRUE);
     op2 = promote (c2m_ctx,
                    type->mode != TM_PTR
@@ -28233,7 +28399,39 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_SUB_ASSIGN:
   case N_MUL_ASSIGN:
   case N_DIV_ASSIGN:
-  case N_MOD_ASSIGN:
+  case N_MOD_ASSIGN: {
+    /* Atomic RMW for += -= &= |= ^= on integer _Atomic lvalues. */
+    node_t lhs_e = NL_HEAD (r->u.ops);
+    struct type *lhs_t = ((struct expr *) lhs_e->attr)->type;
+    MIR_insn_code_t acode = MIR_INSN_BOUND;
+    if (type_atomic_p (lhs_t) && integer_type_p (lhs_t) && lhs_t->mode != TM_PTR) {
+      if (r->code == N_ADD_ASSIGN) acode = MIR_AADD;
+      else if (r->code == N_SUB_ASSIGN) acode = MIR_ASUB;
+      else if (r->code == N_AND_ASSIGN) acode = MIR_AAND;
+      else if (r->code == N_OR_ASSIGN) acode = MIR_AOR;
+      else if (r->code == N_XOR_ASSIGN) acode = MIR_AXOR;
+    }
+    if (acode != MIR_INSN_BOUND) {
+      MIR_type_t at = get_mir_type (c2m_ctx, lhs_t);
+      MIR_insn_code_t bin = (acode == MIR_AADD   ? MIR_ADD
+                             : acode == MIR_ASUB ? MIR_SUB
+                             : acode == MIR_AAND ? MIR_AND
+                             : acode == MIR_AOR  ? MIR_OR
+                                                 : MIR_XOR);
+      var = gen (c2m_ctx, lhs_e, NULL, NULL, FALSE, NULL, NULL);
+      op2 = val_gen (c2m_ctx, NL_NEXT (lhs_e));
+      op2 = promote (c2m_ctx, op2, at, FALSE);
+      op2 = force_reg (c2m_ctx, op2, promote_mir_int_type (at));
+      if (var.mir_op.mode == MIR_OP_MEM) {
+        op_t oldv = get_new_temp (c2m_ctx, promote_mir_int_type (at));
+        var.mir_op.u.mem.type = at;
+        emit3_noopt (c2m_ctx, acode, oldv.mir_op, var.mir_op, op2.mir_op);
+        t = promote_mir_int_type (at);
+        res = get_new_temp (c2m_ctx, t);
+        emit3 (c2m_ctx, bin, res.mir_op, oldv.mir_op, op2.mir_op);
+        break;
+      }
+    }
     gen_assign_bin_op (c2m_ctx, r, ((struct expr *) r->attr)->type2, &val, &op2, &var);
     /* Integer division-by-zero guard for /= and %= (exceptions mode only). */
     if (c2m_options->exceptions_p && (r->code == N_DIV_ASSIGN || r->code == N_MOD_ASSIGN)
@@ -28266,6 +28464,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     res = get_new_temp (c2m_ctx, t);
     goto assign;
     break;
+  }
   case N_ASSIGN: {
     node_t lhs = NL_HEAD (r->u.ops);
     node_t rhs_node = NL_EL (r->u.ops, 1);
@@ -28440,8 +28639,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   }
   assign: /* t/val is promoted type/new value of assign expression */
     if (scalar_type_p (((struct expr *) r->attr)->type)) {
+      struct type *asg_t = ((struct expr *) r->attr)->type;
       assert (t != MIR_T_UNDEF);
-      val = cast (c2m_ctx, val, get_mir_type (c2m_ctx, ((struct expr *) r->attr)->type), FALSE);
+      val = cast (c2m_ctx, val, get_mir_type (c2m_ctx, asg_t), FALSE);
       /* Value-semantic String field (Option D): when storing a String into a
          class member, the object takes a private owned copy and frees the old
          buffer.  This keeps the field pointing at a freeable heap buffer (or
@@ -28459,7 +28659,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         gen_rt_call_void (c2m_ctx, str_drop_proto, str_drop_item, 1, &drop_arg);
         val = owned;
       }
-      emit_scalar_assign (c2m_ctx, var, &val, t, FALSE);
+      if (var.mir_op.mode == MIR_OP_MEM && type_atomic_p (asg_t) && integer_type_p (asg_t)
+          && !floating_type_p (asg_t)) {
+        MIR_type_t at = get_mir_type (c2m_ctx, asg_t);
+        var.mir_op.u.mem.type = at;
+        val = force_reg (c2m_ctx, val, promote_mir_int_type (at));
+        atomic_store_mem (c2m_ctx, var, val);
+      } else {
+        emit_scalar_assign (c2m_ctx, var, &val, t, FALSE);
+      }
       if ((val_p || true_label != NULL) && r->code != N_POST_INC && r->code != N_POST_DEC)
         emit2_noopt (c2m_ctx, tp_mov (t), res.mir_op, val.mir_op);
     } else { /* block move */
@@ -29404,6 +29612,30 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     int prop_eq_p = call_expr->builtin_call_p && strcmp (func->u.s.s, PROP_EQ) == 0;
     int prop_ne_p = call_expr->builtin_call_p && strcmp (func->u.s.s, PROP_NE) == 0;
     int json_p = call_expr->builtin_call_p && strcmp (func->u.s.s, BUILTIN_JSON) == 0;
+    int atomic_load_n_p
+      = call_expr->builtin_call_p && strcmp (func->u.s.s, ATOMIC_LOAD_N) == 0;
+    int atomic_store_n_p
+      = call_expr->builtin_call_p && strcmp (func->u.s.s, ATOMIC_STORE_N) == 0;
+    int atomic_exchange_n_p
+      = call_expr->builtin_call_p && strcmp (func->u.s.s, ATOMIC_EXCHANGE_N) == 0;
+    int atomic_fetch_add_p
+      = call_expr->builtin_call_p && strcmp (func->u.s.s, ATOMIC_FETCH_ADD) == 0;
+    int atomic_fetch_sub_p
+      = call_expr->builtin_call_p && strcmp (func->u.s.s, ATOMIC_FETCH_SUB) == 0;
+    int atomic_fetch_and_p
+      = call_expr->builtin_call_p && strcmp (func->u.s.s, ATOMIC_FETCH_AND) == 0;
+    int atomic_fetch_or_p
+      = call_expr->builtin_call_p && strcmp (func->u.s.s, ATOMIC_FETCH_OR) == 0;
+    int atomic_fetch_xor_p
+      = call_expr->builtin_call_p && strcmp (func->u.s.s, ATOMIC_FETCH_XOR) == 0;
+    int atomic_cas_n_p
+      = call_expr->builtin_call_p && strcmp (func->u.s.s, ATOMIC_COMPARE_EXCHANGE_N) == 0;
+    int atomic_fence_p
+      = call_expr->builtin_call_p && strcmp (func->u.s.s, ATOMIC_THREAD_FENCE) == 0;
+    int atomic_builtin_p
+      = atomic_load_n_p || atomic_store_n_p || atomic_exchange_n_p || atomic_fetch_add_p
+        || atomic_fetch_sub_p || atomic_fetch_and_p || atomic_fetch_or_p || atomic_fetch_xor_p
+        || atomic_cas_n_p || atomic_fence_p;
     int builtin_call_p = alloca_p || va_arg_p || va_start_p, inline_p = FALSE;
     node_t block = FUNC_DEF_BLOCK (curr_func_def);
     struct node_scope *ns = block->attr;
@@ -29562,6 +29794,80 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                  NULL);
       true_label = false_label = NULL;
       val_p = FALSE;
+      break;
+    }
+    if (atomic_builtin_p) {
+      /* seq_cst only; trailing order args are ignored.
+         Value results leave true_label set so finish can BT/BF for
+         `while (!atomic_load(...))` etc.  Void ops clear labels. */
+      if (atomic_fence_p) {
+        emit_insn (c2m_ctx, MIR_new_insn (ctx, MIR_AFENCE));
+        res = zero_op;
+        true_label = false_label = NULL;
+        val_p = FALSE;
+        break;
+      }
+      {
+        node_t a0 = NL_HEAD (args->u.ops);
+        struct type *pt = ((struct expr *) a0->attr)->type;
+        struct type *et = (pt != NULL && pt->mode == TM_PTR) ? pt->u.ptr_type : NULL;
+        MIR_type_t at = et != NULL ? get_mir_type (c2m_ctx, et) : MIR_T_I64;
+        op_t ptr = val_gen (c2m_ctx, a0);
+        op_t mem = atomic_ptr_to_mem (c2m_ctx, ptr, at);
+        if (atomic_load_n_p) {
+          res = atomic_load_mem (c2m_ctx, mem, at);
+        } else if (atomic_store_n_p) {
+          op_t v = val_gen (c2m_ctx, NL_EL (args->u.ops, 1));
+          v = force_reg (c2m_ctx, promote (c2m_ctx, v, at, FALSE), promote_mir_int_type (at));
+          atomic_store_mem (c2m_ctx, mem, v);
+          res = zero_op;
+          true_label = false_label = NULL;
+          val_p = FALSE;
+        } else if (atomic_exchange_n_p) {
+          op_t v = val_gen (c2m_ctx, NL_EL (args->u.ops, 1));
+          v = force_reg (c2m_ctx, promote (c2m_ctx, v, at, FALSE), promote_mir_int_type (at));
+          res = get_new_temp (c2m_ctx, promote_mir_int_type (at));
+          emit3_noopt (c2m_ctx, MIR_AXCHG, res.mir_op, mem.mir_op, v.mir_op);
+        } else if (atomic_fetch_add_p || atomic_fetch_sub_p || atomic_fetch_and_p
+                   || atomic_fetch_or_p || atomic_fetch_xor_p) {
+          MIR_insn_code_t ac = (atomic_fetch_add_p   ? MIR_AADD
+                                : atomic_fetch_sub_p ? MIR_ASUB
+                                : atomic_fetch_and_p ? MIR_AAND
+                                : atomic_fetch_or_p  ? MIR_AOR
+                                                     : MIR_AXOR);
+          op_t v = val_gen (c2m_ctx, NL_EL (args->u.ops, 1));
+          v = force_reg (c2m_ctx, promote (c2m_ctx, v, at, FALSE), promote_mir_int_type (at));
+          res = get_new_temp (c2m_ctx, promote_mir_int_type (at));
+          emit3_noopt (c2m_ctx, ac, res.mir_op, mem.mir_op, v.mir_op);
+        } else if (atomic_cas_n_p) {
+          /* __atomic_compare_exchange_n(ptr, expected*, desired, weak, s, f)
+             Returns bool; on failure updates *expected to the observed value. */
+          op_t exp_ptr = val_gen (c2m_ctx, NL_EL (args->u.ops, 1));
+          op_t des = val_gen (c2m_ctx, NL_EL (args->u.ops, 2));
+          op_t exp_mem, oldv, exp_val, ok;
+          MIR_label_t ok_lab, done_lab;
+          exp_ptr = force_reg (c2m_ctx, exp_ptr, MIR_T_I64);
+          exp_mem = new_op (NULL, MIR_new_mem_op (ctx, at, 0, exp_ptr.mir_op.u.reg, 0, 1));
+          exp_val = get_new_temp (c2m_ctx, promote_mir_int_type (at));
+          emit2 (c2m_ctx, MIR_MOV, exp_val.mir_op, exp_mem.mir_op);
+          des = force_reg (c2m_ctx, promote (c2m_ctx, des, at, FALSE), promote_mir_int_type (at));
+          oldv = get_new_temp (c2m_ctx, promote_mir_int_type (at));
+          emit4_noopt (c2m_ctx, MIR_ACAS, oldv.mir_op, mem.mir_op, exp_val.mir_op, des.mir_op);
+          ok = get_new_temp (c2m_ctx, MIR_T_I64);
+          ok_lab = MIR_new_label (ctx);
+          done_lab = MIR_new_label (ctx);
+          emit3 (c2m_ctx, MIR_BEQ, MIR_new_label_op (ctx, ok_lab), oldv.mir_op, exp_val.mir_op);
+          /* fail: *expected = old */
+          emit2_noopt (c2m_ctx, MIR_MOV, exp_mem.mir_op, oldv.mir_op);
+          emit2 (c2m_ctx, MIR_MOV, ok.mir_op, MIR_new_int_op (ctx, 0));
+          emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, done_lab));
+          emit_label_insn_opt (c2m_ctx, ok_lab);
+          emit2 (c2m_ctx, MIR_MOV, ok.mir_op, MIR_new_int_op (ctx, 1));
+          emit_label_insn_opt (c2m_ctx, done_lab);
+          res = ok;
+        }
+      }
+      /* Keep true_label for load/fetch/cas/exchange so finish emits BT/BF. */
       break;
     }
     if (jret_p) {
@@ -32241,7 +32547,15 @@ finish:
     }
     emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, false_label));
   } else if (val_p) {
-    res = force_val (c2m_ctx, res, ((struct expr *) r->attr)->type->arr_type != NULL);
+    struct type *vt = ((struct expr *) r->attr)->type;
+    /* `_Atomic` rvalue from *ptr / field without a named decl: ALOAD. */
+    if (res.mir_op.mode == MIR_OP_MEM && type_atomic_p (vt) && integer_type_p (vt)
+        && !op_decl_atomic_p (res)) {
+      MIR_type_t at = get_mir_type (c2m_ctx, vt);
+      res = atomic_load_mem (c2m_ctx, res, at);
+    } else {
+      res = force_val (c2m_ctx, res, vt->arr_type != NULL);
+    }
   }
   if (stmt_p) curr_call_arg_area_offset = 0;
   return res;

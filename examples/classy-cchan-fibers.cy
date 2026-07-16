@@ -12,9 +12,8 @@
  *   - Prefer buffered channels so try_send has somewhere to park messages.
  *   - stop → close → join (never join-then-stop).
  *
- * ClassyC note: no reliable C11 atomics under the JIT, so shared counters use
- * a small mutex. Channel traffic itself is still lock-free from the caller's
- * perspective (cchan's own pthread mutexes).
+ * Shared counters / stop flag use C11 atomics (`<stdatomic.h>` → MIR ALOAD /
+ * ASTORE / AADD). Channel traffic still uses cchan’s own pthread mutexes.
  *
  * Run from the project root (all driver options before -eg; program args after):
  *
@@ -45,6 +44,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 /* ── knobs (small defaults so the example finishes in ~1s) ────────────── */
 
@@ -52,46 +52,23 @@
 #define MAX_LOCAL        64
 #define MAX_FIBERS_TOTAL 256
 #define MAX_BOOK         32
-#define FIBER_STACK      (32 * 1024)
+#define FIBER_STACK      (64 * 1024)
 
 static int g_nworkers = 2;    /* multi-OS-thread; needs MCO_PTHREAD_TLS under ClassyC */
 static int g_nfibers  = 24;   /* total fibers (traders + matchers + sinks) */
 static int g_seconds  = 1;    /* sustained run length */
 
-/* ── shared counters (mutex; ClassyC has no stdatomic) ────────────────── */
+/* ── shared counters (stdatomic → MIR seq_cst; same as fiber_workers.c) ─ */
 
-static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-static volatile int    g_stop = 0;
+static atomic_int g_stop;
+static atomic_int g_next_oid;
 
-static unsigned long long g_orders_sent;
-static unsigned long long g_orders_matched;
-static unsigned long long g_orders_filled;
-static unsigned long long g_orders_rejected;
-static unsigned long long g_fill_qty_total;
-static unsigned long long g_book_rests;
-static int                g_next_oid = 1;
-
-static void ctr_add(unsigned long long *p, unsigned long long d) {
-    pthread_mutex_lock(&g_mu);
-    *p += d;
-    pthread_mutex_unlock(&g_mu);
-}
-
-static unsigned long long ctr_get(unsigned long long *p) {
-    unsigned long long v;
-    pthread_mutex_lock(&g_mu);
-    v = *p;
-    pthread_mutex_unlock(&g_mu);
-    return v;
-}
-
-static int next_oid(void) {
-    int id;
-    pthread_mutex_lock(&g_mu);
-    id = g_next_oid++;
-    pthread_mutex_unlock(&g_mu);
-    return id;
-}
+static atomic_ullong g_orders_sent;
+static atomic_ullong g_orders_matched;
+static atomic_ullong g_orders_filled;
+static atomic_ullong g_orders_rejected;
+static atomic_ullong g_fill_qty_total;
+static atomic_ullong g_book_rests;
 
 /* ── fiber-friendly channel I/O (try + yield) ─────────────────────────── */
 
@@ -183,22 +160,22 @@ static void trader_fiber(mco_coro *co) {
     int seq = 0;
     unsigned burst = 0;
 
-    while (!g_stop) {
+    while (!atomic_load(&g_stop)) {
         order_t o;
         memset(&o, 0, sizeof(o));
         o.type = ORD_NEW;
         o.trader_id = cx->global_id;
-        o.order_id = next_oid();
+        o.order_id = atomic_fetch_add(&g_next_oid, 1);
         o.side = (seq + cx->global_id) & 1;
         o.price = 1000 + ((seq * 3 + cx->global_id * 7) % 7) - 3;
         o.qty = 1 + (seq % 4);
 
         if (!fiber_send(g_order_q, &o, 64)) {
-            if (g_stop) break;
+            if (atomic_load(&g_stop)) break;
             mco_yield(co);
             continue;
         }
-        ctr_add(&g_orders_sent, 1);
+        atomic_fetch_add(&g_orders_sent, 1);
         seq++;
         burst++;
         if ((burst & 3u) == 3u)
@@ -232,8 +209,8 @@ static void match_one(book_ent *book, int bookn, order_t *o) {
             fill.fill_qty = fq;
             fill.price = b->price;
             if (fiber_send(g_fill_q, &fill, 32)) {
-                ctr_add(&g_orders_filled, 1);
-                ctr_add(&g_fill_qty_total, (unsigned long long)fq);
+                atomic_fetch_add(&g_orders_filled, 1);
+                atomic_fetch_add(&g_fill_qty_total, (unsigned long long)fq);
             }
         }
         /* resting fill */
@@ -248,14 +225,14 @@ static void match_one(book_ent *book, int bookn, order_t *o) {
             fill.qty = b->qty_left;
             fill.fill_qty = fq;
             if (fiber_send(g_fill_q, &fill, 32)) {
-                ctr_add(&g_orders_filled, 1);
-                ctr_add(&g_fill_qty_total, (unsigned long long)fq);
+                atomic_fetch_add(&g_orders_filled, 1);
+                atomic_fetch_add(&g_fill_qty_total, (unsigned long long)fq);
             }
         }
 
         b->qty_left -= fq;
         remaining -= fq;
-        ctr_add(&g_orders_matched, 1);
+        atomic_fetch_add(&g_orders_matched, 1);
         if (b->qty_left <= 0)
             b->active = 0;
     }
@@ -270,7 +247,7 @@ static void match_one(book_ent *book, int bookn, order_t *o) {
                 book[j].side = o->side;
                 book[j].price = o->price;
                 book[j].qty_left = remaining;
-                ctr_add(&g_book_rests, 1);
+                atomic_fetch_add(&g_book_rests, 1);
                 return;
             }
         }
@@ -280,7 +257,7 @@ static void match_one(book_ent *book, int bookn, order_t *o) {
             rej.type = ORD_REJECT;
             rej.qty = remaining;
             if (fiber_send(g_fill_q, &rej, 16))
-                ctr_add(&g_orders_rejected, 1);
+                atomic_fetch_add(&g_orders_rejected, 1);
         }
     }
 }
@@ -292,10 +269,10 @@ static void matcher_fiber(mco_coro *co) {
     (void)cx;
 
     memset(book, 0, sizeof(book));
-    while (!g_stop || cchan_size(g_order_q) > 0) {
+    while (!atomic_load(&g_stop) || cchan_size(g_order_q) > 0) {
         order_t o;
         if (!fiber_recv(g_order_q, &o, 16)) {
-            if (g_stop && cchan_size(g_order_q) == 0)
+            if (atomic_load(&g_stop) && cchan_size(g_order_q) == 0)
                 break;
             mco_yield(co);
             continue;
@@ -315,10 +292,10 @@ static void matcher_fiber(mco_coro *co) {
 
 static void sink_fiber(mco_coro *co) {
     (void)co;
-    while (!g_stop || cchan_size(g_fill_q) > 0) {
+    while (!atomic_load(&g_stop) || cchan_size(g_fill_q) > 0) {
         order_t o;
         if (!fiber_recv(g_fill_q, &o, 16)) {
-            if (g_stop && cchan_size(g_fill_q) == 0)
+            if (atomic_load(&g_stop) && cchan_size(g_fill_q) == 0)
                 break;
             mco_yield(mco_running());
             continue;
@@ -373,7 +350,7 @@ static void *worker_main(void *arg) {
             idle = 0;
         } else {
             idle++;
-            if (g_stop && idle > 10000)
+            if (atomic_load(&g_stop) && idle > 10000)
                 break;
             if ((idle & 127) == 127)
                 cchan_sleep(0);
@@ -423,14 +400,14 @@ static void run_session(void) {
            "(%d traders + %d matchers + %d sinks) ===\n",
            nfibers, nworkers, g_seconds, ntraders, nmatchers, nsinks);
 
-    g_stop = 0;
-    g_next_oid = 1;
-    g_orders_sent = 0;
-    g_orders_matched = 0;
-    g_orders_filled = 0;
-    g_orders_rejected = 0;
-    g_fill_qty_total = 0;
-    g_book_rests = 0;
+    atomic_store(&g_stop, 0);
+    atomic_store(&g_next_oid, 1);
+    atomic_store(&g_orders_sent, 0);
+    atomic_store(&g_orders_matched, 0);
+    atomic_store(&g_orders_filled, 0);
+    atomic_store(&g_orders_rejected, 0);
+    atomic_store(&g_fill_qty_total, 0);
+    atomic_store(&g_book_rests, 0);
 
     g_order_q = cchan_create(2048, (unsigned short)sizeof(order_t));
     g_fill_q  = cchan_create(2048, (unsigned short)sizeof(order_t));
@@ -495,9 +472,9 @@ static void run_session(void) {
 
         cchan_sleep(1000);
 
-        sent = ctr_get(&g_orders_sent);
-        matched = ctr_get(&g_orders_matched);
-        filled = ctr_get(&g_orders_filled);
+        sent = atomic_load(&g_orders_sent);
+        matched = atomic_load(&g_orders_matched);
+        filled = atomic_load(&g_orders_filled);
         dsent = sent - prev_sent;
         dmatched = matched - prev_matched;
         prev_sent = sent;
@@ -510,7 +487,7 @@ static void run_session(void) {
     }
 
     /* stop → close → join */
-    g_stop = 1;
+    atomic_store(&g_stop, 1);
     cchan_close(g_order_q);
     cchan_close(g_fill_q);
 
@@ -519,12 +496,12 @@ static void run_session(void) {
 
     printf("\n  final: sent=%llu matched=%llu filled=%llu rejected=%llu "
            "fill_qty=%llu rests=%llu\n",
-           ctr_get(&g_orders_sent),
-           ctr_get(&g_orders_matched),
-           ctr_get(&g_orders_filled),
-           ctr_get(&g_orders_rejected),
-           ctr_get(&g_fill_qty_total),
-           ctr_get(&g_book_rests));
+           (unsigned long long)atomic_load(&g_orders_sent),
+           (unsigned long long)atomic_load(&g_orders_matched),
+           (unsigned long long)atomic_load(&g_orders_filled),
+           (unsigned long long)atomic_load(&g_orders_rejected),
+           (unsigned long long)atomic_load(&g_fill_qty_total),
+           (unsigned long long)atomic_load(&g_book_rests));
 
     cchan_dispose(g_order_q);
     cchan_dispose(g_fill_q);
@@ -562,11 +539,11 @@ int main(int argc, char **argv) {
 
     run_session();
 
-    if (ctr_get(&g_orders_sent) == 0) {
+    if (atomic_load(&g_orders_sent) == 0) {
         printf("\nFAIL: no orders sent (scheduler or channel stuck?)\n");
         return 1;
     }
-    if (ctr_get(&g_orders_matched) == 0 && ctr_get(&g_book_rests) == 0) {
+    if (atomic_load(&g_orders_matched) == 0 && atomic_load(&g_book_rests) == 0) {
         printf("\nFAIL: no matches and no book rests\n");
         return 1;
     }

@@ -7,7 +7,7 @@ static const char mirc[]
     "#define __MIRC__ 1\n"
     "#define __STDC_HOSTED__ 1\n"
     "//#define __STDC_ISO_10646__ 201103L\n"
-    "#define __STDC_NO_ATOMICS__ 1\n"
+    "/* Atomics implemented via MIR (CLASSY-ATOMICS.md); do not set __STDC_NO_ATOMICS__. */\n"
     "#define __STDC_NO_COMPLEX__ 1\n"
     "#define __STDC_NO_THREADS__ 1\n"
     "#define __STDC_NO_VLA__ 1\n"
@@ -33,10 +33,12 @@ static const char mirc[]
 #include "mirc_stdalign.h"
 #include "mirc_stdbool.h"
 #include "mirc_stdnoreturn.h"
+#include "mirc_stdatomic.h"
 
 #define TARGET_STD_INCLUDES                                                               \
   {"iso646.h", iso646_str}, {"stdalign.h", stdalign_str}, {"stdbool.h", stdbool_str},     \
-    {"stdnoreturn.h", stdnoreturn_str}, {"float.h", float_str}, {"limits.h", limits_str}, \
-    {"stdarg.h", stdarg_str}, {"stdint.h", stdint_str}, {                                 \
+    {"stdnoreturn.h", stdnoreturn_str}, {"stdatomic.h", stdatomic_str},                   \
+    {"float.h", float_str}, {"limits.h", limits_str}, {"stdarg.h", stdarg_str},           \
+    {"stdint.h", stdint_str}, {                                                           \
     "stddef.h", stddef_str                                                                \
   }

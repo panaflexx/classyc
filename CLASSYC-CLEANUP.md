@@ -9,7 +9,7 @@ Phase B** (`Map<G, List<V>>` nested List shells), true `List<List<T>>`, dense
 `move` monomorph, **for-in body / FDA frame layout** (outer→inner by
 `func_scope_num`), aligned **`type_size`** aggregate copies (not raw 28 for
 `Ship`), neon-grid / aurora-ops showcases, and full `cy-validate`
-(**52** `val-*.cy` files).
+(**53** `val-*.cy` files, incl. val-051 atomics).
 
 **Product target (by-value collection idiom):** **landed.** Everyday LINQ
 pipelines use RAII `List`/`Map`/`Set` values — no `owned auto` / `delete` on
@@ -42,7 +42,7 @@ by-value idiom](#first-class-by-value-idiom--landed).
 | **Uncaught exceptions** | Print + **`exit(1)`** (not abort/core); optional `CY_EXC_ABORT` (val-047) |
 | **Shift-range safety** | Negative / ≥width shift → catchable trap (val-048, bugs/009) |
 | **for-in + body locals** | Frame layout outer→inner (`func_scope_num`); body `Ship leader` no longer aliases for-in `List v` |
-| **Validate** | `cy-validate` **52** files (incl. val-050 nested collections); `bugs/run-bugs.sh`; showcases neon-grid, aurora-ops (stable under `-eg`/`-ei`/`-el`/`-eb`) |
+| **Validate** | `cy-validate` **53** files (val-050 nested collections, val-051 atomics); `bugs/run-bugs.sh`; showcases neon-grid, aurora-ops (stable under `-eg`/`-ei`/`-el`/`-eb`) |
 
 ### House style today (what you should write)
 

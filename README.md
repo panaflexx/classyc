@@ -1315,7 +1315,7 @@ pointer-to-class elements, plus per-field annotations), full-expression temp
 dtors, and AOT dead-code elimination.
 
 The behavior described in this README is exercised by the executable validation
-suite in **[`cy-validate/`](cy-validate/)** (**52** `val-*.cy` files; run
+suite in **[`cy-validate/`](cy-validate/)** (**53** `val-*.cy` files; run
 `sh cy-validate/run-validate.sh`). Bug regressions: `sh bugs/run-bugs.sh`.
 Known rough edges and their workarounds are catalogued in
 **[`cy-validate/SHORTCOMINGS.md`](cy-validate/SHORTCOMINGS.md)**.
