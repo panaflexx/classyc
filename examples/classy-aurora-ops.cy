@@ -424,7 +424,8 @@ main() {
         "domain": {
             "sector": nameof<Sector>(),
             "alert": nameof<Alert>()
-        }
+        },
+		"doom": [1,3,5,7,13,17,21,27]
     };
     printf("  payload: %s\n", uplink.json());
     printf("  feed:    %s\n",

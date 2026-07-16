@@ -210,7 +210,7 @@ auto evens   = nums.Where((int x) => x % 2 == 0);
 auto doubled = evens.Map((int x) => x * 2);
 auto top3    = nums.Take(3);                 // chain-friendly
 auto silver  = nums.Skip(1).Take(1);
-auto by_par  = nums.GroupBy((int x) => x % 2);  // value Map shell + ownsValues buckets
+auto by_par  = nums.GroupBy((int x) => x % 2);  // Map<int, List<int>> nested List shells
 
 // By-value class elements (happy path — no *)
 auto fleet = List<Ship>();
@@ -222,6 +222,10 @@ auto heats = fleet.Select((Ship s) => s.heat);   // Select on pure stack List wo
 Ship deep = fleet.Find((Ship s) => s.IsDeep());  // miss = zero-init; use s.Alive()
 int want = 1;
 Ship hit = fleet.Find((Ship s) => s.id == want); // capturing Find
+int flip = 1;
+fleet.Sort((Ship a, Ship b) => flip * (a.heat - b.heat)); // capturing Sort
+int boost = 10;
+auto scaled = fleet.Select((Ship s) => s.heat + boost);    // capturing Select
 
 auto files = List<String>();
 files.Add("a.txt"); files.Add("b.pdf"); files.Add("c.txt");
@@ -308,10 +312,10 @@ auto hot = board.Where((String k, int v) => v >= floor);  // Map
 // Chains work left-to-right (each capturing HOF open-coded on its own)
 auto q = nums.Where((int x) => x > thr).Take(10);
 
-// GroupBy — value Map shell (RAII); buckets are List* with ownsValues
+// GroupBy — Map<int, List<int>> (nested List shells, RAII)
 auto by = nums.GroupBy((int x) => x % 2);
 for (auto k, bucket in by)
-    printf("%d: %d\n", k, bucket->Count());
+    printf("%d: %d\n", k, bucket.Count());
 ```
 
 **Rules (v1):**
@@ -504,7 +508,7 @@ auto heats = fleet.Select((Ship s) => s.heat);  // stack + by-value T
 
 See `cy-validate/val-031-generic-methods.cy` (heap) and
 `cy-validate/val-046-select-stack.cy` (pure stack). `GroupBy` returns a value
-Map shell (val-049).
+`Map<G, List<V>>` with nested List shells (val-049, val-050).
 
 ### Arrays & Slices → `List<T>` (lengths flow into generics)
 A C array or a filter/map slice converts to a heap `List<T>` with `.ToList()`,
@@ -1282,8 +1286,9 @@ Shipped since the early roadmap: typed lambdas (thin C function pointers),
 generics (`List<T>` and user-defined collections, plus **generic functions**
 with call-site type inference), the **first-class by-value collection idiom**
 (stack `List`/`Map`/`Set`, move-return / prvalue bind, value-returning
-`Where`/`Take`/`Copy`/`Select`/`GroupBy`/…, `GetMut` / `[]` buffer lvalues —
-see `BY-VALUE.md`, `examples/classy-aurora-ops.cy`, `cy-validate/val-040`…`049`),
+`Where`/`Take`/`Copy`/`Select`/`GroupBy`/…, nested `List<List<T>>` /
+`Map<G, List<V>>`, `GetMut` / `[]` buffer lvalues — see `BY-VALUE.md`,
+`examples/classy-aurora-ops.cy`, `cy-validate/val-040`…`050`),
 uncaught exceptions → **exit(1)** (not abort), shift-range safety traps,
 `interface`/`Any<I>` erasure, default-on exceptions + safety guards, array/slice
 → `List<T>` conversion with lengths flowing into generics, **typed JSON binding**
@@ -1292,14 +1297,12 @@ fields — including **collection fields** (`List<T>*` / `Set<T>*` from a JSON
 array), Phase 2), a lightweight **SQLite wrapper** (`include/sqlite.h`) with
 `dict`-row binding and `List<dict>` result sets, and a **gunicorn-style HTTP
 server** library (`include/httpserve.h`).
-In-progress directions include true nested value GroupBy buckets
-(`Map<G, List<V>>` — Phase B; Phase A keeps `List*` buckets inside a value Map
-shell), Phase 3 of the JSON binder (`Map<K,V>*` and pointer-to-class elements,
-plus per-field annotations), full-expression temp dtors, and AOT dead-code
-elimination.
+In-progress directions include Phase 3 of the JSON binder (`Map<K,V>*` and
+pointer-to-class elements, plus per-field annotations), full-expression temp
+dtors, and AOT dead-code elimination.
 
 The behavior described in this README is exercised by the executable validation
-suite in **[`cy-validate/`](cy-validate/)** (**51** `val-*.cy` files; run
+suite in **[`cy-validate/`](cy-validate/)** (**52** `val-*.cy` files; run
 `sh cy-validate/run-validate.sh`). Bug regressions: `sh bugs/run-bugs.sh`.
 Known rough edges and their workarounds are catalogued in
 **[`cy-validate/SHORTCOMINGS.md`](cy-validate/SHORTCOMINGS.md)**.
@@ -1325,8 +1328,8 @@ Contributions, bug reports, and wild ideas are welcome!
   JSON array — any class with a default ctor + `Add(T)`).  `Map<K,V>*` and
   pointer-to-class elements (`List<User*>*`) are **Phase 3** — the compiler
   reports a clear error directing you to write that field by hand.
-- Stack value-construction works for plain classes (including those with constructor arguments): `Point p = Point(1, 2);` runs the constructor in place and `~Point()` at scope exit. **Generic collections are value-first too:** prefer `auto xs = List<int>();` / `Map<String,int>()` / `Set<int>()` — RAII frees the buffer at scope exit. Use `new List<T>` / `owned auto` only when a pointer identity must escape. Bare assign of `List`/`Map`/`Set` is banned (move-only); transfer with `move` or bind a by-value return. Transforms (`Where`/`Take`/`Copy`/`Select`/…) return **value** shells. `GroupBy` returns a **value** `Map` shell whose **bucket** values are still `List*` with `ownsValues` (no `owned` on the Map itself). True nested `Map<G, List<V>>` (List shells in the map dense buffer) is **not** landed yet.
-- **`[]` on collections:** value and pointer receivers use the same Get/Set sugar — `list[i]`, `list_ptr[i]`, `map[k]`, `map_ptr[k]`. Plain `Point*` (no Get) stays C raw indexing. Nested collection dense buffers (future) should use `*(data + i)` in library code so `List*[i]` sugar stays Get/Set.
+- Stack value-construction works for plain classes (including those with constructor arguments): `Point p = Point(1, 2);` runs the constructor in place and `~Point()` at scope exit. **Generic collections are value-first too:** prefer `auto xs = List<int>();` / `Map<String,int>()` / `Set<int>()` — RAII frees the buffer at scope exit. Use `new List<T>` / `owned auto` only when a pointer identity must escape. Bare assign of `List`/`Map`/`Set` is banned (move-only); transfer with `move` or bind a by-value return. Transforms (`Where`/`Take`/`Copy`/`Select`/…) return **value** shells. Nested collections work: `List<List<T>>`, `Map<G, List<V>>`, and `GroupBy` → `Map<G, List<V>>` (Get copies a bucket; `GetMut` mutates in place).
+- **`[]` on collections:** value and pointer receivers use the same Get/Set sugar — `list[i]`, `list_ptr[i]`, `map[k]`, `map_ptr[k]`. Plain `Point*` (no Get) stays C raw indexing. Nested collection dense buffers in the library use `*(data + i)` (and `memcpy` growth) so user-facing `List*[i]` sugar stays Get/Set.
 - Exception names are resolved only at compile time. Runtime stores integer IDs only; there is no symbolic pretty-printing or `nameof`-style reflection for exceptions. The prelude ships `KeyException = 8` and `TypeException = 7` (used by the typed JSON binder); user code can extend the set with `enum { MyErr = 100 }`. Uncaught exceptions and uncaught safety traps print a diagnostic and **`exit(1)`** (not abort/core). Define `CY_EXC_ABORT=1` if you want core dumps for debugging.
 - `List<T>.Sort` / `Set<T>` and a few other methods have minor edge-case limitations documented in the headers. Stack `Select<U>` works on pure value receivers (val-046); prefer nested blocks for RAII of pipeline intermediates when leaving function scope.
 - **Lambdas / capture:** non-capturing lambdas lower to thin C function pointers. Capturing free locals is allowed **only** as a direct argument to List/Map/Set HOFs (`Where`/`Filter`/`Map`/`ForEach`/`Any`/`All`/`Find`/`Sort`/`Select`) via call-site open-coding — not as stored callbacks (`auto f = (int x) => x > thr` is an error). No fat closures / `std::function`-style escape yet. Array `.filter`/`.map` are deferred. See **[LAMBDA-CAPTURE.md](LAMBDA-CAPTURE.md)**.
@@ -1347,10 +1350,11 @@ Contributions, bug reports, and wild ideas are welcome!
   per-field `required` / `optional(=default)` / `renamed("x")` annotations
   (C# `[JsonRequired]` / `[JsonPropertyName]` parity).
 - ~~**First-class by-value collections**~~ **(landed)** — stack shells, move-return /
-  prvalue bind, value-returning LINQ transforms (including **GroupBy** value Map
-  shell and stack **Select**), GetMut/`[]` lvalues, capturing **Find** / **Sort** /
-  **Select**. Remaining: true nested `Map<G, List<V>>` buckets, full-expression
-  temp dtors. See `CLASSYC-CLEANUP.md` and `BY-VALUE.md`.
+  prvalue bind, value-returning LINQ transforms (including **GroupBy** →
+  `Map<G, List<V>>` and stack **Select**), nested `List<List<T>>` /
+  `Map<G, List<V>>`, GetMut/`[]` lvalues, capturing **Find** / **Sort** /
+  **Select**. Remaining: full-expression temp dtors. See `CLASSYC-CLEANUP.md`
+  and `BY-VALUE.md`.
 - ~~Uncaught exception → clean exit~~ **(landed)** — print + `exit(1)`; shift-range
   safety traps; `sh bugs/run-bugs.sh`.
 - Richer `List<T>` / `Map<K,V>` syntactic sugar and initializer syntax (more Pythonic comprehensions, better literal support).

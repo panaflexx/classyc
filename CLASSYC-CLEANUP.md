@@ -2,15 +2,17 @@
 
 Updated 2026-07-16 after List/Map throw-on-OOB, nested generics, stack collection
 values, value-returning LINQ transforms, move-return / prvalue bind, GetMut /
-`[]` lvalues, capturing HOF lambdas (including **Find**), try/argv, stack
-**Select** monomorph, uncaught **exit(1)**, shift-range guards, **GroupBy value
-Map shell**, neon-grid / aurora-ops showcases, and full `cy-validate`
-(**51** `val-*.cy` files).
+`[]` lvalues, capturing HOF lambdas (**Find**, **Sort**, **Select**), try/argv,
+stack **Select** monomorph, uncaught **exit(1)**, shift-range guards, **GroupBy
+Phase B** (`Map<G, List<V>>` nested List shells), true `List<List<T>>`, dense
+`*(data+i)` + memcpy growth, `List*[i]` Get/Set sugar restored, quiet scalar/POD
+`move` monomorph, neon-grid / aurora-ops showcases, and full `cy-validate`
+(**52** `val-*.cy` files).
 
 **Product target (by-value collection idiom):** **landed.** Everyday LINQ
 pipelines use RAII `List`/`Map`/`Set` values — no `owned auto` / `delete` on
-every step (including GroupBy). See [§ First-class by-value
-idiom](#first-class-by-value-idiom--landed).
+every step (including GroupBy’s nested `Map<G, List<V>>`). See [§ First-class
+by-value idiom](#first-class-by-value-idiom--landed).
 
 ---
 
@@ -23,21 +25,21 @@ idiom](#first-class-by-value-idiom--landed).
 | **List / Map / Set** | Full std methods; OOB **throws**; destroy on Clear/Set/Remove; `.owns()` for `T*` |
 | **Stack collections** | `auto xs = List<int>();` / `Map<String,int>()` / `Set` — `~List`/`~Map`/`~Set` at scope exit |
 | **Value-returning transforms** | `Where`/`Take`/`Skip`/`Copy`/`Slice`/`Plus`/`Distinct`/`Map`/`Filter`/`Select<U>` / Map `Where`/`Keys`/`Values` / Set `Filter`/`Union` → **by value** |
-| **GroupBy** | Value `Map<G, List<V>*>` shell + `ownsValues` buckets — no `owned` at call site (val-049) |
+| **GroupBy (Phase B)** | Value `Map<G, List<V>>` — nested List shells in map dense buffer (val-049, val-050) |
 | **Move return / bind** | `return a;` / `return move a;` of move-only collections; `auto x = f()` prvalue bind |
 | **Stack Map subscript** | `m["k"]` / `m["k"]=v` on **value** receivers (N_IND does not swap `TM_CLASS` with pointer key) |
-| **GetMut / `[]` lvalue** | `list[i].Method()` / `map[k].Method()` mutates buffer; val-043 / val-044 |
+| **GetMut / `[]` lvalue** | `list[i].Method()` / `map[k].Method()` mutates buffer; **value and pointer** receivers use Get/Set sugar (`list_ptr[i]` too) |
 | **By-value elements** | `List<LapSample>`, `Map` keys/values, `__destroy` on delete/clear |
 | **Move-only containers** | Bare `List` assign is error; `move` transfers buffer |
-| **Capturing HOF lambdas** | Direct arg to `Where`/`Filter`/`Map`/`ForEach`/`Any`/`All`/**`Find`** open-coded; non-capturing stay thin fn ptrs (val-042) |
-| **Stack Select** | Pure stack `List<T>` method generics (no prior `List*` needed); val-046 |
+| **Capturing HOF lambdas** | Direct arg to `Where`/`Filter`/`Map`/`ForEach`/`Any`/`All`/`Find`/`Sort`/`Select` open-coded; non-capturing stay thin fn ptrs (val-042 §1–12) |
+| **Stack Select** | Pure stack `List<T>` method generics (no prior `List*` needed); val-046 + capturing Select |
 | **owned / move / readonly** | Escapes for heap; not needed for pure stack locals / value pipelines |
-| **Generics** | Nested List/Map, method generics `Select<U>`, free fns `Max`/`GroupBy`+UFCS |
+| **Generics** | Nested type names / method generics `Select<U>`, free fns `Max`/`GroupBy`+UFCS |
 | **nameof / typeof** | Types, enums, values — JSON dispatch + reflection |
 | **try + argv** | Adjusted array params survive `force_val` under try (val-045) |
 | **Uncaught exceptions** | Print + **`exit(1)`** (not abort/core); optional `CY_EXC_ABORT` (val-047) |
 | **Shift-range safety** | Negative / ≥width shift → catchable trap (val-048, bugs/009) |
-| **Validate** | `cy-validate` **51** files; `bugs/run-bugs.sh`; showcases neon-grid, aurora-ops |
+| **Validate** | `cy-validate` **52** files (incl. val-050 nested collections); `bugs/run-bugs.sh`; showcases neon-grid, aurora-ops |
 
 ### House style today (what you should write)
 
@@ -62,21 +64,28 @@ auto top   = quick.Take(3);
 auto ms    = samples.Select((LapSample s) => s.ms);  // stack Select OK
 // ~top / ~quick / ~ms free buffers at scope exit
 
-// Capturing predicates (direct HOF arg) — including Find
+// Capturing predicates / projectors / comparators (direct HOF arg)
 int thr = 3;
 auto big = nums.Where((int x) => x > thr);
 int want = 5;
 Ship s = fleet.Find((Ship x) => x.id == want);
+int flip = -1;
+nums.Sort((int a, int b) => flip * (a - b));
+int mul = 10;
+auto scaled = nums.Select<int>((int x) => x * mul);
 
-// GroupBy — value Map shell (buckets still List* + ownsValues)
+// GroupBy — Map of List shells (value nested collections)
 auto by = roster.GroupBy((Ship s) => s.SectorKey());
 for (auto k, bucket in by)
-    printf("%d: %d\n", k, bucket->Count());
-// ~by frees map + buckets
+    printf("%d: %d\n", k, bucket.Count());
+// ~by frees map + every nested List
 
 // In-place mutation of by-value class elements
 fleet[0].Boost(5);                // GetMut lvalue — not Get() copy
 // fleet.Get(0).Boost(5);         // WRONG: copy; Boost is lost
+// Heap List* uses the same [] sugar:
+List<int>* p = new List<int>();
+p[0] = 42;                        // → Set; also (*p)[0] / p->Get(0)
 
 // Helpers return values
 List<Pilot*> OrderByPace(List<Pilot*>* src) {
@@ -122,7 +131,8 @@ default for every intermediate.
 
 Views from `Where`/`Take`/`Copy` of `List<Pilot*>` stay **non-owning** of
 elements (never copy `_owns_ptrs`) — same as now. GroupBy **buckets** are
-`List*` with `ownsValues` on the result Map (shell is still a value).
+nested **value** `List<V>` shells stored in the Map dense buffer (Phase B);
+`~Map` destroys every bucket List.
 
 ### Target API (product) — implemented
 
@@ -184,15 +194,19 @@ Compiler: `class_is_move_only_collection_p`; N_RETURN implicit `N_MOVE`;
 | `Select<U>` | `List<U>` |
 | `Range` / `Repeat` | `List<T>` |
 | Map `Where` / `SelectValues` / `Copy` / `Keys` / `Values` | value `Map` / `List` |
-| Map / List `GroupBy` | value `Map<G, List<…>*>` + ownsValues |
+| Map / List `GroupBy` | value `Map<G, List<…>>` (nested List shells) |
 | Set `Filter` / `Union` / `Intersect` / `Difference` | value `Set` |
 
 **Invariant:** results remain non-owning of `T*` (do not copy `_owns_ptrs`).
 
 #### P2 — Generics: return type `List<T>` in method bodies  ✅ **done**
 
-Specialisation supports nested generics; monomorphized methods return
-complete-self / nested `List` by value. Tests: val-040, val-031, **val-046**.
+Specialisation supports nested type names; monomorphized methods return
+complete-self / nested `List` by value for ordinary element types. Tests:
+val-040, val-031, **val-046**. True nested collections **landed (Phase B):**
+`List<List<T>>`, `Map<G, List<V>>`, GroupBy → nested List shells (val-049,
+val-050). Dense buffers use `*(data+i)` + `memcpy` growth (SSA/MIR-friendly);
+user-facing `List*[i]` stays Get/Set sugar.
 
 #### P3 — Call-site sugar + docs  ✅ **done**
 
@@ -203,7 +217,7 @@ auto g = roster.GroupBy(...);           // value Map filter buckets
 ```
 
 Docs/examples: `classy-neon-grid.cy`, `classy-aurora-ops.cy`, README house
-style, `val-040`…`val-049`.
+style, `val-040`…`val-050`.
 
 ### Explicit non-goals (still)
 
@@ -220,8 +234,10 @@ style, `val-040`…`val-049`.
 - [x] README house style: stack first, `owned` for escape  
 - [x] Stack `Select` without prior `List*` (val-046)  
 - [x] GroupBy without `owned` (val-049)  
-- [x] Capturing `Find` (val-042 §10)  
+- [x] Capturing `Find` / **`Sort`** / **`Select`** (val-042 §10–12)  
 - [x] Uncaught → exit(1); shift-range; bugs runner  
+- [x] `List*[i]` / `map_ptr[k]` Get/Set sugar (developer expectation)  
+- [x] True nested `Map<G, List<V>>` / `List<List<T>>` (Phase B; val-050)  
 
 ---
 
@@ -229,14 +245,25 @@ style, `val-040`…`val-049`.
 
 | Item | Notes |
 |------|--------|
-| **True `Map<G, List<V>>`** | Phase B — move-only nested values in Map dense buffer still blocked |
 | **Full-expr temp dtor** | Pure `f().Where(...).Take(3)` without names — intermediate RAII may need full-expr temps |
 | **Language sugar** | `list[1..3]`, `operator+` — still use Slice / Plus |
 | **`new List<int>(4)` capacity vs `{4}` singleton** | C# parity |
 | **Method forward-order in class** | Declare callees first |
-| **Capturing Sort / Select open-code** | Find landed; Sort/Select open-code deferred |
 | **AOT DCE / ownership speed** | See FINDINGS §§4–5 |
 | **Stale bugs/** | 002 retire/self-check; 003 update expectations |
+| **Array `.filter`/`.map`** | Deferred; collection HOF capture already covers List/Map/Set |
+
+### Compiler notes landed with capture / stmtexpr (2026-07-16)
+
+* **`move` on scalars** is a no-op pass-through (does not I64-zero int slots — that
+  corrupted `EnsureCapacity` / growth for `List<int>`).
+* **Capturing HOF stmtexpr results** (class-valued) reserve space in the
+  **call-arg area**, not `func_block_scope->size` local offsets — avoids
+  overwriting the source `List` and double-free on scope exit.
+* **N_ASSIGN / N_RETURN storage → `.Copy()`** for move-only collections: unlink
+  the RHS/return expr **before** grafting it under `Copy()` (DLIST ownership).
+* **`[]` protocol:** value *and* pointer collection receivers use Get/Set;
+  plain class pointers without Get stay C raw index.
 
 ---
 
@@ -251,13 +278,16 @@ style, `val-040`…`val-049`.
 * Enum bare names via tpname + S_TAG only (no S_REGULAR tag attr crash on `typedef enum E E`)  
 * **P0–P3 by-value idiom** (move return, value transforms, specialisation, docs)  
 * GetMut / FirstMut / LastMut / ValMut + `[]` → lvalue for by-value class elements  
-* Capturing lambdas Strategy A (open-code HOF args) **including Find**  
+* Capturing lambdas Strategy A (open-code HOF args) **including Find, Sort, Select**  
 * try + adjusted array params (`force_val` pointer load, not `&argv`)  
 * **Stack Select monomorph** — `uniq_cstr` on expr-context generic name + specs `orig_name`  
 * **Uncaught exception / safety trap → exit(1)** (`cyexc.h`; optional `CY_EXC_ABORT`)  
 * **Shift-range guard** (`_safety_trap` reason 5)  
-* **GroupBy value Map shell** (no `owned` at call site)  
+* **GroupBy Phase B** — value `Map<G, List<V>>` nested List shells (no `owned` at call site)  
+* **Nested `List<List<T>>` / `Map<G,List<V>>`** — dense `*(data+i)`, memcpy growth, mir-gen addr-elim  
 * **bugs/run-bugs.sh**  
+* **`List*[i]` Get/Set sugar restored** (not raw C array of Lists)  
+* Quiet scalar/POD `move` monomorph (intentional no-ops; no warning spam)  
 * test-list-stdlib OOB expects throws; neon-grid / aurora-ops stack house style  
 
 ---
@@ -268,17 +298,20 @@ style, `val-040`…`val-049`.
 2. ~~**P1** Value-returning List/Map transforms~~ **done**  
 3. ~~**P2** Specialisation coverage for value returns~~ **done**  
 4. ~~**P3** Examples/docs + validate suite~~ **done**  
-5. ~~**Stack Select / uncaught exit / shift / Find capture / GroupBy shell / bugs runner**~~ **done** (2026-07-16; val-046…049)  
-6. **Next:** true nested value GroupBy buckets; full-expr temp dtor; capturing
-   Sort/Select; ownership-pass speed; AOT DCE; retire stale bugs  
+5. ~~**Stack Select / uncaught exit / shift / Find capture / GroupBy shell / bugs runner**~~ **done**  
+6. ~~**Capturing Sort + Select open-code**~~ **done** (val-042 §11–12)  
+7. ~~**`List*[i]` developer sugar**~~ **done**  
+8. ~~**Nested `Map<G,List<V>>` / `List<List<T>>`**~~ **done** (val-050)  
+9. **Next:** full-expr temp dtor; ownership-pass speed; AOT DCE; retire stale
+   bugs; array `.filter`/`.map`; `Heap` priority queue if needed
 
 ---
 
 ## Notes for implementers
 
 * Transforms that still `new List`/`new Map` force `owned`/delete — today that is
-  mainly **compat helpers** (`SelectString`, `FromJson`) and **GroupBy bucket
-  lists** (the Map **shell** is a value).  
+  mainly **compat helpers** (`SelectString`, static `FromJson` heap return).
+  GroupBy buckets are nested **value** Lists.  
 * `List.owns()` for domain `T*` is orthogonal; value returns must **never** copy
   owns onto views (val-040 §7).  
 * ABI: class by-value pass/return + frame/ALLOCA sizes (12-byte class → sizeof 16
@@ -294,9 +327,13 @@ style, `val-040`…`val-049`.
   prose).  
 * Adjusted array params under try: `force_val` must load the pointer value when
   `type->mode == TM_PTR` even if `arr_type` is set (val-045).  
+* Nested collections: keep **user** `List*[i]` as Get/Set; use `*(data + i)` (or
+  equivalent) for dense `T*` slots inside monomorphized headers. Do not re-break
+  pointer sugar to unblock nested List-of-List.  
 
 Related: [`BY-VALUE.md`](BY-VALUE.md), [`GENERICSMEM.md`](GENERICSMEM.md),
 [`LAMBDA-CAPTURE.md`](LAMBDA-CAPTURE.md), [`CLASSYC-FINDINGS.md`](CLASSYC-FINDINGS.md),
 [`sketch/OPEN-ISSUES-PRIORITY.md`](sketch/OPEN-ISSUES-PRIORITY.md),
 `examples/classy-neon-grid.cy`, `examples/classy-aurora-ops.cy`,
-`cy-validate/val-038-*.cy` … `val-049-*.cy`, `bugs/run-bugs.sh`.
+`examples/test-generic-ptr-args.cy`,
+`cy-validate/val-038-*.cy` … `val-050-*.cy`, `bugs/run-bugs.sh`.

@@ -22205,21 +22205,23 @@ if (base != NULL && base->code == N_ID) {
     if (ie == NULL || ie->type == NULL) break; /* degrade: tail stamps int expr */
     it = ie->type;
     if (r->code == N_MOVE && it->mode == TM_CLASS) {
-      if (!class_has_dtor_p (c2m_ctx, it))
-        warning (c2m_ctx, POS (r),
-                 "`move` on a class without a destructor is a plain value copy");
-      else if (ie->u.lvalue_node == NULL)
+      /* Classes with a dtor need an lvalue so gen can zero the source.
+         POD classes (no dtor) still relocate via block_move + zero — same
+         as nested List shells.  No warning: generic List/Map use `move` for
+         every T and monomorph noise was drowning real diagnostics. */
+      if (class_has_dtor_p (c2m_ctx, it) && ie->u.lvalue_node == NULL)
         error (c2m_ctx, POS (r),
                "`move` of a class value requires an lvalue source");
       /* Reserve stack space for the moved-value temporary emitted in gen. */
       if (curr_scope != top_scope)
         update_call_arg_area_offset (c2m_ctx, it, TRUE);
-    } else if (it->mode != TM_PTR) {
-      /* readonly still pointer-only; move of non-class non-ptr is a no-op warn. */
+    } else if (r->code == N_READONLY && it->mode != TM_PTR) {
+      /* readonly is pointer-only. */
       warning (c2m_ctx, POS (r),
-               "`%s` applies to owned pointers or moveable class values; this "
-               "operand has no managed-ownership effect", kw);
+               "`readonly` applies to owned pointers; this operand has no "
+               "managed-ownership effect");
     }
+    /* move of scalar/float/etc.: silent no-op (generic List/Map monomorphs). */
     e = create_expr (c2m_ctx, r);
     /* Share the inner's type pointer verbatim.  Result is a value, not an
        lvalue — create_expr already nulled u.lvalue_node. */
@@ -31354,17 +31356,21 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       break;
     }
 
+    /* Scalar / float / other non-class: `move` is a pure value pass-through
+       (check already warned).  Do not force through I64 temps — that breaks
+       MIR MOV for double/float (List of double etc.). */
+    if (me == NULL || me->type == NULL || me->type->mode != TM_PTR) {
+      res = gen (c2m_ctx, inner, NULL, NULL, TRUE, NULL, NULL);
+      res = force_val (c2m_ctx, res, FALSE);
+      break;
+    }
+
     op_t mval = gen (c2m_ctx, inner, NULL, NULL, TRUE, NULL, NULL);
     mval = force_val (c2m_ctx, mval, FALSE);
-    /* Copy into a fresh temp first: nulling the source may share the same
-       reg/mem as `mval`, and we must return the original pointer value. */
+    /* Pointer form: copy into a fresh temp first, then null the source. */
     res = get_new_temp (c2m_ctx, MIR_T_I64);
     emit2 (c2m_ctx, MIR_MOV, res.mir_op, mval.mir_op);
-    /* Only null pointer sources.  Scalars (and any non-ptr non-class) keep
-       their storage; check phase already warned that move has no ownership
-       effect on them. */
-    if (me != NULL && me->type != NULL && me->type->mode == TM_PTR
-        && src != NULL
+    if (src != NULL
         && (src->code == N_ID || src->code == N_DEREF_FIELD || src->code == N_FIELD
             || src->code == N_DEREF || src->code == N_IND)) {
       op_t lval = gen (c2m_ctx, src, NULL, NULL, FALSE, NULL, NULL);

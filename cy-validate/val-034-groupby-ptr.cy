@@ -52,33 +52,33 @@ int main() {
     printf("-- 1. UFCS List<Item*>->GroupBy --\n");
     auto by_parity = xs->GroupBy(item_parity);
     check(by_parity.Count() == 2, "1a  two parity buckets");
-    List<Item*>* odd = by_parity.GetOr(1, NULL);
-    List<Item*>* even = by_parity.GetOr(0, NULL);
-    check(odd != NULL && even != NULL, "1b  both buckets present");
-    check(odd->Count() == 3, "1c  odd ids (1,3,5)");
-    check(even->Count() == 2, "1d  even ids (2,4)");
-    check(odd->Get(0)->Id() == 1 && odd->Get(2)->Id() == 5, "1e  odd order + field access");
-    check(even->Get(0)->Id() == 2 && even->Get(1)->Id() == 4, "1f  even order");
+    auto odd = by_parity.Get(1);
+    auto even = by_parity.Get(0);
+    check(by_parity.Contains(0) && by_parity.Contains(1), "1b  both buckets present");
+    check(odd.Count() == 3, "1c  odd ids (1,3,5)");
+    check(even.Count() == 2, "1d  even ids (2,4)");
+    check(odd.Get(0)->Id() == 1 && odd.Get(2)->Id() == 5, "1e  odd order + field access");
+    check(even.Get(0)->Id() == 2 && even.Get(1)->Id() == 4, "1f  even order");
 
     /* ── 2. Free GroupBy(list, fn) same specialization ──────────────────── */
     printf("\n-- 2. free GroupBy --\n");
     auto by_tag = GroupBy(xs, item_tag_bucket);
     check(by_tag.Count() == 3, "2a  three tag buckets (a/b/g)");
-    check(by_tag.Get((int)'a')->Count() == 2, "2b  alpha x2");
-    check(by_tag.Get((int)'b')->Count() == 2, "2c  beta x2");
-    check(by_tag.Get((int)'g')->Count() == 1, "2d  gamma x1");
+    check(by_tag.Get((int)'a').Count() == 2, "2b  alpha x2");
+    check(by_tag.Get((int)'b').Count() == 2, "2c  beta x2");
+    check(by_tag.Get((int)'g').Count() == 1, "2d  gamma x1");
 
     /* ── 3. ListGroupBy alias still works for pointers ──────────────────── */
     printf("\n-- 3. ListGroupBy alias --\n");
     auto alias = ListGroupBy(xs, item_parity);
-    check(alias.Count() == 2 && alias.Get(1)->Count() == 3, "3a  ListGroupBy parity");
+    check(alias.Count() == 2 && alias.Get(1).Count() == 3, "3a  ListGroupBy parity");
 
     /* ── 4. Scalar List<int> regression (still good) ────────────────────── */
     printf("\n-- 4. List<int> GroupBy still works --\n");
     List<int>* nums = new List<int>{10, 11, 12, 13};
     defer delete nums;
     auto ni = nums->GroupBy(int_parity);
-    check(ni.Count() == 2 && ni.Get(0)->Count() == 2 && ni.Get(1)->Count() == 2,
+    check(ni.Count() == 2 && ni.Get(0).Count() == 2 && ni.Get(1).Count() == 2,
           "4a  int UFCS GroupBy");
 
     /* ── 5. No call-arg mismatch warnings path: key selector receives Item* ── */

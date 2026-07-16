@@ -1,4 +1,4 @@
-/* val-036-map-remove-groupby.cy — Map::Remove hash integrity + GroupBy ownsValues.
+/* val-036-map-remove-groupby.cy — Map::Remove hash integrity + GroupBy nested List.
  *
  * Regression for:
  *   · Map::Remove swap-remove used find_slot(key) after overwriting dense[idx],
@@ -21,7 +21,7 @@ void check(int cond, const char *label) {
 int int_parity(int x) { return x % 2; }
 
 int main() {
-    printf("=== val-036 Map Remove + GroupBy ownsValues ===\n\n");
+    printf("=== val-036 Map Remove + GroupBy nested List ===\n\n");
 
     /* ── 1. Random insert/remove stress (was 63/200 fail pre-fix) ──────── */
     printf("-- 1. Remove stress --\n");
@@ -97,17 +97,17 @@ int main() {
               "3b  values after tombstone reuse");
     }
 
-    /* ── 4. GroupBy auto ownsValues (bucket lists free with map) ────────── */
-    printf("\n-- 4. GroupBy owns bucket Lists --\n");
+    /* ── 4. GroupBy nested List shells (free with map) ─────────────────── */
+    printf("\n-- 4. GroupBy nested List buckets --\n");
     {
         List<int>* nums = new List<int>{1, 2, 3, 4, 5, 6};
         defer delete nums;
-        /* No explicit ownsValues() — GroupBy must mark buckets owned. */
+        /* Phase B: nested List shells; ~Map runs ~List on each bucket. */
         auto g = nums->GroupBy(int_parity);
         check(g.Count() == 2, "4a  two parity buckets");
-        check(g.Get(0)->Count() == 3 && g.Get(1)->Count() == 3, "4b  bucket sizes");
+        check(g.Get(0).Count() == 3 && g.Get(1).Count() == 3, "4b  bucket sizes");
         /* double ownsValues is harmless */
-        check(g.Get(0)->Get(0) == 2, "4c  even first is 2");
+        check(g.Get(0).Get(0) == 2, "4c  even first is 2");
     }
     {
         Map<String, int>* ages = new Map<String, int>();
@@ -119,8 +119,8 @@ int main() {
             (void)k;
             return v % 2;
         });
-        check(mp.Count() == 2, "4d  Map.GroupBy auto ownsValues");
-        check(mp.Get(0)->Count() == 1 && mp.Get(1)->Count() == 2, "4e  parity counts");
+        check(mp.Count() == 2, "4d  Map.GroupBy nested List");
+        check(mp.Get(0).Count() == 1 && mp.Get(1).Count() == 2, "4e  parity counts");
     }
 
     /* ── 5. Merge NULL / Copy non-owning ────────────────────────────────── */

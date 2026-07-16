@@ -295,7 +295,7 @@ int main() {
     /* ═══ 4. Faction briefing ══════════════════════════════════════════════ */
     hr("4 · FACTION BRIEFING  (GroupBy · Set watchlist · enum nameof)");
 
-    auto by_faction = roster.GroupBy((Pilot* p) => p.FactionKey());  /* value Map + ownsValues buckets */
+    auto by_faction = roster.GroupBy((Pilot* p) => p.FactionKey());  /* value Map + nested List shells */
     printf("  %d factions (%s)\n", by_faction.Count(), nameof<Faction>());
 
     for (auto bucket, group in by_faction) {

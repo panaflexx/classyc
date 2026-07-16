@@ -103,11 +103,17 @@ class List<T> {
 
     /* ═══════════════════════════ Constructors ═══════════════════════════ */
 
+    /* Dense slots use *(data + i), never data[i]: when T is itself a List/Map/Set,
+     * T* is a pointer-to-collection and data[i] would lower to Get() sugar.
+     * Pointer arithmetic is also SSA-friendly (base + scaled index → one load).
+     * Fresh capacity is zeroed so move-assign's ~T on empty LHS is a no-op. */
+
     /* Default: empty list with initial capacity of 4. Non-owning. */
     List() {
         this->length   = 0;
         this->capacity = 4;
         this->data     = (T*) malloc(sizeof(T) * this->capacity);
+        if (this->data) memset((void*)this->data, 0, sizeof(T) * this->capacity);
         this->_owns_ptrs = 0;
     }
 
@@ -117,6 +123,7 @@ class List<T> {
         this->length   = 0;
         this->capacity = initialCapacity > 0 ? initialCapacity : 4;
         this->data     = (T*) malloc(sizeof(T) * this->capacity);
+        if (this->data) memset((void*)this->data, 0, sizeof(T) * this->capacity);
         this->_owns_ptrs = 0;
     }
 
@@ -126,8 +133,9 @@ class List<T> {
         this->length   = 0;
         this->capacity = 4;
         this->data     = (T*) malloc(sizeof(T) * this->capacity);
+        if (this->data) memset((void*)this->data, 0, sizeof(T) * this->capacity);
         this->_owns_ptrs = 0;
-        this->data[0]  = firstItem;
+        *(this->data + 0) = move firstItem;
         this->length   = 1;
     }
 
@@ -142,9 +150,10 @@ class List<T> {
         this->length   = 0;
         this->capacity = n > 0 ? n : 4;
         this->data     = (T*) malloc(sizeof(T) * this->capacity);
+        if (this->data) memset((void*)this->data, 0, sizeof(T) * this->capacity);
         this->_owns_ptrs = 0;
         for (int i = 0; i < n; i++) {
-            this->data[i] = items[i];
+            *(this->data + i) = move *(items + i);
             this->length++;
         }
     }
@@ -167,9 +176,9 @@ class List<T> {
     ~List() {
         for (int i = 0; i < this->length; i++) {
             if (this->_owns_ptrs && is_pointer<T>()) {
-                delete this->data[i];  /* delete owned pointer elements */
+                delete *(this->data + i);
             } else {
-                __destroy(this->data[i]);  /* by-value or non-owned */
+                __destroy(*(this->data + i));
             }
         }
         if (this->data) free((void*) this->data);
@@ -192,9 +201,13 @@ class List<T> {
         return this;
     }
 
-    /* Get returns T by value (a copy).  Prefer GetMut for in-place mutation of
-     * by-value class elements so Boost/set-field hits the list buffer. */
-    T Get(int index) { if (index < 0 || index >= this->length) throw(OutOfBoundsException, "List.Get oob"); return this->data[index]; }
+    /* Get returns T by value.  Move-only T (nested List/Map/Set) is rewritten
+     * to deep Copy() on return of storage.  Prefer GetMut to mutate in place. */
+    T Get(int index) {
+        if (index < 0 || index >= this->length)
+            throw(OutOfBoundsException, "List.Get oob");
+        return *(this->data + index);
+    }
 
     /* Pointer into the backing store — advanced escape for mutation without
      * re-Set.  Invalidated by reallocation (Add/EnsureCapacity that grows).
@@ -203,35 +216,61 @@ class List<T> {
     T* GetMut(int index) __attribute__((da_ignore)) {
         if (index < 0 || index >= this->length)
             throw(OutOfBoundsException, "List.GetMut oob");
-        return &this->data[index];
+        return this->data + index;
     }
 
-    T First() { if (this->length == 0) throw(OutOfBoundsException, "First empty"); return this->data[0]; }
+    T First() {
+        if (this->length == 0) throw(OutOfBoundsException, "First empty");
+        return *(this->data + 0);
+    }
     T* FirstMut() __attribute__((da_ignore)) {
         if (this->length == 0) throw(OutOfBoundsException, "FirstMut empty");
-        return &this->data[0];
+        return this->data + 0;
     }
-    T Last() { if (this->length == 0) throw(OutOfBoundsException, "Last empty"); return this->data[this->length - 1]; }
+    T Last() {
+        if (this->length == 0) throw(OutOfBoundsException, "Last empty");
+        return *(this->data + (this->length - 1));
+    }
     T* LastMut() __attribute__((da_ignore)) {
         if (this->length == 0) throw(OutOfBoundsException, "LastMut empty");
-        return &this->data[this->length - 1];
+        return this->data + (this->length - 1);
     }
-    T GetOr(int index, T fb){ if(index<0||index>=length) return fb; return data[index]; }
-    bool TryGet(int index, T* out){ if(!out) return false; if(index<0||index>=length) return false; *out=data[index]; return true; }
-    T FirstOr(T fb){ if(length==0) return fb; return data[0]; }
-    T LastOr(T fb){ if(length==0) return fb; return data[length-1]; }
+    T GetOr(int index, T fb) {
+        if (index < 0 || index >= this->length) return fb;
+        return *(this->data + index);
+    }
+    bool TryGet(int index, T* out) {
+        if (!out || index < 0 || index >= this->length) return false;
+        /* Storage RHS rewrites to .Copy() for move-only T (no steal). */
+        *out = *(this->data + index);
+        return true;
+    }
+    T FirstOr(T fb) {
+        if (this->length == 0) return fb;
+        return *(this->data + 0);
+    }
+    T LastOr(T fb) {
+        if (this->length == 0) return fb;
+        return *(this->data + (this->length - 1));
+    }
 
     /* ═════════════════════════ Capacity management ══════════════════════ */
 
     List<T>* owns(int v) { this->_owns_ptrs = v ? 1 : 0; return this; }
 
-    /* Ensure capacity >= min. Doubles until satisfied; preserves elements. */
+    /* Ensure capacity >= min. Doubles until satisfied.
+     * Bulk memcpy relocates live elements (one MIR block move per growth) —
+     * better for SSA than per-element move-assign loops on nested List T. */
     void EnsureCapacity(int min) __attribute__((da_ignore)) {
         if (min <= this->capacity) return;
         int newCap = this->capacity > 0 ? this->capacity : 1;
         while (newCap < min) newCap = newCap * 2;
         T* newData = (T*) malloc(sizeof(T) * newCap);
-        for (int i = 0; i < this->length; i++) newData[i] = this->data[i];
+        if (!newData) return;
+        memset((void*)newData, 0, sizeof(T) * newCap);
+        if (this->length > 0 && this->data)
+            memcpy((void*)newData, (void*)this->data, sizeof(T) * this->length);
+        /* Ownership of nested buffers moved with the bytes; do not ~T old slots. */
         free((void*) this->data);
         this->data     = newData;
         this->capacity = newCap;
@@ -242,7 +281,10 @@ class List<T> {
         int target = this->length > 0 ? this->length : 1;
         if (target == this->capacity) return;
         T* newData = (T*) malloc(sizeof(T) * target);
-        for (int i = 0; i < this->length; i++) newData[i] = this->data[i];
+        if (!newData) return;
+        memset((void*)newData, 0, sizeof(T) * target);
+        if (this->length > 0 && this->data)
+            memcpy((void*)newData, (void*)this->data, sizeof(T) * this->length);
         free((void*) this->data);
         this->data     = newData;
         this->capacity = target;
@@ -253,7 +295,7 @@ class List<T> {
     /* Index of first element equal to item (String = content, else bytes), or -1. */
     int IndexOf(T item) __attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++)
-            if (LIST_EQ(this->data[i], item)) return i;
+            if (LIST_EQ(*(this->data + i), item)) return i;
         return -1;
     }
 
@@ -261,7 +303,7 @@ class List<T> {
     int LastIndexOf(T item) __attribute__((da_ignore)) {
         int i = this->length - 1;
         while (i >= 0) {
-            if (LIST_EQ(this->data[i], item)) return i;
+            if (LIST_EQ(*(this->data + i), item)) return i;
             i--;
         }
         return -1;
@@ -269,39 +311,64 @@ class List<T> {
 
     /* True if item is present.  String compares by content (C# string.Contains-style). */
     int Contains(T item) { return this->IndexOf(item) >= 0; }
-    int FindIndex(int(*pred)(T)) __attribute__((da_ignore)) { for(int i=0;i<length;i++) if(pred(data[i])) return i; return -1; }
+    int FindIndex(int(*pred)(T)) __attribute__((da_ignore)) {
+        for (int i = 0; i < this->length; i++)
+            if (pred(*(this->data + i))) return i;
+        return -1;
+    }
 
     /* ═══════════════════════════ Mutation ═════════════════════════====== */
 
-    void Set(int index, T item) { if(index<0||index>=length) throw(OutOfBoundsException, "Set oob"); if(_owns_ptrs && is_pointer<T>()) delete data[index]; else __destroy(data[index]); data[index]=item; }
+    void Set(int index, T item) {
+        if (index < 0 || index >= this->length)
+            throw(OutOfBoundsException, "Set oob");
+        if (this->_owns_ptrs && is_pointer<T>()) delete *(this->data + index);
+        else __destroy(*(this->data + index));
+        *(this->data + index) = move item;
+    }
 
     /* Append to end. Grows capacity as needed. */
     void Add(T item) {
         this->EnsureCapacity(this->length + 1);
-        this->data[this->length] = item;
+        *(this->data + this->length) = move item;
         this->length++;
     }
 
-    /* Insert before index (clamped). Later elements shift right. */
+    /* Insert before index (clamped). Later elements shift right via memmove. */
     void Insert(int index, T item) {
-        if (index < 0)           index = 0;
+        if (index < 0)            index = 0;
         if (index > this->length) index = this->length;
         this->EnsureCapacity(this->length + 1);
-        for (int i = this->length; i > index; i--) this->data[i] = this->data[i - 1];
-        this->data[index] = item;
+        if (index < this->length) {
+            memmove((void*)(this->data + index + 1), (void*)(this->data + index),
+                    sizeof(T) * (this->length - index));
+            memset((void*)(this->data + index), 0, sizeof(T));
+        }
+        *(this->data + index) = move item;
         this->length++;
     }
 
-    /* Remove and return the last element. Ownership transfers to the caller:
-     * for .owns() pointer lists the pointer is NOT deleted here; for by-value T
-     * the list no longer runs __destroy on that slot (return value holds it). */
+    /* Remove and return the last element. Ownership transfers to the caller. */
     T Pop() {
         if (this->length == 0) throw(OutOfBoundsException, "Pop empty");
         this->length--;
-        return this->data[this->length];
+        T item = move *(this->data + this->length);
+        memset((void*)(this->data + this->length), 0, sizeof(T));
+        return move item;
     }
 
-    void RemoveAt(int index) { if(index<0||index>=length) throw(OutOfBoundsException, "RemoveAt oob"); if(_owns_ptrs && is_pointer<T>()) delete data[index]; else __destroy(data[index]); for(int i=index;i<length-1;i++) data[i]=data[i+1]; length--; }
+    void RemoveAt(int index) {
+        if (index < 0 || index >= this->length)
+            throw(OutOfBoundsException, "RemoveAt oob");
+        if (this->_owns_ptrs && is_pointer<T>()) delete *(this->data + index);
+        else __destroy(*(this->data + index));
+        if (index < this->length - 1) {
+            memmove((void*)(this->data + index), (void*)(this->data + index + 1),
+                    sizeof(T) * (this->length - index - 1));
+        }
+        this->length--;
+        memset((void*)(this->data + this->length), 0, sizeof(T));
+    }
 
     /* Remove first occurrence of item via ==. Returns 1 on success, 0 if absent. */
     int Remove(T item) {
@@ -311,35 +378,44 @@ class List<T> {
         return 1;
     }
 
-    void Clear() { for(int i=0;i<length;i++){ if(_owns_ptrs && is_pointer<T>()) delete data[i]; else __destroy(data[i]); } length=0; }
+    void Clear() {
+        for (int i = 0; i < this->length; i++) {
+            if (this->_owns_ptrs && is_pointer<T>()) delete *(this->data + i);
+            else __destroy(*(this->data + i));
+        }
+        if (this->data && this->length > 0)
+            memset((void*)this->data, 0, sizeof(T) * this->length);
+        this->length = 0;
+    }
 
     /* ═════════════════════════ Transformations ═════════════════════════ */
 
-    /* Reverse elements in place. O(n). */
+    /* Reverse elements in place. O(n). Move-swap is correct for nested List T. */
     void Reverse() __attribute__((da_ignore)) {
         int lo = 0, hi = this->length - 1;
         while (lo < hi) {
-            T tmp = this->data[lo];
-            this->data[lo] = this->data[hi];
-            this->data[hi] = tmp;
+            T tmp = move *(this->data + lo);
+            *(this->data + lo) = move *(this->data + hi);
+            *(this->data + hi) = move tmp;
             lo++;
             hi--;
         }
     }
 
     /* Sort in place using Shell sort (O(n log² n) average).
-     * cmp(a, b) returns <0 if a<b, 0 if equal, >0 if a>b. */
+     * cmp(a, b) returns <0 if a<b, 0 if equal, >0 if a>b.
+     * Uses move for nested collection T; simple index math for SSA. */
     void Sort(int(*cmp)(T, T)) __attribute__((da_ignore)) {
         int gap = this->length / 2;
         while (gap > 0) {
             for (int i = gap; i < this->length; i++) {
-                T   tmp = this->data[i];
-                int j   = i;
-                while (j >= gap && cmp(this->data[j - gap], tmp) > 0) {
-                    this->data[j] = this->data[j - gap];
+                T tmp = move *(this->data + i);
+                int j = i;
+                while (j >= gap && cmp(*(this->data + (j - gap)), tmp) > 0) {
+                    *(this->data + j) = move *(this->data + (j - gap));
                     j = j - gap;
                 }
-                this->data[j] = tmp;
+                *(this->data + j) = move tmp;
             }
             gap = gap / 2;
         }
@@ -350,8 +426,8 @@ class List<T> {
     List<T>* Concat(List<T>* other) {
         if (other) {
             int oc = other->Count();
-            EnsureCapacity(length + oc);
-            for (int i = 0; i < oc; i++) Add(other->Get(i));
+            this->EnsureCapacity(this->length + oc);
+            for (int i = 0; i < oc; i++) this->Add(other->Get(i));
         }
         return this;
     }
@@ -359,34 +435,40 @@ class List<T> {
     void AddRange(List<T>* other) {
         if (!other) return;
         int oc = other->Count();
-        EnsureCapacity(length + oc);
-        for (int i = 0; i < oc; i++) Add(other->Get(i));
+        this->EnsureCapacity(this->length + oc);
+        for (int i = 0; i < oc; i++) this->Add(other->Get(i));
     }
 
     void InsertRange(int index, List<T>* other) {
         if (!other || other->Count() == 0) return;
         if (index < 0) index = 0;
-        if (index > length) index = length;
+        if (index > this->length) index = this->length;
         int oc = other->Count();
-        EnsureCapacity(length + oc);
-        for (int i = length - 1; i >= index; i--) data[i + oc] = data[i];
-        for (int i = 0; i < oc; i++) data[index + i] = other->Get(i);
-        length += oc;
+        this->EnsureCapacity(this->length + oc);
+        if (index < this->length) {
+            memmove((void*)(this->data + index + oc), (void*)(this->data + index),
+                    sizeof(T) * (this->length - index));
+            memset((void*)(this->data + index), 0, sizeof(T) * oc);
+        }
+        for (int i = 0; i < oc; i++)
+            *(this->data + index + i) = other->Get(i); /* prvalue bind / Copy */
+        this->length += oc;
     }
 
     /* Return a by-value list with [start, start+count). Clamps to valid range.
      * Always non-owning of pointees (does not copy .owns()). RAII shell. */
     List<T> Slice(int start, int count) __attribute__((da_ignore)) {
-        if (start < 0)                   start = 0;
-        if (start >= this->length)       count = 0;
-        if (count < 0)                   count = 0;
+        if (start < 0)                    start = 0;
+        if (start >= this->length)        count = 0;
+        if (count < 0)                    count = 0;
         if (start + count > this->length) count = this->length - start;
         auto result = List<T>(count > 0 ? count : 1);
-        for (int i = 0; i < count; i++) result.Add(this->data[start + i]);
+        for (int i = 0; i < count; i++)
+            result.Add(this->Get(start + i));
         return move result;
     }
 
-    /* Shallow copy into a by-value list. Always non-owning of pointees. */
+    /* Deep-enough copy into a by-value list (Get copies move-only T). */
     List<T> Copy() __attribute__((da_ignore)) {
         auto c = List<T>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++)
@@ -405,22 +487,36 @@ class List<T> {
 
     /* ═════════════════════════ Array conversions ═══════════════════════ */
 
-    T* ToArray() { int n=length>0?length:1; T* array=(T*)malloc(sizeof(T)*n); for(int i=0;i<length;i++) array[i]=data[i]; return array; }
-    void CopyTo(T* destination) __attribute__((da_ignore)) { for(int i=0;i<length;i++) destination[i]=data[i]; }
+    T* ToArray() {
+        int n = this->length > 0 ? this->length : 1;
+        T* array = (T*) malloc(sizeof(T) * n);
+        if (array) {
+            memset((void*)array, 0, sizeof(T) * n);
+            for (int i = 0; i < this->length; i++)
+                *(array + i) = this->Get(i);
+        }
+        return array;
+    }
+    void CopyTo(T* destination) __attribute__((da_ignore)) {
+        for (int i = 0; i < this->length; i++)
+            *(destination + i) = this->Get(i);
+    }
     /* Element-wise equality; String elements use content compare via LIST_EQ. */
     int Equals(List<T>* other) __attribute__((da_ignore)) {
-        if (!other || other->Count() != length) return 0;
-        for (int i = 0; i < length; i++) {
-            T a = data[i], b = other->Get(i);
-            if (!LIST_EQ(a, b)) return 0;
+        if (!other || other->Count() != this->length) return 0;
+        for (int i = 0; i < this->length; i++) {
+            T b = other->Get(i);
+            if (!LIST_EQ(*(this->data + i), b)) return 0;
         }
         return 1;
     }
     /* Unique elements; String uniqueness is by content (via IndexOf/LIST_EQ). */
     List<T> Distinct() __attribute__((da_ignore)) {
-        auto r = List<T>(length > 0 ? length : 4);
-        for (int i = 0; i < length; i++)
-            if (r.IndexOf(data[i]) < 0) r.Add(data[i]);
+        auto r = List<T>(this->length > 0 ? this->length : 4);
+        for (int i = 0; i < this->length; i++) {
+            if (r.IndexOf(this->Get(i)) < 0)
+                r.Add(this->Get(i));
+        }
         return move r;
     }
 
@@ -575,10 +671,33 @@ class List<T> {
         return move result;
     }
 
+    /* Alias of ToJsonArray() — automagic per-element typeof conversion.
+     * Body open-coded (same-class call gen can fail on method FIELD def_node). */
     dict ToArrayDict() __attribute__((da_ignore)) {
         dict arr = dict_create_array();
-        dict* d = (dict*)this->data;
-        for (int i = 0; i < this->length; i++) dict_array_append(arr, d[i]);
+        const char* tn = nameof<T>();
+        for (int i = 0; i < this->length; i++) {
+            T* p = this->data + i;
+            dict v;
+            if (strcmp(tn, "String") == 0 || strcmp(tn, "char") == 0)
+                v = dict_create_string(*(char**)p);
+            else if (strcmp(tn, "double") == 0)
+                v = dict_create_number(*(double*)p);
+            else if (strcmp(tn, "float") == 0)
+                v = dict_create_number((double)*(float*)p);
+            else if (strcmp(tn, "long") == 0)
+                v = dict_create_int64(*(long*)p);
+            else if (strcmp(tn, "short") == 0)
+                v = dict_create_int64((long)*(short*)p);
+            else if (strcmp(tn, "int") == 0 || strcmp(tn, "unsigned") == 0
+                     || strcmp(tn, "bool") == 0)
+                v = dict_create_int64((long)*(int*)p);
+            else if (strcmp(tn, "dict") == 0)
+                v = *(dict*)p;
+            else
+                v = dict_create_null();
+            dict_array_append(arr, v);
+        }
         return arr;
     }
 
@@ -589,7 +708,7 @@ class List<T> {
         dict arr = dict_create_array();
         dict* d = (dict*)this->data;
         for (int i = 0; i < this->length; i++) {
-            dict_array_append(arr, d[i]);
+            dict_array_append(arr, *(d + i));
         }
         return arr;
     }
@@ -612,7 +731,7 @@ class List<T> {
     dict StringsToJsonArray() __attribute__((da_ignore)) {
         dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
-            dict_array_append(arr, dict_create_string(*(char**)&this->data[i]));
+            dict_array_append(arr, dict_create_string(*(char**)(this->data + i)));
         }
         return arr;
     }
@@ -623,7 +742,7 @@ class List<T> {
     dict IntsToJsonArray() __attribute__((da_ignore)) {
         dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
-            dict_array_append(arr, dict_create_int64((long)*(int*)&this->data[i]));
+            dict_array_append(arr, dict_create_int64((long)*(int*)(this->data + i)));
         }
         return arr;
     }
@@ -644,7 +763,7 @@ class List<T> {
         dict arr = dict_create_array();
         const char* tn = nameof<T>();
         for (int i = 0; i < this->length; i++) {
-            T* p = &this->data[i];
+            T* p = this->data + i;
             dict v;
             if (strcmp(tn, "String") == 0 || strcmp(tn, "char") == 0)
                 v = dict_create_string(*(char**)p);
@@ -680,7 +799,7 @@ class List<T> {
     dict ToJsonArrayBy(dict(*fn)(T)) __attribute__((da_ignore)) {
         dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
-            dict_array_append(arr, fn(this->data[i]));
+            dict_array_append(arr, fn(*(this->data + i)));
         }
         return arr;
     }
@@ -699,7 +818,8 @@ class List<T> {
     dict ToDictBy(const char*(*keyFn)(T), dict(*valFn)(T)) __attribute__((da_ignore)) {
         dict obj = dict_create_object();
         for (int i = 0; i < this->length; i++) {
-            dict_object_set(obj, (char*)keyFn(this->data[i]), valFn(this->data[i]));
+            dict_object_set(obj, (char*)keyFn(*(this->data + i)),
+                            valFn(*(this->data + i)));
         }
         return obj;
     }
@@ -718,11 +838,34 @@ class List<T> {
      *
      * `array` should be a JSON array; a scalar/object dict yields a length of 0
      * (or 1) per the dict length() rules. */
+    /* Scalar/String/dict elements only.  Avoids `(T)array[i]` so monomorphs of
+     * List_List_Ship (and other class/nested T) do not enter dict-class bind
+     * during gen.  Class-field JSON binding still uses (List*)d Add protocol. */
     static List<T>* FromJson(dict array) __attribute__((da_ignore)) {
         List<T>* r = new List<T>();
+        const char* tn = nameof<T>();
         int n = (int)array.length();
         for (int i = 0; i < n; i++) {
-            r->Add((T)array[i]);
+            T slot;
+            memset((void*)&slot, 0, sizeof(T));
+            if (strcmp(tn, "int") == 0 || strcmp(tn, "unsigned") == 0
+                || strcmp(tn, "bool") == 0)
+                *(int*)&slot = (int)array[i];
+            else if (strcmp(tn, "short") == 0)
+                *(short*)&slot = (short)(int)array[i];
+            else if (strcmp(tn, "long") == 0)
+                *(long*)&slot = (long)array[i];
+            else if (strcmp(tn, "double") == 0)
+                *(double*)&slot = (double)array[i];
+            else if (strcmp(tn, "float") == 0)
+                *(float*)&slot = (float)(double)array[i];
+            else if (strcmp(tn, "String") == 0 || strcmp(tn, "char") == 0)
+                *(char**)&slot = (char*)array[i];
+            else if (strcmp(tn, "dict") == 0)
+                *(dict*)&slot = array[i];
+            else
+                continue; /* nested/class T: skip element */
+            r->Add(slot); /* scalar/String copy; no move (ownership pass) */
         }
         return r;
     }

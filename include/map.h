@@ -178,7 +178,7 @@ class Map<K, V> {
                 return first_tomb >= 0 ? first_tomb : i;            /* free */
             if (idx == -2) {
                 if (first_tomb < 0) first_tomb = i;                 /* reusable */
-            } else if (MAP_EQ(this->keys[idx], key)) {
+            } else if (MAP_EQ(*(this->keys + (idx)), key)) {
                 return i;                                          /* found */
             }
             i = (i + step) & mask;                                  /* triangular probe */
@@ -206,7 +206,7 @@ class Map<K, V> {
         for (int i = 0; i < old_cap; i++) {
             int idx = old[i];
             if (idx >= 0) {
-                int slot = this->find_slot(this->keys[idx]);
+                int slot = this->find_slot(*(this->keys + (idx)));
                 this->table[slot] = idx;
                 this->used++;
             }
@@ -220,11 +220,16 @@ class Map<K, V> {
             this->grow_table();
     }
 
+    /* Dense keys/vals use *(ptr + i), never ptr[i]: when V is List/Map/Set,
+     * V* is a pointer-to-collection and vals[i] would lower to Get() sugar.
+     * Capacity is zeroed so move-assign ~V on empty slots is a no-op. */
     void init_storage(int cap) {
         this->count    = 0;
         this->capacity = cap > 4 ? cap : 4;
         this->keys     = (K*)malloc(sizeof(K) * this->capacity);
         this->vals     = (V*)malloc(sizeof(V) * this->capacity);
+        if (this->keys) memset((void*)this->keys, 0, sizeof(K) * this->capacity);
+        if (this->vals) memset((void*)this->vals, 0, sizeof(V) * this->capacity);
         this->_owns_keys = 0;
         this->_owns_vals = 0;
 
@@ -258,10 +263,10 @@ class Map<K, V> {
      * ownsValues() / ownsKeys()), this deletes owned pointer keys/values too. */
     ~Map() {
         for (int i = 0; i < this->count; i++) {
-            if (this->_owns_keys && is_pointer<K>()) delete this->keys[i];
-            else                                     __destroy(this->keys[i]);
-            if (this->_owns_vals && is_pointer<V>()) delete this->vals[i];
-            else                                     __destroy(this->vals[i]);
+            if (this->_owns_keys && is_pointer<K>()) delete *(this->keys + i);
+            else                                     __destroy(*(this->keys + i));
+            if (this->_owns_vals && is_pointer<V>()) delete *(this->vals + i);
+            else                                     __destroy(*(this->vals + i));
         }
         if (this->keys)  free((void*)this->keys);
         if (this->vals)  free((void*)this->vals);
@@ -307,7 +312,7 @@ class Map<K, V> {
      * Callers that want silent fallback should use GetOr() or TryGet(). */
     V Get(K key) const {
         int idx = this->find_index(key);
-        if (idx >= 0) return this->vals[idx];
+        if (idx >= 0) return *(this->vals + idx); /* Copy rewrite for move-only V */
         throw(KeyException, "missing key in Map");
         V zero;
         memset((void*)&zero, 0, sizeof(V));
@@ -317,17 +322,18 @@ class Map<K, V> {
     /* Value for `key`, or `fallback` if absent. */
     V GetOr(K key, V fallback) const {
         int idx = this->find_index(key);
-        if (idx >= 0) return this->vals[idx];
+        if (idx >= 0) return *(this->vals + idx);
         return fallback;
     }
 
     /* Fast C++-style lookup.  Returns true and writes *out if present;
-     * returns false (leaves *out untouched) if absent.  No exception. */
+     * returns false (leaves *out untouched) if absent.  No exception.
+     * Move-only V: storage assign rewrites to deep Copy(). */
     bool TryGet(K key, V* out) const {
         if (out == NULL) return false;
         int idx = this->find_index(key);
         if (idx >= 0) {
-            *out = this->vals[idx];
+            *out = *(this->vals + idx);
             return true;
         }
         return false;
@@ -338,12 +344,12 @@ class Map<K, V> {
     K KeyAt(int index) const {
         if (index < 0 || index >= this->count)
             throw(OutOfBoundsException, "Map.KeyAt oob");
-        return this->keys[index];
+        return *(this->keys + index);
     }
     V ValAt(int index) const {
         if (index < 0 || index >= this->count)
             throw(OutOfBoundsException, "Map.ValAt oob");
-        return this->vals[index];
+        return *(this->vals + index);
     }
 
     /* Pointer into the dense value array — mutate class values in place
@@ -351,7 +357,7 @@ class Map<K, V> {
     V* ValMut(int index) __attribute__((da_ignore)) {
         if (index < 0 || index >= this->count)
             throw(OutOfBoundsException, "Map.ValMut oob");
-        return &this->vals[index];
+        return this->vals + index;
     }
 
     /* Lookup + mut pointer.  Throws KeyException if missing (same as Get) so
@@ -359,19 +365,19 @@ class Map<K, V> {
     V* GetMut(K key) __attribute__((da_ignore)) {
         int idx = this->find_index(key);
         if (idx < 0) throw(KeyException, "Map.GetMut missing key");
-        return &this->vals[idx];
+        return this->vals + idx;
     }
 
     /* Destroy one key slot (by-value dtor or owned pointer delete). */
     void destroy_key_at(int i) {
-        if (this->_owns_keys && is_pointer<K>()) delete this->keys[i];
-        else                                     __destroy(this->keys[i]);
+        if (this->_owns_keys && is_pointer<K>()) delete *(this->keys + i);
+        else                                     __destroy(*(this->keys + i));
     }
 
     /* Destroy one value slot. */
     void destroy_val_at(int i) {
-        if (this->_owns_vals && is_pointer<V>()) delete this->vals[i];
-        else                                     __destroy(this->vals[i]);
+        if (this->_owns_vals && is_pointer<V>()) delete *(this->vals + i);
+        else                                     __destroy(*(this->vals + i));
     }
 
     /* ───────────────────── Mutation ───────────────────── */
@@ -386,18 +392,23 @@ class Map<K, V> {
         int idx  = this->table[slot];
         if (idx >= 0) {                 /* existing key: overwrite value */
             this->destroy_val_at(idx);
-            this->vals[idx] = val;
+            *(this->vals + idx) = move val;
             return 0;
         }
 
         if (this->count == this->capacity) {
+            int old_cap = this->capacity;
             this->capacity *= 2;
             this->keys = (K*)realloc((void*)this->keys, sizeof(K) * this->capacity);
             this->vals = (V*)realloc((void*)this->vals, sizeof(V) * this->capacity);
+            if (this->keys)
+                memset((void*)(this->keys + old_cap), 0, sizeof(K) * (this->capacity - old_cap));
+            if (this->vals)
+                memset((void*)(this->vals + old_cap), 0, sizeof(V) * (this->capacity - old_cap));
         }
         int n = this->count;
-        this->keys[n] = key;
-        this->vals[n] = val;
+        *(this->keys + n) = key;
+        *(this->vals + n) = move val;
         this->count++;
 
         /* idx is -1 (empty) or -2 (tombstone).  `used` counts live+tomb:
@@ -434,10 +445,10 @@ class Map<K, V> {
          * dense index `last` instead of matching by key equality. */
         int last = this->count - 1;
         if (idx != last) {
-            this->keys[idx] = this->keys[last];
-            this->vals[idx] = this->vals[last];
+            *(this->keys + (idx)) = move *(this->keys + (last));
+            *(this->vals + (idx)) = move *(this->vals + (last));
 
-            uint64_t h = MAP_HASH(this->keys[idx]);
+            uint64_t h = MAP_HASH(*(this->keys + (idx)));
             int mask = this->table_cap - 1;
             int i = (int)(h & (uint64_t)mask);
             int step = 1;
@@ -449,6 +460,9 @@ class Map<K, V> {
                 i = (i + step) & mask;
                 step++;
             }
+        } else {
+            memset((void*)(this->keys + last), 0, sizeof(K));
+            memset((void*)(this->vals + last), 0, sizeof(V));
         }
         this->count--;
 
@@ -470,7 +484,7 @@ class Map<K, V> {
     /* ───────────────────── Accessors (extended) ───────────────────── */
     V GetOrAdd(K key, V fallback) __attribute__((da_ignore)) {
         int idx = this->find_index(key);
-        if (idx >= 0) return this->vals[idx];
+        if (idx >= 0) return *(this->vals + (idx));
         this->Set(key, fallback);
         return fallback;
     }
@@ -478,15 +492,17 @@ class Map<K, V> {
      * matching key equality and C# Dictionary.ContainsValue for strings. */
     bool ContainsValue(V val) const __attribute__((da_ignore)) {
         for (int i = 0; i < this->count; i++)
-            if (MAP_EQ(this->vals[i], val)) return true;
+            if (MAP_EQ(*(this->vals + (i)), val)) return true;
         return false;
     }
     int AddOrUpdate(K key, V val, V(*updater)(V)) __attribute__((da_ignore)) {
         int idx = this->find_index(key);
         if (idx >= 0) {
-            V updated = updater(this->vals[idx]);
+            /* ValAt deep-copies move-only V into the updater arg path. */
+            V cur = this->ValAt(idx);
+            V updated = updater(cur);
             this->destroy_val_at(idx);
-            this->vals[idx] = updated;
+            *(this->vals + (idx)) = move updated;
             return 0;
         }
         this->Set(key, val);
@@ -508,7 +524,7 @@ class Map<K, V> {
     Map<K, V> Copy() const {
         auto r = Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
-            r.Set(this->keys[i], this->vals[i]);
+            r.Set(*(this->keys + (i)), *(this->vals + (i)));
         return move r;
     }
 
@@ -516,60 +532,58 @@ class Map<K, V> {
     Map<K, V> Where(int(*pred)(K, V)) const __attribute__((da_ignore)) {
         auto r = Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
-            if (pred(this->keys[i], this->vals[i]))
-                r.Set(this->keys[i], this->vals[i]);
+            if (pred(*(this->keys + (i)), *(this->vals + (i))))
+                r.Set(*(this->keys + (i)), *(this->vals + (i)));
         return move r;
     }
     Map<K, V> WhereKeys(int(*pred)(K)) const __attribute__((da_ignore)) {
         auto r = Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
-            if (pred(this->keys[i]))
-                r.Set(this->keys[i], this->vals[i]);
+            if (pred(*(this->keys + (i))))
+                r.Set(*(this->keys + (i)), *(this->vals + (i)));
         return move r;
     }
     Map<K, V> WhereValues(int(*pred)(V)) const __attribute__((da_ignore)) {
         auto r = Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
-            if (pred(this->vals[i]))
-                r.Set(this->keys[i], this->vals[i]);
+            if (pred(*(this->vals + (i))))
+                r.Set(*(this->keys + (i)), *(this->vals + (i)));
         return move r;
     }
     int Any(int(*pred)(K, V)) const __attribute__((da_ignore)) {
         for (int i = 0; i < this->count; i++)
-            if (pred(this->keys[i], this->vals[i])) return 1;
+            if (pred(*(this->keys + (i)), *(this->vals + (i)))) return 1;
         return 0;
     }
     int All(int(*pred)(K, V)) const __attribute__((da_ignore)) {
         for (int i = 0; i < this->count; i++)
-            if (!pred(this->keys[i], this->vals[i])) return 0;
+            if (!pred(*(this->keys + (i)), *(this->vals + (i)))) return 0;
         return 1;
     }
     Map<K, W> SelectValues<W>(W(*fn)(K, V)) const __attribute__((da_ignore)) {
         auto r = Map<K, W>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
-            r.Set(this->keys[i], fn(this->keys[i], this->vals[i]));
+            r.Set(*(this->keys + (i)), fn(*(this->keys + (i)), *(this->vals + (i))));
         return move r;
     }
     Map<G, V> SelectKeys<G>(G(*fn)(K, V)) const __attribute__((da_ignore)) {
         auto r = Map<G, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
-            r.Set(fn(this->keys[i], this->vals[i]), this->vals[i]);
+            r.Set(fn(*(this->keys + (i)), *(this->vals + (i))), *(this->vals + (i)));
         return move r;
     }
-    /* Group values by keySelector(k,v).  Returns a by-value Map shell; bucket
-     * List* values use ownsValues so ~Map frees every bucket (no owned/delete
-     * on the map itself).  Element ownership inside each List is unchanged. */
-    Map<G, List<V>*> GroupBy<G>(G(*keySelector)(K, V)) const __attribute__((da_ignore)) {
-        auto result = Map<G, List<V>*>();
-        result.ownsValues();
+    /* Group values by keySelector(k,v).  Returns Map<G, List<V>> by value —
+     * nested List shells live in the map dense buffer (Phase B).  Get/ValAt
+     * deep-Copy a bucket; mutate in place via GetMut/ValMut. */
+    Map<G, List<V>> GroupBy<G>(G(*keySelector)(K, V)) const __attribute__((da_ignore)) {
+        auto result = Map<G, List<V>>();
         for (int i = 0; i < this->count; i++) {
-            G gk = keySelector(this->keys[i], this->vals[i]);
-            List<V>* bucket;
-            if (!result.TryGet(gk, &bucket)) {
-                bucket = new List<V>();
-                result.Set(gk, bucket);
+            G gk = keySelector(*(this->keys + (i)), *(this->vals + (i)));
+            if (!result.Contains(gk)) {
+                auto empty = List<V>();
+                result.Set(gk, move empty);
             }
-            bucket->Add(this->vals[i]);
+            result.GetMut(gk)->Add(*(this->vals + (i)));
         }
         return move result;
     }
@@ -577,7 +591,7 @@ class Map<K, V> {
     /* Call action(key, value) for each entry, in insertion order. */
     void ForEach(void(*action)(K, V)) const {
         for (int i = 0; i < this->count; i++)
-            action(this->keys[i], this->vals[i]);
+            action(*(this->keys + (i)), *(this->vals + (i)));
     }
 
     /* ───────────────────── Conversions ───────────────────── */
@@ -585,13 +599,13 @@ class Map<K, V> {
     /* Collect keys/values into by-value Lists (RAII). */
     List<K> Keys() const {
         auto r = List<K>(this->count > 0 ? this->count : 4);
-        for (int i = 0; i < this->count; i++) r.Add(this->keys[i]);
+        for (int i = 0; i < this->count; i++) r.Add(*(this->keys + (i)));
         return move r;
     }
 
     List<V> Values() const {
         auto r = List<V>(this->count > 0 ? this->count : 4);
-        for (int i = 0; i < this->count; i++) r.Add(this->vals[i]);
+        for (int i = 0; i < this->count; i++) r.Add(*(this->vals + (i)));
         return move r;
     }
 
@@ -614,7 +628,7 @@ class Map<K, V> {
         if (!k_is_str && !k_is_int) return obj;
         const char* vt = nameof<V>();
         for (int i = 0; i < this->count; i++) {
-            V* p = &this->vals[i];
+            V* p = (this->vals + (i));
             dict dv;
             if (strcmp(vt, "String") == 0 || strcmp(vt, "char") == 0)
                 dv = dict_create_string(*(char**)p);
@@ -636,12 +650,12 @@ class Map<K, V> {
             const char* kstr;
             char keybuf[64];
             if (k_is_str) {
-                kstr = *(char**)&this->keys[i];
+                kstr = *(char**)(this->keys + (i));
             } else {
                 long kv = 0;
-                if (strcmp(kt, "long") == 0) kv = *(long*)&this->keys[i];
-                else if (strcmp(kt, "short") == 0) kv = (long)*(short*)&this->keys[i];
-                else kv = (long)*(int*)&this->keys[i];
+                if (strcmp(kt, "long") == 0) kv = *(long*)(this->keys + (i));
+                else if (strcmp(kt, "short") == 0) kv = (long)*(short*)(this->keys + (i));
+                else kv = (long)*(int*)(this->keys + (i));
                 snprintf(keybuf, sizeof(keybuf), "%ld", kv);
                 kstr = keybuf;
             }
@@ -669,47 +683,42 @@ class Map<K, V> {
 };
 
 /* List.GroupBy as a free generic function (method form via UFCS).
- * Returns Map<G, List<T>*> by value (RAII shell; ownsValues buckets).
+ * Returns Map<G, List<T>> by value (nested List shells, not List*).
  *   auto g = nums.GroupBy(parity);
  *   auto g = GroupBy(&nums, keyFn);
  *   auto g = ListGroupBy(&nums, keyFn);
- * Map<K,V>::GroupBy stays the instance method on maps (same name, method wins).
+ * Buckets: Get/ValAt → deep Copy(); mutate with GetMut/ValMut.
  */
-Map<G, List<T>*> GroupBy<T, G>(List<T>* self, G(*keySelector)(T))
+Map<G, List<T>> GroupBy<T, G>(List<T>* self, G(*keySelector)(T))
     __attribute__((da_ignore)) {
-    auto result = Map<G, List<T>*>();
-    result.ownsValues();
+    auto result = Map<G, List<T>>();
     if (self) {
         for (int i = 0; i < self->Count(); i++) {
             T item = self->Get(i);
             G gk = keySelector(item);
-            List<T>* bucket;
-            if (!result.TryGet(gk, &bucket)) {
-                bucket = new List<T>();
-                result.Set(gk, bucket);
+            if (!result.Contains(gk)) {
+                auto empty = List<T>();
+                result.Set(gk, move empty);
             }
-            bucket->Add(item);
+            result.GetMut(gk)->Add(item);
         }
     }
     return move result;
 }
 
 /* Compat alias of GroupBy (pre-UFCS name). */
-Map<G, List<T>*> ListGroupBy<T, G>(List<T>* self, G(*keySelector)(T))
+Map<G, List<T>> ListGroupBy<T, G>(List<T>* self, G(*keySelector)(T))
     __attribute__((da_ignore)) {
-    /* Open-coded body (do not call GroupBy — free generic forward refs are flaky). */
-    auto result = Map<G, List<T>*>();
-    result.ownsValues();
+    auto result = Map<G, List<T>>();
     if (self) {
         for (int i = 0; i < self->Count(); i++) {
             T item = self->Get(i);
             G gk = keySelector(item);
-            List<T>* bucket;
-            if (!result.TryGet(gk, &bucket)) {
-                bucket = new List<T>();
-                result.Set(gk, bucket);
+            if (!result.Contains(gk)) {
+                auto empty = List<T>();
+                result.Set(gk, move empty);
             }
-            bucket->Add(item);
+            result.GetMut(gk)->Add(item);
         }
     }
     return move result;

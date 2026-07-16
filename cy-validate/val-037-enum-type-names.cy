@@ -90,8 +90,8 @@ int main() {
     {
         enum Faction nf = (Faction)0;
         check(strcmp(nf.nameof(), "nova") == 0,      "4b  classic enum local + cast");
-        List<Pilot*>* nova_list = by.GetOr(0, NULL);
-        check(nova_list != NULL && nova_list->Count() == 1, "4c  nova bucket");
+        auto nova_list = by.Get(0);
+        check(nova_list.Count() == 1, "4c  nova bucket");
     }
 
     printf("\n-- reassignment reverse-map --\n");

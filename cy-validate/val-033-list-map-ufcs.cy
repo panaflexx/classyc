@@ -69,14 +69,14 @@ int main() {
 
     auto g = nums->GroupBy(parity);
     check(g.Count() == 2, "3a  GroupBy UFCS two buckets");
-    check(g.Get(0)->Count() == 3, "3b  even bucket");
-    check(g.Get(1)->Count() == 3, "3c  odd bucket");
-    check(g.Get(0)->Get(0) == 2 && g.Get(0)->Get(2) == 6, "3d  even order");
-    check(g.Get(1)->Get(0) == 1 && g.Get(1)->Get(2) == 5, "3e  odd order");
+    check(g.Get(0).Count() == 3, "3b  even bucket");
+    check(g.Get(1).Count() == 3, "3c  odd bucket");
+    check(g.Get(0).Get(0) == 2 && g.Get(0).Get(2) == 6, "3d  even order");
+    check(g.Get(1).Get(0) == 1 && g.Get(1).Get(2) == 5, "3e  odd order");
 
     /* free form still works */
     auto g2 = GroupBy(nums, parity);
-    check(g2.Count() == 2 && g2.Get(0)->Count() == 3, "3f  free GroupBy");
+    check(g2.Count() == 2 && g2.Get(0).Count() == 3, "3f  free GroupBy");
 
     /* ListGroupBy compat alias */
     auto g3 = ListGroupBy(nums, parity);
@@ -86,9 +86,9 @@ int main() {
     defer delete signed_xs;
     auto by_sign = signed_xs->GroupBy(sign_of);
     check(by_sign.Count() == 3, "3h  UFCS three sign buckets");
-    check(by_sign.Get(-1)->Count() == 2, "3i  negatives");
-    check(by_sign.Get(0)->Count() == 1,  "3j  zero");
-    check(by_sign.Get(1)->Count() == 2,  "3k  positives");
+    check(by_sign.Get(-1).Count() == 2, "3i  negatives");
+    check(by_sign.Get(0).Count() == 1,  "3j  zero");
+    check(by_sign.Get(1).Count() == 2,  "3k  positives");
 
     /* ── 4. Map.GroupBy still wins over free GroupBy (method precedence) ─── */
     printf("\n-- 4. Map.GroupBy instance method --\n");
@@ -99,8 +99,8 @@ int main() {
     ages->Set("cy", 20);
     auto mp = ages->GroupBy(map_parity);
     check(mp.Count() == 2, "4a  Map.GroupBy method (not free UFCS)");
-    check(mp.Get(0)->Count() == 2, "4b  even ages");
-    check(mp.Get(1)->Count() == 1, "4c  odd ages");
+    check(mp.Get(0).Count() == 2, "4b  even ages");
+    check(mp.Get(1).Count() == 1, "4c  odd ages");
 
     /* ── 5. Map missing-key still throws (doc cleanup regression) ────────── */
     printf("\n-- 5. Map Get throws --\n");
