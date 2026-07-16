@@ -7,7 +7,7 @@
  *   Memory   · stack List/Map value form (RAII)
  *            · Where/Take/Skip/Copy return value shells — no owned on pipelines
  *            · List<Pilot*>.owns() for domain pointees · move-only containers
- *            · owned / new only for heap escape (split, GroupBy Map*)
+ *            · owned / new only for heap escape (split; GroupBy is value Map)
  *   LINQ     · Where / Select / Any / All / Find / FindOr / GroupBy
  *            · First / Last / Take / Skip · OrderBy helpers · ForEach
  *            · Range · Plus · Slice · Distinct
@@ -295,7 +295,7 @@ int main() {
     /* ═══ 4. Faction briefing ══════════════════════════════════════════════ */
     hr("4 · FACTION BRIEFING  (GroupBy · Set watchlist · enum nameof)");
 
-    owned auto by_faction = roster.GroupBy((Pilot* p) => p.FactionKey());  /* Map* + ownsValues buckets */
+    auto by_faction = roster.GroupBy((Pilot* p) => p.FactionKey());  /* value Map + ownsValues buckets */
     printf("  %d factions (%s)\n", by_faction.Count(), nameof<Faction>());
 
     for (auto bucket, group in by_faction) {
@@ -317,7 +317,7 @@ int main() {
            dup ? "inserted" : "deduped",
            watch.Contains("AURORA") ? "true" : "false");
 
-    owned auto elo_buckets = elos.GroupBy((int e) => (int)RankOf(e));  /* GroupBy → heap Map* */
+    auto elo_buckets = elos.GroupBy((int e) => (int)RankOf(e));  /* GroupBy → value Map shell */
     printf("  elo histogram (%s):", nameof<EloTier>());
     for (auto tier, scores in elo_buckets) {
         EloTier t = (EloTier)tier;
@@ -360,7 +360,7 @@ int main() {
         printf("  threw? %s\n", threw ? "yes" : "no");
     }
 
-    /* ═══ 6. Map LINQ (value Select* / Keys; GroupBy still heap Map*) ══════ */
+    /* ═══ 6. Map LINQ (value Select* / Keys; GroupBy value Map shell) ══════ */
     hr("6 · MAP LINQ  (SelectValues · SelectKeys · GroupBy · Keys)");
 
     auto doubled = board.SelectValues<int>((String k, int v) => {
@@ -376,7 +376,7 @@ int main() {
     });
     printf("  SelectKeys count=%d:\n    %s\n", coded.Count(), coded.ToJson());
 
-    owned auto tiers = board.GroupBy((String k, int v) => {
+    auto tiers = board.GroupBy((String k, int v) => {
         (void)k;
         return (int)RankOf(v);
     });
@@ -413,10 +413,7 @@ int main() {
     printf("  Where(IsQuick): %d\n", quick_laps.Count());
     for (auto s in quick_laps) printf("   · %s\n", s.ToString());
 
-    /* Open-code Select: generic Select monomorphization on stack List+value-T
-       is still a rough edge; Pilot* path uses Select fine. */
-    auto sample_ms = List<int>();
-    for (auto s in samples) sample_ms.Add(s.ms);
+    auto sample_ms = samples.Select((LapSample s) => s.ms);
     printf("  Select(ms): %s\n", sample_ms.ToJson());
 
     samples.Sort(ByLapMs);

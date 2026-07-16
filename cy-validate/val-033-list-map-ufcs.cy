@@ -67,36 +67,28 @@ int main() {
     List<int>* nums = new List<int>{1, 2, 3, 4, 5, 6};
     defer delete nums;
 
-    Map<int, List<int>*>* g = nums->GroupBy(parity);
-    g->ownsValues();
-    defer delete g;
-    check(g->Count() == 2, "3a  GroupBy UFCS two buckets");
-    check(g->Get(0)->Count() == 3, "3b  even bucket");
-    check(g->Get(1)->Count() == 3, "3c  odd bucket");
-    check(g->Get(0)->Get(0) == 2 && g->Get(0)->Get(2) == 6, "3d  even order");
-    check(g->Get(1)->Get(0) == 1 && g->Get(1)->Get(2) == 5, "3e  odd order");
+    auto g = nums->GroupBy(parity);
+    check(g.Count() == 2, "3a  GroupBy UFCS two buckets");
+    check(g.Get(0)->Count() == 3, "3b  even bucket");
+    check(g.Get(1)->Count() == 3, "3c  odd bucket");
+    check(g.Get(0)->Get(0) == 2 && g.Get(0)->Get(2) == 6, "3d  even order");
+    check(g.Get(1)->Get(0) == 1 && g.Get(1)->Get(2) == 5, "3e  odd order");
 
     /* free form still works */
-    Map<int, List<int>*>* g2 = GroupBy(nums, parity);
-    g2->ownsValues();
-    defer delete g2;
-    check(g2->Count() == 2 && g2->Get(0)->Count() == 3, "3f  free GroupBy");
+    auto g2 = GroupBy(nums, parity);
+    check(g2.Count() == 2 && g2.Get(0)->Count() == 3, "3f  free GroupBy");
 
     /* ListGroupBy compat alias */
-    Map<int, List<int>*>* g3 = ListGroupBy(nums, parity);
-    g3->ownsValues();
-    defer delete g3;
-    check(g3->Count() == 2, "3g  ListGroupBy alias");
+    auto g3 = ListGroupBy(nums, parity);
+    check(g3.Count() == 2, "3g  ListGroupBy alias");
 
     List<int>* signed_xs = new List<int>{-2, 0, 5, -1, 3};
     defer delete signed_xs;
-    Map<int, List<int>*>* by_sign = signed_xs->GroupBy(sign_of);
-    by_sign->ownsValues();
-    defer delete by_sign;
-    check(by_sign->Count() == 3, "3h  UFCS three sign buckets");
-    check(by_sign->Get(-1)->Count() == 2, "3i  negatives");
-    check(by_sign->Get(0)->Count() == 1,  "3j  zero");
-    check(by_sign->Get(1)->Count() == 2,  "3k  positives");
+    auto by_sign = signed_xs->GroupBy(sign_of);
+    check(by_sign.Count() == 3, "3h  UFCS three sign buckets");
+    check(by_sign.Get(-1)->Count() == 2, "3i  negatives");
+    check(by_sign.Get(0)->Count() == 1,  "3j  zero");
+    check(by_sign.Get(1)->Count() == 2,  "3k  positives");
 
     /* ── 4. Map.GroupBy still wins over free GroupBy (method precedence) ─── */
     printf("\n-- 4. Map.GroupBy instance method --\n");
@@ -105,12 +97,10 @@ int main() {
     ages->Set("ada", 36);
     ages->Set("bob", 41);
     ages->Set("cy", 20);
-    Map<int, List<int>*>* mp = ages->GroupBy(map_parity);
-    mp->ownsValues();
-    defer delete mp;
-    check(mp->Count() == 2, "4a  Map.GroupBy method (not free UFCS)");
-    check(mp->Get(0)->Count() == 2, "4b  even ages");
-    check(mp->Get(1)->Count() == 1, "4c  odd ages");
+    auto mp = ages->GroupBy(map_parity);
+    check(mp.Count() == 2, "4a  Map.GroupBy method (not free UFCS)");
+    check(mp.Get(0)->Count() == 2, "4b  even ages");
+    check(mp.Get(1)->Count() == 1, "4c  odd ages");
 
     /* ── 5. Map missing-key still throws (doc cleanup regression) ────────── */
     printf("\n-- 5. Map Get throws --\n");

@@ -274,7 +274,7 @@ main() {
     /* ═══ 4. Sector briefing ═════════════════════════════════════════════════ */
     hr("4 · SECTOR BRIEFING  (GroupBy · Set watchlist · enum nameof)");
 
-    owned auto by_sector = roster.GroupBy((Ship s) => s.SectorKey());
+    auto by_sector = roster.GroupBy((Ship s) => s.SectorKey());
     printf("  %d sectors (%s)\n", by_sector.Count(), nameof<Sector>());
 
     for (auto bucket, group in by_sector) {

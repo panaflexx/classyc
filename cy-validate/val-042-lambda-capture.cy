@@ -150,6 +150,53 @@ int main() {
         check(n == 2, "9a method captures local t from this.thr");
     }
 
+    /* ── 10. Capturing Find ──────────────────────────────────────────────── */
+    printf("\n-- 10. Find capture --\n");
+    fflush(stdout);
+    {
+        auto xs = List<int>();
+        xs.Add(1); xs.Add(2); xs.Add(3); xs.Add(4);
+        int want = 3;
+        int hit = xs.Find((int x) => x == want);
+        check(hit == 3, "10a Find captures want");
+        int miss = xs.Find((int x) => x == 99);
+        check(miss == 0, "10b Find miss is zero");
+    }
+
+    /* ── 11. Capturing Sort (comparator) ─────────────────────────────────── */
+    printf("\n-- 11. Sort capture --\n");
+    fflush(stdout);
+    {
+        auto xs = List<int>();
+        xs.Add(3); xs.Add(1); xs.Add(4); xs.Add(1); xs.Add(5);
+        int flip = 1; /* asc: flip*(a-b) */
+        xs.Sort((int a, int b) => flip * (a - b));
+        check(xs.Count() == 5 && xs.Get(0) == 1 && xs.Get(4) == 5,
+              "11a Sort ascending with flip=1");
+        flip = -1;
+        xs.Sort((int a, int b) => flip * (a - b));
+        check(xs.Get(0) == 5 && xs.Get(4) == 1, "11b Sort descending re-reads flip");
+        /* Source list must remain valid after capturing HOF (stmtexpr slot). */
+        check(xs.Count() == 5, "11c list still intact after Sort");
+    }
+
+    /* ── 12. Capturing Select<U> ──────────────────────────────────────────── */
+    printf("\n-- 12. Select capture --\n");
+    fflush(stdout);
+    {
+        auto xs = List<int>();
+        xs.Add(1); xs.Add(2); xs.Add(3); xs.Add(4);
+        int mul = 10;
+        auto ys = xs.Select<int>((int x) => x * mul);
+        check(ys.Count() == 4 && ys.Get(0) == 10 && ys.Get(3) == 40,
+              "12a Select captures mul");
+        mul = 100;
+        auto zs = xs.Select<int>((int x) => x + mul);
+        check(zs.Get(0) == 101 && zs.Get(2) == 103, "12b Select re-reads mul");
+        /* Receiver not stolen by stmtexpr result slot. */
+        check(xs.Count() == 4 && xs.Get(0) == 1, "12c source intact after Select");
+    }
+
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     fflush(stdout);
     return failed;

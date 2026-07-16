@@ -556,22 +556,22 @@ class Map<K, V> {
             r.Set(fn(this->keys[i], this->vals[i]), this->vals[i]);
         return move r;
     }
-    /* Group values by keySelector(k,v).  The result map owns the bucket
-     * List<V>* values (auto ownsValues) so `delete result` frees every bucket.
-     * Element ownership inside each List is unchanged (still non-owning). */
-    Map<G, List<V>*>* GroupBy<G>(G(*keySelector)(K, V)) const __attribute__((da_ignore)) {
-        Map<G, List<V>*>* result = new Map<G, List<V>*>();
+    /* Group values by keySelector(k,v).  Returns a by-value Map shell; bucket
+     * List* values use ownsValues so ~Map frees every bucket (no owned/delete
+     * on the map itself).  Element ownership inside each List is unchanged. */
+    Map<G, List<V>*> GroupBy<G>(G(*keySelector)(K, V)) const __attribute__((da_ignore)) {
+        auto result = Map<G, List<V>*>();
+        result.ownsValues();
         for (int i = 0; i < this->count; i++) {
             G gk = keySelector(this->keys[i], this->vals[i]);
             List<V>* bucket;
-            if (!result->TryGet(gk, &bucket)) {
+            if (!result.TryGet(gk, &bucket)) {
                 bucket = new List<V>();
-                result->Set(gk, bucket);
+                result.Set(gk, bucket);
             }
             bucket->Add(this->vals[i]);
         }
-        result->ownsValues();  /* buckets freed with map; return is the same ptr */
-        return result;
+        return move result;
     }
 
     /* Call action(key, value) for each entry, in insertion order. */
@@ -669,54 +669,50 @@ class Map<K, V> {
 };
 
 /* List.GroupBy as a free generic function (method form via UFCS).
- * list.h cannot return Map from a method without #including map.h (cycle:
- * map.h already includes list.h for Keys/Values).  Call either way:
- *   Map<int, List<int>*>* g = nums->GroupBy(parity);     // UFCS method form
- *   Map<int, List<int>*>* g = GroupBy(nums, keyFn);     // free form
- *   Map<int, List<int>*>* g = ListGroupBy(nums, keyFn); // compat alias
- *   defer delete g;   // buckets are ownsValues() already
+ * Returns Map<G, List<T>*> by value (RAII shell; ownsValues buckets).
+ *   auto g = nums.GroupBy(parity);
+ *   auto g = GroupBy(&nums, keyFn);
+ *   auto g = ListGroupBy(&nums, keyFn);
  * Map<K,V>::GroupBy stays the instance method on maps (same name, method wins).
- *
- * Result always owns the List<T>* bucket values (not the list elements).
  */
-Map<G, List<T>*>* GroupBy<T, G>(List<T>* self, G(*keySelector)(T))
+Map<G, List<T>*> GroupBy<T, G>(List<T>* self, G(*keySelector)(T))
     __attribute__((da_ignore)) {
-    Map<G, List<T>*>* result = new Map<G, List<T>*>();
+    auto result = Map<G, List<T>*>();
+    result.ownsValues();
     if (self) {
         for (int i = 0; i < self->Count(); i++) {
             T item = self->Get(i);
             G gk = keySelector(item);
             List<T>* bucket;
-            if (!result->TryGet(gk, &bucket)) {
+            if (!result.TryGet(gk, &bucket)) {
                 bucket = new List<T>();
-                result->Set(gk, bucket);
+                result.Set(gk, bucket);
             }
             bucket->Add(item);
         }
     }
-    result->ownsValues();  /* buckets freed with map; return is the same ptr */
-    return result;
+    return move result;
 }
 
 /* Compat alias of GroupBy (pre-UFCS name). */
-Map<G, List<T>*>* ListGroupBy<T, G>(List<T>* self, G(*keySelector)(T))
+Map<G, List<T>*> ListGroupBy<T, G>(List<T>* self, G(*keySelector)(T))
     __attribute__((da_ignore)) {
     /* Open-coded body (do not call GroupBy — free generic forward refs are flaky). */
-    Map<G, List<T>*>* result = new Map<G, List<T>*>();
+    auto result = Map<G, List<T>*>();
+    result.ownsValues();
     if (self) {
         for (int i = 0; i < self->Count(); i++) {
             T item = self->Get(i);
             G gk = keySelector(item);
             List<T>* bucket;
-            if (!result->TryGet(gk, &bucket)) {
+            if (!result.TryGet(gk, &bucket)) {
                 bucket = new List<T>();
-                result->Set(gk, bucket);
+                result.Set(gk, bucket);
             }
             bucket->Add(item);
         }
     }
-    result->ownsValues();
-    return result;
+    return move result;
 }
 
 #endif /* CLASSYC_MAP_H */

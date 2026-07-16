@@ -92,7 +92,8 @@ C2M_EXC_API int cy_exc_active (void) {
 }
 
 /* Record an exception and longjmp to the innermost frame.  Never returns: if no
-   frame is active the exception is uncaught, so report and abort. */
+   frame is active the exception is uncaught, so report and exit(1).
+   Define CY_EXC_ABORT=1 to keep abort() (core dump) for debugger sessions. */
 C2M_EXC_API void cy_exc_throw (unsigned int id, const char *msg, const char *file, int line) {
   cy__exc_current.id = id;
   cy__exc_current.msg = msg;
@@ -102,27 +103,36 @@ C2M_EXC_API void cy_exc_throw (unsigned int id, const char *msg, const char *fil
   fprintf (stderr, "uncaught exception %u: %s", id, msg ? msg : "(no message)");
   if (file != NULL) fprintf (stderr, " at %s:%d", file, line);
   fprintf (stderr, "\n");
+#if defined(CY_EXC_ABORT) && CY_EXC_ABORT
   abort ();
+#else
+  exit (1);
+#endif
 }
 
-/* JIT safety trap (bounds/null/div-zero guards, gated on -fexceptions).
+/* JIT safety trap (bounds/null/div-zero/shift guards, gated on -fexceptions).
    Converts a detected fault into a catchable exception when inside a try block,
-   or aborts with a diagnostic when uncaught.
-   reason: 1=OOB, 2=null-ptr, 3=div-by-zero, 4=use-after-free. */
+   or exits with a diagnostic when uncaught.
+   reason: 1=OOB, 2=null-ptr, 3=div-by-zero, 4=use-after-free, 5=shift-out-of-range. */
 C2M_EXC_API void _safety_trap (long reason, long file_id, long line) {
   static const char *const reasons[]
     = {"unknown fault", "out-of-bounds index", "null-pointer dereference",
-       "division by zero", "use-after-free"};
+       "division by zero", "use-after-free", "shift out of range"};
   long n = (long) (sizeof (reasons) / sizeof (reasons[0]));
   const char *what = (reason >= 0 && reason < n) ? reasons[reason] : "unknown fault";
   unsigned int id = reason == 1 ? CY_EXC_OUT_OF_BOUNDS
                     : reason == 2 ? CY_EXC_NULL
                     : reason == 3 ? CY_EXC_ARITHMETIC
+                    : reason == 5 ? CY_EXC_ARITHMETIC
                                   : CY_EXC_RUNTIME;
   (void) file_id;
   if (cy_exc_active ()) cy_exc_throw (id, what, NULL, (int) line);
   fprintf (stderr, "fatal: %s (line %ld)\n", what, line);
+#if defined(CY_EXC_ABORT) && CY_EXC_ABORT
   abort ();
+#else
+  exit (1);
+#endif
 }
 
 #ifdef __cplusplus

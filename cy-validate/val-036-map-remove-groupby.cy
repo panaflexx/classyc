@@ -103,13 +103,11 @@ int main() {
         List<int>* nums = new List<int>{1, 2, 3, 4, 5, 6};
         defer delete nums;
         /* No explicit ownsValues() — GroupBy must mark buckets owned. */
-        Map<int, List<int>*>* g = nums->GroupBy(int_parity);
-        defer delete g;
-        check(g->Count() == 2, "4a  two parity buckets");
-        check(g->Get(0)->Count() == 3 && g->Get(1)->Count() == 3, "4b  bucket sizes");
+        auto g = nums->GroupBy(int_parity);
+        check(g.Count() == 2, "4a  two parity buckets");
+        check(g.Get(0)->Count() == 3 && g.Get(1)->Count() == 3, "4b  bucket sizes");
         /* double ownsValues is harmless */
-        g->ownsValues();
-        check(g->Get(0)->Get(0) == 2, "4c  even first is 2");
+        check(g.Get(0)->Get(0) == 2, "4c  even first is 2");
     }
     {
         Map<String, int>* ages = new Map<String, int>();
@@ -117,13 +115,12 @@ int main() {
         ages->Set("ann", 20);
         ages->Set("bob", 41);
         ages->Set("cy", 33);
-        Map<int, List<int>*>* mp = ages->GroupBy<int>((String k, int v) => {
+        auto mp = ages->GroupBy<int>((String k, int v) => {
             (void)k;
             return v % 2;
         });
-        defer delete mp;  /* buckets owned automatically */
-        check(mp->Count() == 2, "4d  Map.GroupBy auto ownsValues");
-        check(mp->Get(0)->Count() == 1 && mp->Get(1)->Count() == 2, "4e  parity counts");
+        check(mp.Count() == 2, "4d  Map.GroupBy auto ownsValues");
+        check(mp.Get(0)->Count() == 1 && mp.Get(1)->Count() == 2, "4e  parity counts");
     }
 
     /* ── 5. Merge NULL / Copy non-owning ────────────────────────────────── */

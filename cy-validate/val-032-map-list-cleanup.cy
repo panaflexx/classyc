@@ -124,12 +124,10 @@ int main() {
     ages->Set("cy", 20);
     ages->Set("dee", 33);
 
-    Map<int, List<int>*>* parity = ages->GroupBy<int>(map_parity_group);
-        parity->ownsValues();
-        defer delete parity;
-    check(parity->Count() == 2, "4a  GroupBy two parity buckets");
-    List<int>* evens = parity->GetOr(0, NULL);
-    List<int>* odds  = parity->GetOr(1, NULL);
+    auto parity = ages->GroupBy<int>(map_parity_group);
+    check(parity.Count() == 2, "4a  GroupBy two parity buckets");
+    List<int>* evens = parity.GetOr(0, NULL);
+    List<int>* odds  = parity.GetOr(1, NULL);
     check(evens != NULL && odds != NULL, "4b  both buckets present");
     check(evens->Count() == 2, "4c  even ages count");
     check(odds->Count() == 2,  "4d  odd ages count");
@@ -183,25 +181,21 @@ int main() {
         printf("\n-- 7. ListGroupBy --\n");
         List<int>* nums = new List<int>{1, 2, 3, 4, 5, 6};
         defer delete nums;
-        Map<int, List<int>*>* g = ListGroupBy(nums, list_parity);
-            g->ownsValues();
-            defer delete g;
-        check(g->Count() == 2, "7a  ListGroupBy parity buckets");
-        List<int>* g0 = g->Get(0);
-        List<int>* g1 = g->Get(1);
+        auto g = ListGroupBy(nums, list_parity);
+        check(g.Count() == 2, "7a  ListGroupBy parity buckets");
+        List<int>* g0 = g.Get(0);
+        List<int>* g1 = g.Get(1);
         check(g0->Count() == 3 && g1->Count() == 3, "7b  three even / three odd");
         check(g0->Get(0) == 2 && g0->Get(1) == 4 && g0->Get(2) == 6, "7c  even order");
         check(g1->Get(0) == 1 && g1->Get(1) == 3 && g1->Get(2) == 5, "7d  odd order");
 
         List<int>* signed_xs = new List<int>{-2, 0, 5, -1, 3};
         defer delete signed_xs;
-        Map<int, List<int>*>* by_sign = ListGroupBy(signed_xs, list_sign);
-            by_sign->ownsValues();
-            defer delete by_sign;
-        check(by_sign->Count() == 3, "7e  ListGroupBy sign three buckets");
-        check(by_sign->Get(-1)->Count() == 2, "7f  negatives");
-        check(by_sign->Get(0)->Count() == 1,  "7g  zeros");
-        check(by_sign->Get(1)->Count() == 2,  "7h  positives");
+        auto by_sign = ListGroupBy(signed_xs, list_sign);
+        check(by_sign.Count() == 3, "7e  ListGroupBy sign three buckets");
+        check(by_sign.Get(-1)->Count() == 2, "7f  negatives");
+        check(by_sign.Get(0)->Count() == 1,  "7g  zeros");
+        check(by_sign.Get(1)->Count() == 2,  "7h  positives");
 
     /* ── 8. List Slice + Concat remaining cleanup ─────────────────────── */
     printf("\n-- 8. List Slice / Concat --\n");

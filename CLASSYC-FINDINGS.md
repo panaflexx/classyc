@@ -1,6 +1,7 @@
 # ClassyC Compiler Audit — Findings & Improvement Opportunities
 
-Last updated: 2026-07-11 (by-value / stack collections / transform-return target).
+Last updated: 2026-07-16 (P1–P6 polish: stack Select, exit(1), bugs runner,
+shift guard, capturing Find, GroupBy value shell).
 
 Scope: parse/gen correctness, compilation speed, JIT/AOT linking, refactoring,
 missing functionality, and the **first-class by-value collection idiom**.
@@ -9,39 +10,65 @@ Items marked **[measured]** / **[validated]** were reproduced on this tree;
 **[inspection]** is code reading. Product roadmap details live in
 [`CLASSYC-CLEANUP.md`](CLASSYC-CLEANUP.md) and [`BY-VALUE.md`](BY-VALUE.md).
 
-**Validate baseline:** `cy-validate` **41 files** green after by-value/stack work;
-`examples/classy-neon-grid.cy` uses stack Lists/Maps.
+**Validate baseline:** `cy-validate` **51** `val-*.cy` files — full suite green
+after P1–P6 polish. Showcases: `examples/classy-neon-grid.cy`,
+`examples/classy-aurora-ops.cy`. Bugs harness: `sh bugs/run-bugs.sh`.
 
 ---
 
-## 0. Current product target (by-value idiom)
+## 0. Current product status (by-value idiom) — **landed**
 
-**Goal:** Local LINQ pipelines without `owned auto` on every step.
+**Goal (met):** Local LINQ pipelines without `owned auto` on every step.
 
 ```c
-// Target (not fully implemented for transforms yet)
+// House style today (validated: val-040, val-046, val-049, neon-grid, aurora-ops)
 auto samples = List<LapSample>();
 samples.Add(LapSample(1, 59840, 0));
 auto quick = samples.Where((LapSample s) => s.IsQuick());  // value List, RAII
 auto top   = quick.Take(3);
+auto ms    = samples.Select((LapSample s) => s.ms);        // stack Select works
 
-// Today (honest)
-owned auto quick = samples.Where(...);  // List* heap shell
+auto by = roster.GroupBy(keyFn);   // value Map shell; ownsValues List* buckets
+// no owned on GroupBy
+
+int want = 3;
+int hit = xs.Find((int x) => x == want);  // capturing Find
+
+List<int> make() {
+    auto a = List<int>();
+    a.Add(1); a.Add(2);
+    return a;                 // implicit move of move-only collection local
+}
+auto xs = make();             // prvalue bind — no shallow copy
 ```
 
-**Blockers (see CLEANUP “First-class by-value idiom”):**
+**What landed (compiler + headers):**
 
-1. Move-return / bind of move-only `List`/`Map`/`Set` (`return move a` → `auto x = f()`).  
-2. Headers still return `List<T>*` from `Take`/`Skip`/`Where`/`Copy`/…  
-3. Element `.owns()` semantics stay separate — views must not steal owns.
+| Piece | Where |
+|-------|--------|
+| Stack `List`/`Map`/`Set` + RAII dtors | `create_decl` / gen; headers |
+| Move-only bare assign banned; `move` transfer | `class_is_move_only_collection_p` |
+| Implicit move on `return local;` for collections | `check` N_RETURN rewrite → `N_MOVE` |
+| Prvalue init bind (`auto x = f()`) | `create_decl` `prvalue_init_p` |
+| Value-returning `Take`/`Skip`/`Where`/`Copy`/… | `include/list.h`, `map.h`, `set.h` |
+| By-value elements + `__destroy` | List/Map element destroy |
+| Stack Map `m["string"]` | N_IND: no TM_CLASS ↔ pointer key swap |
+| Frame layout for class methods | no 8-byte FUNC_DEF offset clobber of BLK params |
+| `GetMut` / `[]` lvalue for by-value class elements | List + Map; val-043 / val-044 |
+| Capturing lambdas as direct HOF args (Strategy A) | open-code `Where`/`Filter`/`Find`/…; val-042 |
+| `try` + adjusted array params (`char *argv[]`) | `force_val` keeps pointer load; val-045 |
+| **Stack `Select<U>` (method generics)** | intern `orig_name` (no stack buffer); val-046 |
+| **Uncaught exception / safety trap** | `exit(1)` not `abort` (`cyexc.h`); val-047 |
+| **Shift-range safety** | `_safety_trap(5)` on `<<`/`>>`; val-048, bugs/009 |
+| **GroupBy value Map shell** | `Map<G, List<V>*>` by value + ownsValues; val-049 |
+| **bugs/ runner** | `sh bugs/run-bugs.sh` |
 
-**Already landed (supports the target):**
+**Still open (not blockers for everyday pipelines):**
 
-* Stack `List`/`Map`/`Set` + RAII dtors  
-* Move-only bare assign banned  
-* By-value elements + `__destroy`  
-* Stack Map `m["string"]` (N_IND no longer swaps class with pointer key)  
-* Frame layout for class methods (no 8-byte FUNC_DEF offset clobber of BLK params)
+1. True nested `Map<G, List<V>>` (move-only map values) — Phase B; Phase A shell is enough.  
+2. Full-expression temp dtor for pure rvalue chains without intermediate names.  
+3. Capturing `Sort` / `Select` open-code; array `.filter`/`.map`.  
+4. Element `.owns()` stays separate — views must not steal owns (already enforced).
 
 ---
 
@@ -59,7 +86,7 @@ combiner folded addresses across multi-block loop phis after GVN.
 
 ---
 
-## 2. Other correctness fixes (recent, this tree)
+## 2. Other correctness fixes (this tree)
 
 | Item | Status |
 |------|--------|
@@ -69,6 +96,15 @@ combiner folded addresses across multi-block loop phis after GVN.
 | Enum bare name + `typedef enum E E` | No S_REGULAR insert of N_ENUM tag (def_symbol null attr crash); tpname + S_TAG |
 | havoc12 (garbled C) | Exit 1, no SEGV in def_symbol |
 | test-list-stdlib OOB | Expects throws, not no-ops |
+| Move-return + prvalue bind | Implicit `return move a` for move-only collections; `auto x = f()` |
+| Value LINQ shells | `Where`/`Take`/`Skip`/`Copy`/… return `List`/`Map`/`Set` by value |
+| GetMut / `[]` mutate buffer | By-value class elements; not a Get copy |
+| Capturing HOF lambdas | Open-code at call site; includes **Find**; non-capturing stay thin fn ptrs |
+| try + `char *argv[]` | Adjusted array params: force_val loads pointer, does not take `&argv` |
+| Stack Select monomorph | `uniq_cstr` on expr-context generic name + `orig_name` (val-046) |
+| Uncaught throw / safety trap | `exit(1)` + message; optional `CY_EXC_ABORT` (val-047) |
+| Shift OOB | Runtime trap reason 5 (val-048, bugs/009 **FIXED**) |
+| GroupBy shell | Value `Map` + ownsValues buckets; no `owned` at call site (val-049) |
 
 ---
 
@@ -79,16 +115,16 @@ combiner folded addresses across multi-block loop phis after GVN.
 | 001 short-circuit `-O2` | **FIXED** | keep regression |
 | 002 asit/As Drawable | no longer crashes | convert to self-check or retire |
 | 003 String OOB | stale compile expectations | update test |
-| 004 List OOB Get | throws; **uncaught → abort/core** | prefer print + exit(1) |
+| 004 List OOB Get | throws; uncaught → **exit(1)** | print + exit (no core by default) |
 | 005 negative index | PASS | |
 | 006 map missing key | PASS | |
-| 007 null-deref | trap + abort/core; weak static warn | |
+| 007 null-deref | trap + exit(1) uncaught | weak static warn |
 | 008 signed div overflow | PASS | |
-| 009 shift out of range | **LIVE** | need shift-range check |
+| 009 shift out of range | **FIXED** | `_safety_trap(5)` |
 | 010 uninit read | PASS | |
 | 011 VLA negative size | PASS | message still poor |
 
-Make `bugs/` runnable like `cy-validate`.
+Runner: `sh bugs/run-bugs.sh` (mirrors `cy-validate`).
 
 ---
 
@@ -124,62 +160,72 @@ Lazy JIT (`-el`) remains a strong default for run mode.
 * `classyc.c` monolithic — compose with includes, keep single TU if desired  
 * Import boilerplate → table-driven ensure  
 * Diagnostic poisoning for cascades  
-* Uncaught exception / safety trap → clean exit path  
 * Ownership loop false UAF on alloc/delete reassignment  
+* Synthetic lambda bodies for open-code must be **N_BLOCK** (`{ return e; }`),
+  never a bare expr — `N_FUNC_DEF` uses the body as the function scope  
 
 ---
 
 ## 7. Missing functionality (consolidated)
 
-### A. First-class by-value collections (priority)
+### A. By-value collections — remaining polish
 
-See CLEANUP P0–P3:
-
-* Move return of move-only List/Map/Set  
-* Value-returning `Take`/`Skip`/`Where`/`Copy`/Map filters  
-* Validate + neon-grid without `owned` on local pipelines  
+* True nested `Map<G, List<V>>` (move-only values in Map dense buffer)  
+* Full-expr temp dtor for pure rvalue chains  
+* Dual `WherePtr` only if migration needs heap-pointer returns  
 
 ### B. Language / ergonomics
 
 * Slice sugar `list[1..3]`, language `operator+`  
 * Properties, extension methods, list literals without `new` where useful  
-* Dict spread  
+* Dict spread / array-literal assignment into `dict`  
 * Method declaration order independence inside classes  
+* Capturing `Sort` / `Select` open-code; array `.filter`/`.map`  
+* Escaping fat closures for stored UI callbacks  
 
 ### C. Generics
 
 * `if constexpr` / `is_int<T>` for type-conditional bodies  
 * Stronger call-site inference for some method generics  
-* `Select` edge cases on stack List + by-value T (workaround: open code)  
+* Self-referential free generic signatures (`List<T> Sort<T>(List<T> xs)`)  
+* Explicit type args at call site (`Max<int>(3, 5)`)  
 
 ### D. Toolchain
 
-* bugs/ runner, DCE, header cache, shift-range check, uncaught-exit UX  
+* AOT DCE, header cache, ownership-pass speed  
+* Retire/update stale `bugs/` (002, 003)  
 
 ---
 
 ## 8. Design note (for reviewers)
 
 **Value shells + explicit element ownership is the right default.**  
-Developers reach for simple RAII first; forcing `owned auto` on every
-`Take`/`Where` re-introduces C-style ownership fatigue and fights the
-C++/`vector` model already documented in BY-VALUE.md.
+The product stance (C++/`vector` RAII) is implemented for everyday
+`Where`/`Take`/`Copy`/`GroupBy` pipelines. Developers should reach for stack
+locals first.
 
 `owned` remains correct for:
 
 * heap escape across lifetimes  
-* interfaces that intentionally return `List*` / `Map*`  
+* interfaces that intentionally return `List*` / `Map*` (e.g. `String.split`,
+  JSON binder collection fields; GroupBy **buckets** are still `List*` inside
+  a value Map shell)
 
 ---
 
 ## 9. Validation summary
 
 * mir-gen `cycle_phi_p` fix; rebuild `make classyc`  
-* bugs/001 variants PASS at -O2/-O3  
-* cy-validate: **41 pass** after by-value/stack/Map subscript  
-* neon-grid: stack List/Map + Pilot*.owns + LapSample by-value  
-* val-038: stack List + Map string subscript  
-* havoc1–13: exit 1 without crash  
+* bugs/001 variants PASS at -O2/-O3; bugs/009 shift PASS  
+* cy-validate: **51** `val-*.cy` files, full suite green  
+  * val-038…045 — by-value / GetMut / capture / try-argv  
+  * val-046 stack Select (no prior `List*`)  
+  * val-047 uncaught → exit(1)  
+  * val-048 shift-range guard  
+  * val-049 GroupBy value Map shell  
+* neon-grid / aurora-ops: stack List/Map; Select on LapSample; GroupBy without `owned`  
+* `sh bugs/run-bugs.sh` available  
 
 Related: [`CLASSYC-CLEANUP.md`](CLASSYC-CLEANUP.md), [`BY-VALUE.md`](BY-VALUE.md),
-[`GENERICSMEM.md`](GENERICSMEM.md).
+[`GENERICSMEM.md`](GENERICSMEM.md), [`LAMBDA-CAPTURE.md`](LAMBDA-CAPTURE.md),
+[`sketch/OPEN-ISSUES-PRIORITY.md`](sketch/OPEN-ISSUES-PRIORITY.md).

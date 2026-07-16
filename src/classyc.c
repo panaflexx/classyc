@@ -6149,9 +6149,11 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
   node_t spec_id_node = build_id (c2m_ctx, spec_name, pos);
   tpname_add (c2m_ctx, spec_id_node, curr_scope, TRUE);
 
-  /* Record in specialization cache (keep type args for method generics). */
+  /* Record in specialization cache (keep type args for method generics).
+     Intern orig_name: callers may pass stack buffers (expression-context
+     List<T>()); method-generic lookup needs a stable string. */
   generic_spec_t gs;
-  gs.orig_name = base_name;
+  gs.orig_name = uniq_cstr (c2m_ctx, base_name).s;
   gs.spec_name = spec_name;
   gs.n_args = n_args;
   for (int _ai = 0; _ai < 4; _ai++) gs.args[_ai] = (_ai < n_args) ? args[_ai] : NULL;
@@ -6803,13 +6805,16 @@ D (primary_expr) {
       && is_generic_class_p (c2m_ctx, curr_token->repr)) {
     size_t g_mark = record_start (c2m_ctx);
     pos_t g_pos = curr_token->pos;
-    char g_name_buf[256];
-    snprintf (g_name_buf, sizeof (g_name_buf), "%s", curr_token->repr);
+    /* Intern the name: get_or_create_specialization stores orig_name for the
+       life of the compilation unit (method-generic monomorph uses it).  A
+       stack buffer here left dangling pointers so stack `List<T>()` could not
+       resolve Select while `new List<T>()` (interned id) could. */
+    const char *g_name = uniq_cstr (c2m_ctx, curr_token->repr).s;
     node_t g_id;
     MN (T_ID, g_id);
     if (C (T_CMP) && curr_token->node_code == N_LT) {
       record_stop (c2m_ctx, g_mark, FALSE); /* commit: this is Name<...> */
-      r = parse_generic_instantiation (c2m_ctx, g_name_buf, g_pos);
+      r = parse_generic_instantiation (c2m_ctx, g_name, g_pos);
       PA (post_expr_part, r);
       return r;
     }
@@ -14249,7 +14254,9 @@ enum hof_kind {
   HOF_FOREACH,
   HOF_ANY,
   HOF_ALL,
-  HOF_FIND
+  HOF_FIND,
+  HOF_SORT,
+  HOF_SELECT
 };
 
 static enum hof_kind get_hof_kind (const char *name) {
@@ -14261,6 +14268,8 @@ static enum hof_kind get_hof_kind (const char *name) {
   if (strcmp (name, "Any") == 0) return HOF_ANY;
   if (strcmp (name, "All") == 0) return HOF_ALL;
   if (strcmp (name, "Find") == 0) return HOF_FIND;
+  if (strcmp (name, "Sort") == 0) return HOF_SORT;
+  if (strcmp (name, "Select") == 0) return HOF_SELECT;
   return HOF_NONE;
 }
 
@@ -14571,8 +14580,9 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
   node_t result_init, result_decl;
   DLIST_LINK (node_t) saved_link;
   int is_map = (coll_kind != NULL && strcmp (coll_kind, "Map") == 0);
-  int want_2 = is_map && (hk == HOF_WHERE || hk == HOF_FOREACH || hk == HOF_ANY
-                          || hk == HOF_ALL);
+  int want_2 = (is_map && (hk == HOF_WHERE || hk == HOF_FOREACH || hk == HOF_ANY
+                           || hk == HOF_ALL))
+               || (!is_map && hk == HOF_SORT); /* Sort(a,b) comparator */
 
   if (params == NULL || params->code != N_LIST) return FALSE;
   nparams = (int) NL_LENGTH (params->u.ops);
@@ -14582,7 +14592,10 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
   pn1 = lambda_param_name (p1);
   if (want_2) {
     if (nparams != 2 || pn0 == NULL || pn1 == NULL) {
-      error (c2m_ctx, POS (lam), "Map HOF lambda must take two parameters (key, value)");
+      error (c2m_ctx, POS (lam),
+             hk == HOF_SORT
+               ? "Sort comparator lambda must take two parameters (a, b)"
+               : "Map HOF lambda must take two parameters (key, value)");
       return FALSE;
     }
   } else {
@@ -14598,8 +14611,11 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
      open-coded statement-by-statement. */
   pred_expr = lambda_single_return_expr (body);
   if (pred_expr != NULL) pred_expr = parse_copy_expr (c2m_ctx, pred_expr);
+  /* Expression body: if body itself is an expression (not a block), use it. */
+  if (pred_expr == NULL && body != NULL && body->code != N_BLOCK)
+    pred_expr = parse_copy_expr (c2m_ctx, body);
   if ((hk == HOF_WHERE || hk == HOF_FILTER || hk == HOF_MAP || hk == HOF_ANY
-       || hk == HOF_ALL || hk == HOF_FIND)
+       || hk == HOF_ALL || hk == HOF_FIND || hk == HOF_SORT || hk == HOF_SELECT)
       && pred_expr == NULL) {
     error (c2m_ctx, POS (lam),
            "capturing HOF lambda must use an expression body or a single `return expr;` "
@@ -14614,10 +14630,26 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
 
   stmt_list = new_node (c2m_ctx, N_LIST);
 
-  /* Result container for filter/map HOFs (same specialized type as receiver). */
-  if (hk == HOF_WHERE || hk == HOF_FILTER || hk == HOF_MAP) {
+  /* Result container for filter/map/select HOFs.  Where/Filter/Map: same
+     specialized type as the receiver.  Select: List<U> from explicit type
+     args on the call (Select<U>) or same List specialization when U==T. */
+  if (hk == HOF_WHERE || hk == HOF_FILTER || hk == HOF_MAP || hk == HOF_SELECT) {
+    const char *result_cid = cid->u.s.s;
+    if (hk == HOF_SELECT) {
+      /* N_FIELD(recv, Select, optional N_LIST type args). */
+      node_t field = NL_HEAD (call->u.ops);
+      node_t mid = field != NULL ? NL_NEXT (NL_HEAD (field->u.ops)) : NULL;
+      node_t targs = mid != NULL ? NL_NEXT (mid) : NULL;
+      if (targs != NULL && targs->code == N_LIST && NL_HEAD (targs->u.ops) != NULL) {
+        node_t ta = NL_HEAD (targs->u.ops);
+        node_t spec_id = get_or_create_specialization (c2m_ctx, "List", 1, &ta, pos);
+        if (spec_id != NULL && spec_id->code == N_ID) result_cid = spec_id->u.s.s;
+      }
+      /* else: same List_T as receiver — works when U coincides with T;
+         U≠T without explicit <U> is diagnosed when Add typechecks. */
+    }
     result_init = new_pos_node2 (c2m_ctx, N_CALL, pos,
-                                 build_id (c2m_ctx, cid->u.s.s, pos),
+                                 build_id (c2m_ctx, result_cid, pos),
                                  new_node (c2m_ctx, N_LIST));
     result_decl = build_auto_init_decl (c2m_ctx, pos, rname, result_init);
     op_append (c2m_ctx, stmt_list, result_decl);
@@ -14693,17 +14725,45 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
                                   parse_copy_expr (c2m_ctx, recv), for_body);
       op_append (c2m_ctx, stmt_list, fin);
     }
-  } else if (hk == HOF_FIND) {
-    error (c2m_ctx, POS (lam),
-           "capturing lambda in Find is not supported yet (use Where/Any or a non-capturing pred)");
-    return FALSE;
   } else {
     /* List / Set: open-code with Count/Get (matches list.h Filter's double-Get
        policy so by-value class elements like Hit don't miscompile via for-in
-       RAII loop vars inside statement expressions). */
+       RAII loop vars inside statement expressions).
+
+       HOF_FIND reuses the Where-style filter loop into a temp List, then
+       yields hits.Find((T x) => 1) so the first match (or zero-init miss)
+       matches list.h Find semantics without a typed zero-init AST. */
     char iname[64];
     node_t i_id, i_decl, cond, incr, get1, get2, loop_body, for_loop;
     node_t pred_sub = NULL;
+    enum hof_kind loop_hk = hk;
+
+    /* FIND: seed result with zero via non-capturing always-false Find on
+       the receiver, then overwrite on the first capturing match.
+       Lambda body must be a BLOCK (`{ return 0; }`), never a bare expr —
+       N_FUNC_DEF uses the body node as the function scope. */
+    if (hk == HOF_FIND) {
+      node_t zero_lam, zero_args, zero_call, old_body, ret_stmt, blist, zbody;
+      zero_lam = parse_copy_expr (c2m_ctx, lam);
+      if (zero_lam != NULL && zero_lam->code == N_LAMBDA) {
+        zero_lam->attr = NULL;
+        old_body = NL_NEXT (NL_HEAD (zero_lam->u.ops));
+        if (old_body != NULL) NL_REMOVE (zero_lam->u.ops, old_body);
+        ret_stmt = new_pos_node2 (c2m_ctx, N_RETURN, pos, new_node (c2m_ctx, N_LIST),
+                                  new_i_node (c2m_ctx, 0, pos));
+        blist = new_node (c2m_ctx, N_LIST);
+        op_append (c2m_ctx, blist, ret_stmt);
+        zbody = new_pos_node2 (c2m_ctx, N_BLOCK, pos, new_node (c2m_ctx, N_LIST), blist);
+        zbody->attr = NULL;
+        op_append (c2m_ctx, zero_lam, zbody);
+      }
+      zero_args = new_node1 (c2m_ctx, N_LIST,
+                             zero_lam != NULL ? zero_lam : new_i_node (c2m_ctx, 0, pos));
+      zero_call
+        = build_dot_call (c2m_ctx, pos, parse_copy_expr (c2m_ctx, recv), "Find", zero_args);
+      result_decl = build_auto_init_decl (c2m_ctx, pos, rname, zero_call);
+      op_append (c2m_ctx, stmt_list, result_decl);
+    }
 
     snprintf (iname, sizeof (iname), "__cap_i_%u", uid);
     i_id = build_id (c2m_ctx, iname, pos);
@@ -14732,12 +14792,169 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
       op_append (c2m_ctx, for_body_stmts,
                  new_pos_node4 (c2m_ctx, N_IF, pos, new_node (c2m_ctx, N_LIST), pred_sub,
                                 then_stmt, new_node (c2m_ctx, N_IGNORE)));
-    } else if (hk == HOF_MAP) {
+    } else if (hk == HOF_FIND) {
+      /* if (pred(Get(i))) { result = Get(i); break; } */
+      node_t setv = new_pos_node2 (c2m_ctx, N_ASSIGN, pos, build_id (c2m_ctx, rname, pos), get2);
+      node_t brk = new_pos_node1 (c2m_ctx, N_BREAK, pos, new_node (c2m_ctx, N_LIST));
+      node_t then_list = new_node (c2m_ctx, N_LIST);
+      op_append (c2m_ctx, then_list,
+                 new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST), setv));
+      op_append (c2m_ctx, then_list, brk);
+      node_t then_blk
+        = new_pos_node2 (c2m_ctx, N_BLOCK, pos, new_node (c2m_ctx, N_LIST), then_list);
+      then_blk->attr = NULL;
+      op_append (c2m_ctx, for_body_stmts,
+                 new_pos_node4 (c2m_ctx, N_IF, pos, new_node (c2m_ctx, N_LIST), pred_sub,
+                                then_blk, new_node (c2m_ctx, N_IGNORE)));
+    } else if (hk == HOF_MAP || hk == HOF_SELECT) {
+      /* result.Add(proj(Get(i))) — Select projects T→U; Map is T→T. */
       node_t mapped = pred_sub;
       node_t args = new_node1 (c2m_ctx, N_LIST, mapped);
       node_t add = build_dot_call (c2m_ctx, pos, build_id (c2m_ctx, rname, pos), "Add", args);
       op_append (c2m_ctx, for_body_stmts,
                  new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST), add));
+    } else if (hk == HOF_SORT) {
+      /* Shell sort in place (matches list.h Sort).  cmp(a,b) > 0 means a after b. */
+      char gname[64], jname[64], tname[64];
+      node_t gap_decl, i_sort_decl, j_decl, tmp_decl;
+      node_t outer_init, outer_cond, outer_incr, outer_body;
+      node_t inner_stmts, while_cond, while_body, while_loop;
+      node_t get_jg, get_tmp_src, cmp_call, cmp_gt, shift, place_tmp;
+      node_t gap_id, i_id2, j_id, tmp_id;
+      node_t gap_halve, gap_gt0, for_i, i_lt_n, i_incr;
+      node_t j_ge_gap, get_j, get_i, swap_set_j, swap_set_i, tmp_from_i;
+      node_t pred_ab, pn_a, pn_b;
+
+      snprintf (gname, sizeof (gname), "__cap_gap_%u", uid);
+      snprintf (jname, sizeof (jname), "__cap_j_%u", uid);
+      snprintf (tname, sizeof (tname), "__cap_tmp_%u", uid);
+      /* int gap = Count()/2; */
+      gap_decl = build_spec_decl (c2m_ctx, pos,
+                                  new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_INT, pos)),
+                                  build_decl (c2m_ctx, pos, build_id (c2m_ctx, gname, pos), NULL),
+                                  NULL, NULL,
+                                  new_pos_node2 (c2m_ctx, N_DIV, pos,
+                                                 build_count_call (c2m_ctx, pos, recv),
+                                                 new_i_node (c2m_ctx, 2, pos)));
+      op_append (c2m_ctx, stmt_list, gap_decl);
+      /* while (gap > 0) { for (i = gap; i < n; i++) { ... } gap /= 2; } */
+      {
+        node_t while_body_stmts = new_node (c2m_ctx, N_LIST);
+        char iname2[64];
+        snprintf (iname2, sizeof (iname2), "__cap_si_%u", uid);
+        /* for (int i = gap; i < Count(); i++) */
+        i_sort_decl
+          = build_spec_decl (c2m_ctx, pos,
+                             new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_INT, pos)),
+                             build_decl (c2m_ctx, pos, build_id (c2m_ctx, iname2, pos), NULL),
+                             NULL, NULL, build_id (c2m_ctx, gname, pos));
+        i_lt_n = new_pos_node2 (c2m_ctx, N_LT, pos, build_id (c2m_ctx, iname2, pos),
+                                build_count_call (c2m_ctx, pos, recv));
+        i_incr = new_pos_node2 (c2m_ctx, N_ASSIGN, pos, build_id (c2m_ctx, iname2, pos),
+                                new_pos_node2 (c2m_ctx, N_ADD, pos,
+                                               build_id (c2m_ctx, iname2, pos),
+                                               new_i_node (c2m_ctx, 1, pos)));
+        /* T tmp = Get(i); int j = i; */
+        inner_stmts = new_node (c2m_ctx, N_LIST);
+        tmp_from_i = build_get_call (c2m_ctx, pos, recv, build_id (c2m_ctx, iname2, pos));
+        tmp_decl = build_auto_init_decl (c2m_ctx, pos, tname, tmp_from_i);
+        op_append (c2m_ctx, inner_stmts, tmp_decl);
+        j_decl = build_spec_decl (c2m_ctx, pos,
+                                  new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_INT, pos)),
+                                  build_decl (c2m_ctx, pos, build_id (c2m_ctx, jname, pos), NULL),
+                                  NULL, NULL, build_id (c2m_ctx, iname2, pos));
+        op_append (c2m_ctx, inner_stmts, j_decl);
+        /* while (j >= gap && cmp(Get(j-gap), tmp) > 0) { Set(j, Get(j-gap)); j -= gap; } */
+        {
+          node_t j_minus_gap
+            = new_pos_node2 (c2m_ctx, N_SUB, pos, build_id (c2m_ctx, jname, pos),
+                             build_id (c2m_ctx, gname, pos));
+          node_t get_jgap = build_get_call (c2m_ctx, pos, recv, j_minus_gap);
+          node_t cmp_body = pred_expr;
+          /* Substitute pn0 ← Get(j-gap), pn1 ← tmp */
+          cmp_body = lambda_subst_id (c2m_ctx, cmp_body, pn0, get_jgap);
+          cmp_body = lambda_subst_id (c2m_ctx, cmp_body, pn1, build_id (c2m_ctx, tname, pos));
+          node_t cmp_gt0
+            = new_pos_node2 (c2m_ctx, N_GT, pos, cmp_body, new_i_node (c2m_ctx, 0, pos));
+          node_t j_ge
+            = new_pos_node2 (c2m_ctx, N_GE, pos, build_id (c2m_ctx, jname, pos),
+                             build_id (c2m_ctx, gname, pos));
+          while_cond = new_pos_node2 (c2m_ctx, N_ANDAND, pos, j_ge, cmp_gt0);
+          node_t wstmts = new_node (c2m_ctx, N_LIST);
+          /* recv.Set(j, Get(j-gap)) */
+          {
+            node_t set_args = new_node (c2m_ctx, N_LIST);
+            op_append (c2m_ctx, set_args, build_id (c2m_ctx, jname, pos));
+            op_append (c2m_ctx, set_args,
+                       build_get_call (c2m_ctx, pos, recv,
+                                       new_pos_node2 (c2m_ctx, N_SUB, pos,
+                                                      build_id (c2m_ctx, jname, pos),
+                                                      build_id (c2m_ctx, gname, pos))));
+            op_append (c2m_ctx, wstmts,
+                       new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST),
+                                      build_dot_call (c2m_ctx, pos,
+                                                      parse_copy_expr (c2m_ctx, recv), "Set",
+                                                      set_args)));
+          }
+          /* j = j - gap */
+          op_append (c2m_ctx, wstmts,
+                     new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST),
+                                    new_pos_node2 (c2m_ctx, N_ASSIGN, pos,
+                                                   build_id (c2m_ctx, jname, pos),
+                                                   new_pos_node2 (c2m_ctx, N_SUB, pos,
+                                                                  build_id (c2m_ctx, jname, pos),
+                                                                  build_id (c2m_ctx, gname, pos)))));
+          while_body
+            = new_pos_node2 (c2m_ctx, N_BLOCK, pos, new_node (c2m_ctx, N_LIST), wstmts);
+          while_body->attr = NULL;
+          while_loop = new_pos_node3 (c2m_ctx, N_WHILE, pos, new_node (c2m_ctx, N_LIST),
+                                      while_cond, while_body);
+          op_append (c2m_ctx, inner_stmts, while_loop);
+        }
+        /* Set(j, tmp) */
+        {
+          node_t set_args = new_node (c2m_ctx, N_LIST);
+          op_append (c2m_ctx, set_args, build_id (c2m_ctx, jname, pos));
+          op_append (c2m_ctx, set_args, build_id (c2m_ctx, tname, pos));
+          op_append (c2m_ctx, inner_stmts,
+                     new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST),
+                                    build_dot_call (c2m_ctx, pos, parse_copy_expr (c2m_ctx, recv),
+                                                    "Set", set_args)));
+        }
+        {
+          node_t for_body2
+            = new_pos_node2 (c2m_ctx, N_BLOCK, pos, new_node (c2m_ctx, N_LIST), inner_stmts);
+          node_t for_i_loop = new_pos_node (c2m_ctx, N_FOR, pos);
+          for_body2->attr = NULL;
+          for_i_loop->attr = NULL;
+          op_append (c2m_ctx, for_i_loop, new_node (c2m_ctx, N_LIST));
+          op_append (c2m_ctx, for_i_loop, i_sort_decl);
+          op_append (c2m_ctx, for_i_loop, i_lt_n);
+          op_append (c2m_ctx, for_i_loop, i_incr);
+          op_append (c2m_ctx, for_i_loop, for_body2);
+          op_append (c2m_ctx, while_body_stmts, for_i_loop);
+        }
+        /* gap = gap / 2 */
+        op_append (c2m_ctx, while_body_stmts,
+                   new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST),
+                                  new_pos_node2 (c2m_ctx, N_ASSIGN, pos,
+                                                 build_id (c2m_ctx, gname, pos),
+                                                 new_pos_node2 (c2m_ctx, N_DIV, pos,
+                                                                build_id (c2m_ctx, gname, pos),
+                                                                new_i_node (c2m_ctx, 2, pos)))));
+        gap_gt0 = new_pos_node2 (c2m_ctx, N_GT, pos, build_id (c2m_ctx, gname, pos),
+                                 new_i_node (c2m_ctx, 0, pos));
+        {
+          node_t wbody
+            = new_pos_node2 (c2m_ctx, N_BLOCK, pos, new_node (c2m_ctx, N_LIST), while_body_stmts);
+          node_t wloop
+            = new_pos_node3 (c2m_ctx, N_WHILE, pos, new_node (c2m_ctx, N_LIST), gap_gt0, wbody);
+          wbody->attr = NULL;
+          op_append (c2m_ctx, stmt_list, wloop);
+        }
+      }
+      /* Sort is void-ish: no per-element for_body_stmts loop below. */
+      goto list_hof_skip_index_loop;
     } else if (hk == HOF_FOREACH) {
       if (pred_sub != NULL)
         op_append (c2m_ctx, for_body_stmts,
@@ -14788,12 +15005,15 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
     op_append (c2m_ctx, for_loop, incr);
     op_append (c2m_ctx, for_loop, loop_body);
     op_append (c2m_ctx, stmt_list, for_loop);
+  list_hof_skip_index_loop:;
   }
 
-  /* Yield result (move for collections). ForEach yields 0 (void-like int). */
-  if (hk == HOF_FOREACH) {
+  /* Yield result (move for collections). ForEach/Sort yield 0 (void-like). */
+  if (hk == HOF_FOREACH || hk == HOF_SORT) {
     last = new_i_node (c2m_ctx, 0, pos);
-  } else if (hk == HOF_WHERE || hk == HOF_FILTER || hk == HOF_MAP) {
+  } else if (hk == HOF_FIND) {
+    last = build_id (c2m_ctx, rname, pos);
+  } else if (hk == HOF_WHERE || hk == HOF_FILTER || hk == HOF_MAP || hk == HOF_SELECT) {
     last = new_pos_node1 (c2m_ctx, N_MOVE, pos, build_id (c2m_ctx, rname, pos));
   } else {
     last = build_id (c2m_ctx, rname, pos);
@@ -14805,11 +15025,22 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
   block->attr = NULL;
   stmtexpr = new_pos_node1 (c2m_ctx, N_STMTEXPR, pos, block);
 
-  /* Replace call in place, preserving sibling links. */
-  saved_link = call->op_link;
-  check (c2m_ctx, stmtexpr, NULL);
-  *call = *stmtexpr;
-  call->op_link = saved_link;
+  /* Replace call in place, preserving sibling links.
+     Select may have created a new List<U> specialization — materialize it
+     before type-checking the open-coded stmtexpr. */
+  {
+    parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+    size_t pend_mark = 0;
+    if (generic_method_specs != NULL || pending_lambdas != NULL)
+      pend_mark = VARR_LENGTH (node_t, pending_lambdas);
+    /* Drain all currently pending specializations (new List_U for Select). */
+    materialize_pending_specs (c2m_ctx, 0);
+    saved_link = call->op_link;
+    check (c2m_ctx, stmtexpr, NULL);
+    *call = *stmtexpr;
+    call->op_link = saved_link;
+    (void) pend_mark;
+  }
   (void) recv_cls_type; /* reserved for future type checks */
   (void) aname;
   (void) bname;
@@ -14854,6 +15085,7 @@ static int try_desugar_capturing_hof_call (c2m_ctx_t c2m_ctx, node_t call) {
   /* Collection-specific HOF membership. */
   if (strcmp (coll_kind, "List") == 0) {
     if (hk == HOF_NONE) return FALSE;
+    /* Sort / Select / Find / Where / … all allowed on List. */
   } else if (strcmp (coll_kind, "Map") == 0) {
     if (hk != HOF_WHERE && hk != HOF_FOREACH && hk != HOF_ANY && hk != HOF_ALL)
       return FALSE;
@@ -16922,7 +17154,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           const char *fn = VARR_GET (cstr_t, free_names, 0);
           error (c2m_ctx, POS (r),
                  "lambda captures local '%s' but is not a direct argument to "
-                 "Where/Filter/Map/ForEach/Any/All",
+                 "Where/Filter/Map/ForEach/Any/All/Find/Sort/Select",
                  fn != NULL ? fn : "?");
           error (c2m_ctx, POS (r),
                  "hint: use xs.Where((T x) => …) inline, or pass a non-capturing function");
@@ -17385,16 +17617,37 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         }
         /* Move-only collections (List/Map/Set): ban bare shallow assign which
            would alias the heap buffer and double-free.  Require `move` for
-           lvalues; allow prvalue RHS from a by-value call return. */
+           lvalues; allow prvalue RHS from a by-value call return.
+           Storage lvalue RHS (map.vals[i], field): rewrite to `.Copy()`. */
         if (class_is_move_only_collection_p (c2m_ctx, t1)
             && class_is_move_only_collection_p (c2m_ctx, t2)
             && op2->code != N_MOVE && op2->code != N_CALL
             && op2->code != N_STMTEXPR) {
-          node_t cid = (t1->u.tag_type != NULL) ? TAG_ID (t1->u.tag_type) : NULL;
-          error (c2m_ctx, POS (r),
-                 "cannot assign collection '%s' (shallow copy would double-free); "
-                 "use `move` to transfer ownership, or assign a by-value return",
-                 (cid != NULL && cid->code == N_ID) ? cid->u.s.s : "?");
+          node_t pe = op2;
+          while (pe != NULL && pe->code == N_CAST) pe = NL_EL (pe->u.ops, 1);
+          int storage_p
+            = (pe != NULL
+               && (pe->code == N_IND || pe->code == N_FIELD || pe->code == N_DEREF_FIELD
+                   || pe->code == N_DEREF));
+          if (storage_p) {
+            /* lhs = rhs.Copy() — unlink rhs before grafting it under Copy's
+               field node (build_dot_call would otherwise steal the link and
+               leave NL_REMOVE asserting). */
+            NL_REMOVE (r->u.ops, op2);
+            node_t copy_call
+              = build_dot_call (c2m_ctx, POS (r), op2, "Copy", new_node (c2m_ctx, N_LIST));
+            NL_APPEND (r->u.ops, copy_call);
+            check (c2m_ctx, copy_call, r);
+            op2 = copy_call;
+            e2 = op2->attr;
+            t2 = e2 != NULL ? e2->type : t2;
+          } else {
+            node_t cid = (t1->u.tag_type != NULL) ? TAG_ID (t1->u.tag_type) : NULL;
+            error (c2m_ctx, POS (r),
+                   "cannot assign collection '%s' (shallow copy would double-free); "
+                   "use `move` to transfer ownership, or assign a by-value return",
+                   (cid != NULL && cid->code == N_ID) ? cid->u.s.s : "?");
+          }
         }
         check_assignment_types (c2m_ctx, t1, t2, e2, r);
         *e->type = *t1;
@@ -17434,17 +17687,18 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         } else if (t1->mode == TM_CLASS
                    || (t1->mode == TM_PTR && t1->u.ptr_type != NULL
                        && t1->u.ptr_type->mode == TM_CLASS)) {
-          /* class[i] — bracket subscript via Get(int)/Set(int,T) protocol.
-             Resolve the Get(int) method to determine the element type.
-             Assignment (class[i] = val) is handled in the gen N_ASSIGN path. */
+          /* class[i] / Class*[i] — bracket subscript via Get/Set protocol.
+             Developers expect uniform collection sugar:
+               list[i] / list_ptr[i]  → Get/Set element
+               map[k]  / map_ptr[k]  → Get/Set value
+             A plain pointer to a class *without* Get (e.g. Point*, or the
+             T* dense buffer of List<Point>) falls through to C raw indexing.
+             Nested List-of-List dense slots must use *(data+i) in library code
+             rather than data[i], so List* sugar stays ergonomic here. */
           struct type *cls = t1->mode == TM_PTR ? t1->u.ptr_type : t1;
           node_t get_def = find_class_protocol_method (c2m_ctx, cls->u.tag_type, "Get", 1, POS (r));
           if (get_def == NULL && t1->mode == TM_PTR) {
-            /* A plain pointer to a class type with no Get(int) protocol is just
-               an ordinary C pointer — index it like one.  This is what the
-               `T* data` backing array of a generic collection specialised over
-               a by-value class type (List<Point>, Set<Point>) needs: dense[i]
-               must be raw pointer indexing, not the collection Get() sugar. */
+            /* Ordinary C pointer to class — dense element array indexing. */
             *e->type = *t1->u.ptr_type;
             if (incomplete_type_p (c2m_ctx, t1->u.ptr_type))
               error (c2m_ctx, POS (r), "pointer to incomplete type in array subscription");
@@ -21295,18 +21549,17 @@ if (base != NULL && base->code == N_ID) {
     e = create_expr (c2m_ctx, r);
     e->type = create_type (c2m_ctx, t1);
     set_type_layout (c2m_ctx, e->type);
-    /* MIR #452 follow-up: reserve a frame slot for struct/union/class results so
-       sibling statement-expressions get independent storage without ALLOCA. */
+    /* Aggregate stmtexpr results need a temporary that outlives the block's
+       defers (which may destroy the last-expression local).  Reserve space in
+       the call-arg area — NOT in func_block_scope->size / local offsets.
+       process_func_decls_for_allocation recalculates local offsets from decls
+       only, so a check-time bump of fns->size is discarded and e->c.u_val would
+       collide with the first stack local (e.g. overwriting the List that a
+       capturing Where reads, then double-free on exit). */
     if (func_block_scope != NULL
         && (t1->mode == TM_STRUCT || t1->mode == TM_UNION || t1->mode == TM_CLASS)) {
-      struct node_scope *fns = func_block_scope->attr;
-      mir_size_t size = type_size (c2m_ctx, t1);
-      mir_size_t align = var_align (c2m_ctx, t1);
-
-      fns->size = round_size (fns->size, align);
-      e->c.u_val = fns->size;
-      fns->size += size;
-      fns->stack_var_p = TRUE;
+      update_call_arg_area_offset (c2m_ctx, t1, TRUE);
+      ((struct node_scope *) func_block_scope->attr)->stack_var_p = TRUE;
     }
     break;
   }
@@ -21731,27 +21984,39 @@ if (base != NULL && base->code == N_ID) {
                && (ret_type->mode != TM_BASIC || ret_type->u.basic_type != TP_VOID)) {
       error (c2m_ctx, POS (r), "return with no value in function returning non-void");
     } else if (expr->code != N_IGNORE) {
-      /* Move-only collections: returning a named local (or other lvalue) by bare
-         copy would shallow-alias the buffer and double-free when both the local
-         dtor and the caller's RAII shell run.  C++-style implicit move on return
-         of a move-only collection lvalue: rewrite `return a;` to `return move a;`.
-         Explicit `return move a;` and prvalue returns (`return f();`, ctor temps)
-         are left alone.  The inner expression is already checked above — stamp
-         the N_MOVE attr without re-checking the inner node. */
+      /* Move-only collections: bare return of an lvalue would shallow-alias.
+         - Local / parameter: C++-style implicit `return move a;`
+         - Storage lvalue (field, array element of another object, e.g.
+           map.vals[i]): rewrite to `return a.Copy()` so Get/ValAt of
+           Map of List does a deep copy instead of stealing the slot. */
       if (expr->code != N_MOVE && expr->attr != NULL) {
         struct expr *re = expr->attr;
         if (re->type != NULL && class_is_move_only_collection_p (c2m_ctx, re->type)
             && re->u.lvalue_node != NULL) {
-          /* Detach expr from the return first: new_pos_node1 will own it as the
-             N_MOVE child, and a node may live in only one op-list. */
+          node_t pe = expr;
+          while (pe != NULL && pe->code == N_CAST) pe = NL_EL (pe->u.ops, 1);
+          int storage_p
+            = (pe != NULL
+               && (pe->code == N_IND || pe->code == N_FIELD || pe->code == N_DEREF_FIELD
+                   || pe->code == N_DEREF));
+          /* Unlink first: N_MOVE / Copy both re-parent `expr`. */
           NL_REMOVE (r->u.ops, expr);
-          node_t m = new_pos_node1 (c2m_ctx, N_MOVE, POS (r), expr);
-          struct expr *me = create_expr (c2m_ctx, m);
-          me->type = re->type;
-          if (curr_scope != top_scope)
-            update_call_arg_area_offset (c2m_ctx, re->type, TRUE);
-          NL_APPEND (r->u.ops, m);
-          expr = m;
+          if (storage_p) {
+            /* return expr.Copy() */
+            node_t copy_call
+              = build_dot_call (c2m_ctx, POS (r), expr, "Copy", new_node (c2m_ctx, N_LIST));
+            check (c2m_ctx, copy_call, r);
+            NL_APPEND (r->u.ops, copy_call);
+            expr = copy_call;
+          } else {
+            node_t m = new_pos_node1 (c2m_ctx, N_MOVE, POS (r), expr);
+            struct expr *me = create_expr (c2m_ctx, m);
+            me->type = re->type;
+            if (curr_scope != top_scope)
+              update_call_arg_area_offset (c2m_ctx, re->type, TRUE);
+            NL_APPEND (r->u.ops, m);
+            expr = m;
+          }
         }
       }
       check_assignment_types (c2m_ctx, ret_type, NULL, expr->attr, r);
@@ -24567,6 +24832,31 @@ static void gen_oob_check (c2m_ctx_t c2m_ctx, op_t idx_op, MIR_op_t len_op, long
   trap_args[0] = MIR_new_int_op (c2m_ctx->ctx, 1); /* reason: out-of-bounds */
   trap_args[1] = zero_op.mir_op;
   trap_args[2] = MIR_new_int_op (c2m_ctx->ctx, line);
+  gen_rt_call_void (c2m_ctx, safety_trap_proto, safety_trap_item, 3, trap_args);
+  emit_label_insn_opt (c2m_ctx, ok_label);
+}
+
+/* Guard: shift count must be in [0, width_bits).  C11 §6.5.7/3 — negative or
+   >= width is UB.  Emits _safety_trap(5, …) (shift out of range).
+   count_op must be an I64 register.  width_bits is 8/16/32/64. */
+static void gen_shift_range_check (c2m_ctx_t c2m_ctx, op_t count_op, int width_bits, long line) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_label_t ok_label = MIR_new_label (ctx);
+  MIR_label_t trap_label = MIR_new_label (ctx);
+  MIR_op_t trap_args[3];
+  op_t cnt = force_reg (c2m_ctx, count_op, MIR_T_I64);
+  safety_ensure_imports (c2m_ctx);
+  /* if count < 0 → trap */
+  emit3 (c2m_ctx, MIR_BLT, MIR_new_label_op (ctx, trap_label), cnt.mir_op, zero_op.mir_op);
+  /* if count >= width → trap; else ok */
+  emit3 (c2m_ctx, MIR_BGE, MIR_new_label_op (ctx, trap_label), cnt.mir_op,
+         MIR_new_int_op (ctx, width_bits));
+  emit1 (c2m_ctx, MIR_JMP, MIR_new_label_op (ctx, ok_label));
+  emit_label_insn_opt (c2m_ctx, trap_label);
+  trap_args[0] = MIR_new_int_op (ctx, 5); /* reason: shift out of range */
+  trap_args[1] = zero_op.mir_op;
+  trap_args[2] = MIR_new_int_op (ctx, line);
   gen_rt_call_void (c2m_ctx, safety_trap_proto, safety_trap_item, 3, trap_args);
   emit_label_insn_opt (c2m_ctx, ok_label);
 }
@@ -27408,6 +27698,17 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         gen_div_overflow_check (c2m_ctx, dvd_reg, div_reg, minv, (long) POS (r).lno);
       }
     }
+    /* Shift amount range: count in [0, width) of the (promoted) left type. */
+    if (c2m_options->exceptions_p && (r->code == N_LSH || r->code == N_RSH)
+        && integer_type_p (((struct expr *) r->attr)->type)) {
+      struct type *rt = ((struct expr *) r->attr)->type;
+      mir_size_t sz = type_size (c2m_ctx, rt);
+      int width = (int) (sz * MIR_CHAR_BIT);
+      if (width < 8) width = 8;
+      if (width > 64) width = 64;
+      op_t cnt_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
+      gen_shift_range_check (c2m_ctx, cnt_reg, width, (long) POS (r).lno);
+    }
     emit_bin_op (c2m_ctx, r, ((struct expr *) r->attr)->type, res, op1, op2);
     break;
   case N_EQ:
@@ -27523,6 +27824,17 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         op_t dvd_reg = force_reg (c2m_ctx, val, MIR_T_I64);
         gen_div_overflow_check (c2m_ctx, dvd_reg, div_reg, minv, (long) POS (r).lno);
       }
+    }
+    if (c2m_options->exceptions_p
+        && (r->code == N_LSH_ASSIGN || r->code == N_RSH_ASSIGN)
+        && integer_type_p (((struct expr *) r->attr)->type2)) {
+      struct type *rt = ((struct expr *) r->attr)->type2;
+      mir_size_t sz = type_size (c2m_ctx, rt);
+      int width = (int) (sz * MIR_CHAR_BIT);
+      if (width < 8) width = 8;
+      if (width > 64) width = 64;
+      op_t cnt_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
+      gen_shift_range_check (c2m_ctx, cnt_reg, width, (long) POS (r).lno);
     }
     emit_bin_op (c2m_ctx, r, ((struct expr *) r->attr)->type2, val, val, op2);
     t = get_op_type (c2m_ctx, var);
@@ -27866,10 +28178,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             || find_class_protocol_method (c2m_ctx,
                  (arr_type->mode == TM_PTR ? arr_type->u.ptr_type : arr_type)->u.tag_type,
                  "Get", 1, POS (r)) != NULL)) {
-      /* class[i] — bracket subscript read via Get(int) protocol.
-         The checker already validated the Get method and stashed it in e->def_node.
-         A pointer-to-class with no Get protocol falls through to the plain
-         pointer-indexing path below (a by-value class backing array). */
+      /* class[i] / Class*[i] — Get/Set protocol when the class has Get.
+         List/Map pointer sugar matches value receivers; plain T* without Get
+         falls through to raw C indexing below. */
       struct type *cls_type = arr_type->mode == TM_PTR ? arr_type->u.ptr_type : arr_type;
       struct type *this_type
         = arr_type->mode == TM_PTR ? arr_type : create_ptr_type (c2m_ctx, cls_type);
@@ -30038,16 +30349,27 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     gen (c2m_ctx, block, NULL, NULL, FALSE, NULL, NULL);
     stmtexpr_last_expr = saved_last_expr;
     res = top_gen_last_op;
-    /* Copy aggregate results into reserved frame slot (check phase offset). */
+    /* Copy aggregate results into a call-arg-area temp.  Locals live at low
+       FP offsets; call-arg area sits after them (ns->size - call_arg_area_size).
+       Using a stale local-style offset (old se->c.u_val) collided with the
+       first stack variable — fatal for capturing HOF open-code that both
+       reads and returns a List. */
     if (stmtexpr_type != NULL
         && (stmtexpr_type->mode == TM_STRUCT || stmtexpr_type->mode == TM_UNION
             || stmtexpr_type->mode == TM_CLASS)) {
       mir_size_t size = type_size (c2m_ctx, stmtexpr_type);
-      struct expr *se = r->attr;
+      struct node_scope *ns
+        = (struct node_scope *) FUNC_DEF_BLOCK (curr_func_def)->attr;
+      mir_size_t arg_area_offset
+        = curr_call_arg_area_offset + ns->size - ns->call_arg_area_size;
+      op_t base = get_new_temp (c2m_ctx, MIR_T_I64);
+      emit3 (c2m_ctx, MIR_ADD, base.mir_op,
+             MIR_new_reg_op (ctx, MIR_reg (ctx, FP_NAME, curr_func->u.func)),
+             MIR_new_int_op (ctx, arg_area_offset));
+      update_call_arg_area_offset (c2m_ctx, stmtexpr_type, FALSE);
       op_t tmp
-        = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, (MIR_disp_t) se->c.u_val,
-                                        MIR_reg (ctx, FP_NAME, curr_func->u.func), 0, 1));
-      block_move (c2m_ctx, tmp, res, size);
+        = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, base.mir_op.u.reg, 0, 1));
+      if (size > 0) block_move (c2m_ctx, tmp, res, size);
       res = tmp;
     }
     break;
@@ -30998,7 +31320,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
        Pointer form: yield the pointer, then NULL the source lvalue so a later
        delete of the source is a no-op (single-ownership transfer).
        Class-value form: block-copy the aggregate into a stack temp, then zero
-       the source object so its RAII destructor frees nothing. */
+       the source object so its RAII destructor frees nothing.
+       Scalar / other: plain value pass-through (check already warns).  Do NOT
+       zero the source — List/Map use `move` generically when relocating
+       elements, and I64-null of an int slot would clobber the next element. */
     node_t inner = NL_HEAD (r->u.ops);
     node_t src = inner;
     struct expr *me = r->attr;
@@ -31035,7 +31360,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
        reg/mem as `mval`, and we must return the original pointer value. */
     res = get_new_temp (c2m_ctx, MIR_T_I64);
     emit2 (c2m_ctx, MIR_MOV, res.mir_op, mval.mir_op);
-    if (src != NULL
+    /* Only null pointer sources.  Scalars (and any non-ptr non-class) keep
+       their storage; check phase already warned that move has no ownership
+       effect on them. */
+    if (me != NULL && me->type != NULL && me->type->mode == TM_PTR
+        && src != NULL
         && (src->code == N_ID || src->code == N_DEREF_FIELD || src->code == N_FIELD
             || src->code == N_DEREF || src->code == N_IND)) {
       op_t lval = gen (c2m_ctx, src, NULL, NULL, FALSE, NULL, NULL);
