@@ -11173,7 +11173,17 @@ static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
 
           if (anon_process_p) update_members_offset (decl->decl_spec.type, MIR_SIZE_MAX);
           set_type_layout (c2m_ctx, decl->decl_spec.type);
-          if ((member_size = type_size (c2m_ctx, decl->decl_spec.type)) == 0) continue;
+          if ((member_size = type_size (c2m_ctx, decl->decl_spec.type)) == 0) {
+            /* MIR #451: GNU zero-length array member keeps current offset, not 0. */
+            member_align = type_align (decl->decl_spec.type);
+            if (decl->decl_spec.align > member_align) member_align = decl->decl_spec.align;
+            decl->offset = type->mode == TM_UNION
+                             ? 0
+                             : (overall_size + member_align - 1) / member_align * member_align;
+            decl->bit_offset = -1;
+            decl->width = -1;
+            continue;
+          }
           member_align = type_align (decl->decl_spec.type);
           bits
             = width->code == N_IGNORE || !(expr = width->attr)->const_p ? -1 : (int) expr->c.u_val;
@@ -20839,6 +20849,19 @@ if (base != NULL && base->code == N_ID) {
     e = create_expr (c2m_ctx, r);
     e->type = create_type (c2m_ctx, t1);
     set_type_layout (c2m_ctx, e->type);
+    /* MIR #452 follow-up: reserve a frame slot for struct/union/class results so
+       sibling statement-expressions get independent storage without ALLOCA. */
+    if (func_block_scope != NULL
+        && (t1->mode == TM_STRUCT || t1->mode == TM_UNION || t1->mode == TM_CLASS)) {
+      struct node_scope *fns = func_block_scope->attr;
+      mir_size_t size = type_size (c2m_ctx, t1);
+      mir_size_t align = var_align (c2m_ctx, t1);
+
+      fns->size = round_size (fns->size, align);
+      e->c.u_val = fns->size;
+      fns->size += size;
+      fns->stack_var_p = TRUE;
+    }
     break;
   }
   case N_BLOCK:
@@ -21719,6 +21742,8 @@ struct gen_ctx {
   int reg_free_mark;
   MIR_label_t continue_label, break_label;
   op_t top_gen_last_op;
+  node_t stmtexpr_last_expr; /* value-producing last expr of current statement
+                               expression (MIR #452) — saved/restored for nesting */
   struct {
     int res_ref_p; /* flag of returning an aggregate by reference */
     VARR (MIR_type_t) * ret_types;
@@ -21861,6 +21886,7 @@ struct gen_ctx {
 #define continue_label gen_ctx->continue_label
 #define break_label gen_ctx->break_label
 #define top_gen_last_op gen_ctx->top_gen_last_op
+#define stmtexpr_last_expr gen_ctx->stmtexpr_last_expr
 #define proto_info gen_ctx->proto_info
 #define init_els gen_ctx->init_els
 #define memset_proto gen_ctx->memset_proto
@@ -22727,6 +22753,14 @@ static op_t force_val (c2m_ctx_t c2m_ctx, op_t op, int arr_p) {
         && op.decl->decl_spec.type->mode == TM_PTR)
       return op; /* MEM of a pointer value: keep as loadable rvalue */
     return mem_to_address (c2m_ctx, op, FALSE);
+  }
+  /* MIR #459 / issue #458: narrow integer in a register (after addr-taken
+     materialization) must be sign/zero-extended when read as a value. */
+  if (op.decl != NULL && op.decl->addr_p && op.mir_op.mode == MIR_OP_REG
+      && integer_type_p (op.decl->decl_spec.type)) {
+    MIR_type_t nt = get_mir_type (c2m_ctx, op.decl->decl_spec.type);
+    if (nt == MIR_T_I8 || nt == MIR_T_U8 || nt == MIR_T_I16 || nt == MIR_T_U16)
+      return cast (c2m_ctx, op, nt, TRUE);
   }
   if (op.decl == NULL || op.decl->bit_offset < 0) return op;
   assert (op.mir_op.mode == MIR_OP_MEM);
@@ -25851,7 +25885,28 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
     if (rel_offset < size) /* fill the tail: */
       gen_memset (c2m_ctx, offset + rel_offset, base, size - rel_offset);
   } else {
+    VARR (MIR_op_t) * pregen_vals;
+    MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+
     assert (var.mir_op.mode == MIR_OP_REF);
+    /* MIR #448 / PR middle-end/24109: pre-compute element values so compound-literal
+       storage is emitted before this object's data stream (not into the middle). */
+    VARR_CREATE (MIR_op_t, pregen_vals, alloc, VARR_LENGTH (init_el_t, init_els) - init_start);
+    for (size_t k = init_start; k < VARR_LENGTH (init_el_t, init_els); k++) {
+      init_el_t pe = VARR_GET (init_el_t, init_els, k);
+      struct expr *pex = pe.init->attr;
+      MIR_op_t pv;
+
+      pv.mode = MIR_OP_UNDEF;
+      if (!pex->const_addr_p) {
+        if (pex->const_p) {
+          convert_value (pex, pe.el_type);
+          pex->type = pe.el_type;
+        }
+        pv = val_gen (c2m_ctx, pe.init).mir_op;
+      }
+      VARR_PUSH (MIR_op_t, pregen_vals, pv);
+    }
     for (size_t i = init_start; i < VARR_LENGTH (init_el_t, init_els); i++) {
       init_el = VARR_GET (init_el_t, init_els, i);
       if (i != init_start && init_el.offset == VARR_GET (init_el_t, init_els, i - 1).offset
@@ -25859,11 +25914,8 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
         continue;
       e = init_el.init->attr;
       if (!e->const_addr_p) {
-        if (e->const_p) {
-          convert_value (e, init_el.el_type);
-          e->type = init_el.el_type; /* to get the right value in the subsequent gen call */
-        }
-        val = val_gen (c2m_ctx, init_el.init);
+        val.decl = NULL;
+        val.mir_op = VARR_GET (MIR_op_t, pregen_vals, i - init_start);
         assert (val.mir_op.mode == MIR_OP_INT || val.mir_op.mode == MIR_OP_UINT
                 || val.mir_op.mode == MIR_OP_FLOAT || val.mir_op.mode == MIR_OP_DOUBLE
                 || val.mir_op.mode == MIR_OP_LDOUBLE || val.mir_op.mode == MIR_OP_STR
@@ -25983,6 +26035,7 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
       data = MIR_new_bss (ctx, global_name, size - rel_offset);
       if (global_name != NULL) var.decl->u.item = data;
     }
+    VARR_DESTROY (MIR_op_t, pregen_vals);
   }
 }
 
@@ -28706,9 +28759,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       }
       if (type->mode == TM_STRUCT || type->mode == TM_UNION || type->mode == TM_CLASS) {
         if (desirable_dest == NULL) {
+          /* MIR #449: rvalue struct/union/class va_arg needs storage (not NULL). */
           res = get_new_temp (c2m_ctx, MIR_T_I64);
           MIR_append_insn (ctx, curr_func,
-                           MIR_new_insn (ctx, MIR_MOV, res.mir_op, MIR_new_int_op (ctx, 0)));
+                           MIR_new_insn (ctx, MIR_ALLOCA, res.mir_op,
+                                         MIR_new_int_op (ctx, type_size (c2m_ctx, type))));
         } else {
           assert (desirable_dest->mir_op.mode == MIR_OP_MEM);
           res = mem_to_address (c2m_ctx, *desirable_dest, TRUE);
@@ -28718,7 +28773,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                                        MIR_new_int_op (ctx, type_size (c2m_ctx, type)),
                                        MIR_new_int_op (ctx, target_get_blk_type (c2m_ctx, type)
                                                               - MIR_T_BLK)));
-        if (desirable_dest != NULL) res = *desirable_dest;
+        if (desirable_dest != NULL)
+          res = *desirable_dest;
+        else
+          res.mir_op = MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, res.mir_op.u.reg, 0, 1);
       } else {
         MIR_append_insn (ctx, curr_func,
                          MIR_new_insn (ctx, MIR_VA_ARG, op1.mir_op, op2.mir_op,
@@ -29324,6 +29382,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             && NL_HEAD (declarator->u.ops)->code == N_ID);
     assert (decl_type->mode == TM_FUNC);
     reg_free_mark = 0;
+    stmtexpr_last_expr = NULL;
     curr_func_def = r;
     curr_call_arg_area_offset = 0;
     collect_args_and_func_types (c2m_ctx, decl_type->u.func_type);
@@ -29522,8 +29581,29 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     break;
   }
   case N_STMTEXPR: {
-    gen (c2m_ctx, NL_HEAD (r->u.ops), NULL, NULL, FALSE, NULL, NULL);
+    /* MIR #452: statement-expression value correctness. */
+    struct type *stmtexpr_type = ((struct expr *) r->attr)->type;
+    node_t block = NL_HEAD (r->u.ops);
+    node_t last_stmt = NL_TAIL (NL_EL (block->u.ops, 1)->u.ops);
+    node_t saved_last_expr = stmtexpr_last_expr;
+
+    stmtexpr_last_expr
+      = (last_stmt != NULL && last_stmt->code == N_EXPR) ? NL_EL (last_stmt->u.ops, 1) : NULL;
+    gen (c2m_ctx, block, NULL, NULL, FALSE, NULL, NULL);
+    stmtexpr_last_expr = saved_last_expr;
     res = top_gen_last_op;
+    /* Copy aggregate results into reserved frame slot (check phase offset). */
+    if (stmtexpr_type != NULL
+        && (stmtexpr_type->mode == TM_STRUCT || stmtexpr_type->mode == TM_UNION
+            || stmtexpr_type->mode == TM_CLASS)) {
+      mir_size_t size = type_size (c2m_ctx, stmtexpr_type);
+      struct expr *se = r->attr;
+      op_t tmp
+        = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, (MIR_disp_t) se->c.u_val,
+                                        MIR_reg (ctx, FP_NAME, curr_func->u.func), 0, 1));
+      block_move (c2m_ctx, tmp, res, size);
+      res = tmp;
+    }
     break;
   }
   case N_BLOCK: {
@@ -30293,11 +30373,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                                           VARR_ADDR (MIR_op_t, ret_ops)));
     break;
   }
-  case N_EXPR:
+  case N_EXPR: {
+    node_t e = NL_EL (r->u.ops, 1);
+
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
-    top_gen (c2m_ctx, NL_EL (r->u.ops, 1), NULL, NULL, NULL);
+    if (e == stmtexpr_last_expr)
+      /* MIR #452: last expr of statement expression — value context for post ++/--. */
+      top_gen_last_op = gen (c2m_ctx, e, NULL, NULL, TRUE, NULL, NULL);
+    else
+      top_gen (c2m_ctx, e, NULL, NULL, NULL);
     break;
+  }
   case N_DEFER:
     /* Register the deferred statement; its code is emitted (LIFO) at scope exit
        by gen_run_defers from N_BLOCK / N_RETURN / N_BREAK / N_CONTINUE. */
