@@ -302,6 +302,31 @@ static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
     }
   }
 
+  /* new T{e1,e2,...} → gen emits ctor + Add(ei) per element (no N_CALL for Add). */
+  if (n->code == N_NEW && n->attr != NULL && n->attr != (void *) ((intptr_t) -1)) {
+    struct expr *ne = (struct expr *) n->attr;
+    node_t type_id = NL_HEAD (n->u.ops);
+    node_t arg_list = type_id != NULL ? NL_NEXT (type_id) : NULL;
+    node_t init_list = arg_list != NULL ? NL_NEXT (arg_list) : NULL;
+    struct type *cls = NULL;
+
+    if (ne->type != NULL && ne->type->mode == TM_PTR && ne->type->u.ptr_type != NULL
+        && ne->type->u.ptr_type->mode == TM_CLASS)
+      cls = ne->type->u.ptr_type;
+    if (cls != NULL && cls->u.tag_type != NULL && init_list != NULL
+        && init_list->code == N_LIST) {
+      node_t m = find_class_protocol_method (c2m_ctx, cls->u.tag_type, "Add", 1, POS (n));
+      if (m) midopt_mark_keep (m);
+    }
+  }
+
+  /* delete p: r->attr is the resolved destructor N_FUNC_DEF (or NULL / -1). */
+  if (n->code == N_DELETE) {
+    node_t dtor = (node_t) n->attr;
+    if (dtor != NULL && dtor != (node_t) (intptr_t) -1 && dtor->code == N_FUNC_DEF)
+      midopt_mark_keep (dtor);
+  }
+
   if (!midopt_node_has_ops (n->code)) return;
   for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
     midopt_collect_uses (c2m_ctx, c, class_tag);

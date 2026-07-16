@@ -1,5 +1,6 @@
 /* Deep call-chain crash test — exercises 15+ class/method frames.
-   @expect: crash   (intentionally dereferences null to demo the stack trace)
+   @expect: fail   (null deref → safety trap → uncaught fatal, exit 1;
+                    previously SIGSEGV under no safety traps)
    Parliament → GovernmentAgency → Regulator → Country → Region →
    Customer → Bank → Account → Address → Validator → Logger → CRASH */
 int printf(const char *fmt, ...);

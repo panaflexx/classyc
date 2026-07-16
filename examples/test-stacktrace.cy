@@ -1,5 +1,6 @@
 /* test-stacktrace.cy
-   @expect: crash   (intentionally dereferences null to demo the stack trace) */
+   @expect: fail   (null deref → safety trap → uncaught fatal, exit 1;
+                    previously SIGSEGV; exceptions-on is the product default) */
 #include <stdio.h>
 
 class Point {

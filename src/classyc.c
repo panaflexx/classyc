@@ -18134,7 +18134,9 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
                      type_id->u.s.s);
             } else {
               decl_t adecl = add_def->attr;
-              struct func_type *aft = adecl->decl_spec.type->u.func_type;
+              struct func_type *aft;
+              if (adecl != NULL) adecl->used_p = TRUE; /* midopt: gen emits Add calls */
+              aft = adecl->decl_spec.type->u.func_type;
               node_t aparam = NL_HEAD (aft->param_list->u.ops);
               struct decl_spec *apds;
 
