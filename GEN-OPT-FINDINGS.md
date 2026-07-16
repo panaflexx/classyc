@@ -426,3 +426,28 @@ Validate: **52 / 0 / 0**.
 
 ST2000 ticks/sec still noise-flat vs `-fno-midopt` (hot path uses many live
 methods). Compile/JIT graph size is the clear win.
+
+---
+
+## 13. Phase G — midopt safety lattice (nullness + intervals) (2026-07-16)
+
+Per-function forward analysis in `midopt.c` (after method DCE):
+
+| Domain | Facts | Use |
+|--------|-------|-----|
+| **Nullness** | TOP / NULL / NONNULL on locals (`int *p = NULL`, `p = &x`, `if (p==NULL)`) | Definite null deref → **warning** (or **error** with `-fsafety-errors`); NONNULL + `DEREF_GUARD_DEFAULT` → **SAFE** elision |
+| **Intervals** | Known `[lo,hi]` for local ints / const exprs | Fixed C array `a[i]`: full interval in `[0,n)` → `elide_oob_p`; fully outside → definite OOB diagnostic |
+| **Div / shift** | Exact 0 divisor; shift count fully out of width | Definite diagnostics |
+
+**Conservative rules (correctness):**
+
+- Do **not** stamp SAFE over ownership `DEREF_GUARD_CHECK` (object-guards UAF path).  
+- Do **not** treat `new` as NONNULL for elision (MaybeOwned after conditional free).  
+- Calls kill nullness/intervals on pointer/int args (may free or mutate).  
+- Loop bodies kill all intervals after the loop.
+
+**Flags:** `-fsafety-errors` promotes diagnostics to errors; default is warning
+(so intentional trap demos still compile). Sketch: `sketch/sketch-midopt-safety.cy`.
+
+**Still not (Level 2+):** full CFG SSA, heap shape, List.Get length coupling,
+borrow checking.

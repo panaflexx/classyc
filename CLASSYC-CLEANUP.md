@@ -6,7 +6,9 @@ values, value-returning LINQ transforms, move-return / prvalue bind, GetMut /
 stack **Select** monomorph, uncaught **exit(1)**, shift-range guards, **GroupBy
 Phase B** (`Map<G, List<V>>` nested List shells), true `List<List<T>>`, dense
 `*(data+i)` + memcpy growth, `List*[i]` Get/Set sugar restored, quiet scalar/POD
-`move` monomorph, neon-grid / aurora-ops showcases, and full `cy-validate`
+`move` monomorph, **for-in body / FDA frame layout** (outer→inner by
+`func_scope_num`), aligned **`type_size`** aggregate copies (not raw 28 for
+`Ship`), neon-grid / aurora-ops showcases, and full `cy-validate`
 (**52** `val-*.cy` files).
 
 **Product target (by-value collection idiom):** **landed.** Everyday LINQ
@@ -39,7 +41,8 @@ by-value idiom](#first-class-by-value-idiom--landed).
 | **try + argv** | Adjusted array params survive `force_val` under try (val-045) |
 | **Uncaught exceptions** | Print + **`exit(1)`** (not abort/core); optional `CY_EXC_ABORT` (val-047) |
 | **Shift-range safety** | Negative / ≥width shift → catchable trap (val-048, bugs/009) |
-| **Validate** | `cy-validate` **52** files (incl. val-050 nested collections); `bugs/run-bugs.sh`; showcases neon-grid, aurora-ops |
+| **for-in + body locals** | Frame layout outer→inner (`func_scope_num`); body `Ship leader` no longer aliases for-in `List v` |
+| **Validate** | `cy-validate` **52** files (incl. val-050 nested collections); `bugs/run-bugs.sh`; showcases neon-grid, aurora-ops (stable under `-eg`/`-ei`/`-el`/`-eb`) |
 
 ### House style today (what you should write)
 
@@ -265,6 +268,24 @@ style, `val-040`…`val-050`.
 * **`[]` protocol:** value *and* pointer collection receivers use Get/Set;
   plain class pointers without Get stay C raw index.
 
+### Compiler notes — for-in frame layout + aggregate size (2026-07-16)
+
+* **FDA sort key is `func_scope_num`**, not parse-time `node->uid`. `N_FORIN` is
+  allocated *after* `P(stmt)` builds the body, so the body block has a **lower
+  parse uid** than the for-in node. Sorting by uid laid out body locals first,
+  then for-in loop vars at the same outer offset → **stack collision**
+  (`Ship leader` overwrote live `List v`; `List.data` became `Ship.id` →
+  `memcpy` from `0x1` SEGV in aurora-ops section 4 GroupBy for-in).
+  `func_scope_num` is assigned outer→inner in `create_node_scope` during check.
+* **Aggregate local init / copy uses `type_size`** (aligned `sizeof`), not
+  `raw_type_size`. Classes with trailing padding (e.g. `Ship` raw 28 / sizeof 32)
+  must match BLK ABI and array stride; mixing 28 and 32 left garbage or
+  truncated copies in ForEach / Find / GroupBy pipelines.
+* **Symptom looked like “JIT crash”** (ClassyC stacktrace blamed `main` at the
+  for-in line; gdb showed `memcpy(…, 0x1, 32)` in generated code). Compile-only
+  (`-c`) was always fine — bad frame layout, not MIR gen of the function
+  graph.
+
 ---
 
 ## Done backlog (compressed)
@@ -289,6 +310,8 @@ style, `val-040`…`val-050`.
 * **`List*[i]` Get/Set sugar restored** (not raw C array of Lists)  
 * Quiet scalar/POD `move` monomorph (intentional no-ops; no warning spam)  
 * test-list-stdlib OOB expects throws; neon-grid / aurora-ops stack house style  
+* **for-in FDA:** sort by `func_scope_num` (outer→inner); body locals after for-in vars  
+* **type_size for local aggregate memcpy** (Ship 32 not 28); aurora-ops stable  
 
 ---
 
@@ -302,8 +325,9 @@ style, `val-040`…`val-050`.
 6. ~~**Capturing Sort + Select open-code**~~ **done** (val-042 §11–12)  
 7. ~~**`List*[i]` developer sugar**~~ **done**  
 8. ~~**Nested `Map<G,List<V>>` / `List<List<T>>`**~~ **done** (val-050)  
-9. **Next:** full-expr temp dtor; ownership-pass speed; AOT DCE; retire stale
-   bugs; array `.filter`/`.map`; `Heap` priority queue if needed
+9. ~~**for-in FDA + type_size (aurora SEGV)**~~ **done**  
+10. **Next:** full-expr temp dtor; ownership-pass speed; AOT DCE; retire stale
+    bugs; array `.filter`/`.map`; `Heap` priority queue if needed
 
 ---
 
@@ -330,6 +354,10 @@ style, `val-040`…`val-050`.
 * Nested collections: keep **user** `List*[i]` as Get/Set; use `*(data + i)` (or
   equivalent) for dense `T*` slots inside monomorphized headers. Do not re-break
   pointer sugar to unblock nested List-of-List.  
+* Frame allocation: sort FDA by **`func_scope_num`** (check-time nesting), never
+  parse `node->uid` alone — for-in / other post-body scope nodes will collide.  
+* Aggregate block_move / local init: prefer **`type_size`** over
+  **`raw_type_size`** so trailing padding matches BLK returns and dense strides.  
 
 Related: [`BY-VALUE.md`](BY-VALUE.md), [`GENERICSMEM.md`](GENERICSMEM.md),
 [`LAMBDA-CAPTURE.md`](LAMBDA-CAPTURE.md), [`CLASSYC-FINDINGS.md`](CLASSYC-FINDINGS.md),

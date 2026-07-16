@@ -2,7 +2,8 @@
 
 Last updated: 2026-07-16 (capturing Sort/Select, stmtexpr call-arg slots,
 scalar `move` pass-through, quiet POD move monomorph, `List*[i]` Get/Set sugar,
-GroupBy Phase B nested `Map<G, List<V>>` / `List<List<T>>`).
+GroupBy Phase B nested `Map<G, List<V>>` / `List<List<T>>`, **for-in FDA
+`func_scope_num` layout**, aligned **`type_size`** aggregate copies).
 
 Scope: parse/gen correctness, compilation speed, JIT/AOT linking, refactoring,
 missing functionality, and the **first-class by-value collection idiom**.
@@ -72,6 +73,8 @@ auto xs = make();             // prvalue bind — no shallow copy
 | **Dense `*(ptr+i)` + memcpy growth** | Nested List/Map shells; SSA/MIR-friendly |
 | **mir-gen addr-elim** | `collect_addr_uses` no longer asserts on non-move VAR_MEM uses |
 | **bugs/ runner** | `sh bugs/run-bugs.sh` |
+| **for-in FDA outer→inner** | `func_scope_num` sort; body locals after for-in vars (§2a) |
+| **Aligned class copies** | Local init / block_move use `type_size` (Ship 32) |
 
 **Nested collections (Phase B) — landed:** `List<List<T>>`, `Map<G, List<V>>`,
 GroupBy returns nested List shells. Library dense slots use `*(data+i)` /
@@ -123,6 +126,51 @@ combiner folded addresses across multi-block loop phis after GVN.
 | Quiet POD `move` | Intentional no-ops in monomorph; no warning spam on `int`/POD shells |
 | Capturing HOF stmtexpr | Class result slot in call-arg area (not local FP overlap) |
 | `List*[i]` sugar | Get/Set protocol (not raw array-of-List); `test-generic-ptr-args.cy` |
+| **for-in body vs loop vars (FDA)** | Sort by `func_scope_num` (outer→inner), not parse `node->uid` — see §2a |
+| **Aggregate local copy size** | `type_size` (aligned sizeof), not `raw_type_size` (e.g. Ship 32 not 28) |
+
+---
+
+## 2a. FIXED: for-in frame layout + `Ship` memcpy SEGV (aurora-ops) [validated]
+
+**Symptom.** `examples/classy-aurora-ops.cy` (and min repros with
+`GroupBy` + `for (auto k, v in by) { Ship leader = v.First(); … v.ForEach(…); }`)
+flaked ~30–50% with SIGSEGV at section 4. ClassyC stacktrace blamed `main` at
+the for-in line; gdb showed:
+
+```text
+#0  __memcpy_avx_unaligned_erms
+    rdi = stack, rsi = 0x1, rdx = 0x20   // memcpy from address 1, size 32
+```
+
+JIT-generated code mixed **0x20** and **0x1c** for the same `Ship` type.
+Compile-only (`-c`) never failed — bad runtime frame / copy sizes, not a
+missing monomorph.
+
+**Root cause (two related bugs):**
+
+1. **FDA sort used parse `node->uid`.** `N_FORIN` is built *after* `P(stmt)`
+   parses the body, so the body block has a **lower** parse uid than the for-in
+   node. Layout processed body locals first, then for-in vars at the **same**
+   outer offset → `Ship leader` and live `List v` shared `fp+72`. Writing
+   `leader = First()` overwrote the List shell: `List.data` became `Ship.id`
+   (`1` on little-endian) → next Get/ForEach `memcpy` from `0x1`.
+
+2. **Local aggregate init used `raw_type_size` (28 for Ship)** while Get/First
+   returns and BLK params used aligned **`type_size` (32)**. Truncated copies
+   and inconsistent strides in ForEach/Find/GroupBy paths.
+
+**Fix (`src/classyc.c`):**
+
+* `decl_cmp` / FDA: order scopes by **`func_scope_num`** (assigned outer→inner
+  in `create_node_scope` during check), then by size.
+* Local aggregate `gen_initializer` / init size: **`type_size`**, not
+  `raw_type_size`.
+
+**Validation [validated]:** leader+ForEach repro 30/30; aurora-min2 20/20;
+`classy-aurora-ops.cy` 15+ runs under `-eg`/`-ei`/`-el`/`-eb` with `-g`;
+cy-validate **52/0/0**. MIR: distinct slots (`v` @72, `leader` @96), Ship
+memcpys all 32.
 
 ---
 
@@ -183,6 +231,11 @@ Lazy JIT (`-el`) remains a strong default for run mode.
   never a bare expr — `N_FUNC_DEF` uses the body as the function scope  
 * Stmtexpr class results: reserve in **call-arg area** (locals use FDA offsets;
   check-time bumps of `func_block_scope->size` are discarded at allocate)  
+* FDA order must follow **check-time nesting** (`func_scope_num`), not parse
+  uid — for-in (and any scope node allocated after its body) will otherwise
+  collide body locals with loop vars (§2a)  
+* Prefer **`type_size`** over **`raw_type_size`** for by-value class
+  block_move / local init (trailing padding is part of the object for BLK ABI)  
 
 ---
 
@@ -249,6 +302,8 @@ reason to treat `List*` as a C array of Lists.
   * val-048 shift-range guard  
   * val-049 / **val-050** — GroupBy + nested `List<List<T>>` / `Map<G,List<V>>`  
 * neon-grid / aurora-ops: stack List/Map; Select on LapSample; GroupBy without `owned`  
+* aurora-ops for-in + `Ship` body local: **stable** after FDA `func_scope_num` +
+  `type_size` fix (§2a); modes `-ei`/`-eg`/`-el`/`-eb`  
 * `examples/test-generic-ptr-args.cy`: `List<char*>*` bracket Get/Set  
 * `sh bugs/run-bugs.sh` available  
 

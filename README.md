@@ -162,6 +162,8 @@ lib["Kashmir"] = new Track("Kashmir", 508);
 - **for-in** `for (auto k in m)` / `for (auto k, v in m)` — keys and key/value pairs
   in insertion order (`Count` / `KeyAt` / `ValAt`). **`V` (and `K`) may be by-value
   classes**, same as `List.Get` for-in; loop vars are stack slots each iteration.
+  Body locals (e.g. `Ship leader = v.First()`) get their own frame slots after the
+  loop vars — nested class values next to for-in `List` shells are safe.
 - **Mut helpers:** `m.GetMut(k)` / `m.ValMut(i)` return `V*` when you want an explicit
   pointer (invalidated by rehash).
 
@@ -874,6 +876,17 @@ auto arr = {1, 2, 3};           // int[3]
 ### `for (auto x in ...)` Loops
 Works over arrays, `dict`, `List<T>`, `Set<T>`, `Map<K,V>`, and (via methods) strings. Keyed variant `for (auto k, v in m)` is supported for `dict` and `Map`. For a `dict` carrying a JSON **array**, the two-var form binds `(index, element)` (runtime-tag dispatched) so the same loop walks both objects and arrays without a type switch.
 
+Body declarations are ordinary nested scopes relative to the for-in loop vars, so patterns like GroupBy + in-loop locals are fine:
+
+```c
+auto by = roster.GroupBy((Ship s) => s.SectorKey());
+for (auto k, v in by) {
+    Ship leader = v.First();          // own stack slot — does not clobber v
+    printf("%d leader=%s\n", k, leader.callsign);
+    v.ForEach(print_banner);          // still a live List shell
+}
+```
+
 **Typed loop variables.** Instead of `auto`, name the element type and the loop binds the element *coerced to that type* — handy for JSON arrays, where the element would otherwise be a tagged `dict` you have to cast:
 
 ```c
@@ -1033,7 +1046,7 @@ Look in the `examples/` directory:
 | `classy-lambda.cy`         | Typed lambdas: thin fn ptrs + capturing HOF open-code |
 | `classy-docsearch.cy`      | Doc search TUI — capturing `Where` with local `min_score` (no `g_*`) |
 | `classy-neon-grid.cy`      | **By-value house style:** stack List/Map, value Where/Take/Skip, Pilot*.owns, LapSample DTO |
-| `classy-aurora-ops.cy`     | **By-value showcase:** `List<Ship>` happy path, GetMut, value LINQ chains, no owned on pipelines |
+| `classy-aurora-ops.cy`     | **By-value showcase:** `List<Ship>` happy path, GetMut, value LINQ, GroupBy for-in + body locals, no owned on pipelines |
 | `test-list-stdlib.c`       | Full stdlib List<T> validation |
 | `test-array-to-list.cy`    | Array/slice `.ToList()`, `auto` deduction, `List(T*)` ctor |
 | `test-list-conversions.cy` | `List<T>` → array/`dict`: `ToArray`, `CopyTo`, `ToJsonArray`, `ToDictBy` |
@@ -1328,7 +1341,7 @@ Contributions, bug reports, and wild ideas are welcome!
   JSON array — any class with a default ctor + `Add(T)`).  `Map<K,V>*` and
   pointer-to-class elements (`List<User*>*`) are **Phase 3** — the compiler
   reports a clear error directing you to write that field by hand.
-- Stack value-construction works for plain classes (including those with constructor arguments): `Point p = Point(1, 2);` runs the constructor in place and `~Point()` at scope exit. **Generic collections are value-first too:** prefer `auto xs = List<int>();` / `Map<String,int>()` / `Set<int>()` — RAII frees the buffer at scope exit. Use `new List<T>` / `owned auto` only when a pointer identity must escape. Bare assign of `List`/`Map`/`Set` is banned (move-only); transfer with `move` or bind a by-value return. Transforms (`Where`/`Take`/`Copy`/`Select`/…) return **value** shells. Nested collections work: `List<List<T>>`, `Map<G, List<V>>`, and `GroupBy` → `Map<G, List<V>>` (Get copies a bucket; `GetMut` mutates in place).
+- Stack value-construction works for plain classes (including those with constructor arguments): `Point p = Point(1, 2);` runs the constructor in place and `~Point()` at scope exit. **Generic collections are value-first too:** prefer `auto xs = List<int>();` / `Map<String,int>()` / `Set<int>()` — RAII frees the buffer at scope exit. Use `new List<T>` / `owned auto` only when a pointer identity must escape. Bare assign of `List`/`Map`/`Set` is banned (move-only); transfer with `move` or bind a by-value return. Transforms (`Where`/`Take`/`Copy`/`Select`/…) return **value** shells. Nested collections work: `List<List<T>>`, `Map<G, List<V>>`, and `GroupBy` → `Map<G, List<V>>` (Get copies a bucket; `GetMut` mutates in place). By-value class locals inside `for (… in map)` bodies (e.g. `Ship leader = bucket.First()` after GroupBy) share the same frame layout rules as ordinary nested blocks — loop vars and body locals do not alias.
 - **`[]` on collections:** value and pointer receivers use the same Get/Set sugar — `list[i]`, `list_ptr[i]`, `map[k]`, `map_ptr[k]`. Plain `Point*` (no Get) stays C raw indexing. Nested collection dense buffers in the library use `*(data + i)` (and `memcpy` growth) so user-facing `List*[i]` sugar stays Get/Set.
 - Exception names are resolved only at compile time. Runtime stores integer IDs only; there is no symbolic pretty-printing or `nameof`-style reflection for exceptions. The prelude ships `KeyException = 8` and `TypeException = 7` (used by the typed JSON binder); user code can extend the set with `enum { MyErr = 100 }`. Uncaught exceptions and uncaught safety traps print a diagnostic and **`exit(1)`** (not abort/core). Define `CY_EXC_ABORT=1` if you want core dumps for debugging.
 - `List<T>.Sort` / `Set<T>` and a few other methods have minor edge-case limitations documented in the headers. Stack `Select<U>` works on pure value receivers (val-046); prefer nested blocks for RAII of pipeline intermediates when leaving function scope.

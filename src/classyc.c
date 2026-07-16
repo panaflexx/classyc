@@ -10442,7 +10442,7 @@ static void parse_finish (c2m_ctx_t c2m_ctx) {
  3. N_SPEC_DECL (only with ID), N_MEMBER, N_FUNC_DEF have attribute "struct decl"
  4. N_GOTO has attribute node_t (target stmt)
  5. N_STRUCT, N_UNION have attribute "struct node_scope" if they have a decl list
- 6. N_MODULE, N_BLOCK, N_FOR, N_FUNC have attribute "struct node_scope"
+ 6. N_MODULE, N_BLOCK, N_FOR, N_FORIN, N_FUNC have attribute "struct node_scope"
  7. declaration_specs or spec_qual_list N_LISTs have attribute "struct decl_spec",
     but as a part of N_COMPOUND_LITERAL have attribute "struct decl"
  8. N_ENUM has attribute "struct enum_type"
@@ -16689,14 +16689,26 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       NL_PREPEND (NL_EL (func_block->u.ops, 1)->u.ops, decl);
     }
 
-    /* Sort by decl scope nesting (more nested scope has a bigger UID) and decl size. */
+    /* Sort by decl scope nesting then decl size.
+       Use func_scope_num (assigned in create_node_scope during check, outer
+       scopes first) — NOT node parse uid.  N_FORIN is allocated *after* its
+       body is parsed (`P(stmt)` then `new N_FORIN`), so the body block has a
+       lower parse uid than the for-in node.  Sorting by parse uid laid out
+       body locals first, then for-in vars at the same outer offset → stack
+       collision (Ship leader overlaying List v; List.data becomes Ship.id=1
+       → memcpy from 0x1 SEGV in aurora-ops GroupBy for-in). */
     static int decl_cmp (const void *v1, const void *v2) {
       const decl_t d1 = *(const decl_t *) v1, d2 = *(const decl_t *) v2;
       struct type *t1 = d1->decl_spec.type, *t2 = d2->decl_spec.type;
       mir_size_t s1 = raw_type_size (d1->c2m_ctx, t1), s2 = raw_type_size (d2->c2m_ctx, t2);
+      unsigned n1 = 0, n2 = 0;
 
-      if (d1->scope->uid < d2->scope->uid) return -1;
-      if (d1->scope->uid > d2->scope->uid) return 1;
+      if (d1->scope != NULL && d1->scope->attr != NULL)
+        n1 = ((struct node_scope *) d1->scope->attr)->func_scope_num;
+      if (d2->scope != NULL && d2->scope->attr != NULL)
+        n2 = ((struct node_scope *) d2->scope->attr)->func_scope_num;
+      if (n1 < n2) return -1;
+      if (n1 > n2) return 1;
       if (s1 < s2) return -1;
       if (s1 > s2) return 1;
       return 0;
@@ -26633,10 +26645,12 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
       val = gen (c2m_ctx, init_el.init, NULL, NULL, t != MIR_T_UNDEF,
                  t != MIR_T_UNDEF ? NULL : &val, NULL);
       if (!scalar_type_p (init_el.el_type)) {
+        /* Use type_size (aligned sizeof), not raw_type_size: trailing padding is
+           part of the object for array stride / by-value BLK ABI (Ship 32 vs 28). */
         mir_size_t s = init_el.init->code == N_STR     ? init_el.init->u.s.len
                        : init_el.init->code == N_STR16 ? init_el.init->u.s.len / 2
                        : init_el.init->code == N_STR32 ? init_el.init->u.s.len / 4
-                                                       : raw_type_size (c2m_ctx, init_el.el_type);
+                                                       : type_size (c2m_ctx, init_el.el_type);
         gen_memcpy (c2m_ctx, offset + rel_offset, base, val, s);
         rel_offset = init_el.offset + s;
       } else {
@@ -29198,7 +29212,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     int local_p
       = decl->scope != top_scope && !decl->decl_spec.static_p && !decl->decl_spec.thread_local_p;
     gen_initializer (c2m_ctx, init_start, var, global_name,
-                     (local_p ? raw_type_size : type_size) (c2m_ctx, decl->decl_spec.type),
+                     type_size (c2m_ctx, decl->decl_spec.type),
                      local_p);
     VARR_TRUNC (init_el_t, init_els, init_start);
     if (var.mir_op.mode == MIR_OP_REF) var.mir_op.u.ref = var.decl->u.item;
@@ -30475,7 +30489,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           int local_p = (decl->scope != top_scope && !decl->decl_spec.static_p
                          && !decl->decl_spec.thread_local_p);
           gen_initializer (c2m_ctx, init_start, var, name,
-                           (local_p ? raw_type_size : type_size) (c2m_ctx, decl->decl_spec.type),
+                           type_size (c2m_ctx, decl->decl_spec.type),
                            local_p);
           VARR_TRUNC (init_el_t, init_els, init_start);
         }
