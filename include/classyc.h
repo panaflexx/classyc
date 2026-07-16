@@ -29,6 +29,8 @@ struct c2mir_options {
   int check_whole_allocs_p; /* -fcheck-whole-allocs: link-time-style whole-program ownership analysis */
   int no_ownership_p; /* -fno-ownership: skip the ownership analysis pass entirely (no leak/UAF/double-free diagnostics, no -fauto-release synthesis) */
   int object_guards_p; /* -fobject-guards: side-table + quarantine runtime use-after-free / double-free guards on `new` class objects.  Ownership-directed: only derefs the ownership pass classifies as CHECK (MaybeOwned) are instrumented.  Off by default (opt-in). */
+  int no_midopt_p; /* -fno-midopt: skip mid-level optimizer (check→gen). Default off = midopt runs. */
+  int dump_mir_stats_p; /* -fdump-mir-stats: print per-module MIR func/insn/call counts after gen */
   size_t module_num;
   FILE *prepro_output_file; /* non-null for prepro_only_p */
   const char *output_file_name;

@@ -299,6 +299,8 @@ static void init_options (int argc, char *argv[]) {
   options.check_whole_allocs_p = FALSE; /* -fcheck-whole-allocs: whole-program ownership analysis */
   options.no_ownership_p = FALSE; /* -fno-ownership: skip the ownership analysis pass entirely */
   options.object_guards_p = FALSE; /* -fobject-guards: side-table UAF/double-free guards on `new` objects */
+  options.no_midopt_p = FALSE; /* midopt on by default; -fno-midopt disables */
+  options.dump_mir_stats_p = FALSE; /* -fdump-mir-stats: MIR func/insn/call counts after gen */
   gen_debug_level = -1;
   VARR_CREATE (char, temp_string, &default_alloc, 0);
   VARR_CREATE (char_ptr_t, headers, &default_alloc, 0);
@@ -351,6 +353,12 @@ static void init_options (int argc, char *argv[]) {
       options.object_guards_p = TRUE;
     } else if (strcmp (argv[i], "-fno-object-guards") == 0) {
       options.object_guards_p = FALSE;
+    } else if (strcmp (argv[i], "-fno-midopt") == 0) {
+      options.no_midopt_p = TRUE;
+    } else if (strcmp (argv[i], "-fmidopt") == 0) {
+      options.no_midopt_p = FALSE;
+    } else if (strcmp (argv[i], "-fdump-mir-stats") == 0) {
+      options.dump_mir_stats_p = TRUE;
     } else if (strcmp (argv[i], "-pedantic") == 0) {
       options.pedantic_p = TRUE;
     } else if (strcmp (argv[i], "-g") == 0) {

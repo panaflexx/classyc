@@ -11158,6 +11158,9 @@ struct expr {
   unsigned int own_deref_class : 2;
   /* class[i] / map[k] uses GetMut → true element lvalue (not Get by-value copy). */
   unsigned int mut_sub_p : 1;
+  /* Midopt: static array index proved in-range (const index + known length).
+     gen elides the OOB safety trap when set. */
+  unsigned int elide_oob_p : 1;
   union {
     node_t lvalue_node;       /* for id, str, field, deref field, ind, deref, compound literal */
     node_t label_addr_target; /* for label address */
@@ -11225,6 +11228,10 @@ struct decl {
      The ownership pass (src/ownership.c) tracks these bindings as single-owner,
      move-only, and guarantees a single scope-exit release unless moved out. */
   unsigned owned_p : 1;
+  /* Midopt (check→gen): class method proved unreachable from live roots.
+     gen skips body emission and forward MIR items. Free functions are never
+     marked dead (C linkage / export). See src/midopt.c. */
+  unsigned midopt_dead_p : 1;
   int bit_offset, width; /* for bitfields, -1 bit_offset for non bitfields. */
   mir_size_t offset;     /* var offset in frame or bss */
   /* Extra stack bytes for a class/struct local whose trailing flexible array
@@ -15490,6 +15497,8 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
     field = NL_HEAD (r->u.ops);
     if (field != NULL && field->attr != NULL)
       ((struct expr *) field->attr)->def_node = ctor_def;
+    if (ctor_def != NULL && ctor_def->attr != NULL)
+      ((decl_t) ctor_def->attr)->used_p = TRUE;
 
     res = create_type (c2m_ctx, NULL);
     init_type (res);
@@ -15878,6 +15887,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       decl->auto_defer_p = FALSE;
       decl->unowned_p = FALSE;
       decl->owned_p = FALSE;
+      decl->midopt_dead_p = FALSE;
       decl->scope = curr_scope;
       decl->containing_unnamed_anon_struct_union_member = curr_unnamed_anon_struct_union_member;
       decl->u.item = NULL;
@@ -16279,6 +16289,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       e->u.lvalue_node = NULL;
       e->def_node = NULL;
       e->const_p = e->const_addr_p = e->builtin_call_p = FALSE;
+      e->elide_oob_p = FALSE;
       e->bind_p = e->lenient_p = FALSE;
       e->own_deref_class = DEREF_GUARD_DEFAULT;
       e->mut_sub_p = 0;
@@ -17748,8 +17759,11 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
               if (getmut_def != NULL && agg_el) {
                 e->mut_sub_p = 1;
                 e->def_node = getmut_def;
+                if (getmut_def->attr != NULL) ((decl_t) getmut_def->attr)->used_p = TRUE;
               } else {
                 e->def_node = get_def; /* stash Get for gen */
+                if (get_def != NULL && get_def->attr != NULL)
+                  ((decl_t) get_def->attr)->used_p = TRUE;
               }
             }
           }
@@ -18046,6 +18060,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           decl_t cdecl = ctor_def->attr;
           struct func_type *ft = cdecl->decl_spec.type->u.func_type;
           e->def_node = ctor_def;
+          if (cdecl != NULL) cdecl->used_p = TRUE;
           param = NL_HEAD (ft->param_list->u.ops);
           if (param != NULL) param = NL_NEXT (param); /* skip implicit 'this' */
           arg = NL_HEAD (arg_list->u.ops);
@@ -18784,6 +18799,7 @@ if (base != NULL && base->code == N_ID) {
           e->type->u.ptr_type = fnt;
           e->type->func_type_before_adjustment_p = TRUE;
           e->def_node = func;
+          if (decl != NULL) decl->used_p = TRUE;
           e->u.lvalue_node = NULL;
         } else {
           if(sym.def_node == NULL || sym.id == NULL) {
@@ -19347,6 +19363,8 @@ if (base != NULL && base->code == N_ID) {
           e->type->u.basic_type = TP_VOID;
           e->builtin_call_p = TRUE;
           e->def_node = dtor_def;
+          if (dtor_def != NULL && dtor_def->attr != NULL)
+            ((decl_t) dtor_def->attr)->used_p = TRUE;
           break;
         }
         /* ClassName(args) value construction: temporary by-value class object.
@@ -19386,6 +19404,8 @@ if (base != NULL && base->code == N_ID) {
             e->type = class_type;
             e->builtin_call_p = TRUE;
             e->def_node = ctor_def;
+            if (ctor_def != NULL && ctor_def->attr != NULL)
+              ((decl_t) ctor_def->attr)->used_p = TRUE;
 
             if (ctor_def != NULL && ctor_def->code == N_FUNC_DEF) {
               decl_t cdecl = ctor_def->attr;
@@ -19982,6 +20002,9 @@ if (base != NULL && base->code == N_ID) {
 	                    set_type_layout(c2m_ctx, pf);
 	                    fe->type = pf;
 	                    fe->def_node = func_def;
+	                    if (func_def->attr != NULL
+	                        && func_def->attr != (void *) ((intptr_t) -1))
+	                      ((decl_t) func_def->attr)->used_p = TRUE;
 	                  }
 	                }
 	                /* Check user args against params (no implicit 'this'). */
@@ -20364,6 +20387,9 @@ if (base != NULL && base->code == N_ID) {
 	                    set_type_layout(c2m_ctx, pf);
 	                    fe->type = pf;
 	                    fe->def_node = func_def;
+	                    if (func_def->attr != NULL
+	                        && func_def->attr != (void *) ((intptr_t) -1))
+	                      ((decl_t) func_def->attr)->used_p = TRUE;
 	                  }
 	                }
 
@@ -27133,6 +27159,7 @@ static void gen_forward_class_methods (c2m_ctx_t c2m_ctx, node_t module) {
       if (m->code != N_FUNC_DEF) continue;
       decl_t mdecl = m->attr;
       if (mdecl == NULL) continue;
+      if (mdecl->midopt_dead_p) continue; /* midopt P0: no forward for dead methods */
       if (mdecl->u.item != NULL) continue;  /* already (forward-)declared */
       struct type *mtype = mdecl->decl_spec.type;
       if (mtype == NULL || mtype->mode != TM_FUNC) continue;
@@ -28286,7 +28313,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
        is the original TM_ARR type with a constant size).  Negative or oversized
        indices are caught by unsigned comparison. */
     if (c2m_options->exceptions_p && arr_type->arr_type != NULL
-        && arr_type->arr_type->mode == TM_ARR) {
+        && arr_type->arr_type->mode == TM_ARR
+        && (r->attr == NULL || !((struct expr *) r->attr)->elide_oob_p)) {
       node_t sz_node = arr_type->arr_type->u.arr_type->size;
       if (sz_node != NULL && sz_node->code != N_IGNORE && sz_node->attr != NULL) {
         struct expr *sze = sz_node->attr;
@@ -28516,6 +28544,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       MIR_item_t fitem = mdecl ? mdecl->u.item : NULL;
       if (fitem) {
         res = new_op (NULL, MIR_new_ref_op (ctx, fitem));
+        break;
+      }
+      /* Midopt may have pruned a method still named in residual AST (e.g. a
+         monomorph branch that is never taken at runtime).  Prefer a clear
+         diagnostic over falling through to the N_MEMBER path. */
+      if (mdecl != NULL && mdecl->midopt_dead_p) {
+        warning (c2m_ctx, POS (r),
+                 "internal: reference to midopt-dead method (null MIR item)");
+        res = zero_op;
         break;
       }
     }
@@ -30104,6 +30141,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     /* Skip generic function templates (sentinel attr): only their
        monomorphized specializations are generated. */
     if (r->attr == (void *)((intptr_t)-1)) break;
+    /* Midopt P0: unreachable class methods — no MIR body. */
+    if (r->attr != NULL && ((decl_t) r->attr)->midopt_dead_p) break;
     node_t decl_specs = FUNC_DEF_SPECS (r);
     node_t declarator = FUNC_DEF_DECL (r);
     node_t decls = FUNC_DEF_DECLS (r);
@@ -32896,12 +32935,17 @@ static int top_level_getc (c2m_ctx_t c2m_ctx) { return c_getc (c_getc_data); }
    c2mir_options) and BEFORE c2mir_compile, which calls ownership_run. */
 #include "ownership.c"
 
+/* Mid-level optimizer (check → gen).  Same include model as ownership.c.
+   See src/midopt.c and GEN-OPT.md Phases A/B. */
+#include "midopt.c"
+
 int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func) (void *),
                    void *getc_data, const char *source_name, FILE *output_file) {
   struct c2m_ctx *c2m_ctx = *c2m_ctx_loc (ctx);
   double start_time = real_usec_time ();
   double prev_time = start_time; /* advanced per stage by stage_time() */
-  double t_init = 0, t_pre = 0, t_parse = 0, t_check = 0, t_ownership = 0, t_gen = 0;
+  double t_init = 0, t_pre = 0, t_parse = 0, t_check = 0, t_ownership = 0, t_midopt = 0,
+         t_gen = 0;
   node_t r;
   unsigned n_error_before;
   MIR_module_t m;
@@ -32971,8 +33015,14 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
           /* Fall through to gen_mir anyway today; once the pass emits real
              errors we'll guard gen the same way `check` is guarded above. */
         }
+        /* Midopt: dead class-method pruning + static safety elision stamps.
+           Runs after ownership so SAFE/CHECK attributes are available. */
+        midopt_run (c2m_ctx, r);
+        t_midopt = stage_time (&prev_time);
         m = MIR_new_module (ctx, get_module_name (c2m_ctx));
         gen_mir (c2m_ctx, r);
+        if (c2m_options->dump_mir_stats_p)
+          midopt_dump_mir_stats (c2m_ctx, m);
         if ((c2m_options->asm_p || c2m_options->object_p) && n_errors == 0) {
           if (strcmp (source_name, COMMAND_LINE_SOURCE_NAME) == 0) {
             MIR_output_module (ctx, c2m_options->message_file, m);
@@ -33003,11 +33053,13 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
     /* One-line per-stage timing summary (skipped stages read 0). */
     FILE *f = c2m_options->message_file;
     int color = log_color_enabled (f);
-    const char *names[] = {"init", "preprocess", "parse", "check", "ownership", "generate", "total"};
-    double vals[] = {t_init, t_pre, t_parse, t_check, t_ownership, t_gen, real_usec_time () - start_time};
+    const char *names[]
+      = {"init", "preprocess", "parse", "check", "ownership", "midopt", "generate", "total"};
+    double vals[] = {t_init, t_pre, t_parse, t_check, t_ownership, t_midopt, t_gen,
+                     real_usec_time () - start_time};
 
     fprintf (f, "  %stimings (usec):%s", log_c (color, LOG_BOLD), log_c (color, LOG_RESET));
-    for (int i = 0; i < 7; i++)
+    for (int i = 0; i < 8; i++)
       fprintf (f, " %s%s%s=%s%.0f%s", log_c (color, LOG_CYAN), names[i], log_c (color, LOG_RESET),
                log_c (color, LOG_BOLD), vals[i], log_c (color, LOG_RESET));
     fprintf (f, "\n");
