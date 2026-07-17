@@ -412,14 +412,8 @@ struct type {
   = {.raw_size = MIR_SIZE_MAX, .align = -1, .mode = TM_BASIC, .u = {.basic_type = TP_VOID}};
 
 static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type);
-static void set_class_layout (c2m_ctx_t c2m_ctx, node_t decl_node, struct type *type);
-static void ensure_class_type_layout (c2m_ctx_t c2m_ctx, struct type *type);
 
 static mir_size_t raw_type_size (c2m_ctx_t c2m_ctx, struct type *type) {
-  /* Classes may still have sticky size 0 from an earlier incomplete layout
-     pass (ListView while only forward-declared).  Recompute before trusting
-     raw_size for stack allocation / ABI. */
-  if (type != NULL && type->mode == TM_CLASS) ensure_class_type_layout (c2m_ctx, type);
   if (type->raw_size == MIR_SIZE_MAX) set_type_layout (c2m_ctx, type);
   if (n_errors != 0 && type->raw_size == MIR_SIZE_MAX) {
     /* Use safe values for programs with errors: */
@@ -11735,47 +11729,9 @@ static void aux_set_type_align (c2m_ctx_t c2m_ctx, struct type *type) {
   type->align = align;
 }
 
-/* Force a complete layout for class types that were sized as incomplete
-   (raw_size MIR_SIZE_MAX or 0) while their definition was not yet visible —
-   e.g. ListView.ToList() return type List<T> when the FUNC type was first
-   built.  Without this, MIR emits `rblk:0(Ret_Addr)` and the move-return
-   never copies into the caller's return buffer (double-free / empty List). */
-static void ensure_class_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
-  node_t members, el;
-  int has_field;
-
-  if (type == NULL || type->mode != TM_CLASS || type->u.tag_type == NULL) return;
-  if (type->raw_size != MIR_SIZE_MAX && type->raw_size != 0) return;
-  members = TAG_MEMBER_LIST (type->u.tag_type);
-  if (members == NULL || members->code == N_IGNORE) return;
-  has_field = 0;
-  for (el = NL_HEAD (members->u.ops); el != NULL; el = NL_NEXT (el)) {
-    if (el->code == N_MEMBER) {
-      has_field = 1;
-      break;
-    }
-  }
-  if (!has_field) return;
-  /* Invalidate sticky 0 / MAX from an earlier incomplete pass and recompute. */
-  type->raw_size = MIR_SIZE_MAX;
-  type->align = -1;
-  set_type_layout (c2m_ctx, type);
-  if ((type->raw_size == MIR_SIZE_MAX || type->raw_size == 0)
-      && !incomplete_type_p (c2m_ctx, type)) {
-    /* incomplete_type_p can still say complete while set_type_layout left
-       MAX if a prior incomplete pass stored MAX with align set; use the
-       dedicated class layout walker. */
-    type->raw_size = MIR_SIZE_MAX;
-    type->align = -1;
-    set_class_layout (c2m_ctx, type->u.tag_type, type);
-  }
-}
-
 static mir_size_t type_size (c2m_ctx_t c2m_ctx, struct type *type) {
-  mir_size_t size;
+  mir_size_t size = raw_type_size (c2m_ctx, type);
 
-  if (type != NULL && type->mode == TM_CLASS) ensure_class_type_layout (c2m_ctx, type);
-  size = raw_type_size (c2m_ctx, type);
   return type->align == 0 ? size : round_size (size, type->align);
 }
 
@@ -24338,11 +24294,7 @@ static void MIR_UNUSED simple_add_res_proto (c2m_ctx_t c2m_ctx, struct type *ret
   } else {
     var.name = RET_ADDR_NAME;
     var.type = MIR_T_RBLK;
-    /* Re-layout class returns: ListView.ToList's List ret type may still be
-       size 0 if it was first visited incomplete during specialization. */
-    if (ret_type->mode == TM_CLASS) ensure_class_type_layout (c2m_ctx, ret_type);
     var.size = type_size (c2m_ctx, ret_type);
-    if (var.size == 0) var.size = 1; /* avoid rblk:0 (MIR/link footgun) */
     VARR_PUSH (MIR_var_t, arg_vars, var);
   }
 }
@@ -24374,7 +24326,6 @@ static int MIR_UNUSED simple_add_call_res_op (c2m_ctx_t c2m_ctx, struct type *re
      unions without destructors keep the classic call-arg-area path for less
      stack growth; classes always use ALLOCA (they may have user ~T()). */
   temp = get_new_temp (c2m_ctx, MIR_T_I64);
-  if (ret_type->mode == TM_CLASS) ensure_class_type_layout (c2m_ctx, ret_type);
   csize = type_size (c2m_ctx, ret_type);
   if (csize == 0) csize = 1;
   if (ret_type->mode == TM_CLASS) {
@@ -24410,12 +24361,9 @@ static void MIR_UNUSED simple_add_ret_ops (c2m_ctx_t c2m_ctx, struct type *ret_t
   if (!simple_return_by_addr_p (c2m_ctx, ret_type)) {
     VARR_PUSH (MIR_op_t, ret_ops, val.mir_op);
   } else {
-    mir_size_t rsz;
-    if (ret_type->mode == TM_CLASS) ensure_class_type_layout (c2m_ctx, ret_type);
-    rsz = type_size (c2m_ctx, ret_type);
     ret_addr_reg = MIR_reg (ctx, RET_ADDR_NAME, curr_func->u.func);
     var = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_I8, 0, ret_addr_reg, 0, 1));
-    if (rsz > 0) block_move (c2m_ctx, var, val, rsz);
+    block_move (c2m_ctx, var, val, type_size (c2m_ctx, ret_type));
   }
 }
 

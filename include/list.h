@@ -39,9 +39,9 @@
  * ListView<T> is a non-owning window over a list buffer (or C array):
  *   auto v = fleet.View();                 // borrows fleet.data
  *   int n  = v.CountWhere((Ship s) => s.IsAlive());  // no intermediate List
- *   auto copy = v.ToList();                // or List.FromView(v)
+ *   auto copy = v.ToList();                // materialize only when needed
  * The view must not outlive its source.  Prefer CountWhere / Any / All / Find
- * on List or ListView for real-time scans; use Where / ToList when you need a new list.
+ * on List or ListView for real-time scans; use Where only when you need a new list.
  *
  * Move-only: bare assign / copy-init of List is an error (buffer alias).
  *   auto b = move a;   or   b = move a;   transfers ownership; source emptied.
@@ -592,7 +592,8 @@ class List<T> {
         return ListView<T>(this->data, this->length);
     }
 
-    /* Materialize a ListView into a fresh List (also ListView.ToList()). */
+    /* Materialize a ListView into a fresh List (preferred over ListView.ToList
+     * for move-return reliability: same-class List→List). */
     static List<T> FromView(ListView<T> v) __attribute__((da_ignore)) {
         auto result = List<T>();
         int n = v.Count();
@@ -1031,9 +1032,6 @@ class ListView<T> {
 
 
 
-    /* Materialize into an owning List shell (element copies).  Move-return
-     * of List from ListView relies on ensure_class_type_layout so RBLK size
-     * is 24 (not 0) when the method was typed while List was still incomplete. */
     List<T> ToList() __attribute__((da_ignore)) {
         auto r = List<T>();
         int i;
@@ -1041,6 +1039,10 @@ class ListView<T> {
             r.Add(this->Get(i));
         return move r;
     }
+
+    /* Prefer List.FromView(view) to materialize — returning List from a
+     * ListView method currently mishandles move-only List shells (double free).
+     * Scans (CountWhere/Any/Find) stay on the view. */
 };
 
 
