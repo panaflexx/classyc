@@ -5035,6 +5035,12 @@ struct parse_ctx {
      class type params for nested-specialization placeholder purposes. */
   int n_method_type_params;
   const char *method_type_params[4];
+  /* When a reserved keyword (e.g. `class`) is seen where an identifier is
+     required, remember it.  Top-level TRY(declaration) often rewinds so that
+     by the time error_recovery runs, curr_token is no longer on the keyword
+     and the generic "syntax error on struct/int" message is useless. */
+  const char *reserved_id_kw; /* NULL, or e.g. "class" */
+  pos_t reserved_id_pos;
 };
 
 #define record_level parse_ctx->record_level
@@ -5084,11 +5090,63 @@ static void record_stop (c2m_ctx_t c2m_ctx, size_t mark, int restore_p) {
   read_token (c2m_ctx);
 }
 
+/* Stash a reserved-keyword-as-identifier misuse.  Kept until the next
+   error_recovery / syntax_error so the message can be reported at the right
+   place even after TRY rewinds the token stream. */
+static void note_reserved_as_identifier (c2m_ctx_t c2m_ctx, const char *kw) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+
+  if (parse_ctx == NULL || kw == NULL) return;
+  if (parse_ctx->reserved_id_kw != NULL) return; /* keep the first site */
+  parse_ctx->reserved_id_kw = kw;
+  parse_ctx->reserved_id_pos = curr_token->pos;
+}
+
+/* Emit the stashed reserved-keyword diagnostic, if any.  Returns 1 if it
+   reported (caller should skip a less-specific syntax_error). */
+static int report_reserved_as_identifier (c2m_ctx_t c2m_ctx) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  const char *kw;
+  pos_t pos;
+
+  if (parse_ctx == NULL || parse_ctx->reserved_id_kw == NULL) return 0;
+  kw = parse_ctx->reserved_id_kw;
+  pos = parse_ctx->reserved_id_pos;
+  parse_ctx->reserved_id_kw = NULL;
+  error (c2m_ctx, pos,
+         "'%s' is a reserved keyword and cannot be used as an identifier "
+         "(ClassyC, like C++, reserves '%s' for class definitions — rename "
+         "the variable, parameter, or member)",
+         kw, kw);
+  return 1;
+}
+
+/* If curr_token is a hard keyword commonly mistaken for an identifier, note
+   it for a clearer diagnostic.  Returns 1 when a note was recorded. */
+static int note_if_reserved_identifier_token (c2m_ctx_t c2m_ctx) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+
+  if (parse_ctx == NULL || curr_token == NULL) return 0;
+  if (curr_token->code == T_CLASS) {
+    note_reserved_as_identifier (c2m_ctx, "class");
+    return 1;
+  }
+  return 0;
+}
+
 static void syntax_error (c2m_ctx_t c2m_ctx, const char *expected_name) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
   FILE *f = c2m_options->message_file;
   pos_t pos = curr_token->pos;
   const char *tok = get_token_name (c2m_ctx, curr_token->code);
+  /* Prefer a stashed reserved-keyword misuse (often at a better location after
+     TRY rewind) over a generic "syntax error on struct/int" message. */
+  if (report_reserved_as_identifier (c2m_ctx)) return;
+  /* curr_token itself is the reserved word (e.g. `p->class`, PT(T_ID) fails). */
+  if (curr_token->code == T_CLASS) {
+    note_reserved_as_identifier (c2m_ctx, "class");
+    if (report_reserved_as_identifier (c2m_ctx)) return;
+  }
   /* When the offending token is a bare identifier, surface its spelling and
      a hint that it isn't a known type.  This catches the very common case of
      a method returning/parameter-taking a class/typedef that hasn't been
@@ -6934,6 +6992,8 @@ DA (post_expr_part) {
         M (T_TYPEOF);
         r = build_id (c2m_ctx, "typeof", idpos);
       } else {
+        /* e.g. `p->class` — class is reserved, not a field name */
+        note_if_reserved_identifier_token (c2m_ctx);
         return err_node;
       }
       // Build the N_FIELD now, then continue the loop so that a following '('
@@ -6987,6 +7047,7 @@ DA (post_expr_part) {
         M (T_TYPEOF);
         r = build_id (c2m_ctx, "typeof", idpos);
       } else {
+        note_if_reserved_identifier_token (c2m_ctx);
         return err_node;
       }
       inner
@@ -8590,6 +8651,10 @@ D (direct_declarator) {
     res = r;
     PT (')');
   } else {
+    /* e.g. `int class = 1;` or `long **(*class)(int)` — `class` is a keyword.
+       Note it even under TRY so error_recovery can report a useful message
+       after the speculative parse rewinds. */
+    note_if_reserved_identifier_token (c2m_ctx);
     return err_node;
   }
   list = NL_NEXT (NL_HEAD (res->u.ops));
@@ -9359,7 +9424,8 @@ D (stmt) {
 static void error_recovery (c2m_ctx_t c2m_ctx, int par_lev, const char *expected) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
 
-  syntax_error (c2m_ctx, expected);
+  /* Prefer "class is reserved" over "syntax error on struct" after TRY rewind. */
+  if (!report_reserved_as_identifier (c2m_ctx)) syntax_error (c2m_ctx, expected);
   if (c2m_options->debug_p) fprintf (stderr, "error recovery: skipping");
   for (;;) {
     if (curr_token->code == T_EOFILE || (par_lev == 0 && curr_token->code == ';')) break;

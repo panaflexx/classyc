@@ -594,72 +594,153 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
                 break;
             }
 
-            case MIR_data_item: {
-                MIR_data_t d = item->u.data;
-                size_t sz = d->nel * _MIR_type_size(ctx, d->el_type);
-                /* Drop only anonymous empty data; a *named* zero-length item
-                   (e.g. an unused __func__ array) must still define a symbol so
-                   that code referencing its address can be linked. */
-                if (sz == 0 && d->name == NULL) break;
-                if (n_datas >= cap_datas) {
-                    cap_datas = cap_datas ? cap_datas * 2 : 32;
-                    datas = realloc(datas, cap_datas * sizeof(data_entry_t));
-                }
-                data_entry_t *de = &datas[n_datas++];
-                de->name = d->name;
-                de->size = sz;
-                de->bytes = sz ? malloc(sz) : NULL;
-                if (sz) memcpy(de->bytes, d->u.els, sz);
-                de->data_offset = 0;
-                de->is_ref_data = 0;
-                de->ref_item = NULL;
-                de->ref_disp = 0;
-                de->item_addr = item->addr;
-                DBG("  data: %s  size=%zu  addr=%p", d->name ? d->name : "(anon)", sz, item->addr);
-                break;
-            }
+            /*
+             * Data / bss / ref_data form *objects* the same way MIR's
+             * load_bss_data_section does: a named item starts an object, then
+             * any number of *anonymous* data/bss/ref items continue it, packed
+             * contiguously (no inter-item padding).  Classyc uses anonymous
+             * MIR_bss for struct-member padding inside global initializers
+             * (e.g. 4 zero bytes between an i32 and the next pointer).  Those
+             * zeros must stay in .data at the right offset — if we shunt them
+             * into .bss the later pointer fields slide left and function
+             * pointers in tables like oggenc's `formats[]` become garbage.
+             *
+             * Pure-bss objects (named bss + optional anon bss) still go to
+             * .bss.  Mixed objects go entirely to .data (bss pieces as zeros).
+             */
+            case MIR_data_item:
+            case MIR_ref_data_item:
+            case MIR_bss_item:
+            case MIR_lref_data_item:
+            case MIR_expr_data_item: {
+                /* Only start an object on a named item (or a lone anonymous
+                   that MIR would still load as a section head).  Anonymous
+                   continuations are consumed by the object that started
+                   earlier; if we see a stray anonymous here it is a section
+                   head with no name (rare) — still process it as an object. */
+                MIR_item_t head = item;
+                MIR_item_t curr;
+                int has_non_bss = 0;
 
-            case MIR_ref_data_item: {
-                MIR_ref_data_t rd = item->u.ref_data;
-                if (n_datas >= cap_datas) {
-                    cap_datas = cap_datas ? cap_datas * 2 : 32;
-                    datas = realloc(datas, cap_datas * sizeof(data_entry_t));
+                /* Walk the contiguous object and decide pure-bss vs mixed. */
+                for (curr = head; curr != NULL; curr = DLIST_NEXT(MIR_item_t, curr)) {
+                    if (curr != head) {
+                        /* Continuation must be anonymous dataish. */
+                        const char *n = NULL;
+                        if (curr->item_type == MIR_data_item) n = curr->u.data->name;
+                        else if (curr->item_type == MIR_ref_data_item) n = curr->u.ref_data->name;
+                        else if (curr->item_type == MIR_bss_item) n = curr->u.bss->name;
+                        else if (curr->item_type == MIR_lref_data_item) n = curr->u.lref_data->name;
+                        else if (curr->item_type == MIR_expr_data_item) n = curr->u.expr_data->name;
+                        else break;
+                        if (n != NULL) break;
+                    } else {
+                        /* Head must be dataish (we are in those cases). */
+                    }
+                    if (curr->item_type == MIR_data_item
+                        || curr->item_type == MIR_ref_data_item
+                        || curr->item_type == MIR_lref_data_item
+                        || curr->item_type == MIR_expr_data_item)
+                        has_non_bss = 1;
+                    else if (curr->item_type != MIR_bss_item)
+                        break;
                 }
-                data_entry_t *de = &datas[n_datas++];
-                de->name = rd->name;
-                de->size = 8;
-                de->bytes = calloc(1, 8);
-                de->data_offset = 0;
-                de->is_ref_data = 1;
-                de->ref_item = rd->ref_item;
-                de->ref_disp = rd->disp;
-                de->item_addr = item->addr;
-                DBG("  ref_data: %s -> %s + %ld",
-                    rd->name ? rd->name : "(anon)",
-                    MIR_item_name(ctx, rd->ref_item), (long)rd->disp);
-                break;
-            }
 
-            case MIR_bss_item: {
-                MIR_bss_t b = item->u.bss;
-                if (n_bsses >= cap_bsses) {
-                    cap_bsses = cap_bsses ? cap_bsses * 2 : 16;
-                    bsses = realloc(bsses, cap_bsses * sizeof(bss_entry_t));
+                /* Emit each piece of the object.  `curr` is the first item
+                   *not* in this object (or NULL).  Advance the outer loop by
+                   walking pieces and setting item to the last one emitted. */
+                MIR_item_t last = head;
+                for (MIR_item_t p = head; p != curr; p = DLIST_NEXT(MIR_item_t, p)) {
+                    last = p;
+                    if (p->item_type == MIR_bss_item) {
+                        MIR_bss_t b = p->u.bss;
+                        if (!has_non_bss) {
+                            /* Pure bss object → .bss section */
+                            if (n_bsses >= cap_bsses) {
+                                cap_bsses = cap_bsses ? cap_bsses * 2 : 16;
+                                bsses = realloc(bsses, cap_bsses * sizeof(bss_entry_t));
+                            }
+                            bss_entry_t *be = &bsses[n_bsses++];
+                            be->name = b->name;
+                            be->len = b->len;
+                            be->bss_offset = 0;
+                            be->item_addr = p->addr;
+                            if (b->name)
+                                DBG("  bss: %s  len=%lu  addr=%p", b->name,
+                                    (unsigned long)b->len, p->addr);
+                        } else {
+                            /* Mixed object: emit zero-filled .data padding */
+                            if (b->len == 0 && b->name == NULL) continue;
+                            if (n_datas >= cap_datas) {
+                                cap_datas = cap_datas ? cap_datas * 2 : 32;
+                                datas = realloc(datas, cap_datas * sizeof(data_entry_t));
+                            }
+                            data_entry_t *de = &datas[n_datas++];
+                            de->name = b->name;
+                            de->size = b->len;
+                            de->bytes = b->len ? calloc(1, b->len) : NULL;
+                            de->data_offset = 0;
+                            de->is_ref_data = 0;
+                            de->ref_item = NULL;
+                            de->ref_disp = 0;
+                            de->item_addr = p->addr;
+                            DBG("  data(bss-pad): %s  size=%lu",
+                                b->name ? b->name : "(anon)", (unsigned long)b->len);
+                        }
+                    } else if (p->item_type == MIR_data_item) {
+                        MIR_data_t d = p->u.data;
+                        size_t sz = d->nel * _MIR_type_size(ctx, d->el_type);
+                        if (sz == 0 && d->name == NULL) continue;
+                        if (n_datas >= cap_datas) {
+                            cap_datas = cap_datas ? cap_datas * 2 : 32;
+                            datas = realloc(datas, cap_datas * sizeof(data_entry_t));
+                        }
+                        data_entry_t *de = &datas[n_datas++];
+                        de->name = d->name;
+                        de->size = sz;
+                        de->bytes = sz ? malloc(sz) : NULL;
+                        if (sz) memcpy(de->bytes, d->u.els, sz);
+                        de->data_offset = 0;
+                        de->is_ref_data = 0;
+                        de->ref_item = NULL;
+                        de->ref_disp = 0;
+                        de->item_addr = p->addr;
+                        DBG("  data: %s  size=%zu  addr=%p",
+                            d->name ? d->name : "(anon)", sz, p->addr);
+                    } else if (p->item_type == MIR_ref_data_item) {
+                        MIR_ref_data_t rd = p->u.ref_data;
+                        if (n_datas >= cap_datas) {
+                            cap_datas = cap_datas ? cap_datas * 2 : 32;
+                            datas = realloc(datas, cap_datas * sizeof(data_entry_t));
+                        }
+                        data_entry_t *de = &datas[n_datas++];
+                        de->name = rd->name;
+                        de->size = 8;
+                        de->bytes = calloc(1, 8);
+                        de->data_offset = 0;
+                        de->is_ref_data = 1;
+                        de->ref_item = rd->ref_item;
+                        de->ref_disp = rd->disp;
+                        de->item_addr = p->addr;
+                        DBG("  ref_data: %s -> %s + %ld",
+                            rd->name ? rd->name : "(anon)",
+                            MIR_item_name(ctx, rd->ref_item), (long)rd->disp);
+                    } else if (p->item_type == MIR_lref_data_item
+                               || p->item_type == MIR_expr_data_item) {
+                        /* Not yet supported for AOT object emission. */
+                        fprintf(stderr,
+                                "warning: b2obj: skipping unsupported %s item in data object\n",
+                                p->item_type == MIR_lref_data_item ? "lref_data" : "expr_data");
+                    }
                 }
-                bss_entry_t *be = &bsses[n_bsses++];
-                be->name = b->name;
-                be->len = b->len;
-                be->bss_offset = 0;
-                be->item_addr = item->addr;
-                if (b->name)
-                    DBG("  bss: %s  len=%lu  addr=%p", b->name, (unsigned long)b->len, item->addr);
+                /* Outer for-loop will DLIST_NEXT from item; point item at last
+                   so the next iteration starts at curr. */
+                item = last;
                 break;
             }
 
             case MIR_forward_item:
             case MIR_proto_item:
-            case MIR_lref_data_item:
-            case MIR_expr_data_item:
                 break;
 
             default:
