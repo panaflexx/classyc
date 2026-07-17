@@ -46,7 +46,7 @@
 
 enum {
     N_PLANETS     = 18,
-    N_SHIPS       = 56,
+    N_SHIPS       = 1000,
     N_CARGO       = 8,
     WORLD_W       = 1000,
     WORLD_H       = 700,
@@ -125,6 +125,7 @@ class Ship {
     int     kills;
     int     trades;
     int     alive;
+	double  death_time;    // time of death
     float   angle;         /* heading for glyph */
 
     Ship(int id, String name, Faction f, int planet_id, int credits) {
@@ -143,6 +144,7 @@ class Ship {
         this.trades = 0;
         this.alive = 1;
         this.angle = 0;
+		this.death_time = 0;
         int i;
         for (i = 0; i < N_CARGO; i++) this.cargo[i] = 0;
     }
@@ -167,14 +169,18 @@ class Ship {
         cargo_tons -= qty;
         return 1;
     }
-    void Damage(int d) {
+    void Damage(double frame_start, int d) {
         hull -= d;
-        if (hull <= 0) { hull = 0; alive = 0; }
+		//printf(f"Damage! {name} took {d} damage!");
+        if (hull <= 0)
+			 { hull = 0; alive = 0; death_time=frame_start; /*printf(" AND DIED!\n");*/ }
+		//else
+		//	printf("\n");
     }
     void Repair(int r) {
         hull += r;
         if (hull > 100) hull = 100;
-        if (hull > 0) alive = 1;
+        if (hull > 0) { /*printf(f"RESURRECTED {name}\n");*/ alive = 1; death_time = 0; }
     }
 
     String ToString() {
@@ -235,7 +241,7 @@ static const char *prof_names[PROF_N] = {
     "swap+poll"
 };
 
-static int    g_profile = 0;
+static int    g_profile = 1;
 static double g_prof_ms[PROF_N];
 static int    g_prof_frames = 0;
 
@@ -525,7 +531,7 @@ int FindTargetAtPlanet(List<Ship> *fleet, int aggressor, int planet_id) {
 }
 
 void DoBattle(List<Ship> *fleet, List<Planet> *world, List<BattleFx> *fx,
-              int *deaths, int *battles) {
+              int *deaths, int *battles, double frame_start) {
     int a = PickDockedShip(fleet);
     if (a < 0) return;
     Ship *ta = fleet.GetMut(a);
@@ -554,8 +560,8 @@ void DoBattle(List<Ship> *fleet, List<Planet> *world, List<BattleFx> *fx,
     if (ta.hull < 40) da = da * 2 / 3;
     if (tb.hull < 40) db = db * 2 / 3;
 
-    ta.Damage(db);
-    tb.Damage(da);
+    ta.Damage(frame_start, db);
+    tb.Damage(frame_start, da);
     (*battles)++;
 
     int fatal = 0;
@@ -575,7 +581,7 @@ void DoBattle(List<Ship> *fleet, List<Planet> *world, List<BattleFx> *fx,
 }
 
 void TickSim(List<Ship> *fleet, List<Planet> *world, List<BattleFx> *fx,
-             int *deaths, int *battles, float dt) {
+             int *deaths, int *battles,double frame_start, float dt) {
     int n = fleet.Count();
     int base = rnd(0, n - 1);
     int k;
@@ -586,7 +592,7 @@ void TickSim(List<Ship> *fleet, List<Planet> *world, List<BattleFx> *fx,
     }
     /* Several engagement rolls per tick — targets are co-located rivals */
     for (k = 0; k < 8; k++)
-        DoBattle(fleet, world, fx, deaths, battles);
+        DoBattle(fleet, world, fx, deaths, battles, frame_start);
 
     /* Light repairs only — don't undo combat every tick */
     for (k = 0; k < 4; k++) {
@@ -595,6 +601,7 @@ void TickSim(List<Ship> *fleet, List<Planet> *world, List<BattleFx> *fx,
         if (!t.IsAlive()) {
             /* occasional salvage rebuild so the map stays populated */
             if (rnd(0, 180) == 0) {
+				//printf(f"Salvage {t.name}\n");
                 t.Repair(55);
                 t.credits = 1500 + rnd(0, 2500);
                 t.kills = 0;
@@ -694,7 +701,8 @@ void DrawStars(NVGcontext *vg, float x, float y, float w, float h, float t) {
         int a = (int)(40 + 160 * tw);
         float r = 0.6f + (float)(u % 3) * 0.45f;
         nvgBeginPath(vg);
-        nvgCircle(vg, sx, sy, r);
+        //nvgCircle(vg, sx, sy, r);
+        nvgRect(vg, sx, sy, 3,3);
         nvgFillColor(vg, nvgRGBA(220, 230, 255, a));
         nvgFill(vg);
     }
@@ -775,14 +783,18 @@ void DrawPlanet(NVGcontext *vg, Planet p, float sx, float sy, float scale,
     }
 }
 
-void DrawShip(NVGcontext *vg, Ship s, float sx, float sy, float scale) {
+void DrawShip(NVGcontext *vg, Ship s, float sx, float sy, float scale, double frame_start) {
     float sz = 5.5f * scale;
 
+	//printf(f"{s.name} {s.alive} calc { frame_start - s.death_time}\n");
+
     /* wreck — grey X so kills stay visible on the map */
-    if (!s.IsAlive()) {
+    if (!s.IsAlive() && (frame_start-s.death_time < 5.0)) {
+		//printf(f"DEAD {s.name} {s.alive} calc {frame_start} {s.death_time} - { frame_start - s.death_time}\n");
+		int alpha= (int)( 255.0 * (5-frame_start-s.death_time / 5));
         nvgSave(vg);
         nvgTranslate(vg, sx, sy);
-        nvgStrokeColor(vg, nvgRGBA(180, 90, 90, 160));
+        nvgStrokeColor(vg, nvgRGBA(180, 90, 90, alpha/2));
         nvgStrokeWidth(vg, 1.8f * scale);
         nvgBeginPath(vg);
         nvgMoveTo(vg, -sz, -sz);
@@ -792,12 +804,14 @@ void DrawShip(NVGcontext *vg, Ship s, float sx, float sy, float scale) {
         nvgStroke(vg);
         nvgBeginPath(vg);
         nvgCircle(vg, 0, 0, sz * 0.9f);
-        nvgStrokeColor(vg, nvgRGBA(120, 40, 40, 90));
+        nvgStrokeColor(vg, nvgRGBA(120, 40, 40, alpha/3));
         nvgStrokeWidth(vg, 1.0f);
         nvgStroke(vg);
         nvgRestore(vg);
         return;
     }
+    if (!s.IsAlive())
+		return;
 
     if (s.IsTraveling()) sz *= 0.9f;
 
@@ -1234,7 +1248,7 @@ int main(void) {
         if (!g_paused) {
             int s;
             for (s = 0; s < g_speed; s++) {
-                TickSim(&fleet, &world, &fx, &deaths, &battles, dt);
+                TickSim(&fleet, &world, &fx, &deaths, &battles, frame_start, dt);
                 tick++;
             }
         } else {
@@ -1323,7 +1337,7 @@ int main(void) {
             if (g_filter >= 0 && s.FactionKey() != g_filter) continue;
             float sx, sy;
             WorldToScreen(s.x, s.y, map_x, map_y, map_w, map_h, &sx, &sy);
-            DrawShip(vg, s, sx, sy, scale * 1.1f);
+            DrawShip(vg, s, sx, sy, scale * 1.1f, frame_start);
         }
         t1 = prof_now();
         if (g_profile) g_prof_ms[PROF_SHIPS] += t1 - t0;

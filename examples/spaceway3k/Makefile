@@ -16,7 +16,7 @@ INCLUDE   := $(ROOT)/include
 
 NANOVG_SRC := $(ROOT)/PROJ/nanogui2/ext/nanovg/src
 NANOVG_EX  := $(ROOT)/PROJ/nanogui2/ext/nanovg/example
-LIBNANOVG  := $(NANOVG_SRC)/libnanovg.bmir
+LIBNANOVG  := ./libnanovg.bmir
 
 SRC := spaceway3k.cy
 
