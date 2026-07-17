@@ -1,13 +1,14 @@
 /* list.h — Generic dynamic-array collection for ClassyC
  *
- * Provides a production-ready List<T> with 30 methods covering:
+ * Provides a production-ready List<T> with methods covering:
  *   · Constructors (default, capacity, singleton, array-view)
  *   · Accessors    (Count, Capacity, IsEmpty, Get, GetMut, First, FirstMut, Last)
  *   · Capacity     (EnsureCapacity, TrimExcess)
  *   · Mutation     (Set, Add, Insert, Pop, RemoveAt, Remove, Clear)
  *   · Search       (IndexOf, LastIndexOf, Contains)
  *   · Transform    (Reverse, Sort, Concat, Slice, Copy, Equals)
- *   · Higher-order (ForEach, Filter)
+ *   · Higher-order (ForEach, Filter, Where, CountWhere, …)
+ *   · Views        (ListView<T> — non-owning span; View() / CountWhere)
  *
  * Usage:
  *   #include "list.h"
@@ -34,6 +35,13 @@
  * Slice/Copy/Filter/Where/Select/Plus/Take/Skip/… return List<T> by value
  * (RAII shells — no owned/delete needed for local pipelines). Results are
  * always non-owning of T* pointees — they never copy the source .owns() flag.
+ *
+ * ListView<T> is a non-owning window over a list buffer (or C array):
+ *   auto v = fleet.View();                 // borrows fleet.data
+ *   int n  = v.CountWhere((Ship s) => s.IsAlive());  // no intermediate List
+ *   auto copy = v.ToList();                // or List.FromView(v)
+ * The view must not outlive its source.  Prefer CountWhere / Any / All / Find
+ * on List or ListView for real-time scans; use Where / ToList when you need a new list.
  *
  * Move-only: bare assign / copy-init of List is an error (buffer alias).
  *   auto b = move a;   or   b = move a;   transfers ownership; source emptied.
@@ -94,6 +102,10 @@ dict dict_create_string(char *s);
 int  dict_array_append(dict array_val, dict new_val);
 int  dict_object_set(dict obj_val, char *key, dict new_val);
 void dict_destroy(dict v);
+
+/* Forward decl so List.View() can return ListView before the body is defined.
+ * Completing definition is after class List (uses List in ToList). */
+class ListView<T>;
 
 class List<T> {
     T*  data;
@@ -554,12 +566,39 @@ class List<T> {
         return move result;
     }
 
-    /* Where == Filter. Non-owning view for T*; by-value T is copied. */
+    /* Where == Filter. Non-owning view for T*; by-value T is copied.
+     * Allocates a new List — for counts use CountWhere / View().CountWhere. */
     List<T> Where(int(*pred)(T)) __attribute__((da_ignore)) {
         auto result = List<T>();
         for (int i = 0; i < this->length; i++) {
             if (pred(this->Get(i))) result.Add(this->Get(i));
         }
+        return move result;
+    }
+
+    /* Non-allocating: how many elements satisfy pred.  Capturing lambdas
+     * open-code (Strategy A), same as Where/Any. */
+    int CountWhere(int(*pred)(T)) __attribute__((da_ignore)) {
+        int n = 0;
+        for (int i = 0; i < this->length; i++) {
+            if (pred(this->Get(i))) n++;
+        }
+        return n;
+    }
+
+    /* Non-owning span over this list's buffer.  Must not outlive the List
+     * (or survive Add that reallocates).  Cheap to copy. */
+    ListView<T> View() __attribute__((da_ignore)) {
+        return ListView<T>(this->data, this->length);
+    }
+
+    /* Materialize a ListView into a fresh List (also ListView.ToList()). */
+    static List<T> FromView(ListView<T> v) __attribute__((da_ignore)) {
+        auto result = List<T>();
+        int n = v.Count();
+        int i;
+        for (i = 0; i < n; i++)
+            result.Add(v.Get(i));
         return move result;
     }
 
@@ -894,6 +933,114 @@ class List<T> {
         return this->ToJson();
     }
 
+};
+
+/* ── ListView<T> — non-owning span over T[length] ──────────────────────────
+ * Cheap to copy (pointer + length).  Does not free data.  Lifetime ≤ source.
+ * Implements Count/Get so for-in and HOF open-code work like List.
+ * Defined after List so ToList() can return List<T> by value. */
+class ListView<T> {
+    T*  data;
+    int length;
+
+    ListView() {
+        this->data = NULL;
+        this->length = 0;
+    }
+    /* Borrow `n` elements starting at `items`.  Non-owning. */
+    ListView(T* items, int n) {
+        this->data = items;
+        this->length = n > 0 ? n : 0;
+    }
+    ~ListView() { /* non-owning — never free data */ }
+
+    int Count()   { return this->length; }
+    int IsEmpty() { return this->length == 0; }
+
+    T Get(int index) {
+        if (index < 0 || index >= this->length)
+            throw(OutOfBoundsException, "ListView.Get oob");
+        return *(this->data + index);
+    }
+    T* GetMut(int index) __attribute__((da_ignore)) {
+        if (index < 0 || index >= this->length)
+            throw(OutOfBoundsException, "ListView.GetMut oob");
+        return this->data + index;
+    }
+    T First() {
+        if (this->length == 0) throw(OutOfBoundsException, "ListView.First empty");
+        return *(this->data + 0);
+    }
+    T Last() {
+        if (this->length == 0) throw(OutOfBoundsException, "ListView.Last empty");
+        return *(this->data + (this->length - 1));
+    }
+
+    /* Sub-window — still non-owning. */
+    ListView<T> Slice(int start, int count) __attribute__((da_ignore)) {
+        if (start < 0) start = 0;
+        if (start > this->length) start = this->length;
+        if (count < 0) count = 0;
+        if (start + count > this->length) count = this->length - start;
+        return ListView<T>(this->data + start, count);
+    }
+
+    /* ── Non-allocating scans (prefer over Where for counts / existence) ── */
+
+    int CountWhere(int(*pred)(T)) __attribute__((da_ignore)) {
+        int n = 0;
+        for (int i = 0; i < this->length; i++) {
+            if (pred(this->Get(i))) n++;
+        }
+        return n;
+    }
+    int Any(int(*pred)(T)) __attribute__((da_ignore)) {
+        for (int i = 0; i < this->length; i++) {
+            if (pred(this->Get(i))) return 1;
+        }
+        return 0;
+    }
+    int All(int(*pred)(T)) __attribute__((da_ignore)) {
+        for (int i = 0; i < this->length; i++) {
+            if (!pred(this->Get(i))) return 0;
+        }
+        return 1;
+    }
+    T Find(int(*pred)(T)) __attribute__((da_ignore)) {
+        for (int i = 0; i < this->length; i++) {
+            T item = this->Get(i);
+            if (pred(item)) return item;
+        }
+        T z;
+        memset((void*)&z, 0, sizeof(T));
+        return z;
+    }
+    T FindOr(T fb, int(*pred)(T)) __attribute__((da_ignore)) {
+        for (int i = 0; i < this->length; i++) {
+            T item = this->Get(i);
+            if (pred(item)) return item;
+        }
+        return fb;
+    }
+    void ForEach(void(*action)(T)) __attribute__((da_ignore)) {
+        for (int i = 0; i < this->length; i++) {
+            T item = this->Get(i);
+            action(item);
+        }
+    }
+
+
+
+    /* Materialize into an owning List shell (element copies).  Move-return
+     * of List from ListView relies on ensure_class_type_layout so RBLK size
+     * is 24 (not 0) when the method was typed while List was still incomplete. */
+    List<T> ToList() __attribute__((da_ignore)) {
+        auto r = List<T>();
+        int i;
+        for (i = 0; i < this->length; i++)
+            r.Add(this->Get(i));
+        return move r;
+    }
 };
 
 

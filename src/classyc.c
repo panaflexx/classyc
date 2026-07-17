@@ -412,8 +412,14 @@ struct type {
   = {.raw_size = MIR_SIZE_MAX, .align = -1, .mode = TM_BASIC, .u = {.basic_type = TP_VOID}};
 
 static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type);
+static void set_class_layout (c2m_ctx_t c2m_ctx, node_t decl_node, struct type *type);
+static void ensure_class_type_layout (c2m_ctx_t c2m_ctx, struct type *type);
 
 static mir_size_t raw_type_size (c2m_ctx_t c2m_ctx, struct type *type) {
+  /* Classes may still have sticky size 0 from an earlier incomplete layout
+     pass (ListView while only forward-declared).  Recompute before trusting
+     raw_size for stack allocation / ABI. */
+  if (type != NULL && type->mode == TM_CLASS) ensure_class_type_layout (c2m_ctx, type);
   if (type->raw_size == MIR_SIZE_MAX) set_type_layout (c2m_ctx, type);
   if (n_errors != 0 && type->raw_size == MIR_SIZE_MAX) {
     /* Use safe values for programs with errors: */
@@ -4913,6 +4919,18 @@ typedef struct {
 
 DEF_VARR (generic_tmpl_t);
 
+/* Specializations requested while the target template was still incomplete
+   (class Name<T>; only).  Queued as mangled placeholders; drained when the
+   completing class Name<T> { ... } body is registered. */
+typedef struct {
+  const char *base_name;
+  int n_args;
+  node_t args[4];
+  pos_t pos;
+} generic_deferred_spec_t;
+
+DEF_VARR (generic_deferred_spec_t);
+
 /* Specialization cache: tracks which List<String>, List<int>, etc. have been created.
    n_args/args retain the concrete type arguments so method specialization can
    re-bind class type params (T) from a receiver like `__generic_List_int`. */
@@ -5025,6 +5043,7 @@ struct parse_ctx {
   VARR (generic_tmpl_t) * generic_templates; /* registered generic class templates */
   VARR (generic_spec_t) * generic_specs;     /* created specializations (dedup cache) */
   VARR (generic_crossref_t) * generic_crossrefs; /* pending cross-generic refs */
+  VARR (generic_deferred_spec_t) * generic_deferred_specs; /* incomplete-template wait queue */
   VARR (iface_t) * interfaces;               /* registered interface contracts */
   VARR (generic_fn_tmpl_t) * generic_fn_templates; /* registered generic function templates */
   VARR (generic_fn_spec_t) * generic_fn_specs;     /* generic function specialization cache */
@@ -5053,6 +5072,7 @@ struct parse_ctx {
 #define generic_templates parse_ctx->generic_templates
 #define generic_specs parse_ctx->generic_specs
 #define generic_crossrefs parse_ctx->generic_crossrefs
+#define generic_deferred_specs parse_ctx->generic_deferred_specs
 #define interfaces parse_ctx->interfaces
 #define generic_fn_templates parse_ctx->generic_fn_templates
 #define generic_fn_specs parse_ctx->generic_fn_specs
@@ -5441,6 +5461,24 @@ static generic_tmpl_t *get_generic_template (c2m_ctx_t c2m_ctx, const char *name
     if (strcmp (t->name, name) == 0) return t;
   }
   return NULL;
+}
+
+/* Index of template `name`, or (size_t)-1.  Used when completing a forward decl. */
+static size_t get_generic_template_index (c2m_ctx_t c2m_ctx, const char *name) {
+  if (c2m_ctx->parse_ctx == NULL || name == NULL) return (size_t)-1;
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  VARR (generic_tmpl_t) *gt = generic_templates;
+  if (gt == NULL) return (size_t)-1;
+  for (size_t i = 0; i < VARR_LENGTH (generic_tmpl_t, gt); i++) {
+    if (strcmp (VARR_GET (generic_tmpl_t, gt, i).name, name) == 0) return i;
+  }
+  return (size_t)-1;
+}
+
+/* True if the template is registered but still incomplete (class Name<T>; with
+   no body yet, or mid-parse pre-registration before '}' ). */
+static int generic_template_incomplete_p (generic_tmpl_t *t) {
+  return t != NULL && t->class_node == NULL;
 }
 
 /* Phase 2: Any<I> erased-handle synthesis (defined after find_interface).
@@ -6139,15 +6177,37 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
            base_name, tmpl->n_type_params, n_args);
     return build_id (c2m_ctx, base_name, pos);
   }
-  /* The template body never finished parsing (e.g. a syntax error inside the
-     generic class definition left class_node un-backfilled).  Specialising a
-     NULL body would yield a NULL N_CLASS that later gets dereferenced during
-     module injection, so bail out with a diagnostic instead of crashing. */
+  /* Incomplete template: either still only `class Name<T>;`, or mid-parse
+     body.  Do not error — return a mangled placeholder and queue the concrete
+     args so the specialization is created once the body is registered.
+     Needed for List.View() → ListView while ListView is still forward-decl'd
+     (List_String monomorphization at end of List body drains before ListView's
+     completing definition is seen). */
   if (tmpl->class_node == NULL) {
-    error (c2m_ctx, pos,
-           "cannot instantiate generic class '%s': its definition failed to parse",
-           base_name);
-    return build_id (c2m_ctx, base_name, pos);
+    const char *ph = mangle_generic_name (c2m_ctx, base_name, n_args, args);
+    node_t ph_id = build_id (c2m_ctx, ph, pos);
+    tpname_add (c2m_ctx, ph_id, top_scope != NULL ? top_scope : curr_scope, TRUE);
+    {
+      int dup = 0;
+      for (size_t di = 0; generic_deferred_specs != NULL
+           && di < VARR_LENGTH (generic_deferred_spec_t, generic_deferred_specs); di++) {
+        generic_deferred_spec_t *d
+          = &VARR_ADDR (generic_deferred_spec_t, generic_deferred_specs)[di];
+        if (strcmp (d->base_name, base_name) != 0 || d->n_args != n_args) continue;
+        /* Dedup by mangled name of args (cheap: same n_args + same base). */
+        const char *dm = mangle_generic_name (c2m_ctx, d->base_name, d->n_args, d->args);
+        if (strcmp (dm, ph) == 0) { dup = 1; break; }
+      }
+      if (!dup && generic_deferred_specs != NULL) {
+        generic_deferred_spec_t ds;
+        ds.base_name = base_name;
+        ds.n_args = n_args;
+        for (int ai = 0; ai < 4; ai++) ds.args[ai] = (ai < n_args) ? args[ai] : NULL;
+        ds.pos = pos;
+        VARR_PUSH (generic_deferred_spec_t, generic_deferred_specs, ds);
+      }
+    }
+    return ph_id;
   }
 
   const char *spec_name = mangle_generic_name (c2m_ctx, base_name, n_args, args);
@@ -8282,15 +8342,40 @@ DA (type_spec) {
              is_generic_class_p() / parse_generic_instantiation() during parsing.
              get_or_create_specialization() detects the NULL class_node and returns
              a mangled placeholder name instead of materialising a real class;
-             specialize_node() later resolves the placeholder to the concrete name. */
+             specialize_node() later resolves the placeholder to the concrete name.
+
+             If a prior `class Name<T>;` forward declaration already registered
+             the name with class_node == NULL, complete that slot instead of
+             pushing a second template (which would hide the real body). */
           if (n_type_params > 0 && id_p) {
-            generic_tmpl_t pre;
-            pre.name        = op1->u.s.s;
-            pre.class_node  = NULL; /* back-filled after body is parsed */
-            pre.n_type_params = n_type_params;
-            for (int _i = 0; _i < 4; _i++) pre.type_params[_i] = type_params[_i];
-            VARR_PUSH (generic_tmpl_t, generic_templates, pre);
-            generic_tmpl_preidx = VARR_LENGTH (generic_tmpl_t, generic_templates) - 1;
+            size_t exist_i = get_generic_template_index (c2m_ctx, op1->u.s.s);
+            if (exist_i != (size_t)-1) {
+              generic_tmpl_t *exist
+                = VARR_ADDR (generic_tmpl_t, generic_templates) + exist_i;
+              if (exist->class_node != NULL) {
+                error (c2m_ctx, pos, "redefinition of generic class '%s'", op1->u.s.s);
+              } else if (exist->n_type_params != n_type_params) {
+                error (c2m_ctx, pos,
+                       "generic class '%s' forward-declared with %d type parameter(s), "
+                       "defined with %d",
+                       op1->u.s.s, exist->n_type_params, n_type_params);
+              } else {
+                /* Completing a forward declaration: reuse the slot, refresh
+                   type-param names from this definition. */
+                for (int _i = 0; _i < 4; _i++)
+                  exist->type_params[_i] = type_params[_i];
+                exist->n_type_params = n_type_params;
+                generic_tmpl_preidx = exist_i;
+              }
+            } else {
+              generic_tmpl_t pre;
+              pre.name        = op1->u.s.s;
+              pre.class_node  = NULL; /* back-filled after body is parsed */
+              pre.n_type_params = n_type_params;
+              for (int _i = 0; _i < 4; _i++) pre.type_params[_i] = type_params[_i];
+              VARR_PUSH (generic_tmpl_t, generic_templates, pre);
+              generic_tmpl_preidx = VARR_LENGTH (generic_tmpl_t, generic_templates) - 1;
+            }
             generic_body_xref_mark = VARR_LENGTH (generic_crossref_t, generic_crossrefs);
           }
           P (class_member_list);
@@ -8305,6 +8390,36 @@ DA (type_spec) {
       PT ('}');
     } else if (!id_p) {
       return err_node;
+    } else if (struct_p == 3 && n_type_params > 0) {
+      /* Generic class forward declaration:  class ListView<T>;
+         Registers the template name (incomplete, class_node == NULL) so peer
+         classes may use ListView<T> as a return/parameter type.  A later
+         class ListView<T> { ... } completes the same registry slot. */
+      if (id_p) tpname_add (c2m_ctx, op1, curr_scope, TRUE);
+      {
+        size_t exist_i = get_generic_template_index (c2m_ctx, op1->u.s.s);
+        if (exist_i != (size_t)-1) {
+          generic_tmpl_t *exist
+            = VARR_ADDR (generic_tmpl_t, generic_templates) + exist_i;
+          if (exist->n_type_params != n_type_params) {
+            error (c2m_ctx, pos,
+                   "generic class '%s' redeclared with %d type parameter(s) "
+                   "(was %d)",
+                   op1->u.s.s, n_type_params, exist->n_type_params);
+          }
+          /* Redundant forward after forward, or after complete definition: OK. */
+        } else {
+          generic_tmpl_t tmpl;
+          tmpl.name = op1->u.s.s;
+          tmpl.class_node = NULL; /* incomplete until body definition */
+          tmpl.n_type_params = n_type_params;
+          for (int _i = 0; _i < 4; _i++) tmpl.type_params[_i] = type_params[_i];
+          VARR_PUSH (generic_tmpl_t, generic_templates, tmpl);
+        }
+      }
+      /* Emit a lightweight N_CLASS with no members so the declaration is a
+         valid type-specifier; attr sentinel marks it as a template shell. */
+      r = new_node (c2m_ctx, N_IGNORE);
     } else {
       r = new_node (c2m_ctx, N_IGNORE);
     }
@@ -8320,19 +8435,61 @@ DA (type_spec) {
       if (impl_list != NULL) op_append (c2m_ctx, r, impl_list);
       if (n_type_params > 0) {
         /* Generic class template: store in registry, mark with sentinel attr.
-           The base name is registered as a tpname so List<X> can be parsed later. */
+           The base name is registered as a tpname so List<X> can be parsed later.
+
+           Forward declarations (no '{') already registered with class_node NULL
+           above; do not overwrite a complete template with this empty shell. */
         if (id_p) tpname_add (c2m_ctx, op1, curr_scope, TRUE);
         if (generic_tmpl_preidx != (size_t)-1) {
-          /* Back-fill the class_node into the pre-registered entry. */
+          /* Back-fill the class_node into the pre-registered / forward entry. */
           (VARR_ADDR (generic_tmpl_t, generic_templates) + generic_tmpl_preidx)->class_node = r;
+          /* Drain specializations that waited on this incomplete template
+             (e.g. ListView_String requested while only class ListView<T>;). */
+          if (generic_deferred_specs != NULL && id_p) {
+            const char *done_name = op1->u.s.s;
+            size_t di = 0;
+            while (di < VARR_LENGTH (generic_deferred_spec_t, generic_deferred_specs)) {
+              generic_deferred_spec_t d
+                = VARR_GET (generic_deferred_spec_t, generic_deferred_specs, di);
+              if (strcmp (d.base_name, done_name) != 0) {
+                di++;
+                continue;
+              }
+              /* Swap-remove then re-request (template is now complete). */
+              size_t last = VARR_LENGTH (generic_deferred_spec_t, generic_deferred_specs) - 1;
+              if (di != last)
+                VARR_SET (generic_deferred_spec_t, generic_deferred_specs, di,
+                          VARR_GET (generic_deferred_spec_t, generic_deferred_specs, last));
+              VARR_POP (generic_deferred_spec_t, generic_deferred_specs);
+              (void) get_or_create_specialization (c2m_ctx, d.base_name, d.n_args,
+                                                   d.args, d.pos);
+            }
+          }
         } else {
-          /* No pre-registration (forward declaration only, no body): push fresh. */
-          generic_tmpl_t tmpl;
-          tmpl.name = op1->u.s.s;
-          tmpl.class_node = r;
-          tmpl.n_type_params = n_type_params;
-          for (int _i = 0; _i < 4; _i++) tmpl.type_params[_i] = type_params[_i];
-          VARR_PUSH (generic_tmpl_t, generic_templates, tmpl);
+          /* Body-less forward already registered; or non-body path.  Only push
+             if the name is still unknown (should not happen for n_type_params>0
+             with a body — body path always sets preidx). */
+          size_t exist_i = get_generic_template_index (c2m_ctx, op1->u.s.s);
+          if (exist_i == (size_t)-1) {
+            generic_tmpl_t tmpl;
+            tmpl.name = op1->u.s.s;
+            tmpl.class_node = r;
+            tmpl.n_type_params = n_type_params;
+            for (int _i = 0; _i < 4; _i++) tmpl.type_params[_i] = type_params[_i];
+            VARR_PUSH (generic_tmpl_t, generic_templates, tmpl);
+          } else {
+            generic_tmpl_t *exist
+              = VARR_ADDR (generic_tmpl_t, generic_templates) + exist_i;
+            /* Completing definition without preidx only when body path failed
+               to set it; if still incomplete and we have a real member list,
+               fill in.  Forward-only shell (N_IGNORE members) must not clobber. */
+            if (exist->class_node == NULL
+                && NL_HEAD (r->u.ops) != NULL
+                && TAG_MEMBER_LIST (r) != NULL
+                && TAG_MEMBER_LIST (r)->code != N_IGNORE) {
+              exist->class_node = r;
+            }
+          }
         }
         /* Materialise concrete nested specialisations deferred during the body
            (e.g. List<String> referenced from List<T>.SelectString).  class_node
@@ -10311,6 +10468,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (node_t, pending_lambdas, alloc, 8);
   lambda_uid = 0;
   VARR_CREATE (generic_tmpl_t, generic_templates, alloc, 4);
+  VARR_CREATE (generic_deferred_spec_t, generic_deferred_specs, alloc, 4);
   VARR_CREATE (generic_spec_t, generic_specs, alloc, 8);
   VARR_CREATE (generic_crossref_t, generic_crossrefs, alloc, 4);
   VARR_CREATE (local_type_hoist_t, local_type_hoists, alloc, 4);
@@ -10485,6 +10643,8 @@ static void parse_finish (c2m_ctx_t c2m_ctx) {
       VARR_DESTROY (generic_spec_t, generic_specs);
     if (generic_crossrefs != NULL)
       VARR_DESTROY (generic_crossref_t, generic_crossrefs);
+    if (generic_deferred_specs != NULL)
+      VARR_DESTROY (generic_deferred_spec_t, generic_deferred_specs);
     if (local_type_hoists != NULL)
       VARR_DESTROY (local_type_hoist_t, local_type_hoists);
     if (generic_fn_templates != NULL)
@@ -11575,9 +11735,47 @@ static void aux_set_type_align (c2m_ctx_t c2m_ctx, struct type *type) {
   type->align = align;
 }
 
-static mir_size_t type_size (c2m_ctx_t c2m_ctx, struct type *type) {
-  mir_size_t size = raw_type_size (c2m_ctx, type);
+/* Force a complete layout for class types that were sized as incomplete
+   (raw_size MIR_SIZE_MAX or 0) while their definition was not yet visible —
+   e.g. ListView.ToList() return type List<T> when the FUNC type was first
+   built.  Without this, MIR emits `rblk:0(Ret_Addr)` and the move-return
+   never copies into the caller's return buffer (double-free / empty List). */
+static void ensure_class_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
+  node_t members, el;
+  int has_field;
 
+  if (type == NULL || type->mode != TM_CLASS || type->u.tag_type == NULL) return;
+  if (type->raw_size != MIR_SIZE_MAX && type->raw_size != 0) return;
+  members = TAG_MEMBER_LIST (type->u.tag_type);
+  if (members == NULL || members->code == N_IGNORE) return;
+  has_field = 0;
+  for (el = NL_HEAD (members->u.ops); el != NULL; el = NL_NEXT (el)) {
+    if (el->code == N_MEMBER) {
+      has_field = 1;
+      break;
+    }
+  }
+  if (!has_field) return;
+  /* Invalidate sticky 0 / MAX from an earlier incomplete pass and recompute. */
+  type->raw_size = MIR_SIZE_MAX;
+  type->align = -1;
+  set_type_layout (c2m_ctx, type);
+  if ((type->raw_size == MIR_SIZE_MAX || type->raw_size == 0)
+      && !incomplete_type_p (c2m_ctx, type)) {
+    /* incomplete_type_p can still say complete while set_type_layout left
+       MAX if a prior incomplete pass stored MAX with align set; use the
+       dedicated class layout walker. */
+    type->raw_size = MIR_SIZE_MAX;
+    type->align = -1;
+    set_class_layout (c2m_ctx, type->u.tag_type, type);
+  }
+}
+
+static mir_size_t type_size (c2m_ctx_t c2m_ctx, struct type *type) {
+  mir_size_t size;
+
+  if (type != NULL && type->mode == TM_CLASS) ensure_class_type_layout (c2m_ctx, type);
+  size = raw_type_size (c2m_ctx, type);
   return type->align == 0 ? size : round_size (size, type->align);
 }
 
@@ -14351,7 +14549,8 @@ enum hof_kind {
   HOF_ALL,
   HOF_FIND,
   HOF_SORT,
-  HOF_SELECT
+  HOF_SELECT,
+  HOF_COUNTWHERE
 };
 
 static enum hof_kind get_hof_kind (const char *name) {
@@ -14365,6 +14564,7 @@ static enum hof_kind get_hof_kind (const char *name) {
   if (strcmp (name, "Find") == 0) return HOF_FIND;
   if (strcmp (name, "Sort") == 0) return HOF_SORT;
   if (strcmp (name, "Select") == 0) return HOF_SELECT;
+  if (strcmp (name, "CountWhere") == 0) return HOF_COUNTWHERE;
   return HOF_NONE;
 }
 
@@ -14612,6 +14812,12 @@ static int coll_class_kind (struct type *t, const char **kind_out, node_t *cid_o
     if (cid_out) *cid_out = cid;
     return TRUE;
   }
+  /* ListView uses the same Count/Get open-code protocol as List (non-alloc HOFs). */
+  if (strncmp (nm, "__generic_ListView_", 19) == 0) {
+    if (kind_out) *kind_out = "ListView";
+    if (cid_out) *cid_out = cid;
+    return TRUE;
+  }
   if (strncmp (nm, "__generic_Map_", 14) == 0) {
     if (kind_out) *kind_out = "Map";
     if (cid_out) *cid_out = cid;
@@ -14710,7 +14916,8 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
   if (pred_expr == NULL && body != NULL && body->code != N_BLOCK)
     pred_expr = parse_copy_expr (c2m_ctx, body);
   if ((hk == HOF_WHERE || hk == HOF_FILTER || hk == HOF_MAP || hk == HOF_ANY
-       || hk == HOF_ALL || hk == HOF_FIND || hk == HOF_SORT || hk == HOF_SELECT)
+       || hk == HOF_ALL || hk == HOF_FIND || hk == HOF_SORT || hk == HOF_SELECT
+       || hk == HOF_COUNTWHERE)
       && pred_expr == NULL) {
     error (c2m_ctx, POS (lam),
            "capturing HOF lambda must use an expression body or a single `return expr;` "
@@ -14748,7 +14955,8 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
                                  new_node (c2m_ctx, N_LIST));
     result_decl = build_auto_init_decl (c2m_ctx, pos, rname, result_init);
     op_append (c2m_ctx, stmt_list, result_decl);
-  } else if (hk == HOF_ANY) {
+  } else if (hk == HOF_ANY || hk == HOF_COUNTWHERE) {
+    /* int r = 0;  ANY flips to 1; COUNTWHERE increments. */
     op_append (c2m_ctx, stmt_list,
                build_spec_decl (c2m_ctx, pos,
                                 new_node1 (c2m_ctx, N_LIST, new_pos_node (c2m_ctx, N_INT, pos)),
@@ -15086,6 +15294,17 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
       op_append (c2m_ctx, for_body_stmts,
                  new_pos_node4 (c2m_ctx, N_IF, pos, new_node (c2m_ctx, N_LIST), condp, then_blk,
                                 new_node (c2m_ctx, N_IGNORE)));
+    } else if (hk == HOF_COUNTWHERE) {
+      /* if (pred(Get(i))) r = r + 1; */
+      node_t incr_r
+        = new_pos_node2 (c2m_ctx, N_ASSIGN, pos, build_id (c2m_ctx, rname, pos),
+                         new_pos_node2 (c2m_ctx, N_ADD, pos, build_id (c2m_ctx, rname, pos),
+                                        new_i_node (c2m_ctx, 1, pos)));
+      node_t then_stmt
+        = new_pos_node2 (c2m_ctx, N_EXPR, pos, new_node (c2m_ctx, N_LIST), incr_r);
+      op_append (c2m_ctx, for_body_stmts,
+                 new_pos_node4 (c2m_ctx, N_IF, pos, new_node (c2m_ctx, N_LIST), pred_sub,
+                                then_stmt, new_node (c2m_ctx, N_IGNORE)));
     } else {
       return FALSE;
     }
@@ -15180,7 +15399,12 @@ static int try_desugar_capturing_hof_call (c2m_ctx_t c2m_ctx, node_t call) {
   /* Collection-specific HOF membership. */
   if (strcmp (coll_kind, "List") == 0) {
     if (hk == HOF_NONE) return FALSE;
-    /* Sort / Select / Find / Where / … all allowed on List. */
+    /* Sort / Select / Find / Where / CountWhere / … all allowed on List. */
+  } else if (strcmp (coll_kind, "ListView") == 0) {
+    /* Views: non-allocating HOFs only (Where materializes via method, not open-code). */
+    if (hk != HOF_COUNTWHERE && hk != HOF_FOREACH && hk != HOF_ANY && hk != HOF_ALL
+        && hk != HOF_FIND)
+      return FALSE;
   } else if (strcmp (coll_kind, "Map") == 0) {
     if (hk != HOF_WHERE && hk != HOF_FOREACH && hk != HOF_ANY && hk != HOF_ALL)
       return FALSE;
@@ -15482,8 +15706,37 @@ static void materialize_pending_specs (c2m_ctx_t c2m_ctx, size_t mark) {
     node_t *items = reg_malloc (c2m_ctx, n * sizeof (node_t));
     for (size_t i = 0; i < n; i++) items[i] = VARR_GET (node_t, pending_lambdas, mark + i);
     VARR_TRUNC (node_t, pending_lambdas, mark);
-    for (size_t i = 0; i < n; i++) {
+
+    /* Pass 1: inject every pending item into the module list so gen order is
+       stable and class nodes are reachable from the AST. */
+    for (size_t i = 0; i < n; i++)
       DLIST_INSERT_BEFORE (node_t, module_item_list->u.ops, curr_module_item, items[i]);
+
+    /* Pass 2: pre-register every specialized CLASS name as a type before any
+       method signature is checked.  Mutual generics (Host ↔ Peer, List ↔
+       ListView) otherwise fail with "unknown type __generic_X_int" when peer
+       A is checked while peer B is only sitting later in the same batch —
+       return types on signatures are not deferred by defer_method_bodies_p. */
+    for (size_t i = 0; i < n; i++) {
+      node_t cls = items[i];
+      node_t cid;
+      if (cls == NULL || cls->code != N_CLASS) continue;
+      if (cls->attr == (void *)((intptr_t)-1)) continue; /* template shell */
+      cid = NL_HEAD (cls->u.ops);
+      if (cid == NULL || cid->code != N_ID || cid->u.s.s == NULL) continue;
+      {
+        node_t scope = top_scope != NULL ? top_scope : curr_scope;
+        if (scope == NULL) continue;
+        if (find_def (c2m_ctx, S_REGULAR, cid, scope, NULL) == NULL)
+          symbol_insert (c2m_ctx, S_REGULAR, cid, scope, cls, NULL);
+        if (find_def (c2m_ctx, S_TAG, cid, scope, NULL) == NULL)
+          symbol_insert (c2m_ctx, S_TAG, cid, scope, cls, NULL);
+        tpname_add (c2m_ctx, cid, scope, TRUE);
+      }
+    }
+
+    /* Pass 3: full check (class signatures / method bodies per defer flags). */
+    for (size_t i = 0; i < n; i++) {
       if (items[i]->code == N_CLASS)
         check_injected_class (c2m_ctx, items[i]);
       else
@@ -17265,7 +17518,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           const char *fn = VARR_GET (cstr_t, free_names, 0);
           error (c2m_ctx, POS (r),
                  "lambda captures local '%s' but is not a direct argument to "
-                 "Where/Filter/Map/ForEach/Any/All/Find/Sort/Select",
+                 "Where/Filter/Map/ForEach/Any/All/Find/Sort/Select/CountWhere",
                  fn != NULL ? fn : "?");
           error (c2m_ctx, POS (r),
                  "hint: use xs.Where((T x) => …) inline, or pass a non-capturing function");
@@ -21767,20 +22020,35 @@ if (base != NULL && base->code == N_ID) {
        N_ID resolution in check_decl_spec() would emit "unknown type X" when
        a class body mentions a sibling class declared further down in the
        same translation unit.  Plain C semantics for typedefs / structs /
-       functions are unaffected: only N_CLASS nodes are pre-registered. */
+       functions are unaffected: only N_CLASS nodes are pre-registered.
+
+       Also pre-register bare N_CLASS specializations injected from
+       pending_lambdas at parse end (e.g. __generic_Host_int).  Those are
+       not wrapped in N_SPEC_DECL; skipping them breaks mutual generics
+       (Host ↔ Peer, List ↔ ListView) whose method signatures name each other. */
     {
       node_t items = NL_HEAD (r->u.ops);
       if (items != NULL && items->code == N_LIST) {
         for (node_t it = NL_HEAD (items->u.ops); it != NULL; it = NL_NEXT (it)) {
-          if (it->code != N_SPEC_DECL) continue;
-          node_t specs = NL_HEAD (it->u.ops);
-          if (specs == NULL) continue;
-          if (specs->code == N_SHARE) specs = NL_HEAD (specs->u.ops);
-          if (specs == NULL || specs->code != N_LIST) continue;
-          for (node_t s = NL_HEAD (specs->u.ops); s != NULL; s = NL_NEXT (s)) {
-            if (s->code != N_CLASS) continue;
+          node_t classes[4];
+          int n_cls = 0;
+          if (it->code == N_CLASS) {
+            classes[n_cls++] = it;
+          } else if (it->code == N_SPEC_DECL) {
+            node_t specs = NL_HEAD (it->u.ops);
+            if (specs == NULL) continue;
+            if (specs->code == N_SHARE) specs = NL_HEAD (specs->u.ops);
+            if (specs == NULL || specs->code != N_LIST) continue;
+            for (node_t s = NL_HEAD (specs->u.ops); s != NULL; s = NL_NEXT (s)) {
+              if (s->code == N_CLASS && n_cls < 4) classes[n_cls++] = s;
+            }
+          } else {
+            continue;
+          }
+          for (int ci = 0; ci < n_cls; ci++) {
+            node_t s = classes[ci];
             /* Skip generic class templates (only their specializations are
-               real types).  Sentinel attr matches type_spec at L6302. */
+               real types).  Sentinel attr matches type_spec template mark. */
             if (s->attr == (void *)((intptr_t)-1)) continue;
             node_t cid = NL_HEAD (s->u.ops);
             if (cid == NULL || cid->code != N_ID) continue;
@@ -21792,6 +22060,7 @@ if (base != NULL && base->code == N_ID) {
                doing it here first does not double-bind. */
             if (find_def (c2m_ctx, S_REGULAR, cid, curr_scope, NULL) == NULL) {
               symbol_insert (c2m_ctx, S_REGULAR, cid, curr_scope, s, NULL);
+              symbol_insert (c2m_ctx, S_TAG, cid, curr_scope, s, NULL);
               tpname_add (c2m_ctx, cid, curr_scope, TRUE);
             }
           }
@@ -24069,7 +24338,11 @@ static void MIR_UNUSED simple_add_res_proto (c2m_ctx_t c2m_ctx, struct type *ret
   } else {
     var.name = RET_ADDR_NAME;
     var.type = MIR_T_RBLK;
+    /* Re-layout class returns: ListView.ToList's List ret type may still be
+       size 0 if it was first visited incomplete during specialization. */
+    if (ret_type->mode == TM_CLASS) ensure_class_type_layout (c2m_ctx, ret_type);
     var.size = type_size (c2m_ctx, ret_type);
+    if (var.size == 0) var.size = 1; /* avoid rblk:0 (MIR/link footgun) */
     VARR_PUSH (MIR_var_t, arg_vars, var);
   }
 }
@@ -24101,6 +24374,7 @@ static int MIR_UNUSED simple_add_call_res_op (c2m_ctx_t c2m_ctx, struct type *re
      unions without destructors keep the classic call-arg-area path for less
      stack growth; classes always use ALLOCA (they may have user ~T()). */
   temp = get_new_temp (c2m_ctx, MIR_T_I64);
+  if (ret_type->mode == TM_CLASS) ensure_class_type_layout (c2m_ctx, ret_type);
   csize = type_size (c2m_ctx, ret_type);
   if (csize == 0) csize = 1;
   if (ret_type->mode == TM_CLASS) {
@@ -24136,9 +24410,12 @@ static void MIR_UNUSED simple_add_ret_ops (c2m_ctx_t c2m_ctx, struct type *ret_t
   if (!simple_return_by_addr_p (c2m_ctx, ret_type)) {
     VARR_PUSH (MIR_op_t, ret_ops, val.mir_op);
   } else {
+    mir_size_t rsz;
+    if (ret_type->mode == TM_CLASS) ensure_class_type_layout (c2m_ctx, ret_type);
+    rsz = type_size (c2m_ctx, ret_type);
     ret_addr_reg = MIR_reg (ctx, RET_ADDR_NAME, curr_func->u.func);
     var = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_I8, 0, ret_addr_reg, 0, 1));
-    block_move (c2m_ctx, var, val, type_size (c2m_ctx, ret_type));
+    if (rsz > 0) block_move (c2m_ctx, var, val, rsz);
   }
 }
 
@@ -27352,8 +27629,37 @@ static void mangle_func_def_mir_name (c2m_ctx_t c2m_ctx, node_t func_def,
    so free functions still follow ordinary C ordering semantics -- a free
    function called before its definition still needs an explicit prototype,
    as in C11. */
-static void gen_forward_class_methods (c2m_ctx_t c2m_ctx, node_t module) {
+static void gen_forward_methods_for_class (c2m_ctx_t c2m_ctx, node_t class_node) {
   MIR_context_t ctx = c2m_ctx->ctx;
+  node_t class_id, decl_list;
+
+  if (class_node == NULL || class_node->code != N_CLASS) return;
+  /* Skip generic class templates -- only their concrete specializations
+     generate code.  Sentinel attr matches the marker set in type_spec. */
+  if (class_node->attr == (void *) ((intptr_t) -1)) return;
+
+  class_id = NL_HEAD (class_node->u.ops);
+  if (class_id == NULL || class_id->code != N_ID) return;
+  decl_list = NL_NEXT (class_id);
+  if (decl_list == NULL || decl_list->code != N_LIST) return;
+
+  for (node_t m = NL_HEAD (decl_list->u.ops); m != NULL; m = NL_NEXT (m)) {
+    if (m->code != N_FUNC_DEF) continue;
+    /* Template / open generic-method sentinels are not real decl_t attrs. */
+    if (m->attr == NULL || m->attr == (void *) ((intptr_t) -1)) continue;
+    decl_t mdecl = m->attr;
+    if (mdecl->midopt_dead_p) continue; /* midopt P0: no forward for dead methods */
+    if (mdecl->u.item != NULL) continue;  /* already (forward-)declared */
+    struct type *mtype = mdecl->decl_spec.type;
+    if (mtype == NULL || mtype->mode != TM_FUNC) continue;
+
+    char fname[256] = {0};
+    mangle_func_def_mir_name (c2m_ctx, m, fname, sizeof fname);
+    mdecl->u.item = MIR_new_forward (ctx, fname);
+  }
+}
+
+static void gen_forward_class_methods (c2m_ctx_t c2m_ctx, node_t module) {
   node_t items;
 
   if (module == NULL || module->code != N_MODULE) return;
@@ -27361,38 +27667,20 @@ static void gen_forward_class_methods (c2m_ctx_t c2m_ctx, node_t module) {
   if (items == NULL || items->code != N_LIST) return;
 
   for (node_t it = NL_HEAD (items->u.ops); it != NULL; it = NL_NEXT (it)) {
+    /* Source classes live under N_SPEC_DECL; parse-injected generic
+       specializations (__generic_Host_int etc.) are bare N_CLASS items. */
+    if (it->code == N_CLASS) {
+      gen_forward_methods_for_class (c2m_ctx, it);
+      continue;
+    }
     if (it->code != N_SPEC_DECL) continue;
     node_t specs = NL_HEAD (it->u.ops);
     if (specs == NULL) continue;
     if (specs->code == N_SHARE) specs = NL_HEAD (specs->u.ops);
     if (specs == NULL || specs->code != N_LIST) continue;
 
-    node_t class_node = NULL;
     for (node_t s = NL_HEAD (specs->u.ops); s != NULL; s = NL_NEXT (s))
-      if (s->code == N_CLASS) { class_node = s; break; }
-    if (class_node == NULL) continue;
-    /* Skip generic class templates -- only their concrete specializations
-       generate code.  Sentinel attr matches the marker set in type_spec. */
-    if (class_node->attr == (void *) ((intptr_t) -1)) continue;
-
-    node_t class_id = NL_HEAD (class_node->u.ops);
-    if (class_id == NULL || class_id->code != N_ID) continue;
-    node_t decl_list = NL_NEXT (class_id);
-    if (decl_list == NULL || decl_list->code != N_LIST) continue;
-
-    for (node_t m = NL_HEAD (decl_list->u.ops); m != NULL; m = NL_NEXT (m)) {
-      if (m->code != N_FUNC_DEF) continue;
-      decl_t mdecl = m->attr;
-      if (mdecl == NULL) continue;
-      if (mdecl->midopt_dead_p) continue; /* midopt P0: no forward for dead methods */
-      if (mdecl->u.item != NULL) continue;  /* already (forward-)declared */
-      struct type *mtype = mdecl->decl_spec.type;
-      if (mtype == NULL || mtype->mode != TM_FUNC) continue;
-
-      char fname[256] = {0};
-      mangle_func_def_mir_name (c2m_ctx, m, fname, sizeof fname);
-      mdecl->u.item = MIR_new_forward (ctx, fname);
-    }
+      if (s->code == N_CLASS) gen_forward_methods_for_class (c2m_ctx, s);
   }
 }
 
