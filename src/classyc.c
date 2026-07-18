@@ -5600,6 +5600,29 @@ static const char *type_arg_reflection_name (c2m_ctx_t c2m_ctx, node_t a, int ke
   }
 }
 
+/* Move-only collection type arg?  Mirrors class_is_move_only_collection_p's
+   name check on the (possibly materialized) type node: __generic_List_ /
+   __generic_Map_ / __generic_Set_ instantiations (pointers peeled first).
+   Backs the is_move_only<T>() intrinsic. */
+static int type_arg_move_only_p (node_t a) {
+  const char *nm = NULL;
+  while (a != NULL && a->code == N_POINTER) {
+    /* Pointers (List<int>* included) are copied bitwise — never move-only. */
+    return 0;
+  }
+  if (a == NULL) return 0;
+  if (a->code == N_ID) {
+    nm = a->u.s.s;
+  } else if (a->code == N_CLASS) {
+    node_t id = TAG_ID (a);
+    if (id != NULL && id->code == N_ID) nm = id->u.s.s;
+  }
+  if (nm == NULL) return 0;
+  return (strncmp (nm, "__generic_List_", 15) == 0
+          || strncmp (nm, "__generic_Map_", 14) == 0
+          || strncmp (nm, "__generic_Set_", 14) == 0);
+}
+
 /* Build a mangled specialization name, e.g. List + String -> __generic_List_String */
 static const char *mangle_generic_name (c2m_ctx_t c2m_ctx,
                                          const char *base_name,
@@ -5888,7 +5911,8 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
   if (n->code == N_CALL) {
     node_t callee = NL_HEAD (n->u.ops);
     if (callee != NULL && callee->code == N_ID && callee->u.s.s != NULL
-        && strcmp (callee->u.s.s, "is_pointer") == 0) {
+        && (strcmp (callee->u.s.s, "is_pointer") == 0
+            || strcmp (callee->u.s.s, "is_move_only") == 0)) {
       node_t tlist = NL_NEXT (callee);
       node_t targ = (tlist != NULL) ? NL_HEAD (tlist->u.ops) : NULL;
       if (targ != NULL && targ->code == N_ID) {
@@ -5898,7 +5922,7 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
             node_t arg_copy = copy_node (c2m_ctx, args[i]);
             node_t new_tlist = new_node1 (c2m_ctx, N_LIST, arg_copy);
             node_t new_alist = new_node (c2m_ctx, N_LIST);
-            node_t new_id = build_id (c2m_ctx, "is_pointer", POS (callee));
+            node_t new_id = build_id (c2m_ctx, callee->u.s.s, POS (callee));
             return new_pos_node3 (c2m_ctx, N_CALL, POS (n), new_id, new_tlist, new_alist);
           }
         }
@@ -6857,6 +6881,45 @@ D (primary_expr) {
       }
     }
     record_stop (c2m_ctx, ip_mark, TRUE); /* not is_pointer<T>(): rewind */
+  }
+
+  /* is_move_only<T>(): compiler intrinsic (sibling of is_pointer<T>()) that
+     returns 1 when T is a move-only collection (List/Map/Set instantiation),
+     0 otherwise.  Lets generic collection bodies pick a Copy-via-Get path for
+     move-only elements and a zero-copy buffer path for everything else.
+     Parses like is_pointer<T>() so '<' '>' are not comparison operators. */
+  if (C (T_ID) && curr_token->repr != NULL && strcmp (curr_token->repr, "is_move_only") == 0) {
+    size_t im_mark = record_start (c2m_ctx);
+    node_t im_id;
+    pos_t im_pos = curr_token->pos;
+    MN (T_ID, im_id);
+    if (C (T_CMP) && curr_token->node_code == N_LT) {
+      M (T_CMP); /* consume '<' */
+      node_t targ = parse_generic_type_arg (c2m_ctx);
+      if (targ != NULL) {
+        extern int c2m_pending_extra_gt;
+        /* The closing '>' may arrive split from a '>>' after a nested
+           instantiation (is_move_only<List<int>>()) — consume the pending one. */
+        if (c2m_pending_extra_gt) {
+          c2m_pending_extra_gt = 0;
+          if (M ('(') && M (')')) {
+            record_stop (c2m_ctx, im_mark, FALSE); /* commit */
+            node_t tlist = new_node1 (c2m_ctx, N_LIST, targ);
+            node_t alist = new_node (c2m_ctx, N_LIST);
+            return new_pos_node3 (c2m_ctx, N_CALL, im_pos, im_id, tlist, alist);
+          }
+        } else if (C (T_CMP) && curr_token->node_code == N_GT) {
+          M (T_CMP); /* consume '>' */
+          if (M ('(') && M (')')) {
+            record_stop (c2m_ctx, im_mark, FALSE); /* commit */
+            node_t tlist = new_node1 (c2m_ctx, N_LIST, targ);
+            node_t alist = new_node (c2m_ctx, N_LIST);
+            return new_pos_node3 (c2m_ctx, N_CALL, im_pos, im_id, tlist, alist);
+          }
+        }
+      }
+    }
+    record_stop (c2m_ctx, im_mark, TRUE); /* not is_move_only<T>(): rewind */
   }
 
   /* nameof<T>(): compile-time reflection intrinsic.  Returns the C-level name
@@ -11474,6 +11537,10 @@ struct decl {
      gen skips body emission and forward MIR items. Free functions are never
      marked dead (C linkage / export). See src/midopt.c. */
   unsigned midopt_dead_p : 1;
+  /* Midopt (R2): for-in element loop var proven read-only over an unmutated
+     dense collection — gen binds it by reference (pointer into the buffer)
+     instead of a per-iteration block copy. */
+  unsigned byref_p : 1;
   int bit_offset, width; /* for bitfields, -1 bit_offset for non bitfields. */
   mir_size_t offset;     /* var offset in frame or bss */
   /* Extra stack bytes for a class/struct local whose trailing flexible array
@@ -14816,6 +14883,173 @@ static node_t build_get_call (c2m_ctx_t c2m_ctx, pos_t pos, node_t recv, node_t 
                          new_node1 (c2m_ctx, N_LIST, parse_copy_expr (c2m_ctx, index_expr)));
 }
 
+/* Defined later in this TU (gen side); used by the R2.2a substitution below. */
+static int find_dense_buffer_fields (node_t class_tag, decl_t *arr_out, decl_t *len_out,
+                                     decl_t *cap_out);
+
+/* ── R2.2a: read-only lambda param proof for GetMut-deref substitution ──────
+ * A capturing HOF lambda `(Ship s) => s.IsHot()` is open-coded with the param
+ * substituted by `recv.Get(i)` — a call + block copy per element.  When the
+ * param is only *read* we can instead substitute `*(recv.GetMut(i))`, a
+ * pointer into the buffer: identical reads, zero copies.  These walks prove
+ * the param is never written, addressed, moved, or passed to a mutating
+ * method. */
+
+/* Depth-1 scan of a method body for writes to `this` (name-based; the bodies
+   are already checked, so helper calls on `this` are treated as unknown). */
+static int hof_method_body_pure_p (c2m_ctx_t c2m_ctx, node_t n) {
+  node_t c;
+  if (n == NULL) return 1;
+  switch (n->code) {
+  case N_ASSIGN: case N_ADD_ASSIGN: case N_SUB_ASSIGN: case N_MUL_ASSIGN:
+  case N_DIV_ASSIGN: case N_MOD_ASSIGN: case N_LSH_ASSIGN: case N_RSH_ASSIGN:
+  case N_AND_ASSIGN: case N_OR_ASSIGN: case N_XOR_ASSIGN: {
+    node_t lhs = NL_HEAD (n->u.ops);
+    if (lhs != NULL && (lhs->code == N_FIELD || lhs->code == N_DEREF_FIELD
+                        || lhs->code == N_DEREF)) {
+      node_t base = NL_HEAD (lhs->u.ops);
+      if (base != NULL && base->code == N_ID && base->u.s.s != NULL
+          && strcmp (base->u.s.s, "this") == 0)
+        return 0;
+    }
+    break;
+  }
+  case N_MOVE: case N_DELETE:
+    return 0;
+  case N_ADDR: {
+    node_t op = NL_HEAD (n->u.ops);
+    if (op != NULL && op->code == N_ID && op->u.s.s != NULL
+        && strcmp (op->u.s.s, "this") == 0)
+      return 0;
+    break;
+  }
+  case N_CALL: {
+    node_t fn = NL_HEAD (n->u.ops);
+    if (fn != NULL && (fn->code == N_FIELD || fn->code == N_DEREF_FIELD)) {
+      node_t base = NL_HEAD (fn->u.ops);
+      struct expr *be = base != NULL ? base->attr : NULL;
+      if (be != NULL && be->type != NULL && builtin_string_type_p (be->type)) break;
+      if (base != NULL && base->code == N_ID && base->u.s.s != NULL
+          && strcmp (base->u.s.s, "this") == 0)
+        return 0; /* another method on this: unknown effect */
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  if (generic_node_has_scalar_data (n->code) || n->code == N_ID || n->code == N_STRING
+      || n->code == N_IGNORE)
+    return 1;
+  for (c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (!hof_method_body_pure_p (c2m_ctx, c)) return 0;
+  return 1;
+}
+
+/* Is the method named NM on class TAG (arity NARGS, this excluded) present
+   and provably read-only (depth-1)? */
+static int hof_method_readonly_p (c2m_ctx_t c2m_ctx, node_t tag, const char *nm, int nargs,
+                                  pos_t pos) {
+  node_t id;
+  symbol_t sym;
+  size_t i;
+
+  if (tag == NULL || nm == NULL) return 0;
+  id = build_id (c2m_ctx, nm, pos);
+  if (!find_overload_sym (c2m_ctx, id, tag, &sym)) return 0;
+  for (i = 0; i < VARR_LENGTH (node_t, sym.defs); i++) {
+    node_t def = VARR_GET (node_t, sym.defs, i);
+    decl_t d;
+    struct func_type *ft;
+    int nparams = 0;
+    if (def == NULL || def->code != N_FUNC_DEF || def->attr == NULL) continue;
+    if (def->attr == (void *) ((intptr_t) -1)) continue;
+    d = (decl_t) def->attr;
+    if (d->decl_spec.type == NULL || d->decl_spec.type->mode != TM_FUNC) continue;
+    ft = d->decl_spec.type->u.func_type;
+    if (ft == NULL || ft->class_scope != tag) continue;
+    if (ft->param_list != NULL && ft->param_list->code == N_LIST)
+      nparams = (int) NL_LENGTH (ft->param_list->u.ops);
+    if (nparams != nargs + 1) continue;
+    return hof_method_body_pure_p (c2m_ctx, FUNC_DEF_BLOCK (def));
+  }
+  return 0;
+}
+
+/* Does the lambda body expression N use its param PN read-only?  (Parse-level
+   AST: no receiver injection yet, so `pn.Method()` args are all user args.) */
+static int hof_lambda_param_readonly_p (c2m_ctx_t c2m_ctx, node_t n, const char *pn,
+                                        node_t el_tag, pos_t pos) {
+  node_t c;
+  if (n == NULL || pn == NULL) return 1;
+  switch (n->code) {
+  case N_ASSIGN: case N_ADD_ASSIGN: case N_SUB_ASSIGN: case N_MUL_ASSIGN:
+  case N_DIV_ASSIGN: case N_MOD_ASSIGN: case N_LSH_ASSIGN: case N_RSH_ASSIGN:
+  case N_AND_ASSIGN: case N_OR_ASSIGN: case N_XOR_ASSIGN: {
+    node_t lhs = NL_HEAD (n->u.ops);
+    while (lhs != NULL && (lhs->code == N_FIELD || lhs->code == N_DEREF_FIELD
+                           || lhs->code == N_DEREF || lhs->code == N_IND))
+      lhs = NL_HEAD (lhs->u.ops);
+    if (lhs != NULL && lhs->code == N_ID && lhs->u.s.s != NULL
+        && strcmp (lhs->u.s.s, pn) == 0)
+      return 0;
+    break;
+  }
+  case N_INC: case N_DEC: case N_POST_INC: case N_POST_DEC: {
+    node_t op = NL_HEAD (n->u.ops);
+    while (op != NULL && (op->code == N_FIELD || op->code == N_DEREF_FIELD))
+      op = NL_HEAD (op->u.ops);
+    if (op != NULL && op->code == N_ID && op->u.s.s != NULL
+        && strcmp (op->u.s.s, pn) == 0)
+      return 0;
+    break;
+  }
+  case N_MOVE: case N_DELETE: case N_ADDR: {
+    node_t op = NL_HEAD (n->u.ops);
+    while (op != NULL && (op->code == N_FIELD || op->code == N_DEREF_FIELD))
+      op = NL_HEAD (op->u.ops);
+    if (op != NULL && op->code == N_ID && op->u.s.s != NULL
+        && strcmp (op->u.s.s, pn) == 0)
+      return 0;
+    break;
+  }
+  case N_CALL: {
+    node_t fn = NL_HEAD (n->u.ops);
+    if (fn != NULL && fn->code == N_FIELD) {
+      node_t base = NL_HEAD (fn->u.ops);
+      node_t mid = NL_NEXT (base);
+      if (base != NULL && base->code == N_ID && base->u.s.s != NULL
+          && strcmp (base->u.s.s, pn) == 0) {
+        /* Method on the param: must be provably read-only on the element. */
+        node_t args = NL_EL (n->u.ops, 1);
+        int nargs = (args != NULL && args->code == N_LIST)
+                      ? (int) NL_LENGTH (args->u.ops) : 0;
+        const char *nm = (mid != NULL && mid->code == N_ID) ? mid->u.s.s : NULL;
+        if (!hof_method_readonly_p (c2m_ctx, el_tag, nm, nargs, pos)) return 0;
+      }
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  if (generic_node_has_scalar_data (n->code) || n->code == N_ID || n->code == N_STRING
+      || n->code == N_IGNORE)
+    return 1;
+  for (c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (!hof_lambda_param_readonly_p (c2m_ctx, c, pn, el_tag, pos)) return 0;
+  return 1;
+}
+
+/* Build `*(recv.GetMut(index_expr))` — an element lvalue in the buffer. */
+static node_t build_getmut_deref_call (c2m_ctx_t c2m_ctx, pos_t pos, node_t recv,
+                                       node_t index_expr) {
+  node_t call
+    = build_dot_call (c2m_ctx, pos, parse_copy_expr (c2m_ctx, recv), "GetMut",
+                      new_node1 (c2m_ctx, N_LIST, parse_copy_expr (c2m_ctx, index_expr)));
+  return new_pos_node1 (c2m_ctx, N_DEREF, pos, call);
+}
+
 /* Open-code a capturing HOF call.  Replaces *CALL with an N_STMTEXPR and
    fully type-checks it.  Returns TRUE on success (call is rewritten). */
 static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
@@ -15037,6 +15271,30 @@ static int desugar_capturing_hof (c2m_ctx_t c2m_ctx, node_t call, node_t recv,
                                          new_i_node (c2m_ctx, 1, pos)));
     get1 = build_get_call (c2m_ctx, pos, recv, i_id);
     get2 = build_get_call (c2m_ctx, pos, recv, i_id);
+
+    /* R2.2a: when the element is a non-move-only aggregate and the lambda
+       only reads its param, substitute `*(recv.GetMut(i))` instead of
+       `recv.Get(i)` — identical reads, no per-element block copy.  Move-only
+       elements keep Get (its return path carries the deep-Copy rewrite). */
+    if (pred_expr != NULL && pn0 != NULL && recv_cls_type != NULL
+        && recv_cls_type->u.tag_type != NULL) {
+      node_t tag = recv_cls_type->u.tag_type;
+      decl_t data_f = NULL, len_f = NULL;
+      struct type *el_t = NULL;
+      if (find_dense_buffer_fields (tag, &data_f, &len_f, NULL)
+          && data_f != NULL && data_f->decl_spec.type != NULL)
+        el_t = data_f->decl_spec.type->u.ptr_type;
+      if (el_t != NULL
+          && (el_t->mode == TM_CLASS || el_t->mode == TM_STRUCT || el_t->mode == TM_UNION)
+          && !class_is_move_only_collection_p (c2m_ctx, el_t)
+          && find_class_protocol_method (c2m_ctx, tag, "GetMut", 1, pos) != NULL
+          && hof_lambda_param_readonly_p (c2m_ctx, pred_expr, pn0,
+                                          el_t->mode == TM_CLASS ? el_t->u.tag_type : NULL,
+                                          pos)) {
+        get1 = build_getmut_deref_call (c2m_ctx, pos, recv, i_id);
+        get2 = build_getmut_deref_call (c2m_ctx, pos, recv, i_id);
+      }
+    }
 
     if (pred_expr != NULL)
       pred_sub = lambda_subst_id (c2m_ctx, pred_expr, pn0, get1);
@@ -16185,6 +16443,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       decl->unowned_p = FALSE;
       decl->owned_p = FALSE;
       decl->midopt_dead_p = FALSE;
+      decl->byref_p = FALSE;
       decl->scope = curr_scope;
       decl->containing_unnamed_anon_struct_union_member = curr_unnamed_anon_struct_union_member;
       decl->u.item = NULL;
@@ -19483,6 +19742,30 @@ if (base != NULL && base->code == N_ID) {
            Syntax: is_pointer<TypeArg>()
            Rewritten during check phase to an integer literal (1 or 0) based on the
            resolved type parameter. */
+        /* is_move_only<T>: compiler intrinsic — 1 if T is a move-only
+           collection (List/Map/Set instantiation), else 0.  Rewritten during
+           check to an integer literal, same shape as is_pointer<T>. */
+        if (op1->code == N_ID && strcmp (op1->u.s.s, "is_move_only") == 0) {
+          node_t type_args = NL_NEXT (op1);
+          if (type_args != NULL && type_args->code == N_LIST) {
+            node_t type_arg = NL_HEAD (type_args->u.ops);
+            node_t call_args = NL_NEXT (type_args);
+            if (type_arg != NULL && NL_NEXT (type_arg) == NULL
+                && call_args != NULL && NL_HEAD (call_args->u.ops) == NULL) {
+              int mo = type_arg_move_only_p (type_arg);
+              /* Replace the entire call expression with an integer literal.
+                 Preserve r's op_link (sibling chain) as with is_pointer. */
+              node_t lit = new_i_node (c2m_ctx, (long) mo, POS (r));
+              check (c2m_ctx, lit, NULL);
+              DLIST_LINK (node_t) saved_link = r->op_link;
+              *r = *lit;
+              r->op_link = saved_link;
+              e = r->attr;
+              break;
+            }
+          }
+          /* Malformed is_move_only<...>(...); fall through to error */
+        }
         if (op1->code == N_ID && strcmp (op1->u.s.s, "is_pointer") == 0) {
           node_t type_args = NL_NEXT (op1);
           if (type_args != NULL && type_args->code == N_LIST) {
@@ -28062,6 +28345,29 @@ static int try_open_code_dense_accessor (c2m_ctx_t c2m_ctx, node_t func_def, op_
    values.  SAFE_FLAGS elides null/OOB when the caller has already proved them.
    Aggregate return types are rejected during check. */
 #define GEN_METHOD_MAX_ARGS 8
+/* R2 by-ref table: for-in element loop vars proven read-only by midopt are
+   bound as pointers into the collection buffer instead of per-iteration
+   block copies.  Push/pop is balanced around each N_FORIN's body gen. */
+#define GEN_BYREF_MAX 32
+#define GEN_BYREF_NOREG ((MIR_reg_t) -1)
+static struct { decl_t d; MIR_reg_t reg; } gen_byref_tab[GEN_BYREF_MAX];
+static int gen_byref_n = 0;
+
+static void gen_byref_push (decl_t d, MIR_reg_t reg) {
+  if (d == NULL || gen_byref_n >= GEN_BYREF_MAX) return;
+  gen_byref_tab[gen_byref_n].d = d;
+  gen_byref_tab[gen_byref_n].reg = reg;
+  gen_byref_n++;
+}
+
+static MIR_reg_t gen_byref_find (decl_t d) {
+  int i;
+  if (d == NULL) return GEN_BYREF_NOREG;
+  for (i = gen_byref_n - 1; i >= 0; i--)
+    if (gen_byref_tab[i].d == d) return gen_byref_tab[i].reg;
+  return GEN_BYREF_NOREG;
+}
+
 static op_t gen_class_method_call_dest (c2m_ctx_t c2m_ctx, node_t func_def,
                                         struct type *this_type MIR_UNUSED, op_t this_op,
                                         op_t *args, int n_args, op_t *agg_dest, int safe_flags) {
@@ -29069,6 +29375,16 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                                                       get_type_alias (c2m_ctx, e->type), 0));
         } else if (!decl->reg_p) {
             t = get_mir_type (c2m_ctx, e->type);
+            /* R2: by-ref for-in loop var — read through the element pointer
+               (the frame slot is intentionally never written). */
+            if (decl->byref_p) {
+              MIR_reg_t br = gen_byref_find (decl);
+              if (br != GEN_BYREF_NOREG) {
+                res = new_op (decl, MIR_new_alias_mem_op (ctx, t, 0, br, 0, 1,
+                                                          get_type_alias (c2m_ctx, e->type), 0));
+                break;
+              }
+            }
             res = new_op (decl, MIR_new_alias_mem_op (ctx, t, decl->offset,
                                                       MIR_reg (ctx, FP_NAME, curr_func->u.func), 0, 1,
                                                       get_type_alias (c2m_ctx, e->type), 0));
@@ -29147,25 +29463,39 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       if (integer_type_p (((struct expr *) NL_EL (r->u.ops, 1)->attr)->type))
         idx_op = cast (c2m_ctx, idx_op, MIR_T_I64, FALSE);
       /* GetMut path: true lvalue into the dense buffer (fleet[0].Boost mutates). */
-      if (((struct expr *) r->attr)->mut_sub_p) {
-        op_t ptr_op = gen_class_method_call (c2m_ctx, get_def, this_type, this_op, &idx_op, 1);
-        ptr_op = force_reg (c2m_ctx, ptr_op, MIR_T_I64);
-        {
-          MIR_type_t el_mir = get_mir_type (c2m_ctx, el_type);
-          if (el_type->mode == TM_CLASS || el_type->mode == TM_STRUCT
-              || el_type->mode == TM_UNION) {
-            res = new_op (NULL,
-                          MIR_new_alias_mem_op (ctx, MIR_T_UNDEF, 0, ptr_op.mir_op.u.reg, 0, 1,
-                                                get_type_alias (c2m_ctx, el_type), 0));
-          } else {
-            res = new_op (NULL, MIR_new_mem_op (ctx, el_mir, 0, ptr_op.mir_op.u.reg, 0, 1));
+      {
+        /* Safe flags: value receiver is &slot (never null); ownership/midopt
+           may have stamped SAFE on a pointer receiver; midopt's IV proof sets
+           elide_oob_p when the index is guarded by the loop bound. */
+        int sub_flags = 0;
+        struct expr *ind_e = (struct expr *) r->attr;
+        if (arr_type->mode != TM_PTR)
+          sub_flags |= GEN_SAFE_SKIP_NULL;
+        else if (ind_e->own_deref_class == DEREF_GUARD_SAFE)
+          sub_flags |= GEN_SAFE_SKIP_NULL;
+        if (ind_e->elide_oob_p) sub_flags |= GEN_SAFE_SKIP_OOB;
+        if (((struct expr *) r->attr)->mut_sub_p) {
+          op_t ptr_op = gen_class_method_call_flags (c2m_ctx, get_def, this_type, this_op,
+                                                     &idx_op, 1, sub_flags);
+          ptr_op = force_reg (c2m_ctx, ptr_op, MIR_T_I64);
+          {
+            MIR_type_t el_mir = get_mir_type (c2m_ctx, el_type);
+            if (el_type->mode == TM_CLASS || el_type->mode == TM_STRUCT
+                || el_type->mode == TM_UNION) {
+              res = new_op (NULL,
+                            MIR_new_alias_mem_op (ctx, MIR_T_UNDEF, 0, ptr_op.mir_op.u.reg, 0, 1,
+                                                  get_type_alias (c2m_ctx, el_type), 0));
+            } else {
+              res = new_op (NULL, MIR_new_mem_op (ctx, el_mir, 0, ptr_op.mir_op.u.reg, 0, 1));
+            }
           }
+          break;
         }
+        /* Call: result = this->Get(index)  (by-value copy) */
+        res = gen_class_method_call_flags (c2m_ctx, get_def, this_type, this_op, &idx_op, 1,
+                                           sub_flags);
         break;
       }
-      /* Call: result = this->Get(index)  (by-value copy) */
-      res = gen_class_method_call (c2m_ctx, get_def, this_type, this_op, &idx_op, 1);
-      break;
       }
     }
     if (arr_type->mode == TM_SLICE) {
@@ -30294,17 +30624,51 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
        gen_class_method_call (proto/arity differs from N_CALL's proto_item). */
     if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
       struct expr *fe = func->attr;
+      node_t acc_def = NULL;
       if (fe != NULL && fe->def_node != NULL && fe->def_node->code == N_FUNC_DEF
           && fe->def_node != (node_t) (intptr_t) 1
-          && fe->def_node != (node_t) (intptr_t) 2) {
-        int na = args != NULL ? (int) NL_LENGTH (args->u.ops) : 0;
-        if (dense_accessor_open_codeable_p (fe->def_node, na)) {
+          && fe->def_node != (node_t) (intptr_t) 2)
+        acc_def = fe->def_node;
+      /* Monomorph method calls often lack def_node on the field expr: resolve
+         the accessor by name+arity from the receiver class (same predicate as
+         the class-subscript path).  The dense-layout check below keeps this
+         from hijacking user classes that merely name a method Get/Count. */
+      if (acc_def == NULL) {
+        node_t mobj0 = NL_HEAD (func->u.ops);
+        node_t mid0 = mobj0 != NULL ? NL_NEXT (mobj0) : NULL;
+        struct expr *obj0_e = mobj0 != NULL ? mobj0->attr : NULL;
+        struct type *ct0 = obj0_e != NULL ? obj0_e->type : NULL;
+        struct type *cls0
+          = ct0 != NULL && ct0->mode == TM_CLASS
+              ? ct0
+              : (ct0 != NULL && ct0->mode == TM_PTR && ct0->u.ptr_type != NULL
+                 && ct0->u.ptr_type->mode == TM_CLASS)
+                  ? ct0->u.ptr_type
+                  : NULL;
+        int na0 = args != NULL && NL_HEAD (args->u.ops) != NULL
+                    ? (int) NL_LENGTH (args->u.ops) - 1
+                    : 0; /* args[0] is the injected receiver */
+        if (cls0 != NULL && cls0->u.tag_type != NULL && mid0 != NULL
+            && mid0->code == N_ID)
+          acc_def = find_class_protocol_method (c2m_ctx, cls0->u.tag_type, mid0->u.s.s, na0,
+                                                POS (r));
+      }
+      if (acc_def != NULL) {
+        /* Method calls carry the injected receiver as args[0] (check prepends
+           N_ADDR(obj) for value receivers, the pointer for ->): the accessor
+           arity and the open-code args start after it. */
+        node_t arg0 = args != NULL ? NL_HEAD (args->u.ops) : NULL;
+        int na = arg0 != NULL ? (int) NL_LENGTH (args->u.ops) - 1 : 0;
+        if (dense_accessor_open_codeable_p (acc_def, na)) {
           node_t mobj = NL_HEAD (func->u.ops);
           struct expr *obj_e = mobj != NULL ? mobj->attr : NULL;
+          struct expr *call_e = (struct expr *) r->attr;
           op_t this_op, uargs[GEN_METHOD_MAX_ARGS], oc_res;
           int i = 0, sflags = 0;
           node_t arg;
 
+          /* midopt proved the index in range for this receiver (IV loop). */
+          if (call_e != NULL && call_e->elide_oob_p) sflags |= GEN_SAFE_SKIP_OOB;
           if (func->code == N_DEREF_FIELD) {
             this_op = val_gen (c2m_ctx, mobj);
             /* Ownership/midopt may have stamped SAFE on the receiver expr. */
@@ -30323,12 +30687,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             if (obj_e != NULL && obj_e->own_deref_class == DEREF_GUARD_SAFE)
               sflags |= GEN_SAFE_SKIP_NULL;
           }
-          for (arg = (args ? NL_HEAD (args->u.ops) : NULL);
+          for (arg = (arg0 != NULL ? NL_NEXT (arg0) : NULL);
                arg != NULL && i < GEN_METHOD_MAX_ARGS; arg = NL_NEXT (arg))
             uargs[i++] = val_gen (c2m_ctx, arg);
           /* Const non-negative index into a dense buffer: still need dynamic
              length for full OOB proof — leave OOB on unless SKIP later. */
-          if (try_open_code_dense_accessor (c2m_ctx, fe->def_node, this_op, uargs, i, NULL,
+          if (try_open_code_dense_accessor (c2m_ctx, acc_def, this_op, uargs, i, NULL,
                                             &oc_res, sflags)) {
             res = oc_res;
             goto finish;
@@ -31814,6 +32178,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     break_label = MIR_new_label (ctx);
     defer_break_mark = defer_continue_mark = VARR_LENGTH (node_t, defer_stmts);
     unsigned fsn = r->attr ? ((struct node_scope *) r->attr)->func_scope_num : 0;
+    int saved_byref_n = gen_byref_n; /* R2: pop this loop's bindings after the body */
 
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
@@ -32141,9 +32506,19 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           emit2 (c2m_ctx, tp_mov (idx_t), MIR_new_reg_op (ctx, ivar.reg), i_reg.mir_op);
         }
         if (el_agg) {
-          op_t src_mem
-            = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, addr.mir_op.u.reg, 0, 1));
-          block_move (c2m_ctx, agg_dst, src_mem, dense_el_size);
+          /* R2 borrow: midopt proved the loop var read-only over an unmutated
+             collection — bind it by reference (pointer into the buffer)
+             instead of a per-iteration block copy. */
+          symbol_t bsym;
+          if (symbol_find (c2m_ctx, S_REGULAR, el_var, r, &bsym)
+              && bsym.def_node != NULL && bsym.def_node->attr != NULL
+              && ((decl_t) bsym.def_node->attr)->byref_p) {
+            gen_byref_push ((decl_t) bsym.def_node->attr, addr.mir_op.u.reg);
+          } else {
+            op_t src_mem
+              = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, addr.mir_op.u.reg, 0, 1));
+            block_move (c2m_ctx, agg_dst, src_mem, dense_el_size);
+          }
         } else {
           MIR_type_t load_t = promote_mir_int_type (dense_el_mir);
           op_t el_res = get_new_temp (c2m_ctx, load_t);
@@ -32279,6 +32654,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                                &saved_loop_break_label);
     /* gen body */
     gen (c2m_ctx, body, NULL, NULL, FALSE, NULL, NULL);
+    gen_byref_n = saved_byref_n; /* pop this loop's by-ref bindings */
     /* continue_label: i_reg++ */
     emit_label_insn_opt (c2m_ctx, continue_label);
     /* Release iteration's per-loop allocations before back-edge. */

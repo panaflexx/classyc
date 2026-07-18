@@ -390,20 +390,13 @@ class Map<K, V> {
 
     /* ───────────────────── Mutation ───────────────────── */
 
-    /* Insert or update `key` -> `val`.  Returns 1 if a new key was inserted,
-     * 0 if an existing key's value was overwritten.  On overwrite the old
-     * value is destroyed (by-value dtor or owned pointer delete). */
-    int Set(K key, V val) {
-        this->ensure_table();
-
-        int slot = this->find_slot(key);
-        int idx  = this->table[slot];
-        if (idx >= 0) {                 /* existing key: overwrite value */
-            this->destroy_val_at(idx);
-            *(this->vals + idx) = move val;
-            return 0;
-        }
-
+    /* Insert a provably-absent key at a slot already found by find_slot().
+     * Caller contract: ensure_table() ran *before* the find_slot() that
+     * produced `slot`, and nothing rehashed since.  Single-probe primitive
+     * shared by Set / TryAdd / GetOrAdd / GroupBy (GEN-OPT-RESEARCH.md R3).
+     * Returns 1 (always inserts). */
+    int insert_new_at(int slot, K key, V val) {
+        int idx = this->table[slot];    /* -1 empty or -2 tombstone */
         if (this->count == this->capacity) {
             int old_cap = this->capacity;
             this->capacity *= 2;
@@ -435,11 +428,30 @@ class Map<K, V> {
         return 1;
     }
 
+    /* Insert or update `key` -> `val`.  Returns 1 if a new key was inserted,
+     * 0 if an existing key's value was overwritten.  On overwrite the old
+     * value is destroyed (by-value dtor or owned pointer delete). */
+    int Set(K key, V val) {
+        this->ensure_table();
+
+        int slot = this->find_slot(key);
+        int idx  = this->table[slot];
+        if (idx >= 0) {                 /* existing key: overwrite value */
+            this->destroy_val_at(idx);
+            *(this->vals + idx) = move val;
+            return 0;
+        }
+        return this->insert_new_at(slot, key, move val);
+    }
+
     /* Insert only if `key` is absent.  Returns true if inserted, false if the
-     * key was already present (existing value left unchanged). */
+     * key was already present (existing value left unchanged).
+     * Single probe (was Contains + Set = two). */
     bool TryAdd(K key, V val) {
-        if (this->Contains(key)) return false;
-        this->Set(key, val);
+        this->ensure_table();
+        int slot = this->find_slot(key);
+        if (this->table[slot] >= 0) return false;
+        this->insert_new_at(slot, key, move val);
         return true;
     }
 
@@ -499,11 +511,15 @@ class Map<K, V> {
     }
 
     /* ───────────────────── Accessors (extended) ───────────────────── */
+    /* Value for `key`, inserting `fallback` when absent.  Single probe on
+     * both hit and miss paths (was find_index + Set = two on miss). */
     V GetOrAdd(K key, V fallback) __attribute__((da_ignore)) {
-        int idx = this->find_index(key);
+        this->ensure_table();
+        int slot = this->find_slot(key);
+        int idx = this->table[slot];
         if (idx >= 0) return *(this->vals + (idx));
-        this->Set(key, fallback);
-        return fallback;
+        this->insert_new_at(slot, key, move fallback);
+        return *(this->vals + (this->count - 1));
     }
     /* True if any value equals `val`.  String values compare by content (MAP_EQ),
      * matching key equality and C# Dictionary.ContainsValue for strings. */
@@ -591,16 +607,21 @@ class Map<K, V> {
     }
     /* Group values by keySelector(k,v).  Returns Map<G, List<V>> by value —
      * nested List shells live in the map dense buffer (Phase B).  Get/ValAt
-     * deep-Copy a bucket; mutate in place via GetMut/ValMut. */
+     * deep-Copy a bucket; mutate in place via GetMut/ValMut.
+     * One probe per element (was Contains + Set + GetMut = three). */
     Map<G, List<V>> GroupBy<G>(G(*keySelector)(K, V)) const __attribute__((da_ignore)) {
         auto result = Map<G, List<V>>();
         for (int i = 0; i < this->count; i++) {
             G gk = keySelector(*(this->keys + (i)), *(this->vals + (i)));
-            if (!result.Contains(gk)) {
+            result.ensure_table();
+            int slot = result.find_slot(gk);
+            int didx = result.table[slot];
+            if (didx < 0) {
                 auto empty = List<V>();
-                result.Set(gk, move empty);
+                result.insert_new_at(slot, gk, move empty);
+                didx = result.count - 1;
             }
-            result.GetMut(gk)->Add(*(this->vals + (i)));
+            result.ValMut(didx)->Add(*(this->vals + (i)));
         }
         return move result;
     }
@@ -705,6 +726,7 @@ class Map<K, V> {
  *   auto g = GroupBy(&nums, keyFn);
  *   auto g = ListGroupBy(&nums, keyFn);
  * Buckets: Get/ValAt → deep Copy(); mutate with GetMut/ValMut.
+ * One probe per element (was Contains + Set + GetMut = three).
  */
 Map<G, List<T>> GroupBy<T, G>(List<T>* self, G(*keySelector)(T))
     __attribute__((da_ignore)) {
@@ -713,17 +735,23 @@ Map<G, List<T>> GroupBy<T, G>(List<T>* self, G(*keySelector)(T))
         for (int i = 0; i < self->Count(); i++) {
             T item = self->Get(i);
             G gk = keySelector(item);
-            if (!result.Contains(gk)) {
+            result.ensure_table();
+            int slot = result.find_slot(gk);
+            int didx = result.table[slot];
+            if (didx < 0) {
                 auto empty = List<T>();
-                result.Set(gk, move empty);
+                result.insert_new_at(slot, gk, move empty);
+                didx = result.count - 1;
             }
-            result.GetMut(gk)->Add(item);
+            result.ValMut(didx)->Add(item);
         }
     }
     return move result;
 }
 
-/* Compat alias of GroupBy (pre-UFCS name). */
+/* Compat alias of GroupBy (pre-UFCS name).  Duplicates the body: a monomorph
+ * of one free generic cannot call another free generic's specialization
+ * (unresolved reference in __genfn_ListGroupBy_* — val-032). */
 Map<G, List<T>> ListGroupBy<T, G>(List<T>* self, G(*keySelector)(T))
     __attribute__((da_ignore)) {
     auto result = Map<G, List<T>>();
@@ -731,11 +759,15 @@ Map<G, List<T>> ListGroupBy<T, G>(List<T>* self, G(*keySelector)(T))
         for (int i = 0; i < self->Count(); i++) {
             T item = self->Get(i);
             G gk = keySelector(item);
-            if (!result.Contains(gk)) {
+            result.ensure_table();
+            int slot = result.find_slot(gk);
+            int didx = result.table[slot];
+            if (didx < 0) {
                 auto empty = List<T>();
-                result.Set(gk, move empty);
+                result.insert_new_at(slot, gk, move empty);
+                didx = result.count - 1;
             }
-            result.GetMut(gk)->Add(item);
+            result.ValMut(didx)->Add(item);
         }
     }
     return move result;

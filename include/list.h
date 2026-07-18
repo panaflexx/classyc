@@ -339,9 +339,13 @@ class List<T> {
         *(this->data + index) = move item;
     }
 
-    /* Append to end. Grows capacity as needed. */
+    /* Append to end. Grows capacity as needed.
+     * Fast path: only call EnsureCapacity on the growth edge — the checked
+     * call blocks MIR inlining, so keeping it off the common path matters
+     * for fill loops (see GEN-OPT-RESEARCH.md R4/R6). */
     void Add(T item) {
-        this->EnsureCapacity(this->length + 1);
+        if (this->length >= this->capacity)
+            this->EnsureCapacity(this->length + 1);
         *(this->data + this->length) = move item;
         this->length++;
     }
@@ -453,7 +457,10 @@ class List<T> {
         if (other) {
             int oc = other->Count();
             this->EnsureCapacity(this->length + oc);
-            for (int i = 0; i < oc; i++) this->Add(other->Get(i));
+            for (int i = 0; i < oc; i++) {
+                if (is_move_only<T>()) this->Add(other->Get(i));
+                else                   this->Add(*(other->data + i));
+            }
         }
         return this;
     }
@@ -462,7 +469,10 @@ class List<T> {
         if (!other) return;
         int oc = other->Count();
         this->EnsureCapacity(this->length + oc);
-        for (int i = 0; i < oc; i++) this->Add(other->Get(i));
+        for (int i = 0; i < oc; i++) {
+            if (is_move_only<T>()) this->Add(other->Get(i));
+            else                   this->Add(*(other->data + i));
+        }
     }
 
     void InsertRange(int index, List<T>* other) {
@@ -476,8 +486,10 @@ class List<T> {
                     sizeof(T) * (this->length - index));
             memset((void*)(this->data + index), 0, sizeof(T) * oc);
         }
-        for (int i = 0; i < oc; i++)
-            *(this->data + index + i) = other->Get(i); /* prvalue bind / Copy */
+        for (int i = 0; i < oc; i++) {
+            if (is_move_only<T>()) *(this->data + index + i) = other->Get(i); /* Copy */
+            else                   *(this->data + index + i) = *(other->data + i);
+        }
         this->length += oc;
     }
 
@@ -489,16 +501,20 @@ class List<T> {
         if (count < 0)                    count = 0;
         if (start + count > this->length) count = this->length - start;
         auto result = List<T>(count > 0 ? count : 1);
-        for (int i = 0; i < count; i++)
-            result.Add(this->Get(start + i));
+        for (int i = 0; i < count; i++) {
+            if (is_move_only<T>()) result.Add(this->Get(start + i));
+            else                   result.Add(*(this->data + (start + i)));
+        }
         return move result;
     }
 
     /* Deep-enough copy into a by-value list (Get copies move-only T). */
     List<T> Copy() __attribute__((da_ignore)) {
         auto c = List<T>(this->length > 0 ? this->length : 1);
-        for (int i = 0; i < this->length; i++)
-            c.Add(this->Get(i));
+        for (int i = 0; i < this->length; i++) {
+            if (is_move_only<T>()) c.Add(this->Get(i));
+            else                     c.Add(*(this->data + i));
+        }
         return move c;
     }
 
@@ -518,21 +534,29 @@ class List<T> {
         T* array = (T*) malloc(sizeof(T) * n);
         if (array) {
             memset((void*)array, 0, sizeof(T) * n);
-            for (int i = 0; i < this->length; i++)
-                *(array + i) = this->Get(i);
+            for (int i = 0; i < this->length; i++) {
+                if (is_move_only<T>()) *(array + i) = this->Get(i);
+                else                   *(array + i) = *(this->data + i);
+            }
         }
         return array;
     }
     void CopyTo(T* destination) __attribute__((da_ignore)) {
-        for (int i = 0; i < this->length; i++)
-            *(destination + i) = this->Get(i);
+        for (int i = 0; i < this->length; i++) {
+            if (is_move_only<T>()) *(destination + i) = this->Get(i);
+            else                   *(destination + i) = *(this->data + i);
+        }
     }
     /* Element-wise equality; String elements use content compare via LIST_EQ. */
     int Equals(List<T>* other) __attribute__((da_ignore)) {
         if (!other || other->Count() != this->length) return 0;
         for (int i = 0; i < this->length; i++) {
-            T b = other->Get(i);
-            if (!LIST_EQ(*(this->data + i), b)) return 0;
+            if (is_move_only<T>()) {
+                T b = other->Get(i);
+                if (!LIST_EQ(*(this->data + i), b)) return 0;
+            } else {
+                if (!LIST_EQ(*(this->data + i), *(other->data + i))) return 0;
+            }
         }
         return 1;
     }
@@ -540,8 +564,14 @@ class List<T> {
     List<T> Distinct() __attribute__((da_ignore)) {
         auto r = List<T>(this->length > 0 ? this->length : 4);
         for (int i = 0; i < this->length; i++) {
-            if (r.IndexOf(this->Get(i)) < 0)
-                r.Add(this->Get(i));
+            if (is_move_only<T>()) {
+                if (r.IndexOf(this->Get(i)) < 0)
+                    r.Add(this->Get(i));
+            } else {
+                T* p = this->data + i;
+                if (r.IndexOf(*p) < 0)
+                    r.Add(*p);
+            }
         }
         return move r;
     }
@@ -551,8 +581,12 @@ class List<T> {
     /* Call action(item) for each element in order. */
     void ForEach(void(*action)(T)) __attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
-            T item = this->Get(i);
-            action(item);
+            if (is_move_only<T>()) {
+                T item = this->Get(i);
+                action(item);
+            } else {
+                action(*(this->data + i));
+            }
         }
     }
 
@@ -560,11 +594,17 @@ class List<T> {
     List<T> Filter(int(*pred)(T)) __attribute__((da_ignore)) {
         auto result = List<T>();
         for (int i = 0; i < this->length; i++) {
-            /* Call Get twice rather than `T item = Get(i)`: a named by-value
-               class local with a user dtor is RAII-registered and, with current
-               aggregate call/return codegen, can corrupt monomorphized filter
-               results.  pred/Add take value params that copy from Get. */
-            if (pred(this->Get(i))) result.Add(this->Get(i));
+            /* Move-only T must go through Get (its return path carries the
+               deep-Copy rewrite).  Everything else reads straight from the
+               buffer — pred/Add params still receive copies, so semantics are
+               identical, but the per-element Get call + block copy is gone.
+               `i` is in range by the loop header (GEN-OPT-RESEARCH R2). */
+            if (is_move_only<T>()) {
+                if (pred(this->Get(i))) result.Add(this->Get(i));
+            } else {
+                T* p = this->data + i;
+                if (pred(*p)) result.Add(*p);
+            }
         }
         return move result;
     }
@@ -574,18 +614,28 @@ class List<T> {
     List<T> Map(T(*fn)(T)) __attribute__((da_ignore)) {
         auto result = List<T>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++) {
-            T item = this->Get(i);
-            result.Add(fn(item));
+            if (is_move_only<T>()) {
+                T item = this->Get(i);
+                result.Add(fn(item));
+            } else {
+                result.Add(fn(*(this->data + i)));
+            }
         }
         return move result;
     }
 
     /* Where == Filter. Non-owning view for T*; by-value T is copied.
-     * Allocates a new List — for counts use CountWhere / View().CountWhere. */
+     * Allocates a new List — for counts use CountWhere / View().CountWhere.
+     * Same is_move_only split as Filter (R2). */
     List<T> Where(int(*pred)(T)) __attribute__((da_ignore)) {
         auto result = List<T>();
         for (int i = 0; i < this->length; i++) {
-            if (pred(this->Get(i))) result.Add(this->Get(i));
+            if (is_move_only<T>()) {
+                if (pred(this->Get(i))) result.Add(this->Get(i));
+            } else {
+                T* p = this->data + i;
+                if (pred(*p)) result.Add(*p);
+            }
         }
         return move result;
     }
@@ -595,7 +645,11 @@ class List<T> {
     int CountWhere(int(*pred)(T)) __attribute__((da_ignore)) {
         int n = 0;
         for (int i = 0; i < this->length; i++) {
-            if (pred(this->Get(i))) n++;
+            if (is_move_only<T>()) {
+                if (pred(this->Get(i))) n++;
+            } else {
+                if (pred(*(this->data + i))) n++;
+            }
         }
         return n;
     }
@@ -623,8 +677,12 @@ class List<T> {
     List<U> Select<U>(U(*fn)(T)) __attribute__((da_ignore)) {
         auto result = List<U>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++) {
-            T item = this->Get(i);
-            result.Add(fn(item));
+            if (is_move_only<T>()) {
+                T item = this->Get(i);
+                result.Add(fn(item));
+            } else {
+                result.Add(fn(*(this->data + i)));
+            }
         }
         return move result;
     }
@@ -638,8 +696,12 @@ class List<T> {
     List<String>* SelectString(String(*fn)(T)) __attribute__((da_ignore)) {
         List<String>* result = new List<String>(this->length > 0 ? this->length : 4);
         for (int i = 0; i < this->length; i++) {
-            T item = this->Get(i);
-            result->Add(fn(item));
+            if (is_move_only<T>()) {
+                T item = this->Get(i);
+                result->Add(fn(item));
+            } else {
+                result->Add(fn(*(this->data + i)));
+            }
         }
         return result;
     }
@@ -652,24 +714,37 @@ class List<T> {
 
     int Any(int(*pred)(T)) __attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
-            T item = this->Get(i);
-            if (pred(item)) return 1;
+            if (is_move_only<T>()) {
+                T item = this->Get(i);
+                if (pred(item)) return 1;
+            } else {
+                if (pred(*(this->data + i))) return 1;
+            }
         }
         return 0;
     }
 
     int All(int(*pred)(T)) __attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
-            T item = this->Get(i);
-            if (!pred(item)) return 0;
+            if (is_move_only<T>()) {
+                T item = this->Get(i);
+                if (!pred(item)) return 0;
+            } else {
+                if (!pred(*(this->data + i))) return 0;
+            }
         }
         return 1;
     }
 
     T Find(int(*pred)(T)) __attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
-            T item = this->Get(i);
-            if (pred(item)) return item;
+            if (is_move_only<T>()) {
+                T item = this->Get(i);
+                if (pred(item)) return item;
+            } else {
+                T* p = this->data + i;
+                if (pred(*p)) return *p;
+            }
         }
         T z;
         memset((void*)&z, 0, sizeof(T));
@@ -678,8 +753,13 @@ class List<T> {
 
     T FindOr(T fb, int(*pred)(T)) __attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
-            T item = this->Get(i);
-            if (pred(item)) return item;
+            if (is_move_only<T>()) {
+                T item = this->Get(i);
+                if (pred(item)) return item;
+            } else {
+                T* p = this->data + i;
+                if (pred(*p)) return *p;
+            }
         }
         return fb;
     }
@@ -709,7 +789,10 @@ class List<T> {
         if (count < 0) count = 0;
         if (count > this->length) count = this->length;
         auto result = List<T>(count > 0 ? count : 4);
-        for (int i = 0; i < count; i++) result.Add(Get(i));
+        for (int i = 0; i < count; i++) {
+            if (is_move_only<T>()) result.Add(Get(i));
+            else                   result.Add(*(this->data + i));
+        }
         return move result;
     }
 
@@ -721,7 +804,10 @@ class List<T> {
         }
         int remaining = this->length - count;
         auto result = List<T>(remaining);
-        for (int i = count; i < this->length; i++) result.Add(Get(i));
+        for (int i = count; i < this->length; i++) {
+            if (is_move_only<T>()) result.Add(Get(i));
+            else                   result.Add(*(this->data + i));
+        }
         return move result;
     }
 

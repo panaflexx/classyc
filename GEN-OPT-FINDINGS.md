@@ -451,3 +451,151 @@ Per-function forward analysis in `midopt.c` (after method DCE):
 
 **Still not (Level 2+):** full CFG SSA, heap shape, List.Get length coupling,
 borrow checking.
+
+---
+
+## 14. Phase H — header quick harvest + cy-bench harness (2026-07-18)
+
+From [`GEN-OPT-RESEARCH.md`](GEN-OPT-RESEARCH.md) R3/R4/R6.  Header-only
+changes plus one midopt helper-name; no gen changes.
+
+| Item | Where | Result |
+|------|-------|--------|
+| `Add` capacity fast path (`length >= capacity` guard before `EnsureCapacity` call) | `include/list.h` | removes a thunked call per non-growth Add |
+| `insert_new_at(slot, k, v)` single-probe primitive factored out of `Set` | `include/map.h` | `Set` behavior identical (validate green) |
+| `TryAdd` single-probe (was `Contains` + `Set` = 2) | `include/map.h` | **−16%** on 10k-op bench (median, interleaved A/B) |
+| `GetOrAdd` single-probe on miss | `include/map.h` | neutral on hit-heavy bench (hit path was already 1 probe) |
+| `GroupBy` (Map method + free `GroupBy`/`ListGroupBy`) single-probe (was `Contains` + `Set` + `GetMut` = 3) | `include/map.h` | **−32%** on 30×10k-elem bench |
+| `insert_new_at` added to `midopt_helper_names` | `src/midopt.c` | DCE keeps it on live monomorphs |
+| Bench harness `cy-bench/` (`bench-list-pipeline.cy`, `bench-map-probes.cy`, `run-bench.sh`) | new | checksums double as correctness tests |
+
+**Reverted after measurement:** single-`Get` rewrite of `Where`/`Filter`/
+`Distinct` (`T item = Get(i); … Add(move item)`).  It measured **~45%
+slower**: the named local pays a per-iteration RAII dtor registration, and
+prvalue `Get(i)` already binds straight into the `pred`/`Add` params with no
+extra copy.  The real fix is borrow-don't-copy (R2, compiler-side).  The
+`Filter` comment now records the *actual* reason for the double-Get.
+
+**Pitfall found:** a monomorph of one free generic cannot call another free
+generic's specialization (`ListGroupBy` → `GroupBy` = unresolved reference in
+`__genfn_ListGroupBy_int_int`, val-032 SIGSEGV).  Keep duplicated bodies.
+
+**Validation:** `cy-validate` **54 passed / 0 failed / 0 crashed**.
+`bugs/run-bugs.sh` 8/3/0 — failures are the pre-existing stale expectations
+(003, 004, 007) documented in `CLASSYC-FINDINGS.md` §3.
+
+**A/B protocol:** interleaved runs (old headers stashed ↔ new headers) because
+absolute times are load-sensitive; medians of 3 rounds reported above.
+
+---
+
+## 15. Phase I — R1 symbolic-constraint guard elimination (2026-07-18)
+
+From [`GEN-OPT-RESEARCH.md`](GEN-OPT-RESEARCH.md) R1 (LLVM IRCE /
+ConstraintElimination analog, at the typed-AST layer).
+
+**What landed (`src/midopt.c`, `src/classyc.c`):**
+
+| Piece | Where | Behavior |
+|-------|-------|----------|
+| IV recognition for `N_FOR` | `midopt_safety_for` | `for (i = LO; i < B; step++)` with non-decreasing step; interval `[LO, B-1]` set on the IV in the body env (constant B) |
+| Symbolic bound `i < recv.Count()` | `struct midopt_fact.sym_recv/sym_lo` | direct form and via bound local `int n = recv.Count();` |
+| Hazard analysis | `midopt_iv_hazard_p`, `addr_taken_p`, `midopt_kill_sym_for`, safe-method whitelist | shrink/unknown method on recv, `&recv`, `move recv`, recv/IV/bound writes, escaped receiver → no elision (growth is SAFE: `Add` etc. whitelisted) |
+| Stamp consumption | `elide_oob_p` on N_CALL/N_IND | gen N_CALL intercept and class subscript add `GEN_SAFE_SKIP_OOB`; C arrays already consumed it |
+| N_CALL open-code enabled | gen intercept | resolves accessor by **name+arity** when `def_node` absent (monomorph paths) |
+
+**Measurements:**
+
+| Bench | Before | After | Speedup |
+|-------|-------:|------:|--------:|
+| `for(i<xs.Count()) s+=xs.Get(i)` (cy-bench/bench-iv-access) | 135.2 ms | 39.6 ms | **3.4×** |
+| `xs[i]` same loop | 110.4 ms | 42.0 ms | **2.6×** |
+| C array `a[i]` counted loop | 4.2 ms | 1.8 ms | **2.3×** |
+| sketch-midopt-iv-guards traps in main | 6 sites guarded | 1 (intentional hazard) | — |
+| space-trader ST2000 `-O2 -fno-exceptions` ticks/sec (median of 3) | 48813 | 51945 | +6% (noise-adjacent) |
+
+**Pitfalls discovered (worth remembering):**
+
+1. **Check injects the receiver as `args[0]` of every non-static method call**
+   (`N_ADDR(obj)` for value receivers, pointer copy for `->`).  Everything that
+   inspects method-call args must skip it: the gen N_CALL intercept computed
+   arity wrong (never fired), midopt's `N_ADDR` walk marked every receiver
+   addr-taken (poisoned escape proofs).  Both fixed with skip-receiver logic.
+2. **Locals link via `expr.u.lvalue_node` (the N_SPEC_DECL), not `def_node`**
+   (NULL for plain local uses).  `midopt_id_decl` now falls back — this also
+   repairs the *existing* Phase G lattice, whose local tracking silently
+   matched nothing through `def_node` alone.
+3. `midopt_same_decl(NULL, NULL) == 1` foot-gun: null-check ordering in
+   identity comparisons.
+4. Open-coded accessor OOB traps report the *method's* source line (list.h:218)
+   not the call site's — trap line numbers are not per-site distinguishable.
+
+**Correctness:** `cy-validate` **54/0/0**; bugs 8/3/0 (pre-existing stale);
+sketch `sketch-midopt-iv-guards.cy` PASS (guard-free results identical);
+aurora-ops / neon-grid run clean.
+
+**Scope notes (v1):** value-class receivers only (pointer receivers alias);
+`while`-form IVs not yet recognized; `i <= n` only for constant bounds;
+user-defined dense classes need whitelisted method names to elide.
+
+---
+
+## 16. Phase J — R2 borrow-don't-copy (2026-07-18)
+
+From [`GEN-OPT-RESEARCH.md`](GEN-OPT-RESEARCH.md) R2 (C++ NRVO / LLVM SROA /
+GCC ipa-sra analog, adapted to ClassyC's typed-AST midopt + gen).
+
+### What landed
+
+| Piece | Where | Behavior |
+|-------|-------|----------|
+| `is_move_only<T>()` intrinsic | classyc.c (parse special-form, specialize substitution, check fold) | folds to 1 for List/Map/Set instantiations, 0 else — lets generic bodies pick a Copy-safe path per element kind |
+| R2.2b zero-copy HOFs | `include/list.h` | Filter/Where/CountWhere/Any/All/Find/FindOr/ForEach/Map/Select/SelectString/Distinct/Copy/Equals/Slice/Concat/AddRange/InsertRange/Take/Skip/ToArray/CopyTo: non-move-only elements read straight from `data+i` (pred/Add params still copy — semantics identical); move-only keeps the Get prvalue-Copy path |
+| R2.1 for-in by-ref | `src/midopt.c` proof + `src/classyc.c` gen | `for (auto s in xs)` over dense List/Set class elements: when the body provably never mutates the var or the collection and calls only proven read-only methods on the var, gen binds the var as a **pointer into the buffer** instead of a per-iteration block copy |
+| R2.2a capturing-lambda deref | `src/classyc.c` open-code builder | capturing Where/CountWhere/Find/Any/All/Map/Select: param substituted by `*(recv.GetMut(i))` instead of `recv.Get(i)` when the param is read-only and the element is a non-move-only aggregate |
+
+### Measurements
+
+| Bench | Before | After | Speedup |
+|-------|-------:|------:|--------:|
+| for-in over 2000×64B elements ×3000 (midopt on vs `-fno-midopt`) | 80 ms | 27 ms | **2.9×** |
+| CountWhere 2000×64B ×4000 (header stash A/B) | 510 ms | 334 ms | **1.5×** |
+| Where same (A/B) | 102 ms | 81 ms | **1.25×** |
+| capturing CountWhere MIR | 2 Get calls + 2 block copies/elem | 2 GetMut, **0 copies** | — |
+
+### Mechanism notes (for future work)
+
+- **Proofs are the product.** R2.1's conditions: loop var never assigned /
+  INC / moved / address-taken; collection never mutated (pure-read method
+  whitelist — growth is NOT allowed here since a realloc moves the buffer);
+  method calls on the var must pass a depth-capped `this`-write body analysis.
+  All failures fall back to the copy path with identical semantics.
+- For-in loop vars carry **no RAII dtor** today (verified empirically) — the
+  by-ref binding changes nothing about destruction (the List owns elements).
+- `is_move_only<T>()` is name-based (mangled `__generic_{List,Map,Set}_`),
+  mirroring `class_is_move_only_collection_p`.  `List<int>*` is 0 (pointers
+  copy bitwise).  `>>` in nested type args needs `c2m_pending_extra_gt`
+  handling in the parse special form (is_pointer has the same latent gap).
+- Call-arg init from an lvalue does **not** get the move-only Copy rewrite
+  (only N_RETURN / N_ASSIGN do) — `Add(*p)` on `List<List<int>>` shallow-copies
+  and double-frees.  This is why move-only T keeps the Get prvalue path.
+- Method calls inject the receiver as args[0] — any AST use-walk must skip it
+  (same lesson as R1).
+- For-in var N_IDs are declaration sites: no `u.lvalue_node`; resolve via
+  `symbol_find (S_REGULAR, var, forin_node)`.
+
+### Validation
+
+`cy-validate` **54/0/0**; bugs 8/3/0 (pre-existing); probes:
+`sketch/probe-forin-byref.cy` (byref + 3 hazard fallbacks, all modes),
+`sketch/probe-hof-deref.cy` (capturing Where/CountWhere/Find + mutating-lambda
+fallback + move-only nested), `/tmp/test-ismo*.cy` (intrinsic matrix).
+aurora-ops / neon-grid clean.
+
+### Deferred within R2
+
+- Sort comparator params (open-coded Sort's tmp move is required; comparator
+  deref is possible but the shift logic makes it delicate).
+- R2.3 by-value class function params → pointer (borrow params; ABI-visible,
+  ownership `PA_BORROWS` inference input).
+- Map dense for-in by-ref (values arrays), pointer-receiver collections.
