@@ -346,6 +346,20 @@ class List<T> {
         this->length++;
     }
 
+#ifdef CLASSYC_FAST_LIST
+    /* Unsafe accessors for hot loops where the caller has already proven
+     * bounds and capacity. These compile to a single load/store and avoid
+     * the exception-handling paths that block MIR inlining of the checked
+     * versions. */
+    T UnsafeGet(int index) {
+        return *(this->data + index);
+    }
+    void UnsafeAdd(T item) {
+        *(this->data + this->length) = move item;
+        this->length++;
+    }
+#endif
+
     /* Insert before index (clamped). Later elements shift right via memmove. */
     void Insert(int index, T item) {
         if (index < 0)            index = 0;

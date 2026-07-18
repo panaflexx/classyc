@@ -368,10 +368,18 @@ class Map<K, V> {
         return this->vals + idx;
     }
 
-    /* Destroy one key slot (by-value dtor or owned pointer delete). */
+    /* Destroy one key slot (by-value dtor, owned pointer delete, or
+     * heap-copied String key release). */
     void destroy_key_at(int i) {
-        if (this->_owns_keys && is_pointer<K>()) delete *(this->keys + i);
-        else                                     __destroy(*(this->keys + i));
+        const char* kt = nameof<K>();
+        int k_is_str = (strcmp(kt, "String") == 0 || strcmp(kt, "char") == 0);
+        if (k_is_str) {
+            void* stored = NULL;
+            memcpy(&stored, (void*)(this->keys + i), sizeof(K));
+            if (stored != NULL) free(stored);
+        }
+        if (this->_owns_keys && is_pointer<K>() && !k_is_str) delete *(this->keys + i);
+        else                                                  __destroy(*(this->keys + i));
     }
 
     /* Destroy one value slot. */
@@ -407,7 +415,16 @@ class Map<K, V> {
                 memset((void*)(this->vals + old_cap), 0, sizeof(V) * (this->capacity - old_cap));
         }
         int n = this->count;
-        *(this->keys + n) = key;
+        const char* kt = nameof<K>();
+        int k_is_str = (strcmp(kt, "String") == 0 || strcmp(kt, "char") == 0);
+        if (k_is_str) {
+            void* key_ptr = NULL;
+            memcpy(&key_ptr, &key, sizeof(K));
+            void* copied = key_ptr != NULL ? (void*)strdup((const char*)key_ptr) : NULL;
+            memcpy((void*)(this->keys + n), &copied, sizeof(K));
+        } else {
+            *(this->keys + n) = key;
+        }
         *(this->vals + n) = move val;
         this->count++;
 

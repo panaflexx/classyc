@@ -163,7 +163,7 @@ int serve(int port) {
         close(sfd);
         return 1;
     }
-    if (listen(sfd, 16) < 0) {
+    if (listen(sfd, 128) < 0) {
         printf("listen() failed\n");
         close(sfd);
         return 1;

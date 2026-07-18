@@ -63,7 +63,7 @@ static String path_after(String path, String prefix) {
    ═══════════════════════════════════════════════════════════════════════ */
 class Request {
     String method;   /* normalised to upper-case                          */
-    String path;     /* normalised to lower-case, trimmed                 */
+    String path;     /* trimmed; case preserved (ids are case-sensitive)  */
     String query;    /* raw query string, e.g. "page=1&limit=10"          */
     dict   body;     /* parsed from a JSON body, or 0                      */
 
@@ -71,7 +71,7 @@ class Request {
         /* Value-semantic String fields: these copies are owned by the Request
            and freed with it — no manual cleanup. */
         this.method = method.trim().upper();
-        this.path   = path.trim().lower();
+        this.path   = path.trim();
         if ((char*)query != NULL) this.query = query; else this.query = "";
         this.body   = 0;
         if ((char*)bodyJson != NULL && strlen((char*)bodyJson) > 0)
@@ -97,6 +97,7 @@ class Response {
     int    status;
     String statusText;
     String body;      /* JSON string ready to send                        */
+    int    keep_alive; /* 1 => "Connection: keep-alive" (server core sets) */
 
     Response(int status, String statusText, String body) {
         this.status     = status;
@@ -104,6 +105,7 @@ class Response {
         /* `body` is a transient arena String; this copies it into a buffer the
            Response owns and frees on destruction. */
         this.body       = body;
+        this.keep_alive = 0;
     }
 
     /* Render the full HTTP/1.1 response message (status line + headers + body).
@@ -112,7 +114,8 @@ class Response {
     String wire() {
         String b = this.body;
         int n = (int) strlen((char*)b);
-        return f"HTTP/1.1 {this.status} {this.statusText}\r\nContent-Type: application/json\r\nContent-Length: {n}\r\nConnection: close\r\n\r\n{b}";
+        String conn = this.keep_alive ? "keep-alive" : "close";
+        return f"HTTP/1.1 {this.status} {this.statusText}\r\nContent-Type: application/json\r\nContent-Length: {n}\r\nConnection: {conn}\r\n\r\n{b}";
     }
 };
 
@@ -140,6 +143,11 @@ extern Response* app_handle(Request* req);
 /* Implemented by the SERVER (http-serve.c).  Starts the accept loop on `port`
    and never returns under normal operation.  The application's main() calls it. */
 extern int serve(int port);
+
+/* Implemented by the FIBER SERVER (http-serve-fibers.c).  Like serve(), but
+   every connection is handled by its own minicoro fiber with non-blocking
+   sockets on a single OS thread — many concurrent clients, no pthreads. */
+extern int serve_fibers(int port);
 
 /* ═══════════════════════════════════════════════════════════════════════
    Attribute-based routing (ASP.NET-style auto-discovery)
