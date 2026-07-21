@@ -11466,6 +11466,11 @@ struct expr {
   /* Midopt: static array index proved in-range (const index + known length).
      gen elides the OOB safety trap when set. */
   unsigned int elide_oob_p : 1;
+  /* Midopt R-LICM: this N_CALL is a proven loop-invariant, side-effect-free
+     accessor (e.g. `recv.Count()`) used as a counted-loop bound whose receiver
+     is never mutated in the loop.  gen memoizes its pre-header value and reuses
+     it at the loop-bottom condition instead of re-calling each iteration. */
+  unsigned int hoist_call_p : 1;
   union {
     node_t lvalue_node;       /* for id, str, field, deref field, ind, deref, compound literal */
     node_t label_addr_target; /* for label address */
@@ -23272,6 +23277,12 @@ struct gen_ctx {
   MIR_item_t cy_obj_note_free_proto, cy_obj_note_free_item; /* void cy_obj_note_free(ptr,line) */
   MIR_item_t cy_obj_check_proto, cy_obj_check_item;         /* void cy_obj_check(ptr,line)     */
   int exc_depth;                                        /* try nesting depth (label uids) */
+  /* Midopt R-LICM memo: proven loop-invariant call nodes mapped to the op that
+     holds their once-evaluated pre-header value (see gen_hoist_* helpers). */
+#define GEN_HOIST_MAX 32
+  node_t hoist_nodes[GEN_HOIST_MAX];
+  op_t hoist_ops[GEN_HOIST_MAX];
+  int hoist_n;
   VARR (MIR_op_t) * call_ops, *ret_ops, *switch_ops;
   VARR (case_t) * switch_cases;
   int curr_mir_proto_num;
@@ -23449,6 +23460,9 @@ struct gen_ctx {
 #define cy_obj_check_proto gen_ctx->cy_obj_check_proto
 #define cy_obj_check_item gen_ctx->cy_obj_check_item
 #define exc_depth gen_ctx->exc_depth
+#define hoist_nodes gen_ctx->hoist_nodes
+#define hoist_ops gen_ctx->hoist_ops
+#define hoist_n gen_ctx->hoist_n
 #define call_ops gen_ctx->call_ops
 #define ret_ops gen_ctx->ret_ops
 #define switch_ops gen_ctx->switch_ops
@@ -23480,6 +23494,7 @@ static void init_reg_vars (c2m_ctx_t c2m_ctx) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
 
   reg_free_mark = 0;
+  hoist_n = 0; /* R-LICM memo is per-function */
   HTAB_CREATE (reg_var_t, reg_var_tab, alloc, 128, reg_var_hash, reg_var_eq, NULL);
 }
 
@@ -28679,6 +28694,33 @@ static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm
   return res_ptr;
 }
 
+/* ── Midopt R-LICM memo (loop-invariant pure-call hoist) ──
+   The N_FOR gen emits its condition twice: as a pre-header guard (runs once at
+   entry) and at the loop bottom (runs every iteration).  When midopt proves a
+   bound call like `recv.Count()` invariant, gen evaluates it on the first
+   (pre-header) emission and memoizes the result op here; the loop-bottom
+   emission reuses it instead of re-calling.  Temp reg names increase
+   monotonically within a function body (top_gen never resets reg_free_mark),
+   so the cached reg survives and its pre-header def dominates the reuse. */
+static int gen_hoist_lookup (c2m_ctx_t c2m_ctx, node_t call, op_t *out) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  int i;
+  for (i = 0; i < hoist_n; i++)
+    if (hoist_nodes[i] == call) { *out = hoist_ops[i]; return 1; }
+  return 0;
+}
+
+static void gen_hoist_store (c2m_ctx_t c2m_ctx, node_t call, op_t op) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  int i;
+  for (i = 0; i < hoist_n; i++)
+    if (hoist_nodes[i] == call) return;   /* already memoized */
+  if (hoist_n >= GEN_HOIST_MAX) return;   /* cache full: skip (correctness-safe) */
+  hoist_nodes[hoist_n] = call;
+  hoist_ops[hoist_n] = op;
+  hoist_n++;
+}
+
 static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_t false_label,
                  int val_p, op_t *desirable_dest, int *expect_res) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
@@ -28713,6 +28755,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           || (true_label != NULL && false_label != NULL));
   assert (!val_p || desirable_dest == NULL);
   if (expect_res != NULL) *expect_res = 0; /* no expected result */
+  /* Midopt R-LICM: reuse a proven loop-invariant pure call's pre-header value
+     (value context only — the cond gens its operands as values). */
+  if (r->code == N_CALL && true_label == NULL && false_label == NULL) {
+    struct expr *ce = r->attr;
+    if (ce != NULL && ce->hoist_call_p && gen_hoist_lookup (c2m_ctx, r, &res)) return res;
+  }
   if (r->code != N_ANDAND && r->code != N_OROR && expr_attr_p && push_const_val (c2m_ctx, r, &res))
     goto finish;
   switch (r->code) {
@@ -32100,6 +32148,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     int saved_loop_str_active, saved_loop_obj_active;
     op_t saved_loop_str_mark, saved_loop_obj_mark;
     MIR_label_t saved_loop_break_label;
+    int saved_hoist_n = hoist_n; /* scope R-LICM memo entries to this loop */
 
     assert (false_label == NULL && true_label == NULL);
     continue_label = MIR_new_label (ctx);
@@ -32137,6 +32186,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     break_label = saved_break_label;
     defer_break_mark = saved_defer_break_mark;
     defer_continue_mark = saved_defer_continue_mark;
+    hoist_n = saved_hoist_n; /* drop this loop's R-LICM memo entries */
     break;
   }
   case N_IN: {
@@ -33243,6 +33293,12 @@ finish:
     } else {
       res = force_val (c2m_ctx, res, vt->arr_type != NULL);
     }
+  }
+  /* Midopt R-LICM: memoize this loop-invariant call's finalized value so the
+     loop-bottom condition emission reuses it instead of re-calling. */
+  if (r->code == N_CALL && true_label == NULL && false_label == NULL) {
+    struct expr *ce = r->attr;
+    if (ce != NULL && ce->hoist_call_p) gen_hoist_store (c2m_ctx, r, res);
   }
   if (stmt_p) curr_call_arg_area_offset = 0;
   return res;

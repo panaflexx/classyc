@@ -626,6 +626,8 @@ static void midopt_kill_sym_for (struct midopt_env *env, node_t decl);
 static node_t midopt_method_call_recv (node_t func, const char **name);
 static void midopt_check_class_iv (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *env);
 static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *env);
+static int midopt_pure_coll_method_p (const char *nm);
+static int midopt_recv_mutated_p (node_t n, node_t recv);
 
 /* If N is a `recv.Count()` call on a value-class receiver (TM_CLASS local),
  * return the receiver's decl identity; else NULL.  Used to establish the
@@ -969,6 +971,13 @@ static void midopt_safety_expr (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
     }
     midopt_check_shift (c2m_ctx, n, env);
     return;
+  case N_SIZEOF: case N_EXPR_SIZEOF: case N_ALIGNOF:
+    /* Operands of sizeof/_Alignof are UNEVALUATED in C: `sizeof(*p)` does not
+       dereference p.  Descending would let the inner N_DEREF reach
+       midopt_check_deref and raise a spurious "definite null dereference" on
+       idioms like `x = calloc(1, sizeof(*x))` where x is provably null on this
+       path.  (VLA size exprs are evaluated, but `sizeof(*p)` never derefs p.) */
+    return;
   default:
     if (!midopt_node_has_ops (n->code)) return;
     for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
@@ -1173,6 +1182,7 @@ static int midopt_iv_hazard_p (node_t n, node_t iv_decl, node_t bound_decl, node
 static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *env) {
   node_t init, cond, iter, stmt;
   node_t iv_decl = NULL, iv_spec = NULL, bound_decl = NULL, bound_recv = NULL;
+  node_t bound_call = NULL; /* the direct `recv.Count()` call node, if any (R-LICM) */
   mir_llong init_lo = 0, init_hi = 0, bound_lo = 0, bound_hi = 0;
   int init_p = 0, bound_ival_p = 0, strict = 1, step_ok = 0;
   struct midopt_env body_env;
@@ -1233,6 +1243,7 @@ static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *e
     if (bound_expr != NULL) {
       bound_ival_p = midopt_expr_ival (env, bound_expr, &bound_lo, &bound_hi);
       bound_recv = midopt_count_call_recv (bound_expr);
+      if (bound_recv != NULL) bound_call = bound_expr; /* direct `recv.Count()` */
       bound_decl = midopt_id_decl (bound_expr);
       if (bound_recv == NULL && bound_decl != NULL) {
         struct midopt_fact *bf = midopt_env_find (env, bound_decl);
@@ -1307,6 +1318,19 @@ static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *e
         f->sym_recv = bound_recv;
         f->sym_lo = init_lo;
       }
+    }
+    /* R-LICM: the loop bound is a direct `recv.Count()` whose receiver is
+       neither escaped nor mutated anywhere in the body/iter → the count is
+       loop-invariant.  Stamp the call so gen memoizes its pre-header value and
+       stops re-calling it every iteration.  This is STRICTER than the OOB proof
+       above (which tolerates growth): here any mutation, incl. Add, disqualifies. */
+    if (bound_call != NULL && bound_recv != NULL && !recv_escaped
+        && bound_call->attr != NULL
+        && !midopt_recv_mutated_p (stmt, bound_recv)
+        && !midopt_recv_mutated_p (iter, bound_recv)) {
+      ((struct expr *) bound_call->attr)->hoist_call_p = 1;
+      if (midopt_verbose_p)
+        fprintf (stderr, "  [midopt] R-LICM hoist loop-invariant Count() bound\n");
     }
   }
 
@@ -1436,6 +1460,62 @@ static int midopt_rooted_at (node_t n, node_t decl) {
     }
     return 0;
   }
+  return 0;
+}
+
+/* Strict receiver-mutation scan for R-LICM (hoisting `recv.Count()`).  Unlike
+   midopt_iv_hazard_p — which whitelists growth (Add/Insert/…) as OOB-safe
+   because it only *increases* length — hoisting a count bound requires the
+   count be INVARIANT, so any mutating method (not in the pure-read whitelist),
+   any write through RECV, address-of, move, or delete disqualifies.  Returns 1
+   if N (a loop body / iter) may change RECV's observable count. */
+static int midopt_recv_mutated_p (node_t n, node_t recv) {
+  node_t c;
+  if (n == NULL || recv == NULL) return 0;
+  switch (n->code) {
+  case N_ASSIGN: case N_ADD_ASSIGN: case N_SUB_ASSIGN: case N_MUL_ASSIGN:
+  case N_DIV_ASSIGN: case N_MOD_ASSIGN: case N_LSH_ASSIGN: case N_RSH_ASSIGN:
+  case N_AND_ASSIGN: case N_OR_ASSIGN: case N_XOR_ASSIGN: {
+    node_t lhs = NL_HEAD (n->u.ops);
+    if (midopt_same_decl (midopt_id_decl (lhs), recv)) return 1;
+    if (lhs != NULL && (lhs->code == N_FIELD || lhs->code == N_DEREF_FIELD
+                        || lhs->code == N_IND || lhs->code == N_DEREF)
+        && midopt_rooted_at (lhs, recv))
+      return 1;
+    break;
+  }
+  case N_INC: case N_DEC: case N_POST_INC: case N_POST_DEC:
+    if (midopt_rooted_at (NL_HEAD (n->u.ops), recv)) return 1;
+    break;
+  case N_ADDR: case N_MOVE: case N_DELETE:
+    if (midopt_same_decl (midopt_id_decl (NL_HEAD (n->u.ops)), recv)) return 1;
+    break;
+  case N_CALL: {
+    const char *nm = NULL;
+    node_t fn = NL_HEAD (n->u.ops);
+    node_t rd = midopt_method_call_recv (fn, &nm);
+    if (rd != NULL && midopt_same_decl (rd, recv) && !midopt_pure_coll_method_p (nm))
+      return 1;
+    /* Skip the injected receiver-copy arg (args[0] N_ADDR) like iv_hazard_p. */
+    if (fn != NULL && (fn->code == N_FIELD || fn->code == N_DEREF_FIELD)) {
+      node_t args = NL_EL (n->u.ops, 1);
+      node_t a0 = args != NULL && args->code == N_LIST ? NL_HEAD (args->u.ops) : NULL;
+      if (a0 != NULL && a0->code == N_ADDR) {
+        node_t a;
+        if (midopt_recv_mutated_p (fn, recv)) return 1;
+        for (a = NL_NEXT (a0); a != NULL; a = NL_NEXT (a))
+          if (midopt_recv_mutated_p (a, recv)) return 1;
+        return 0;
+      }
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  if (!midopt_node_has_ops (n->code)) return 0;
+  for (c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (midopt_recv_mutated_p (c, recv)) return 1;
   return 0;
 }
 
@@ -2212,6 +2292,54 @@ static void midopt_dump_mir_stats (c2m_ctx_t c2m_ctx, MIR_module_t m) {
 /* ── entry point ─────────────────────────────────────────────────────────── */
 
 /* Run midopt over the module AST.  Safe to call when no_midopt_p (no-op). */
+/* Does subtree N contain a call?  Keeps auto-inline candidates tiny and dodges
+   the pointer-into-`this` chaining hazard (a return that flows through a call). */
+static int midopt_expr_has_call_p (node_t n) {
+  node_t c;
+  if (n == NULL) return 0;
+  if (n->code == N_CALL) return 1;
+  if (!midopt_node_has_ops (n->code)) return 0;
+  for (c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (midopt_expr_has_call_p (c)) return 1;
+  return 0;
+}
+
+/* True when FUNC_DEF is a trivial getter safe to mark MIR_INLINE: its body is
+   exactly one `return <arithmetic/enum expr>;` with no nested calls and no
+   writes to `this`.  Requiring an arithmetic (incl. enum) return type excludes
+   pointer / String / aggregate returns — i.e. the Get/GetMut pointer-into-`this`
+   case that miscompiles chaining (see midopt_run step 4). */
+static int midopt_trivial_scalar_getter_p (c2m_ctx_t c2m_ctx, node_t func_def) {
+  decl_t d;
+  struct func_type *ft;
+  struct type *ret;
+  node_t block, list, s = NULL, expr;
+  int n_stmt = 0;
+
+  if (func_def == NULL || func_def->code != N_FUNC_DEF) return 0;
+  d = (decl_t) func_def->attr;
+  if (d == NULL || d->decl_spec.type == NULL || d->decl_spec.type->mode != TM_FUNC) return 0;
+  ft = d->decl_spec.type->u.func_type;
+  if (ft == NULL || ft->ret_type == NULL) return 0;
+  ret = ft->ret_type;
+  if (!arithmetic_type_p (ret)) return 0; /* excludes ptr/String/struct/class */
+
+  block = FUNC_DEF_BLOCK (func_def);
+  if (block == NULL || block->code != N_BLOCK) return 0;
+  list = NL_EL (block->u.ops, 1);
+  if (list == NULL || list->code != N_LIST) return 0;
+  for (node_t st = NL_HEAD (list->u.ops); st != NULL; st = NL_NEXT (st)) {
+    if (++n_stmt > 1) return 0; /* more than a single statement */
+    s = st;
+  }
+  if (n_stmt != 1 || s == NULL || s->code != N_RETURN) return 0;
+  expr = NL_EL (s->u.ops, 1); /* N_RETURN(N_LIST labels, expr?) */
+  if (expr == NULL || expr->code == N_IGNORE) return 0; /* bare `return;` */
+  if (midopt_expr_has_call_p (expr)) return 0;
+  if (!midopt_method_readonly_p (c2m_ctx, func_def, 0)) return 0;
+  return 1;
+}
+
 static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
   MIR_alloc_t alloc;
   int n_methods = 0, n_dead = 0;
@@ -2305,7 +2433,8 @@ static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
       decl_t d = f->attr;
       if (nm == NULL || d == NULL) continue;
       if (strcmp (nm, "Count") == 0 || strcmp (nm, "IsEmpty") == 0
-          || strcmp (nm, "Capacity") == 0) {
+          || strcmp (nm, "Capacity") == 0
+          || midopt_trivial_scalar_getter_p (c2m_ctx, f)) {
         d->decl_spec.inline_p = TRUE;
         if (midopt_verbose_p) fprintf (stderr, "  [midopt] inline mark %s\n", nm);
       }
