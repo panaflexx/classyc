@@ -32456,9 +32456,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
                  MIR_new_int_op (ctx, (long long) dense_v_size));
           emit3 (c2m_ctx, MIR_ADD, v_addr.mir_op, vals_base.mir_op, v_off.mir_op);
           if (v_is_agg) {
-            op_t src_mem
-              = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, v_addr.mir_op.u.reg, 0, 1));
-            block_move (c2m_ctx, v_agg, src_mem, dense_v_size);
+            /* R2 borrow: midopt proved the value var read-only over an
+               unmutated Map — bind by reference into the vals buffer. */
+            symbol_t bsym;
+            if (symbol_find (c2m_ctx, S_REGULAR, val_id, r, &bsym)
+                && bsym.def_node != NULL && bsym.def_node->attr != NULL
+                && ((decl_t) bsym.def_node->attr)->byref_p) {
+              gen_byref_push ((decl_t) bsym.def_node->attr, v_addr.mir_op.u.reg);
+            } else {
+              op_t src_mem
+                = new_op (NULL, MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, v_addr.mir_op.u.reg, 0, 1));
+              block_move (c2m_ctx, v_agg, src_mem, dense_v_size);
+            }
           } else {
             MIR_type_t load_t = promote_mir_int_type (dense_v_mir);
             op_t v_res = get_new_temp (c2m_ctx, load_t);

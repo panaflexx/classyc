@@ -599,3 +599,14 @@ aurora-ops / neon-grid clean.
 - R2.3 by-value class function params → pointer (borrow params; ABI-visible,
   ownership `PA_BORROWS` inference input).
 - Map dense for-in by-ref (values arrays), pointer-receiver collections.
+
+### R2.1 addendum — Map for-in by-ref (2026-07-18, same day)
+
+Extended the for-in borrow to dense Maps (`keys`+`vals`+`count`): the two-var
+`for (auto k, v in m)` value var binds by reference when `V` is a class and
+the body is read-only over an unmutated map (Map read methods added to the
+pure whitelist; `Set`/`TryAdd`/`insert_new_at` etc. disqualify).  Keys stay
+copied (scalars/Strings are single loads).  Probe:
+`sketch/probe-map-forin-byref.cy` (byref + 3 hazard fallbacks).  Bench
+(1500×72B values ×4000 iterations, midopt on vs off): **100 ms → 36.7 ms
+(2.7×)**.  cy-validate 54/0/0.

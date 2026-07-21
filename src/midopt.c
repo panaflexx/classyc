@@ -1412,7 +1412,8 @@ static const char *const midopt_pure_coll_methods[] = {
   "ToJsonArrayBy", "ToDictBy", "Copy", "Slice", "Plus", "Distinct", "Filter",
   "Where", "Map", "Select", "SelectString", "Take", "Skip", "FromJson",
   "FromView", "KeyAt", "ValAt", "ContainsKey", "ContainsValue", "Keys",
-  "Values", "GroupBy", NULL
+  "Values", "GroupBy", "WhereKeys", "WhereValues", "SelectValues", "SelectKeys",
+  NULL
 };
 
 static int midopt_pure_coll_method_p (const char *nm) {
@@ -1770,11 +1771,32 @@ static void midopt_byref_forin (c2m_ctx_t c2m_ctx, node_t n) {
   cls = coll_e->type;
   if (cls->u.tag_type == NULL) return;
   tag = cls->u.tag_type;
-  if (!find_dense_buffer_fields (tag, &data_f, &len_f, NULL)) {
-    return;
+
+  /* Two dense layouts:
+       List/Set (data+length): element var = single var, or two-var val
+       Map (keys+vals+count):  only the two-var VALUE var is worth borrowing
+                               (keys copy cheap — scalars and Strings). */
+  el_var = NULL;
+  el_t = NULL;
+  if (find_dense_buffer_fields (tag, &data_f, &len_f, NULL)) {
+    el_t = data_f->decl_spec.type != NULL ? data_f->decl_spec.type->u.ptr_type : NULL;
+    el_var = (val_id != NULL && val_id->code == N_ID) ? val_id
+             : (key_id != NULL && key_id->code == N_ID) ? key_id : NULL;
+  } else {
+    decl_t keys_f = find_class_field_by_name (tag, "keys");
+    decl_t vals_f = find_class_field_by_name (tag, "vals");
+    decl_t count_f = find_class_field_by_name (tag, "count");
+    int dense_map = (count_f != NULL && keys_f != NULL && vals_f != NULL
+                     && keys_f->decl_spec.type != NULL
+                     && keys_f->decl_spec.type->mode == TM_PTR
+                     && vals_f->decl_spec.type != NULL
+                     && vals_f->decl_spec.type->mode == TM_PTR);
+    if (dense_map) {
+      el_t = vals_f->decl_spec.type->u.ptr_type;
+      el_var = (val_id != NULL && val_id->code == N_ID) ? val_id : NULL;
+    }
   }
-  el_t = data_f->decl_spec.type != NULL ? data_f->decl_spec.type->u.ptr_type : NULL;
-  if (el_t == NULL) return;
+  if (el_var == NULL || el_t == NULL) return;
   if (el_t->mode != TM_CLASS && el_t->mode != TM_STRUCT && el_t->mode != TM_UNION) {
     return; /* scalars/pointers are already cheap single loads */
   }
@@ -1788,14 +1810,9 @@ static void midopt_byref_forin (c2m_ctx_t c2m_ctx, node_t n) {
     return;
   }
 
-  /* Element loop var: two-var form's val, else the single var.  The loop var
-     N_IDs are declaration sites (never checked as expression uses), so they
-     carry no u.lvalue_node — resolve via the symbol table like gen does. */
-  el_var = (val_id != NULL && val_id->code == N_ID) ? val_id
-           : (key_id != NULL && key_id->code == N_ID) ? key_id : NULL;
-  if (el_var == NULL) {
-    return;
-  }
+  /* The loop var N_IDs are declaration sites (never checked as expression
+     uses), so they carry no u.lvalue_node — resolve via the symbol table
+     like gen does. */
   {
     symbol_t vsym;
     if (!symbol_find (c2m_ctx, S_REGULAR, el_var, n, &vsym)
