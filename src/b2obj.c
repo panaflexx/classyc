@@ -2294,9 +2294,25 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
 
 int main(int argc, char **argv) {
     MIR_alloc_t alloc = &default_alloc;
+    int opt_level = -1;  /* -1: not given on the command line */
+    int argi = 1;
 
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <mir_input> <object_file>\n", argv[0]);
+    /* Optional -O0..-O3 code-generation optimisation level.  Overrides the
+       B2OBJ_OPT env var when given. */
+    if (argi < argc && strncmp(argv[argi], "-O", 2) == 0) {
+        const char *p = argv[argi] + 2;
+        if (p[0] >= '0' && p[0] <= '3' && p[1] == '\0') {
+            opt_level = p[0] - '0';
+            argi++;
+        } else {
+            fprintf(stderr, "%s: invalid optimisation level '%s' (use -O0, -O1, -O2 or -O3)\n",
+                    argv[0], argv[argi]);
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (argc - argi != 2) {
+        fprintf(stderr, "Usage: %s [-O0|-O1|-O2|-O3] <mir_input> <object_file>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -2308,8 +2324,8 @@ int main(int argc, char **argv) {
     lib_dirs_from_env_var("LD_LIBRARY_PATH");
     lib_dirs_from_env_var(MIR_ENV_VAR_LIB_DIRS);
 
-    const char *mir_input_file = argv[1];
-    const char *output_file = argv[2];
+    const char *mir_input_file = argv[argi];
+    const char *output_file = argv[argi + 1];
 
     MIR_context_t ctx = MIR_init();
 
@@ -2352,9 +2368,10 @@ int main(int argc, char **argv) {
            is 2 (GVN/CCP), but that pass can be extremely slow on large inputs
            (e.g. self-compiling c2mir.c).  Level 1 (register allocation +
            combiner) is a good default for ahead-of-time builds: it optimises
-           well and completes quickly.  Override with the B2OBJ_OPT env var. */
+           well and completes quickly.  Override with the B2OBJ_OPT env var or
+           the -O0..-O3 command-line option (which takes precedence). */
         const char *opt = getenv("B2OBJ_OPT");
-        int level = opt != NULL ? atoi(opt) : 1;
+        int level = opt_level >= 0 ? opt_level : (opt != NULL ? atoi(opt) : 1);
         MIR_gen_set_optimize_level(ctx, (unsigned)level);
         DBG("optimize level = %d", level);
     }
