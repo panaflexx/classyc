@@ -2660,7 +2660,7 @@ static void cfg_build_node (cfg_builder_t *b, node_t n) {
     cfg_build_node (b, FUNC_DEF_BLOCK (n));
     return;
   default:
-    /* Linear effect (declaration / expression / assignment / call / ...) 
+    /* Linear effect (declaration / expression / assignment / call / ...)
        — add to current block in source order. */
     bb_emit (b, n);
     return;
@@ -2949,7 +2949,7 @@ static int try_synthesize_auto_release (flowctx_t *ctx, candidate_t *c) {
      guard the synthesized N_CALL would emit "unknown identifier" errors
      during check() and pollute the build. */
   callee_id  = build_id (c2m_ctx, c->release_fn, POS (id));
-  callee_def = find_def (c2m_ctx, S_REGULAR, callee_id, d->scope, NULL);
+  callee_def = find_def (c2m_ctx, S_REGULARS, callee_id, d->scope, NULL);
   if (callee_def == NULL) {
     if (verbose_p)
       fprintf (stderr,

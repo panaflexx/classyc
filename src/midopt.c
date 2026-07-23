@@ -1895,7 +1895,7 @@ static void midopt_byref_forin (c2m_ctx_t c2m_ctx, node_t n) {
      like gen does. */
   {
     symbol_t vsym;
-    if (!symbol_find (c2m_ctx, S_REGULAR, el_var, n, &vsym)
+    if (!symbol_find (c2m_ctx, S_REGULARS, el_var, n, &vsym)
         || vsym.def_node == NULL || vsym.def_node->attr == NULL) {
       return;
     }

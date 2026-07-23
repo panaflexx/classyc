@@ -145,7 +145,7 @@ DEF_VARR (token_t);
 
 typedef struct node *node_t;
 
-enum symbol_mode { S_REGULAR, S_TAG, S_LABEL };
+enum symbol_mode { S_REGULARS, S_TAG, S_LABEL };
 
 DEF_VARR (node_t);
 
@@ -6268,7 +6268,7 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
       /* Nested class tags are pre-inserted into the parse-time curr_scope
          (the enclosing block).  Only look there -- parent walk needs
          struct node_scope which is not yet defined at this point in the file. */
-      if (symbol_find (c2m_ctx, S_REGULAR, _ta, curr_scope, &_sym)
+      if (symbol_find (c2m_ctx, S_REGULARS, _ta, curr_scope, &_sym)
           && _sym.def_node != NULL && _sym.def_node->code == N_CLASS)
         _cdef = _sym.def_node;
       else if (symbol_find (c2m_ctx, S_TAG, _ta, curr_scope, &_sym)
@@ -10990,7 +10990,7 @@ static void symbol_insert (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, 
   MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
   symbol_t el, symbol;
   const char *smode = (mode == S_TAG ? "s_tag" :
-                       mode == S_REGULAR ? "s_regular" : "s_label");
+                       mode == S_REGULARS ? "s_regular" : "s_label");
 
   if (c2m_options->verbose_p) {
       printf("symbol_insert: %s type %s class ? %s\n", id->u.s.s, smode, c2m_ctx->curr_class?"YES":"NO");
@@ -11037,7 +11037,7 @@ static void symbol_dump_one (symbol_t sym, void *arg) {
     pos = POS(sym.def_node);
 
   const char *smode = (sym.mode == S_TAG ? "s_tag" :
-                       sym.mode == S_REGULAR ? "s_regular" : "s_label");
+                       sym.mode == S_REGULARS ? "s_regular" : "s_label");
 
   fprintf (stderr, "Symbol: %s (%s), at %s:%d:%d\n",
            sym.id->u.s.s, smode,
@@ -12402,11 +12402,11 @@ static node_t find_class_dtor_def (c2m_ctx_t c2m_ctx, node_t class_def) {
   snprintf (dtor_name, sizeof (dtor_name), "__dtor_%s", cid->u.s.s);
   dtor_id = build_id (c2m_ctx, dtor_name, POS (class_def));
   if (check_ctx != NULL && top_scope != NULL) {
-    def = find_def (c2m_ctx, S_REGULAR, dtor_id, top_scope, NULL);
+    def = find_def (c2m_ctx, S_REGULARS, dtor_id, top_scope, NULL);
     if (def != NULL && def->code == N_FUNC_DEF) return def;
   }
   if (check_ctx != NULL && curr_scope != NULL) {
-    def = find_def (c2m_ctx, S_REGULAR, dtor_id, curr_scope, NULL);
+    def = find_def (c2m_ctx, S_REGULARS, dtor_id, curr_scope, NULL);
     if (def != NULL && def->code == N_FUNC_DEF) return def;
   }
   return NULL;
@@ -12455,7 +12455,7 @@ static node_t process_tag (c2m_ctx_t c2m_ctx, node_t r, node_t id, node_t decl_l
   if (!found_p) {
     // Classes need both, since they implement their own definition(tag)
     //if (r->code != N_CLASS)
-    //    symbol_insert (c2m_ctx, S_REGULAR, id, scope, r, NULL);
+    //    symbol_insert (c2m_ctx, S_REGULARS, id, scope, r, NULL);
     //else
         symbol_insert (c2m_ctx, S_TAG, id, scope, r, NULL);
   } else if (sym.def_node == r) {
@@ -12934,7 +12934,7 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
         error (c2m_ctx, POS (n), "double with short");
       break;
     case N_ID: {
-      node_t def = find_def (c2m_ctx, S_REGULAR, n, skip_struct_scopes (curr_scope), NULL);
+      node_t def = find_def (c2m_ctx, S_REGULARS, n, skip_struct_scopes (curr_scope), NULL);
       decl_t decl;
 
       set_type_pos_node (type, n);
@@ -13010,7 +13010,7 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
             // The def_node is the CLASS node (class_node_for_symbol) to which we attach .attr.
             node_t class_node_for_symbol = res_tag_type ? res_tag_type : n;
             if (id->code == N_ID) {
-                symbol_insert(c2m_ctx, S_REGULAR, id, curr_scope, class_node_for_symbol, NULL);
+                symbol_insert(c2m_ctx, S_REGULARS, id, curr_scope, class_node_for_symbol, NULL);
                 tpname_add(c2m_ctx, id, curr_scope, TRUE); // Register in tpname_tab
             }
 
@@ -13112,10 +13112,10 @@ static struct decl_spec check_decl_spec (c2m_ctx_t c2m_ctx, node_t r, node_t dec
           id = NL_HEAD (en->u.ops);
           const_expr = NL_NEXT (id);
           check (c2m_ctx, const_expr, n);
-          if (symbol_find (c2m_ctx, S_REGULAR, id, enum_const_scope, &sym)) {
+          if (symbol_find (c2m_ctx, S_REGULARS, id, enum_const_scope, &sym)) {
             error (c2m_ctx, POS (id), "enum constant %s redeclaration", id->u.s.s);
           } else {
-            symbol_insert (c2m_ctx, S_REGULAR, id, enum_const_scope, en, n);
+            symbol_insert (c2m_ctx, S_REGULARS, id, enum_const_scope, en, n);
           }
           curr_val++;
           if (curr_val == 0) neg_p = FALSE;
@@ -13455,7 +13455,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
     static node_code_t get_id_linkage (c2m_ctx_t c2m_ctx, int func_p, node_t id, node_t scope,
                                        struct decl_spec decl_spec) {
       node_code_t linkage;
-      node_t def = find_def (c2m_ctx, S_REGULAR, id, scope, NULL);
+      node_t def = find_def (c2m_ctx, S_REGULARS, id, scope, NULL);
 
       if (decl_spec.typedef_p) return N_IGNORE;                       // p6: no linkage
       if (decl_spec.static_p && scope == top_scope) return N_STATIC;  // p3: internal linkage
@@ -13562,7 +13562,7 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
        found by walking up from `scope`. */
     static int find_overload_sym (c2m_ctx_t c2m_ctx, node_t id, node_t scope, symbol_t *out) {
       for (;;) {
-        if (symbol_find (c2m_ctx, S_REGULAR, id, scope, out)) return TRUE;
+        if (symbol_find (c2m_ctx, S_REGULARS, id, scope, out)) return TRUE;
         if (scope == NULL || scope->attr == NULL) return FALSE;
         scope = ((struct node_scope *) scope->attr)->scope;
       }
@@ -14769,7 +14769,7 @@ static void lambda_free_vars_walk (c2m_ctx_t c2m_ctx, node_t n, VARR (cstr_t) * 
       VARR_PUSH (cstr_t, free_names, s);
       return;
     }
-    def = find_def (c2m_ctx, S_REGULAR, n, curr_scope, NULL);
+    def = find_def (c2m_ctx, S_REGULARS, n, curr_scope, NULL);
     if (def_is_auto_capture_p (c2m_ctx, def))
       VARR_PUSH (cstr_t, free_names, s);
     return;
@@ -16036,8 +16036,8 @@ static void materialize_pending_specs (c2m_ctx_t c2m_ctx, size_t mark) {
       {
         node_t scope = top_scope != NULL ? top_scope : curr_scope;
         if (scope == NULL) continue;
-        if (find_def (c2m_ctx, S_REGULAR, cid, scope, NULL) == NULL)
-          symbol_insert (c2m_ctx, S_REGULAR, cid, scope, cls, NULL);
+        if (find_def (c2m_ctx, S_REGULARS, cid, scope, NULL) == NULL)
+          symbol_insert (c2m_ctx, S_REGULARS, cid, scope, cls, NULL);
         if (find_def (c2m_ctx, S_TAG, cid, scope, NULL) == NULL)
           symbol_insert (c2m_ctx, S_TAG, cid, scope, cls, NULL);
         tpname_add (c2m_ctx, cid, scope, TRUE);
@@ -16126,7 +16126,7 @@ static struct type *check_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq
       error (c2m_ctx, POS (r), "'ToList' could not instantiate List<T>");
       return NULL;
     }
-    class_def = find_def (c2m_ctx, S_REGULAR, spec_id, curr_scope, NULL);
+    class_def = find_def (c2m_ctx, S_REGULARS, spec_id, curr_scope, NULL);
     if (class_def == NULL || class_def->code != N_CLASS) {
       error (c2m_ctx, POS (r),
              "'ToList' requires the generic List<T> class in scope (#include \"list.h\")");
@@ -16290,7 +16290,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
     error (c2m_ctx, pos, "could not instantiate List<T>");
     return NULL;
   }
-  class_def = find_def (c2m_ctx, S_REGULAR, spec_id, curr_scope, NULL);
+  class_def = find_def (c2m_ctx, S_REGULARS, spec_id, curr_scope, NULL);
   if (class_def == NULL || class_def->code != N_CLASS) {
     error (c2m_ctx, pos,
            "this operation requires the generic List<T> class in scope (#include \"list.h\")");
@@ -16458,7 +16458,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
                 /* dict key handled later in check_dict_initializer */
               } else if (curr_type->mode != TM_STRUCT && curr_type->mode != TM_UNION && curr_type->mode != TM_CLASS) {
                 error (c2m_ctx, POS (curr_des), "field name not in struct, union or class initializer");
-              } else if (!symbol_find (c2m_ctx, S_REGULAR, id, curr_type->u.tag_type, &sym)) {
+              } else if (!symbol_find (c2m_ctx, S_REGULARS, id, curr_type->u.tag_type, &sym)) {
                 error (c2m_ctx, POS (curr_des), "unknown field %s in initializer", id->u.s.s);
               } else {
                 process_init_field_designator (c2m_ctx, sym.def_node, curr_type);
@@ -16652,7 +16652,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           VARR_PUSH (decl_t, func_decls_for_allocation, decl);
       }
       if (declarator->code == N_DECL) {
-        def_symbol (c2m_ctx, S_REGULAR, id, scope, decl_node, decl->decl_spec.linkage);
+        def_symbol (c2m_ctx, S_REGULARS, id, scope, decl_node, decl->decl_spec.linkage);
         /* A block-scope `extern` declaration also refers to the file-scope
            identifier, so it is mirrored into top_scope.
 
@@ -16676,7 +16676,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
                              && (strncmp (id->u.s.s, "__ctor_", 7) == 0
                                  || strncmp (id->u.s.s, "__dtor_", 7) == 0));
           if (!member_scope_p || ctor_dtor_p)
-            def_symbol (c2m_ctx, S_REGULAR, id, top_scope, decl_node, N_EXTERN);
+            def_symbol (c2m_ctx, S_REGULARS, id, top_scope, decl_node, N_EXTERN);
         }
         if (func_p && decl->decl_spec.thread_local_p) {
           error (c2m_ctx, POS (id), "thread local function declaration");
@@ -16802,8 +16802,8 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
              or move-init).  Copy-init of dtor classes is rejected above. */
           snprintf (nm, sizeof (nm), "__dtor_%s", cid->u.s.s);
           cdtor_id = build_id (c2m_ctx, nm, POS (id));
-          if (find_def (c2m_ctx, S_REGULAR, cdtor_id, scope, NULL) != NULL
-              || find_def (c2m_ctx, S_REGULAR, cdtor_id, top_scope, NULL) != NULL) {
+          if (find_def (c2m_ctx, S_REGULARS, cdtor_id, scope, NULL) != NULL
+              || find_def (c2m_ctx, S_REGULARS, cdtor_id, top_scope, NULL) != NULL) {
             call = new_pos_node2 (c2m_ctx, N_CALL, POS (id),
                                   new_pos_node2 (c2m_ctx, N_FIELD, POS (id),
                                                  copy_node (c2m_ctx, id),
@@ -17561,18 +17561,18 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       if (class_tag == NULL) {
         node_t cid = NL_HEAD (curr_class->u.ops);
         if (cid != NULL && cid->code == N_ID) {
-          class_tag = find_def (c2m_ctx, S_REGULAR, cid, curr_scope, NULL);
+          class_tag = find_def (c2m_ctx, S_REGULARS, cid, curr_scope, NULL);
           if (class_tag == NULL) class_tag = find_def (c2m_ctx, S_TAG, cid, curr_scope, NULL);
         }
       }
       if (class_tag == NULL || class_tag->code != N_CLASS) return FALSE;
       /* `m` must be a data member or method registered in the class scope. */
-      if (!symbol_find (c2m_ctx, S_REGULAR, r, class_tag, &sym) || sym.def_node == NULL
+      if (!symbol_find (c2m_ctx, S_REGULARS, r, class_tag, &sym) || sym.def_node == NULL
           || (sym.def_node->code != N_MEMBER && sym.def_node->code != N_FUNC_DEF))
         return FALSE;
       /* An implicit `this` receiver must be in scope (non-static method). */
       this_id = build_id (c2m_ctx, "this", POS (r));
-      if (find_def (c2m_ctx, S_REGULAR, this_id, curr_scope, NULL) == NULL) return FALSE;
+      if (find_def (c2m_ctx, S_REGULARS, this_id, curr_scope, NULL) == NULL) return FALSE;
       /* Rewrite `m` (N_ID) in place into `this.m` (N_DEREF_FIELD(this, m)).
          Capture the member name before reusing r's union for the op list. */
       member_id = new_str_node (c2m_ctx, N_ID, r->u.s, POS (r));
@@ -17949,7 +17949,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         node_t aux_node = NULL;
         decl_t decl;
 
-        op1 = find_def (c2m_ctx, S_REGULAR, r, curr_scope, &aux_node);
+        op1 = find_def (c2m_ctx, S_REGULARS, r, curr_scope, &aux_node);
         /* Inside a class method, an unqualified identifier that names a data
            member (resolved here as an N_MEMBER) or is otherwise unresolved but
            names a method (op1 == NULL — methods are registered under the class
@@ -18590,7 +18590,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           break;
         }
 
-        class_def = find_def (c2m_ctx, S_REGULAR, type_id, curr_scope, NULL);
+        class_def = find_def (c2m_ctx, S_REGULARS, type_id, curr_scope, NULL);
         e = create_expr (c2m_ctx, r);
         if (class_def == NULL || class_def->code != N_CLASS) {
           error (c2m_ctx, POS (r), "'new' requires a class type, '%s' is not a class",
@@ -18903,7 +18903,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
              not a register; register them for frame allocation. */ \
           if (!_d->reg_p && curr_scope != top_scope) \
             VARR_PUSH (decl_t, func_decls_for_allocation, _d); \
-          symbol_insert(c2m_ctx, S_REGULAR, _copy, curr_scope, _sd, NULL); \
+          symbol_insert(c2m_ctx, S_REGULARS, _copy, curr_scope, _sd, NULL); \
         } while(0)
 
         if (forin_arr_p || forin_slice_p) {
@@ -19180,7 +19180,7 @@ if (base != NULL && base->code == N_ID) {
      regular variable/decl — i.e. it's purely a class name or a
      generic type parameter. */
   symbol_t vsym;
-  int is_var = symbol_find (c2m_ctx, S_REGULAR, base, curr_scope, &vsym)
+  int is_var = symbol_find (c2m_ctx, S_REGULARS, base, curr_scope, &vsym)
                && vsym.def_node != NULL
                && vsym.def_node->code != N_CLASS;
   if (!is_var) {
@@ -19225,13 +19225,13 @@ if (base != NULL && base->code == N_ID) {
           node_t class_node = csym.def_node;
           symbol_t msym;
           node_t mfunc = NULL, mfunc_op = NULL;
-          if (symbol_find (c2m_ctx, S_REGULAR, mem, class_node, &msym)) {
+          if (symbol_find (c2m_ctx, S_REGULARS, mem, class_node, &msym)) {
             if (msym.def_node && msym.def_node->code == N_FUNC_DEF) {
               mfunc = msym.def_node;
             }
           }
           if (!mfunc)
-            mfunc = find_def (c2m_ctx, S_REGULAR, mem, class_node, &mfunc_op);
+            mfunc = find_def (c2m_ctx, S_REGULARS, mem, class_node, &mfunc_op);
           if (mfunc && mfunc->code == N_FUNC_DEF) {
             e = create_expr (c2m_ctx, r);
             e->type->mode = TM_BASIC;
@@ -19296,8 +19296,8 @@ if (base != NULL && base->code == N_ID) {
           struct seq_recv seq_sr;
           if (classify_seq_receiver (c2m_ctx, t1, POS (r), &seq_sr) != SEQ_RECV_NONE
               && (seq_sr.kind != SEQ_RECV_CLASS
-                  || (!symbol_find (c2m_ctx, S_REGULAR, op2, seq_sr.cls_type->u.tag_type, &sym)
-                      && find_def (c2m_ctx, S_REGULAR, op2, seq_sr.cls_type->u.tag_type, NULL)
+                  || (!symbol_find (c2m_ctx, S_REGULARS, op2, seq_sr.cls_type->u.tag_type, &sym)
+                      && find_def (c2m_ctx, S_REGULARS, op2, seq_sr.cls_type->u.tag_type, NULL)
                            == NULL))) {
             e->type->mode = TM_BASIC;
             e->type->u.basic_type = TP_VOID;
@@ -19309,7 +19309,7 @@ if (base != NULL && base->code == N_ID) {
            treatment as the String/seq methods; N_CALL lowers it to
            c2m_str_join.  List<String> defines no user `join`. */
         if (list_string_type_p (t1) && get_string_method (op2->u.s.s, NULL, NULL) == SM_JOIN
-            && find_def (c2m_ctx, S_REGULAR, op2, t1->u.tag_type, NULL) == NULL) {
+            && find_def (c2m_ctx, S_REGULARS, op2, t1->u.tag_type, NULL) == NULL) {
           e->type->mode = TM_BASIC;
           e->type->u.basic_type = TP_VOID;
           e->u.lvalue_node = NULL;
@@ -19345,8 +19345,8 @@ if (base != NULL && base->code == N_ID) {
           error (c2m_ctx, POS (r), "request for member %s in something not a structure, union, class or dict",
                  op2->u.s.s);
           break;
-        } else if (t1->mode != TM_DICT && !symbol_find (c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &sym) &&
-            !(func = find_def(c2m_ctx, S_REGULAR, op2, t1->u.tag_type, &func_op)) )  {
+        } else if (t1->mode != TM_DICT && !symbol_find (c2m_ctx, S_REGULARS, op2, t1->u.tag_type, &sym) &&
+            !(func = find_def(c2m_ctx, S_REGULARS, op2, t1->u.tag_type, &func_op)) )  {
             /* TM_CLASS namespace: first look for a static or instance method
                (ClassName.method or obj.method).  Only fall back to variant
                sugar / error if nothing is found. */
@@ -19354,7 +19354,7 @@ if (base != NULL && base->code == N_ID) {
               node_t class_node = t1->u.tag_type;
               symbol_t msym;
               node_t mfunc = NULL, mfunc_op = NULL;
-              if (symbol_find(c2m_ctx, S_REGULAR, op2, class_node, &msym)) {
+              if (symbol_find(c2m_ctx, S_REGULARS, op2, class_node, &msym)) {
                 if (msym.def_node && msym.def_node->code == N_FUNC_DEF) {
                   mfunc = msym.def_node;
                 } else if (msym.def_node && msym.def_node->code == N_MEMBER) {
@@ -19368,7 +19368,7 @@ if (base != NULL && base->code == N_ID) {
                 }
               }
               if (!mfunc) {
-                mfunc = find_def(c2m_ctx, S_REGULAR, op2, class_node, &mfunc_op);
+                mfunc = find_def(c2m_ctx, S_REGULARS, op2, class_node, &mfunc_op);
               }
               if (mfunc && mfunc->code == N_FUNC_DEF) {
                 func = mfunc;
@@ -19381,7 +19381,7 @@ if (base != NULL && base->code == N_ID) {
                 node_t v_id = build_id(c2m_ctx, "variants", POS(op2));
                 symbol_t vsym2;
                 node_t valnode = NULL;
-                if (symbol_find(c2m_ctx, S_REGULAR, v_id, class_node, &vsym2)) {
+                if (symbol_find(c2m_ctx, S_REGULARS, v_id, class_node, &vsym2)) {
                   node_t vd = vsym2.def_node;
                   node_t vi = vd ? MEMBER_INIT(vd) : NULL;
                   node_t found_sub = NULL;
@@ -19898,7 +19898,7 @@ if (base != NULL && base->code == N_ID) {
               } else if (type_arg->code == N_ID) {
                 /* Could be a template parameter T that resolved to a pointer type.
                    Look up the symbol and check its type. */
-                node_t def = find_def (c2m_ctx, S_REGULAR, type_arg, curr_scope, NULL);
+                node_t def = find_def (c2m_ctx, S_REGULARS, type_arg, curr_scope, NULL);
                 if (def != NULL && def->attr != NULL) {
                   struct expr *e_attr = (struct expr *) def->attr;
                   if (e_attr->type != NULL && e_attr->type->mode == TM_PTR) {
@@ -20001,7 +20001,7 @@ if (base != NULL && base->code == N_ID) {
             if (obj->code == N_ID) {
               node_t def = (oe != NULL) ? oe->def_node : NULL;
               if (def == NULL)
-                def = find_def (c2m_ctx, S_REGULAR, obj, curr_scope, NULL);
+                def = find_def (c2m_ctx, S_REGULARS, obj, curr_scope, NULL);
               if (def != NULL && def->code == N_ENUM_CONST) {
                 rewrite_node_to_str (c2m_ctx, r, obj->u.s.s);
                 e = r->attr;
@@ -20063,7 +20063,7 @@ if (base != NULL && base->code == N_ID) {
               node_t dtor_id;
               snprintf (dtor_name, sizeof (dtor_name), "__dtor_%s", cid->u.s.s);
               dtor_id = build_id (c2m_ctx, dtor_name, POS (r));
-              dtor_def = find_def (c2m_ctx, S_REGULAR, dtor_id, curr_scope, NULL);
+              dtor_def = find_def (c2m_ctx, S_REGULARS, dtor_id, curr_scope, NULL);
               if (dtor_def != NULL && dtor_def->code != N_FUNC_DEF) dtor_def = NULL;
             }
           }
@@ -20087,7 +20087,7 @@ if (base != NULL && base->code == N_ID) {
            (same protocol as N_NEW, but without malloc).  Marked builtin_call_p
            so the normal function-call path is skipped. */
         if (op1->code == N_ID) {
-          node_t class_def = find_def (c2m_ctx, S_REGULAR, op1,
+          node_t class_def = find_def (c2m_ctx, S_REGULARS, op1,
                                        skip_struct_scopes (curr_scope), NULL);
           if (class_def == NULL)
             class_def = find_def (c2m_ctx, S_TAG, op1,
@@ -20181,7 +20181,7 @@ if (base != NULL && base->code == N_ID) {
            it whenever `m` is unresolved or resolves to a member/method (not to
            a genuine local/global object, which would shadow the member). */
         if (op1->code == N_ID) {
-          node_t cdef = find_def(c2m_ctx, S_REGULAR, op1, curr_scope, NULL);
+          node_t cdef = find_def(c2m_ctx, S_REGULARS, op1, curr_scope, NULL);
           if ((cdef == NULL || cdef->code == N_MEMBER || cdef->code == N_FUNC_DEF)
               && try_rewrite_implicit_this(c2m_ctx, op1)) {
             /* op1 is now N_DEREF_FIELD(this, m); the method-call path handles it. */
@@ -20197,7 +20197,7 @@ if (base != NULL && base->code == N_ID) {
            Only fires when no concrete function/decl with this name is in scope
            (so a real function shadows a same-named template, and a template
            name used as a value is left alone). */
-        if (op1->code == N_ID && find_def(c2m_ctx, S_REGULAR, op1, curr_scope, NULL) == NULL
+        if (op1->code == N_ID && find_def(c2m_ctx, S_REGULARS, op1, curr_scope, NULL) == NULL
             && is_generic_fn_p (c2m_ctx, op1->u.s.s)) {
           parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
           generic_fn_tmpl_t *gtmpl = get_generic_fn_template (c2m_ctx, op1->u.s.s);
@@ -20474,7 +20474,7 @@ if (base != NULL && base->code == N_ID) {
                    op1->u.s.s);
           }
         }
-        if (op1->code == N_ID && find_def(c2m_ctx, S_REGULAR, op1, curr_scope, NULL) == NULL) {
+        if (op1->code == N_ID && find_def(c2m_ctx, S_REGULARS, op1, curr_scope, NULL) == NULL) {
           va_arg_p = str_eq_p(op1->u.s.s, BUILTIN_VA_ARG);
           va_start_p = str_eq_p(op1->u.s.s, BUILTIN_VA_START);
           if (!va_arg_p && !va_start_p && !alloca_p && !json_p && !atomic_load_n_p
@@ -20738,7 +20738,7 @@ if (base != NULL && base->code == N_ID) {
 	                if (find_overload_sym(c2m_ctx, method_id, class_node, &msym))
 	                  func_def = select_method_overload(c2m_ctx, &msym, class_node, arg_list);
 	                if (!func_def)
-	                  func_def = find_def(c2m_ctx, S_REGULAR, method_id, class_node, NULL);
+	                  func_def = find_def(c2m_ctx, S_REGULARS, method_id, class_node, NULL);
 	                if (!func_def || func_def->code != N_FUNC_DEF) {
 	                  error(c2m_ctx, POS(r), "class %s has no static method %s",
 	                        obj->u.s.s, method_id->u.s.s);
@@ -20857,7 +20857,7 @@ if (base != NULL && base->code == N_ID) {
                          != SEQ_RECV_NONE)
                   seq_call_p
                     = (seq_sr.kind != SEQ_RECV_CLASS
-                       || find_def (c2m_ctx, S_REGULAR, seq_mid, seq_sr.cls_type->u.tag_type,
+                       || find_def (c2m_ctx, S_REGULARS, seq_mid, seq_sr.cls_type->u.tag_type,
                                     NULL)
                             == NULL);
                 if (seq_call_p) {
@@ -21030,7 +21030,7 @@ if (base != NULL && base->code == N_ID) {
 		                // normal method lookup) and lower to c2m_str_join in gen.
 		                if (list_string_type_p(obj_type)
 		                    && get_string_method(method_id->u.s.s, NULL, NULL) == SM_JOIN
-		                    && find_def(c2m_ctx, S_REGULAR, method_id, obj_type->u.tag_type, NULL)
+		                    && find_def(c2m_ctx, S_REGULARS, method_id, obj_type->u.tag_type, NULL)
 		                         == NULL) {
 		                  if (NL_LENGTH(arg_list->u.ops) != 1)
 		                    error(c2m_ctx, POS(r), "String method 'join' expects 1 argument");
@@ -21061,7 +21061,7 @@ if (base != NULL && base->code == N_ID) {
 	                if (have_msym)
 	                  func_def = select_method_overload(c2m_ctx, &msym, obj_type->u.tag_type, arg_list);
 	                if (!func_def)
-	                  func_def = find_def(c2m_ctx, S_REGULAR, method_id, obj_type->u.tag_type, NULL);
+	                  func_def = find_def(c2m_ctx, S_REGULARS, method_id, obj_type->u.tag_type, NULL);
 	                /* Collection convenience: list->AddRange(arr) fills the count of a
 	                   (T* items, int count) method, just like the constructor case. */
 	                if (have_msym) {
@@ -21664,7 +21664,7 @@ if (base != NULL && base->code == N_ID) {
               = (initializer->code == N_CALL) ? NL_HEAD (initializer->u.ops) : NULL;
             node_t class_def = NULL;
             if (ctor_callee != NULL && ctor_callee->code == N_ID) {
-              class_def = find_def (c2m_ctx, S_REGULAR, ctor_callee,
+              class_def = find_def (c2m_ctx, S_REGULARS, ctor_callee,
                                     skip_struct_scopes (curr_scope), NULL);
               if (class_def == NULL)
                 class_def = find_def (c2m_ctx, S_TAG, ctor_callee,
@@ -22006,7 +22006,7 @@ if (base != NULL && base->code == N_ID) {
       if (!class_tag) {
         node_t cid = NL_HEAD(curr_class->u.ops);
         if (cid && cid->code == N_ID) {
-          class_tag = find_def(c2m_ctx, S_REGULAR, cid, curr_scope, NULL);
+          class_tag = find_def(c2m_ctx, S_REGULARS, cid, curr_scope, NULL);
           if (!class_tag) class_tag = find_def(c2m_ctx, S_TAG, cid, curr_scope, NULL);
         }
       }
@@ -22048,7 +22048,7 @@ if (base != NULL && base->code == N_ID) {
       } else {
         node_t cid = NL_HEAD (curr_class->u.ops);
         if (cid != NULL && cid->code == N_ID) {
-          class_node = find_def (c2m_ctx, S_REGULAR, cid, curr_scope, NULL);
+          class_node = find_def (c2m_ctx, S_REGULARS, cid, curr_scope, NULL);
           if (class_node == NULL) class_node = find_def (c2m_ctx, S_TAG, cid, curr_scope, NULL);
         }
       }
@@ -22121,7 +22121,7 @@ if (base != NULL && base->code == N_ID) {
                 } else {
                     node_t class_id = NL_HEAD(curr_class->u.ops);
                     if (class_id && class_id->code == N_ID) {
-                        class_def = find_def(c2m_ctx, S_REGULAR, class_id, curr_scope, NULL);
+                        class_def = find_def(c2m_ctx, S_REGULARS, class_id, curr_scope, NULL);
                         if (!class_def) class_def = find_def(c2m_ctx, S_TAG, class_id, curr_scope, NULL);
                     }
                 }
@@ -22167,7 +22167,7 @@ if (base != NULL && base->code == N_ID) {
         next_p = NL_NEXT(p);
         if (p->code != N_ID) break;
         NL_REMOVE(param_list->u.ops, p);
-        if (!symbol_find(c2m_ctx, S_REGULAR, p, curr_scope, &sym)) {
+        if (!symbol_find(c2m_ctx, S_REGULARS, p, curr_scope, &sym)) {
             if (c2m_options->pedantic_p) {
                 error(c2m_ctx, POS(p), "parameter %s has no type", p->u.s.s);
             } else {
@@ -22412,8 +22412,8 @@ if (base != NULL && base->code == N_ID) {
                canonical insert in check_decl_spec()'s N_CLASS arm will run
                in due course; symbol_insert is HTAB_INSERT-with-replace so
                doing it here first does not double-bind. */
-            if (find_def (c2m_ctx, S_REGULAR, cid, curr_scope, NULL) == NULL) {
-              symbol_insert (c2m_ctx, S_REGULAR, cid, curr_scope, s, NULL);
+            if (find_def (c2m_ctx, S_REGULARS, cid, curr_scope, NULL) == NULL) {
+              symbol_insert (c2m_ctx, S_REGULARS, cid, curr_scope, s, NULL);
               symbol_insert (c2m_ctx, S_TAG, cid, curr_scope, s, NULL);
               tpname_add (c2m_ctx, cid, curr_scope, TRUE);
             }
@@ -22430,8 +22430,8 @@ if (base != NULL && base->code == N_ID) {
       for (size_t _hi = 0; _hi < VARR_LENGTH (local_type_hoist_t, local_type_hoists); _hi++) {
         local_type_hoist_t _h = VARR_GET (local_type_hoist_t, local_type_hoists, _hi);
         if (_h.id == NULL || _h.class_def == NULL) continue;
-        if (find_def (c2m_ctx, S_REGULAR, _h.id, top_scope, NULL) == NULL) {
-          symbol_insert (c2m_ctx, S_REGULAR, _h.id, top_scope, _h.class_def, NULL);
+        if (find_def (c2m_ctx, S_REGULARS, _h.id, top_scope, NULL) == NULL) {
+          symbol_insert (c2m_ctx, S_REGULARS, _h.id, top_scope, _h.class_def, NULL);
           symbol_insert (c2m_ctx, S_TAG, _h.id, top_scope, _h.class_def, NULL);
           tpname_add (c2m_ctx, _h.id, top_scope, TRUE);
         }
@@ -22947,7 +22947,7 @@ if (base != NULL && base->code == N_ID) {
           node_t dtor_id, dtor_def;
           snprintf (dtor_name, sizeof (dtor_name), "__dtor_%s", cid->u.s.s);
           dtor_id = build_id (c2m_ctx, dtor_name, POS (r));
-          dtor_def = find_def (c2m_ctx, S_REGULAR, dtor_id, curr_scope, NULL);
+          dtor_def = find_def (c2m_ctx, S_REGULARS, dtor_id, curr_scope, NULL);
           if (dtor_def != NULL && dtor_def->code == N_FUNC_DEF) r->attr = dtor_def;
         }
       }
@@ -23118,7 +23118,7 @@ if (base != NULL && base->code == N_ID) {
     /* Register the class name in S_REGULAR so check_decl_spec N_ID can find it
        (needed for specialized classes injected directly into the module list). */
     if (id->code == N_ID) {
-      symbol_insert (c2m_ctx, S_REGULAR, id, curr_scope, r, NULL);
+      symbol_insert (c2m_ctx, S_REGULARS, id, curr_scope, r, NULL);
     }
 
     // Always attach as decl_t (consistent with check_decl_spec N_CLASS path) so that
@@ -25232,7 +25232,7 @@ check_one_value:
 
           /* field should be only in struct/union initializer */
           assert (curr_type->mode == TM_STRUCT || curr_type->mode == TM_UNION || curr_type->mode == TM_CLASS);
-          found_p = symbol_find (c2m_ctx, S_REGULAR, id, curr_type->u.tag_type, &sym);
+          found_p = symbol_find (c2m_ctx, S_REGULARS, id, curr_type->u.tag_type, &sym);
           assert (found_p); /* field should present */
           process_init_field_designator (c2m_ctx, sym.def_node, curr_type);
           ok_p = update_path_and_do (c2m_ctx, NL_NEXT (curr_des) == NULL, collect_init_els, mark,
@@ -31420,7 +31420,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         decl->u.item = MIR_new_forward (ctx, name);
         move_item_forward (c2m_ctx, decl->u.item);
       } else if (decl->used_p && decl->decl_spec.linkage != N_IGNORE) {
-        if (symbol_find (c2m_ctx, S_REGULAR, id,
+        if (symbol_find (c2m_ctx, S_REGULARS, id,
                          decl->decl_spec.linkage == N_EXTERN ? top_scope : decl->scope, &sym)
             && (decl->u.item = get_ref_item (c2m_ctx, sym.def_node, name)) == NULL) {
           for (i = 0; i < VARR_LENGTH (node_t, sym.defs); i++)
@@ -31441,7 +31441,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           } else if (decl->scope != top_scope && decl->decl_spec.static_p) {
             decl->u.item = MIR_new_bss (ctx, name, raw_type_size (c2m_ctx, decl->decl_spec.type));
           } else if (decl->scope == top_scope
-                     && symbol_find (c2m_ctx, S_REGULAR, id, top_scope, &sym)
+                     && symbol_find (c2m_ctx, S_REGULARS, id, top_scope, &sym)
                      && ((curr_decl = sym.def_node->attr)->u.item == NULL
                          || (curr_decl->u.item->item_type != MIR_bss_item
                              && curr_decl->u.item->item_type != MIR_tls_bss_item))) {
@@ -32661,7 +32661,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
          approach as the dict branch below). */
       #define STORE_FORIN_VAR(var_node, src_op) do {                                  \
         symbol_t _vs; MIR_type_t _vt = MIR_T_I64;                                      \
-        if (symbol_find (c2m_ctx, S_REGULAR, (var_node), r, &_vs) && _vs.def_node != NULL \
+        if (symbol_find (c2m_ctx, S_REGULARS, (var_node), r, &_vs) && _vs.def_node != NULL \
             && _vs.def_node->attr != NULL)                                            \
           _vt = promote_mir_int_type (                                                \
                   get_mir_type (c2m_ctx, ((decl_t) _vs.def_node->attr)->decl_spec.type)); \
@@ -32676,7 +32676,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
          decl's frame offset. */
       #define FORIN_AGG_DEST(var_node, dst_out, vty_out, has_agg_out) do {             \
         symbol_t _vs; (vty_out) = NULL; (has_agg_out) = 0;                            \
-        if (symbol_find (c2m_ctx, S_REGULAR, (var_node), r, &_vs) && _vs.def_node != NULL \
+        if (symbol_find (c2m_ctx, S_REGULARS, (var_node), r, &_vs) && _vs.def_node != NULL \
             && _vs.def_node->attr != NULL) {                                          \
           decl_t _vd = (decl_t) _vs.def_node->attr;                                   \
           (vty_out) = _vd->decl_spec.type;                                            \
@@ -32725,7 +32725,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             /* R2 borrow: midopt proved the value var read-only over an
                unmutated Map — bind by reference into the vals buffer. */
             symbol_t bsym;
-            if (symbol_find (c2m_ctx, S_REGULAR, val_id, r, &bsym)
+            if (symbol_find (c2m_ctx, S_REGULARS, val_id, r, &bsym)
                 && bsym.def_node != NULL && bsym.def_node->attr != NULL
                 && ((decl_t) bsym.def_node->attr)->byref_p) {
               gen_byref_push ((decl_t) bsym.def_node->attr, v_addr.mir_op.u.reg);
@@ -32785,7 +32785,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
              collection — bind it by reference (pointer into the buffer)
              instead of a per-iteration block copy. */
           symbol_t bsym;
-          if (symbol_find (c2m_ctx, S_REGULAR, el_var, r, &bsym)
+          if (symbol_find (c2m_ctx, S_REGULARS, el_var, r, &bsym)
               && bsym.def_node != NULL && bsym.def_node->attr != NULL
               && ((decl_t) bsym.def_node->attr)->byref_p) {
             gen_byref_push ((decl_t) bsym.def_node->attr, addr.mir_op.u.reg);
@@ -32853,7 +32853,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       MIR_type_t kt = MIR_T_I64;
       {
         symbol_t ksym;
-        if (symbol_find (c2m_ctx, S_REGULAR, key_id, r, &ksym) && ksym.def_node != NULL
+        if (symbol_find (c2m_ctx, S_REGULARS, key_id, r, &ksym) && ksym.def_node != NULL
             && ksym.def_node->attr != NULL)
           kt = promote_mir_int_type (
                  get_mir_type (c2m_ctx, ((decl_t) ksym.def_node->attr)->decl_spec.type));
@@ -32866,7 +32866,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       int two_var = (val_id->code == N_ID);
       if (two_var) {
         symbol_t vsym;
-        if (symbol_find (c2m_ctx, S_REGULAR, val_id, r, &vsym) && vsym.def_node != NULL
+        if (symbol_find (c2m_ctx, S_REGULARS, val_id, r, &vsym) && vsym.def_node != NULL
             && vsym.def_node->attr != NULL)
           vt = promote_mir_int_type (
                  get_mir_type (c2m_ctx, ((decl_t) vsym.def_node->attr)->decl_spec.type));
@@ -35161,7 +35161,7 @@ void c2mir_release_analysis (MIR_context_t ctx) {
 	  node_t id_node = build_id (c2m_ctx, ident, no_pos);
 
 	  /* Try ordinary symbol (functions, globals, vars, class methods registered at class scope). */
-	  node_t def = find_def (c2m_ctx, S_REGULAR, id_node, c2m_ctx->top_scope, NULL);
+	  node_t def = find_def (c2m_ctx, S_REGULARS, id_node, c2m_ctx->top_scope, NULL);
 
 	  const char *kind = "S_REGULAR";
 	  if (def == NULL) {
@@ -35216,7 +35216,7 @@ void c2mir_release_analysis (MIR_context_t ctx) {
 
 	  /* 1. locate the receiver identifier at global (top) scope */
 	  node_t rid = build_id (c2m_ctx, receiver, no_pos);
-	  node_t recv_def = find_def (c2m_ctx, S_REGULAR, rid, c2m_ctx->top_scope, NULL);
+	  node_t recv_def = find_def (c2m_ctx, S_REGULARS, rid, c2m_ctx->top_scope, NULL);
 	  if (!recv_def)
 	    recv_def = find_def (c2m_ctx, S_TAG, rid, c2m_ctx->top_scope, NULL);
 
@@ -35243,7 +35243,7 @@ void c2mir_release_analysis (MIR_context_t ctx) {
 
 	  /* 3. look up the member name inside the class scope */
 	  node_t mid = build_id (c2m_ctx, member, no_pos);
-	  node_t mdef = find_def (c2m_ctx, S_REGULAR, mid, class_node, NULL);
+	  node_t mdef = find_def (c2m_ctx, S_REGULARS, mid, class_node, NULL);
 	  const char *kind = "member (class scope)";
 	  if (!mdef) {
 	    mdef = find_def (c2m_ctx, S_TAG, mid, class_node, NULL);
