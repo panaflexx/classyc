@@ -225,7 +225,7 @@ class List<T> {
      * re-Set.  Invalidated by reallocation (Add/EnsureCapacity that grows).
      * Prefer the [] sugar:  list[i].field = …  /  list[i].Method()  already
      * lower to GetMut and yield a true element lvalue (not a Get() copy). */
-    T* GetMut(int index) __attribute__((da_ignore)) {
+    T* GetMut(int index) __mirc_attribute__((da_ignore)) {
         if (index < 0 || index >= this->length)
             throw(OutOfBoundsException, "List.GetMut oob");
         return this->data + index;
@@ -235,7 +235,7 @@ class List<T> {
         if (this->length == 0) throw(OutOfBoundsException, "First empty");
         return *(this->data + 0);
     }
-    T* FirstMut() __attribute__((da_ignore)) {
+    T* FirstMut() __mirc_attribute__((da_ignore)) {
         if (this->length == 0) throw(OutOfBoundsException, "FirstMut empty");
         return this->data + 0;
     }
@@ -243,7 +243,7 @@ class List<T> {
         if (this->length == 0) throw(OutOfBoundsException, "Last empty");
         return *(this->data + (this->length - 1));
     }
-    T* LastMut() __attribute__((da_ignore)) {
+    T* LastMut() __mirc_attribute__((da_ignore)) {
         if (this->length == 0) throw(OutOfBoundsException, "LastMut empty");
         return this->data + (this->length - 1);
     }
@@ -273,7 +273,7 @@ class List<T> {
     /* Ensure capacity >= min. Doubles until satisfied.
      * Bulk memcpy relocates live elements (one MIR block move per growth) —
      * better for SSA than per-element move-assign loops on nested List T. */
-    void EnsureCapacity(int min) __attribute__((da_ignore)) {
+    void EnsureCapacity(int min) __mirc_attribute__((da_ignore)) {
         if (min <= this->capacity) return;
         int newCap = this->capacity > 0 ? this->capacity : 1;
         while (newCap < min) newCap = newCap * 2;
@@ -289,7 +289,7 @@ class List<T> {
     }
 
     /* Shrink backing array to Count() (minimum 1). Releases wasted memory. */
-    void TrimExcess() __attribute__((da_ignore)) {
+    void TrimExcess() __mirc_attribute__((da_ignore)) {
         int target = this->length > 0 ? this->length : 1;
         if (target == this->capacity) return;
         T* newData = (T*) malloc(sizeof(T) * target);
@@ -305,14 +305,14 @@ class List<T> {
     /* ═════════════════════════ Search ══════════════════════════════════ */
 
     /* Index of first element equal to item (String = content, else bytes), or -1. */
-    int IndexOf(T item) __attribute__((da_ignore)) {
+    int IndexOf(T item) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++)
             if (LIST_EQ(*(this->data + i), item)) return i;
         return -1;
     }
 
     /* Index of last element equal to item (String = content, else bytes), or -1. */
-    int LastIndexOf(T item) __attribute__((da_ignore)) {
+    int LastIndexOf(T item) __mirc_attribute__((da_ignore)) {
         int i = this->length - 1;
         while (i >= 0) {
             if (LIST_EQ(*(this->data + i), item)) return i;
@@ -323,7 +323,7 @@ class List<T> {
 
     /* True if item is present.  String compares by content (C# string.Contains-style). */
     int Contains(T item) { return this->IndexOf(item) >= 0; }
-    int FindIndex(int(*pred)(T)) __attribute__((da_ignore)) {
+    int FindIndex(int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++)
             if (pred(*(this->data + i))) return i;
         return -1;
@@ -421,7 +421,7 @@ class List<T> {
     /* ═════════════════════════ Transformations ═════════════════════════ */
 
     /* Reverse elements in place. O(n). Move-swap is correct for nested List T. */
-    void Reverse() __attribute__((da_ignore)) {
+    void Reverse() __mirc_attribute__((da_ignore)) {
         int lo = 0, hi = this->length - 1;
         while (lo < hi) {
             T tmp = move *(this->data + lo);
@@ -435,7 +435,7 @@ class List<T> {
     /* Sort in place using Shell sort (O(n log² n) average).
      * cmp(a, b) returns <0 if a<b, 0 if equal, >0 if a>b.
      * Uses move for nested collection T; simple index math for SSA. */
-    void Sort(int(*cmp)(T, T)) __attribute__((da_ignore)) {
+    void Sort(int(*cmp)(T, T)) __mirc_attribute__((da_ignore)) {
         int gap = this->length / 2;
         while (gap > 0) {
             for (int i = gap; i < this->length; i++) {
@@ -495,7 +495,7 @@ class List<T> {
 
     /* Return a by-value list with [start, start+count). Clamps to valid range.
      * Always non-owning of pointees (does not copy .owns()). RAII shell. */
-    List<T> Slice(int start, int count) __attribute__((da_ignore)) {
+    List<T> Slice(int start, int count) __mirc_attribute__((da_ignore)) {
         if (start < 0)                    start = 0;
         if (start >= this->length)        count = 0;
         if (count < 0)                    count = 0;
@@ -509,7 +509,7 @@ class List<T> {
     }
 
     /* Deep-enough copy into a by-value list (Get copies move-only T). */
-    List<T> Copy() __attribute__((da_ignore)) {
+    List<T> Copy() __mirc_attribute__((da_ignore)) {
         auto c = List<T>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) c.Add(this->Get(i));
@@ -521,7 +521,7 @@ class List<T> {
     /* By-value list = this ++ other (non-mutating).
      * Stand-in for operator+ until the language gets overloaded +.
      * Declared after Copy/AddRange (method order matters). */
-    List<T> Plus(List<T>* other) __attribute__((da_ignore)) {
+    List<T> Plus(List<T>* other) __mirc_attribute__((da_ignore)) {
         auto r = this->Copy();
         if (other) r.AddRange(other);
         return move r;
@@ -541,14 +541,14 @@ class List<T> {
         }
         return array;
     }
-    void CopyTo(T* destination) __attribute__((da_ignore)) {
+    void CopyTo(T* destination) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) *(destination + i) = this->Get(i);
             else                   *(destination + i) = *(this->data + i);
         }
     }
     /* Element-wise equality; String elements use content compare via LIST_EQ. */
-    int Equals(List<T>* other) __attribute__((da_ignore)) {
+    int Equals(List<T>* other) __mirc_attribute__((da_ignore)) {
         if (!other || other->Count() != this->length) return 0;
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
@@ -561,7 +561,7 @@ class List<T> {
         return 1;
     }
     /* Unique elements; String uniqueness is by content (via IndexOf/LIST_EQ). */
-    List<T> Distinct() __attribute__((da_ignore)) {
+    List<T> Distinct() __mirc_attribute__((da_ignore)) {
         auto r = List<T>(this->length > 0 ? this->length : 4);
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
@@ -579,7 +579,7 @@ class List<T> {
     /* ═════════════════════════ Higher-order ═══════════════════════════ */
 
     /* Call action(item) for each element in order. */
-    void ForEach(void(*action)(T)) __attribute__((da_ignore)) {
+    void ForEach(void(*action)(T)) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
                 T item = this->Get(i);
@@ -591,7 +591,7 @@ class List<T> {
     }
 
     /* By-value list of elements where pred(item) != 0. Always non-owning of T*. */
-    List<T> Filter(int(*pred)(T)) __attribute__((da_ignore)) {
+    List<T> Filter(int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         auto result = List<T>();
         for (int i = 0; i < this->length; i++) {
             /* Move-only T must go through Get (its return path carries the
@@ -611,7 +611,7 @@ class List<T> {
 
     /* By-value list with fn(item) applied to every element (T → T).
      * Chains with Filter:  auto r = nums.Filter(p).Map(f); */
-    List<T> Map(T(*fn)(T)) __attribute__((da_ignore)) {
+    List<T> Map(T(*fn)(T)) __mirc_attribute__((da_ignore)) {
         auto result = List<T>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
@@ -627,7 +627,7 @@ class List<T> {
     /* Where == Filter. Non-owning view for T*; by-value T is copied.
      * Allocates a new List — for counts use CountWhere / View().CountWhere.
      * Same is_move_only split as Filter (R2). */
-    List<T> Where(int(*pred)(T)) __attribute__((da_ignore)) {
+    List<T> Where(int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         auto result = List<T>();
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
@@ -642,7 +642,7 @@ class List<T> {
 
     /* Non-allocating: how many elements satisfy pred.  Capturing lambdas
      * open-code (Strategy A), same as Where/Any. */
-    int CountWhere(int(*pred)(T)) __attribute__((da_ignore)) {
+    int CountWhere(int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         int n = 0;
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
@@ -656,13 +656,13 @@ class List<T> {
 
     /* Non-owning span over this list's buffer.  Must not outlive the List
      * (or survive Add that reallocates).  Cheap to copy. */
-    ListView<T> View() __attribute__((da_ignore)) {
+    ListView<T> View() __mirc_attribute__((da_ignore)) {
         return ListView<T>(this->data, this->length);
     }
 
     /* Materialize a ListView into a fresh List (preferred over ListView.ToList
      * for move-return reliability: same-class List→List). */
-    static List<T> FromView(ListView<T> v) __attribute__((da_ignore)) {
+    static List<T> FromView(ListView<T> v) __mirc_attribute__((da_ignore)) {
         auto result = List<T>();
         int n = v.Count();
         int i;
@@ -674,7 +674,7 @@ class List<T> {
     /* LINQ-style projection: T → U.  U is a method type parameter (specialized
      * at the call site): xs.Select<String>(toName) or xs.Select(fn) with U
      * inferred from fn's return type.  Returns List<U> by value (RAII). */
-    List<U> Select<U>(U(*fn)(T)) __attribute__((da_ignore)) {
+    List<U> Select<U>(U(*fn)(T)) __mirc_attribute__((da_ignore)) {
         auto result = List<U>(this->length > 0 ? this->length : 1);
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
@@ -693,7 +693,7 @@ class List<T> {
      * Nested concrete List<String> by-value shells inside a List<T> method body
      * still hit a monomorphization edge; keep the heap-pointer return here.
      * Call sites use `owned auto` or `delete`, or open-code Select. */
-    List<String>* SelectString(String(*fn)(T)) __attribute__((da_ignore)) {
+    List<String>* SelectString(String(*fn)(T)) __mirc_attribute__((da_ignore)) {
         List<String>* result = new List<String>(this->length > 0 ? this->length : 4);
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
@@ -712,7 +712,7 @@ class List<T> {
      *   GroupBy(nums, keyFn)   // free form
      * Prefer Map.GroupBy when the source is already a map. */
 
-    int Any(int(*pred)(T)) __attribute__((da_ignore)) {
+    int Any(int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
                 T item = this->Get(i);
@@ -724,7 +724,7 @@ class List<T> {
         return 0;
     }
 
-    int All(int(*pred)(T)) __attribute__((da_ignore)) {
+    int All(int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
                 T item = this->Get(i);
@@ -736,7 +736,7 @@ class List<T> {
         return 1;
     }
 
-    T Find(int(*pred)(T)) __attribute__((da_ignore)) {
+    T Find(int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
                 T item = this->Get(i);
@@ -751,7 +751,7 @@ class List<T> {
         return z;
     }
 
-    T FindOr(T fb, int(*pred)(T)) __attribute__((da_ignore)) {
+    T FindOr(T fb, int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
             if (is_move_only<T>()) {
                 T item = this->Get(i);
@@ -764,13 +764,13 @@ class List<T> {
         return fb;
     }
 
-    static List<T> Repeat(T item, int count) __attribute__((da_ignore)) {
+    static List<T> Repeat(T item, int count) __mirc_attribute__((da_ignore)) {
         if (count < 0) count = 0;
         auto r = List<T>(count > 0 ? count : 4);
         for (int i = 0; i < count; i++) r.Add(item);
         return move r;
     }
-    static List<T> Range(int start, int count) __attribute__((da_ignore)) {
+    static List<T> Range(int start, int count) __mirc_attribute__((da_ignore)) {
         if (count < 0) throw(OutOfBoundsException, "List.Range count < 0");
         const char* tn = nameof<T>();
         if (strcmp(tn, "int") != 0 && strcmp(tn, "short") != 0 && strcmp(tn, "long") != 0
@@ -785,7 +785,7 @@ class List<T> {
         return move r;
     }
 
-    List<T> Take(int count) __attribute__((da_ignore)) {
+    List<T> Take(int count) __mirc_attribute__((da_ignore)) {
         if (count < 0) count = 0;
         if (count > this->length) count = this->length;
         auto result = List<T>(count > 0 ? count : 4);
@@ -796,7 +796,7 @@ class List<T> {
         return move result;
     }
 
-    List<T> Skip(int count) __attribute__((da_ignore)) {
+    List<T> Skip(int count) __mirc_attribute__((da_ignore)) {
         if (count < 0) count = 0;
         if (count >= this->length) {
             auto empty = List<T>(4);
@@ -813,7 +813,7 @@ class List<T> {
 
     /* Alias of ToJsonArray() — automagic per-element typeof conversion.
      * Body open-coded (same-class call gen can fail on method FIELD def_node). */
-    dict ToArrayDict() __attribute__((da_ignore)) {
+    dict ToArrayDict() __mirc_attribute__((da_ignore)) {
         dict arr = dict_create_array();
         const char* tn = nameof<T>();
         for (int i = 0; i < this->length; i++) {
@@ -844,7 +844,7 @@ class List<T> {
     /* Convert List<dict> to DICT_ARRAY. Casts the backing store to dict* so the
      * generic body type-checks for every element specialization (the method is
      * only meaningful for List<dict>). */
-    dict ToDict() __attribute__((da_ignore)) {
+    dict ToDict() __mirc_attribute__((da_ignore)) {
         dict arr = dict_create_array();
         dict* d = (dict*)this->data;
         for (int i = 0; i < this->length; i++) {
@@ -868,7 +868,7 @@ class List<T> {
      * for *every* element specialization (a bare `(char*)elem` cast is rejected
      * for floating-point T like List<double>), while reading the real value
      * when the list actually holds Strings. */
-    dict StringsToJsonArray() __attribute__((da_ignore)) {
+    dict StringsToJsonArray() __mirc_attribute__((da_ignore)) {
         dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
             dict_array_append(arr, dict_create_string(*(char**)(this->data + i)));
@@ -879,7 +879,7 @@ class List<T> {
     /* Convert List<int> to a DICT_ARRAY of DICT_INT64 values. The integer
      * sibling of StringsToJsonArray(); reads via `*(int*)&elem` so the body
      * type-checks for all T and round-trips the value for List<int>. */
-    dict IntsToJsonArray() __attribute__((da_ignore)) {
+    dict IntsToJsonArray() __mirc_attribute__((da_ignore)) {
         dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
             dict_array_append(arr, dict_create_int64((long)*(int*)(this->data + i)));
@@ -899,7 +899,7 @@ class List<T> {
      * `*(double*)&elem`, `*(char**)&elem`): those casts are pointer-to-pointer
      * (always valid for any T), and only the nameof-selected branch runs, so
      * the body both type-checks for every specialization and reads correctly. */
-    dict ToJsonArray() __attribute__((da_ignore)) {
+    dict ToJsonArray() __mirc_attribute__((da_ignore)) {
         dict arr = dict_create_array();
         const char* tn = nameof<T>();
         for (int i = 0; i < this->length; i++) {
@@ -936,7 +936,7 @@ class List<T> {
      *   dict out = { "items": nums->ToJsonArrayBy(asNum) };
      *
      * `fn(item)` is responsible for producing each element value. */
-    dict ToJsonArrayBy(dict(*fn)(T)) __attribute__((da_ignore)) {
+    dict ToJsonArrayBy(dict(*fn)(T)) __mirc_attribute__((da_ignore)) {
         dict arr = dict_create_array();
         for (int i = 0; i < this->length; i++) {
             dict_array_append(arr, fn(*(this->data + i)));
@@ -955,7 +955,7 @@ class List<T> {
      * the same key overwrites the earlier value (last-one-wins, as in C#'s
      * indexer-based fill).  The returned dict is owned by whatever dict
      * references it. */
-    dict ToDictBy(const char*(*keyFn)(T), dict(*valFn)(T)) __attribute__((da_ignore)) {
+    dict ToDictBy(const char*(*keyFn)(T), dict(*valFn)(T)) __mirc_attribute__((da_ignore)) {
         dict obj = dict_create_object();
         for (int i = 0; i < this->length; i++) {
             dict_object_set(obj, (char*)keyFn(*(this->data + i)),
@@ -981,7 +981,7 @@ class List<T> {
     /* Scalar/String/dict elements only.  Avoids `(T)array[i]` so monomorphs of
      * List_List_Ship (and other class/nested T) do not enter dict-class bind
      * during gen.  Class-field JSON binding still uses (List*)d Add protocol. */
-    static List<T>* FromJson(dict array) __attribute__((da_ignore)) {
+    static List<T>* FromJson(dict array) __mirc_attribute__((da_ignore)) {
         List<T>* r = new List<T>();
         const char* tn = nameof<T>();
         int n = (int)array.length();
@@ -1019,18 +1019,18 @@ class List<T> {
      * Intended for scalar element lists (int/double/String); for a List<dict>
      * use ToDict() and serialize the owning dict yourself (ToJson() would free
      * the referenced element dicts). */
-    String ToJson() __attribute__((da_ignore)) {
+    String ToJson() __mirc_attribute__((da_ignore)) {
         dict arr = this->ToJsonArray();
         String j = arr.json();
         dict_destroy(arr);
         return j;
     }
 
-    String ToString() __attribute__((da_ignore)) {
+    String ToString() __mirc_attribute__((da_ignore)) {
         return this->ToJson();
     }
 
-    String to_string() __attribute__((da_ignore)) {
+    String to_string() __mirc_attribute__((da_ignore)) {
         return this->ToJson();
     }
 
@@ -1063,7 +1063,7 @@ class ListView<T> {
             throw(OutOfBoundsException, "ListView.Get oob");
         return *(this->data + index);
     }
-    T* GetMut(int index) __attribute__((da_ignore)) {
+    T* GetMut(int index) __mirc_attribute__((da_ignore)) {
         if (index < 0 || index >= this->length)
             throw(OutOfBoundsException, "ListView.GetMut oob");
         return this->data + index;
@@ -1078,7 +1078,7 @@ class ListView<T> {
     }
 
     /* Sub-window — still non-owning. */
-    ListView<T> Slice(int start, int count) __attribute__((da_ignore)) {
+    ListView<T> Slice(int start, int count) __mirc_attribute__((da_ignore)) {
         if (start < 0) start = 0;
         if (start > this->length) start = this->length;
         if (count < 0) count = 0;
@@ -1088,26 +1088,26 @@ class ListView<T> {
 
     /* ── Non-allocating scans (prefer over Where for counts / existence) ── */
 
-    int CountWhere(int(*pred)(T)) __attribute__((da_ignore)) {
+    int CountWhere(int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         int n = 0;
         for (int i = 0; i < this->length; i++) {
             if (pred(this->Get(i))) n++;
         }
         return n;
     }
-    int Any(int(*pred)(T)) __attribute__((da_ignore)) {
+    int Any(int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
             if (pred(this->Get(i))) return 1;
         }
         return 0;
     }
-    int All(int(*pred)(T)) __attribute__((da_ignore)) {
+    int All(int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
             if (!pred(this->Get(i))) return 0;
         }
         return 1;
     }
-    T Find(int(*pred)(T)) __attribute__((da_ignore)) {
+    T Find(int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
             T item = this->Get(i);
             if (pred(item)) return item;
@@ -1116,14 +1116,14 @@ class ListView<T> {
         memset((void*)&z, 0, sizeof(T));
         return z;
     }
-    T FindOr(T fb, int(*pred)(T)) __attribute__((da_ignore)) {
+    T FindOr(T fb, int(*pred)(T)) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
             T item = this->Get(i);
             if (pred(item)) return item;
         }
         return fb;
     }
-    void ForEach(void(*action)(T)) __attribute__((da_ignore)) {
+    void ForEach(void(*action)(T)) __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->length; i++) {
             T item = this->Get(i);
             action(item);
@@ -1132,7 +1132,7 @@ class ListView<T> {
 
 
 
-    List<T> ToList() __attribute__((da_ignore)) {
+    List<T> ToList() __mirc_attribute__((da_ignore)) {
         auto r = List<T>();
         int i;
         for (i = 0; i < this->length; i++)

@@ -5016,6 +5016,7 @@ typedef struct {
   int n_type_params;           /* method type params only (U, not class T) */
   const char *type_params[4];
   int is_static;               /* 1 = no implicit this */
+  int da_ignore_p;             /* trailing __attribute__((da_ignore)) on template */
 } generic_method_tmpl_t;
 
 DEF_VARR (generic_method_tmpl_t);
@@ -5066,6 +5067,12 @@ struct parse_ctx {
      and the generic "syntax error on struct/int" message is useless. */
   const char *reserved_id_kw; /* NULL, or e.g. "class" */
   pos_t reserved_id_pos;
+  /* Free-function trail: TRY(declaration) consumes
+     `void f() __attribute__((da_ignore))` then fails on `{` and rewinds the
+     token stream — but the free-function path re-parses the declarator and
+     must still learn about da_ignore.  Set when declaration sees
+     attrs+`{` so the function-definition branch can apply PRECHECK_DA_IGNORE. */
+  int pending_func_da_ignore;
 };
 
 #define record_level parse_ctx->record_level
@@ -5686,6 +5693,141 @@ static int generic_node_has_scalar_data (node_code_t code) {
   }
 }
 
+/* True if `attrs` is an N_LIST of N_ATTR (or a single N_ATTR, or nested
+   lists from merging multiple __attribute__((...)) specs) naming
+   `da_ignore` / `classyc_da_ignore`.  Used by the parser (method/function
+   trailing attrs) and by create_decl to set decl->da_ignore_p. */
+static int attr_list_has_da_ignore (node_t attrs) {
+  if (attrs == NULL) return 0;
+  if (attrs->code == N_ATTR) {
+    node_t aname = NL_HEAD (attrs->u.ops);
+    return (aname != NULL && aname->code == N_ID && aname->u.s.s != NULL
+            && (strcmp (aname->u.s.s, "da_ignore") == 0
+                || strcmp (aname->u.s.s, "classyc_da_ignore") == 0));
+  }
+  if (attrs->code != N_LIST) return 0;
+  for (node_t aa = NL_HEAD (attrs->u.ops); aa != NULL; aa = NL_NEXT (aa)) {
+    if (aa->code == N_LIST) {
+      if (attr_list_has_da_ignore (aa)) return 1;
+      continue;
+    }
+    if (aa->code != N_ATTR) continue;
+    node_t aname = NL_HEAD (aa->u.ops);
+    if (aname != NULL && aname->code == N_ID && aname->u.s.s != NULL
+        && (strcmp (aname->u.s.s, "da_ignore") == 0
+            || strcmp (aname->u.s.s, "classyc_da_ignore") == 0))
+      return 1;
+  }
+  return 0;
+}
+
+/* Pre-check marker stashed on N_FUNC_DEF->attr before create_decl runs.
+   Template sentinel is (void*)(intptr_t)-1; this means the definition carried
+   __attribute__((da_ignore)) and create_decl should set decl->da_ignore_p. */
+#define PRECHECK_DA_IGNORE ((void *) (intptr_t) 2)
+
+/* ── HTTP route attributes ───────────────────────────────────────────────
+   ASP.NET / Spring-style C23 attributes on handler functions:
+
+     [[HttpGet("/health")]]
+     static Response* health(Request* req) { ... }
+
+   Lowers to the same registry static that ROUTE("GET","/health",health)
+   produces, so route_dispatch / __start_cyreg_routes keep working. */
+
+/* If ATTRS contains HttpGet/Post/Put/Delete/Patch(path) or
+   HttpRoute(method, path), write method/path and return 1. */
+static int http_route_from_attrs (node_t attrs, const char **method_out,
+                                  const char **path_out) {
+  if (attrs == NULL) return 0;
+  if (attrs->code == N_LIST) {
+    for (node_t a = NL_HEAD (attrs->u.ops); a != NULL; a = NL_NEXT (a)) {
+      if (a->code == N_LIST) {
+        if (http_route_from_attrs (a, method_out, path_out)) return 1;
+        continue;
+      }
+      if (a->code == N_ATTR && http_route_from_attrs (a, method_out, path_out))
+        return 1;
+    }
+    return 0;
+  }
+  if (attrs->code != N_ATTR) return 0;
+  node_t id = NL_HEAD (attrs->u.ops);
+  if (id == NULL || id->code != N_ID || id->u.s.s == NULL) return 0;
+  const char *name = id->u.s.s;
+  node_t arglist = NL_NEXT (id);
+  if (arglist == NULL || arglist->code != N_LIST) return 0;
+  node_t a0 = NL_HEAD (arglist->u.ops);
+  if (a0 == NULL || (a0->code != N_STR && a0->code != N_ID)) return 0;
+
+  if (strcmp (name, "HttpGet") == 0) {
+    *method_out = "GET"; *path_out = a0->u.s.s; return 1;
+  }
+  if (strcmp (name, "HttpPost") == 0) {
+    *method_out = "POST"; *path_out = a0->u.s.s; return 1;
+  }
+  if (strcmp (name, "HttpPut") == 0) {
+    *method_out = "PUT"; *path_out = a0->u.s.s; return 1;
+  }
+  if (strcmp (name, "HttpDelete") == 0) {
+    *method_out = "DELETE"; *path_out = a0->u.s.s; return 1;
+  }
+  if (strcmp (name, "HttpPatch") == 0) {
+    *method_out = "PATCH"; *path_out = a0->u.s.s; return 1;
+  }
+  if (strcmp (name, "HttpRoute") == 0) {
+    node_t a1 = NL_NEXT (a0);
+    if (a1 == NULL || (a1->code != N_STR && a1->code != N_ID)) return 0;
+    *method_out = a0->u.s.s;
+    *path_out = a1->u.s.s;
+    return 1;
+  }
+  return 0;
+}
+
+/* Build the AST for:
+     [[registry("routes")]] static RouteReg __cy_route_<fn>_<n>
+       = { method, path, fn };
+   Same shape the ROUTE() macro expands to. */
+static node_t make_http_route_reg (c2m_ctx_t c2m_ctx, pos_t pos,
+                                   const char *method, const char *path,
+                                   const char *fn_name) {
+  static int counter = 0;
+  char vname[256];
+  snprintf (vname, sizeof vname, "__cy_route_%s_%d",
+            fn_name != NULL ? fn_name : "anon", counter++);
+
+  node_t specs = new_node (c2m_ctx, N_LIST);
+  op_append (c2m_ctx, specs, new_pos_node (c2m_ctx, N_STATIC, pos));
+  op_append (c2m_ctx, specs, build_id (c2m_ctx, "RouteReg", pos));
+
+  node_t decl = build_decl (c2m_ctx, pos, build_id (c2m_ctx, vname, pos), NULL);
+
+  node_t reg_args = new_node (c2m_ctx, N_LIST);
+  op_append (c2m_ctx, reg_args,
+             new_str_node (c2m_ctx, N_STR, uniq_cstr (c2m_ctx, "routes"), pos));
+  node_t reg_attr
+    = new_node2 (c2m_ctx, N_ATTR, build_id (c2m_ctx, "registry", pos), reg_args);
+  node_t attrs = new_node (c2m_ctx, N_LIST);
+  op_append (c2m_ctx, attrs, reg_attr);
+
+  node_t init_list = new_node (c2m_ctx, N_LIST);
+  op_append (c2m_ctx, init_list,
+             new_node2 (c2m_ctx, N_INIT, new_node (c2m_ctx, N_LIST),
+                        new_str_node (c2m_ctx, N_STR, uniq_cstr (c2m_ctx, method),
+                                      pos)));
+  op_append (c2m_ctx, init_list,
+             new_node2 (c2m_ctx, N_INIT, new_node (c2m_ctx, N_LIST),
+                        new_str_node (c2m_ctx, N_STR, uniq_cstr (c2m_ctx, path),
+                                      pos)));
+  op_append (c2m_ctx, init_list,
+             new_node2 (c2m_ctx, N_INIT, new_node (c2m_ctx, N_LIST),
+                        build_id (c2m_ctx, fn_name, pos)));
+
+  return build_shared_spec_decl (c2m_ctx, pos, specs, decl, attrs, NULL,
+                                 init_list);
+}
+
 /* Deep-copy `n`, substituting type-parameter N_IDs with concrete type-arg nodes.
    Also renames `orig_name` -> `spec_name` and __ctor_/dtor_ accordingly. */
 static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
@@ -5964,6 +6106,11 @@ static node_t specialize_node (c2m_ctx_t c2m_ctx, node_t n,
   /* Allocate a new node of the same kind */
   node_t cp = new_node (c2m_ctx, n->code);
   set_node_pos (c2m_ctx, cp, POS (n));
+  /* Preserve pre-check da_ignore marker on method definitions so monomorphized
+     List/Map methods keep __attribute__((da_ignore)).  Template sentinel (-1)
+     is NOT copied (specializations are real functions). */
+  if (n->code == N_FUNC_DEF && n->attr == PRECHECK_DA_IGNORE)
+    cp->attr = PRECHECK_DA_IGNORE;
 
   if (generic_node_has_scalar_data (n->code)) {
     /* Literal value node: copy the scalar union member */
@@ -6722,8 +6869,9 @@ static node_t get_or_create_generic_method_specialization (
              class_name, mt->method_name);
       return NULL;
     }
-    /* Clear template sentinel from the specialized copy. */
-    spec_fn->attr = NULL;
+    /* Clear template sentinel from the specialized copy; re-apply da_ignore
+       so create_decl sets decl->da_ignore_p on the monomorphized free fn. */
+    spec_fn->attr = mt->da_ignore_p ? PRECHECK_DA_IGNORE : NULL;
     if (!mt->is_static)
       prepend_this_param_to_func (c2m_ctx, spec_fn, class_spec_name, pos);
 
@@ -7874,6 +8022,13 @@ D (declaration) {
         if (attrs != NULL && attrs->code == N_LIST)
           register_builtin_methods_from_attrs (c2m_ctx, attrs);
         if (asm_part == NULL) asm_part = new_node (c2m_ctx, N_IGNORE);
+        /* Function definition with trailing attrs:
+             void f() __attribute__((da_ignore)) { ... }
+           TRY(declaration) would consume the attrs then fail on `{` and
+           rewind tokens; the free-function path re-parses the declarator
+           and would miss da_ignore.  Stash a sticky flag for it. */
+        if (C ('{') && attrs != NULL && attr_list_has_da_ignore (attrs))
+          parse_ctx->pending_func_da_ignore = 1;
         if (M ('=')) {
           P (initializer);
         } else {
@@ -8161,10 +8316,12 @@ D (class_member_declaration) {
     /* Accept trailing cv-qualifiers and/or GCC/C23 attributes on a method
        definition: `Ret name() const __attribute__((...)) {}` or the
        `__attribute__((da_ignore))` used in list.h for the definitely-assigned
-       analysis.  Attributes are parsed via try_attr_spec which handles both
-       `__attribute__((...))` and C23 `[[...]]` plus optional `__asm`.  Only
-       commit when ultimately followed by '{' so a malformed data member is
-       still diagnosed below. */
+       analysis and String-scope out-param warnings.  Attributes are parsed
+       via try_attr_spec (GCC + C23).  Only commit when ultimately followed
+       by '{' so a malformed data member is still diagnosed below.
+       Trailing attrs are KEPT (merged into trail_attrs) so create_decl can
+       set decl->da_ignore_p — previously they were parse-and-discard. */
+    node_t trail_attrs = NULL;
     {
       size_t tail_mark = record_start(c2m_ctx);
       int saw_tail = 0;
@@ -8176,12 +8333,31 @@ D (class_member_declaration) {
           saw_tail = 1;
           continue;
         }
-        /* consume one GCC attribute / C23 attribute / asm-spec if present */
         {
           node_t asmp = NULL;
           node_t ar = try_attr_spec(c2m_ctx, curr_token->pos, &asmp);
           if (ar != err_node && (ar != NULL || asmp != NULL)) {
             saw_tail = 1;
+            if (ar != NULL && ar != err_node) {
+              if (trail_attrs == NULL)
+                trail_attrs = ar;
+              else {
+                /* Flatten multiple __attribute__((...)) into one N_LIST. */
+                if (trail_attrs->code == N_LIST && ar->code == N_LIST) {
+                  for (node_t a = NL_HEAD (ar->u.ops); a != NULL; ) {
+                    node_t next = NL_NEXT (a);
+                    NL_REMOVE (ar->u.ops, a);
+                    op_append (c2m_ctx, trail_attrs, a);
+                    a = next;
+                  }
+                } else {
+                  node_t merged = new_node (c2m_ctx, N_LIST);
+                  op_append (c2m_ctx, merged, trail_attrs);
+                  op_append (c2m_ctx, merged, ar);
+                  trail_attrs = merged;
+                }
+              }
+            }
             continue;
           }
         }
@@ -8222,6 +8398,8 @@ D (class_member_declaration) {
 
       node_t fdef = build_func_def(c2m_ctx, POS(decl), spec, decl,
                                     new_node(c2m_ctx, N_LIST), body);
+      int method_da_ignore
+        = (trail_attrs != NULL && attr_list_has_da_ignore (trail_attrs));
       /* Register as a generic method template.  Marked with sentinel so class
          check skips the unsubstitued U body; call sites monomorphize. */
       if (meth_n_tp > 0 && parse_ctx->curr_class != NULL
@@ -8235,9 +8413,15 @@ D (class_member_declaration) {
           mt.n_type_params = meth_n_tp;
           for (int i = 0; i < 4; i++) mt.type_params[i] = meth_tps[i];
           mt.is_static = is_static_method;
+          mt.da_ignore_p = method_da_ignore;
           VARR_PUSH (generic_method_tmpl_t, generic_method_templates, mt);
           fdef->attr = (void *)((intptr_t)-1); /* template: skip check/gen */
         }
+      } else if (method_da_ignore) {
+        /* Stash for create_decl → decl->da_ignore_p (see PRECHECK_DA_IGNORE). */
+        fdef->attr = PRECHECK_DA_IGNORE;
+      } else if (trail_attrs != NULL) {
+        fdef->attr = trail_attrs; /* other attrs: create_decl scans for da_ignore */
       }
       return fdef;
     } else {
@@ -10436,13 +10620,17 @@ D (transl_unit) {
   read_token (c2m_ctx);
   list = new_node (c2m_ctx, N_LIST);
   while (!C (T_EOFILE)) { /* external-declaration */
+    node_t http_route_extra = NULL; /* optional [[HttpGet]]-synthesized RouteReg */
     if (C_SOFT ("interface")) {
       PE (interface_declaration, err);
     } else if ((r = TRY (declaration)) != err_node) {
       // Successfully parsed a declaration or class definition (e.g. "int x;"
       // or "class MyClass { ... };") -- declaration handles class bodies too.
     } else {
-      // Attempt to parse a function definition
+      // Attempt to parse a function definition.
+      // Leading C23 attrs: [[HttpGet("/path")]] static Response* f(...) { }
+      node_t lead_attrs = try_attr_spec (c2m_ctx, curr_token->pos, NULL);
+      if (lead_attrs == err_node) lead_attrs = NULL;
       PAE (declaration_specs, (node_t) 1, err);
       ds = r;
       PE (declarator, err);
@@ -10465,13 +10653,32 @@ D (transl_unit) {
       d->attr = curr_scope;
       curr_scope = d;
       /* Trailing GCC/C23 attributes or __asm may appear between the declarator
-         and the function body: `void foo() __attribute__((...)) {}`.  Consume
-         them here (loop, since several may appear) before entering the K&R
-         declaration-list loop.  They are ignored for codegen. */
+         and the function body: `void foo() __attribute__((da_ignore)) {}`.
+         Collect them so create_decl can set decl->da_ignore_p. */
+      node_t free_trail_attrs = NULL;
       for (;;) {
         node_t asmp = NULL;
         node_t ar = try_attr_spec (c2m_ctx, curr_token->pos, &asmp);
-        if (ar != err_node && (ar != NULL || asmp != NULL)) continue;
+        if (ar != err_node && (ar != NULL || asmp != NULL)) {
+          if (ar != NULL && ar != err_node) {
+            if (free_trail_attrs == NULL)
+              free_trail_attrs = ar;
+            else if (free_trail_attrs->code == N_LIST && ar->code == N_LIST) {
+              for (node_t a = NL_HEAD (ar->u.ops); a != NULL; ) {
+                node_t next = NL_NEXT (a);
+                NL_REMOVE (ar->u.ops, a);
+                op_append (c2m_ctx, free_trail_attrs, a);
+                a = next;
+              }
+            } else {
+              node_t merged = new_node (c2m_ctx, N_LIST);
+              op_append (c2m_ctx, merged, free_trail_attrs);
+              op_append (c2m_ctx, merged, ar);
+              free_trail_attrs = merged;
+            }
+          }
+          continue;
+        }
         break;
       }
       while (!C ('{')) { /* declaration-list */
@@ -10513,6 +10720,28 @@ D (transl_unit) {
           VARR_PUSH (generic_fn_tmpl_t, generic_fn_templates, tmpl);
           r->attr = (void *)((intptr_t)-1); /* sentinel: template, not a real function */
         }
+      } else if ((free_trail_attrs != NULL
+                  && attr_list_has_da_ignore (free_trail_attrs))
+                 || (lead_attrs != NULL && attr_list_has_da_ignore (lead_attrs))
+                 || parse_ctx->pending_func_da_ignore) {
+        r->attr = PRECHECK_DA_IGNORE;
+        parse_ctx->pending_func_da_ignore = 0;
+      } else if (free_trail_attrs != NULL) {
+        r->attr = free_trail_attrs;
+      }
+      parse_ctx->pending_func_da_ignore = 0;
+
+      /* [[HttpGet("/path")]] (etc.) → synthesize
+         [[registry("routes")]] static RouteReg __cy_route_... = {...}; */
+      if (lead_attrs != NULL && fn_n_tp == 0) {
+        const char *hm = NULL, *hp = NULL;
+        if (http_route_from_attrs (lead_attrs, &hm, &hp)) {
+          node_t fn_id = NL_HEAD (d->u.ops);
+          const char *fn_name
+            = (fn_id != NULL && fn_id->code == N_ID) ? fn_id->u.s.s : "handler";
+          http_route_extra
+            = make_http_route_reg (c2m_ctx, POS (d), hm, hp, fn_name);
+        }
       }
     }
     /* Inject any lambdas defined while parsing this top-level item (they must
@@ -10523,6 +10752,8 @@ D (transl_unit) {
     }
     VARR_TRUNC (node_t, pending_lambdas, 0);
     op_flat_append (c2m_ctx, list, r);
+    if (http_route_extra != NULL)
+      op_flat_append (c2m_ctx, list, http_route_extra);
     continue;
   decl_err:
     curr_scope = d->attr;
@@ -10658,6 +10889,14 @@ static void add_standard_includes (c2m_ctx_t c2m_ctx) {
      the [[builtin_method]] form).  Resolves via auto-discovered include/. */
   add_string_stream (c2m_ctx, "<string-builtins>",
                      "#include \"string_builtins.h\"\n");
+  /* Attribute spelling that survives glibc: when the host is not treated as
+     GCC/clang, sys/cdefs.h empties `__attribute__(xyz)`, so
+     `__attribute__((da_ignore))` vanishes after `#include <stdio.h>`.
+     The parser also accepts `__mirc_attribute__` (same shape); ClassyC
+     list/map/set use that form.  CLASSYC_DA_IGNORE is a convenience for
+     user code that must include system headers first. */
+  add_string_stream (c2m_ctx, "<classyc-attrs>",
+                     "#define CLASSYC_DA_IGNORE __mirc_attribute__((da_ignore))\n");
 }
 
 /* Pre-scan the post-preprocessor token stream and register every `class NAME`
@@ -11636,6 +11875,15 @@ struct decl {
      dense collection — gen binds it by reference (pointer into the buffer)
      instead of a per-iteration block copy. */
   unsigned byref_p : 1;
+  /* `__mirc_attribute__((da_ignore))` / `__attribute__((da_ignore))` /
+     `classyc_da_ignore` on a binding OR on the enclosing function/method.
+     Function-level: set on the N_FUNC_DEF's decl during create_decl from
+     trailing attrs (PRECHECK_DA_IGNORE).  Prefer `__mirc_attribute__` or
+     CLASSYC_DA_IGNORE after system headers — glibc empties `__attribute__`
+     when not building as GCC.  Suppresses definite-assignment noise and
+     String-out-param scope warnings in stdlib methods without silencing
+     all .h files. */
+  unsigned da_ignore_p : 1;
   int bit_offset, width; /* for bitfields, -1 bit_offset for non bitfields. */
   mir_size_t offset;     /* var offset in frame or bss */
   /* Extra stack bytes for a class/struct local whose trailing flexible array
@@ -16537,6 +16785,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       decl->auto_defer_p = FALSE;
       decl->unowned_p = FALSE;
       decl->owned_p = FALSE;
+      decl->da_ignore_p = FALSE;
       decl->midopt_dead_p = FALSE;
       decl->byref_p = FALSE;
       decl->scope = curr_scope;
@@ -16611,12 +16860,31 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       node_t list_head, declarator;
       struct type *type;
       decl_t decl = reg_malloc (c2m_ctx, sizeof (struct decl));
+      int pre_da_ignore = 0;
 
       assert (decl_node->code == N_MEMBER || decl_node->code == N_SPEC_DECL
               || decl_node->code == N_FUNC_DEF);
+      /* Recover function-level da_ignore stashed by the parser (trailing
+         attrs on the definition) before we overwrite ->attr with decl. */
+      if (func_def_p && decl_node->attr != NULL
+          && decl_node->attr != (void *) ((intptr_t) -1)) {
+        if (decl_node->attr == PRECHECK_DA_IGNORE)
+          pre_da_ignore = 1;
+        else {
+          node_t pre = (node_t) decl_node->attr;
+          if (pre->code == N_LIST || pre->code == N_ATTR)
+            pre_da_ignore = attr_list_has_da_ignore (pre);
+        }
+      }
       init_decl (c2m_ctx, decl);
       decl->scope = scope;
       decl->decl_spec = decl_spec;
+      decl->da_ignore_p = pre_da_ignore;
+      /* Binding-level attrs on N_SPEC_DECL (and members): same name. */
+      if (!decl->da_ignore_p && decl_node->code == N_SPEC_DECL) {
+        node_t battrs = SPEC_DECL_ATTRS (decl_node);
+        if (battrs != NULL) decl->da_ignore_p = attr_list_has_da_ignore (battrs);
+      }
       decl_node->attr = decl;
       declarator = NL_EL (decl_node->u.ops, 1);
       if (declarator->code == N_IGNORE) {
@@ -18344,6 +18612,77 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           }
         }
         check_assignment_types (c2m_ctx, t1, t2, e2, r);
+        /* String arena scope: gen emits c2m_str_release_to at every return,
+           and only a *returned* String is protected via release_keeping.
+           Class fields go through c2m_str_own (private heap copy).  A plain
+           store through an out-param `String *` does neither — the pointer
+           written to the caller dangles as soon as this function returns:
+
+               void f (String *out) {
+                 *out = f"id={n}";   // UAF after return
+               }
+
+           Scope (keep noise down):
+             - Only simple `*id = …` (out-param shape), not `*(p+i) = …`
+               (List/Map buffer writes).
+             - Suppress when the RHS is a non-tracked value (literal), an
+               explicit detach, or a plain pointer load (`*p`, a[i], field)
+               that is not itself a fresh arena allocation in this statement.
+           Safe escapes: return-by-value, `detach <expr>` / `.detach()`,
+           string literals, class-field assignment. */
+        if (op1->code == N_DEREF && builtin_string_type_p (t1)) {
+          node_t base = NL_HEAD (op1->u.ops);
+          while (base != NULL && base->code == N_CAST)
+            base = NL_EL (base->u.ops, 1);
+          if (base != NULL && base->code == N_ID) {
+            node_t rhs = op2;
+            while (rhs != NULL && rhs->code == N_CAST)
+              rhs = NL_EL (rhs->u.ops, 1);
+            int safe_p = 0;
+            if (rhs == NULL)
+              safe_p = 1;
+            else if (rhs->code == N_STR)
+              safe_p = 1; /* string literal — not arena-tracked */
+            else if (rhs->code == N_DETACH)
+              safe_p = 1; /* explicit detach — removed from tracker */
+            else if (rhs->code == N_DEREF || rhs->code == N_IND
+                     || rhs->code == N_FIELD || rhs->code == N_DEREF_FIELD)
+              /* Copying an existing pointer (e.g. List.TryGet) — not a
+                 fresh f-string/concat in this statement.  Still UAF if the
+                 source was allocated earlier in *this* function; that case
+                 is rarer and needs flow-sensitive analysis. */
+              safe_p = 1;
+            else if (rhs->code == N_CALL) {
+              node_t fn = NL_HEAD (rhs->u.ops);
+              if (fn != NULL
+                  && (fn->code == N_FIELD || fn->code == N_DEREF_FIELD)) {
+                node_t mid = NL_EL (fn->u.ops, 1);
+                if (mid != NULL && mid->code == N_ID
+                    && strcmp (mid->u.s.s, "detach") == 0)
+                  safe_p = 1;
+              }
+            }
+            /* Opt out via `__attribute__((da_ignore))` on the enclosing
+               function/method (list.h / map.h / set.h already annotate their
+               methods).  No blanket ".h" silence — the attribute is the
+               intentional contract for stdlib internals. */
+            if (!safe_p) {
+              int ignore_p = 0;
+              if (curr_func_def != NULL && curr_func_def->attr != NULL
+                  && curr_func_def->attr != (void *) ((intptr_t) -1)
+                  && curr_func_def->attr != PRECHECK_DA_IGNORE) {
+                decl_t fdecl = (decl_t) curr_func_def->attr;
+                if (fdecl->da_ignore_p) ignore_p = 1;
+              }
+              if (!ignore_p)
+                warning (c2m_ctx, POS (r),
+                         "String stored through pointer may be freed when "
+                         "this function returns (use-after-free); return the "
+                         "String by value, or store `detach <expr>` / "
+                         "`<expr>.detach()` so it survives the scope");
+            }
+          }
+        }
         *e->type = *t1;
         if ((e->type2 = assign_expr_type) != NULL) set_type_layout (c2m_ctx, assign_expr_type);
         break;

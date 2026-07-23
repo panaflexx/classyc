@@ -821,7 +821,10 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         size_t w = 0;
         for (size_t i = 0; i < n_datas; i++) {
             const char *nm = datas[i].name;
-            if (nm != NULL && datas[i].is_ref_data && strncmp(nm, "__cyreg_", 8) == 0) {
+            /* Prefer is_ref_data; also accept 8-byte __cyreg_* left as ordinary
+               .data (some MIR→bmir paths drop the ref_data tag). */
+            if (nm != NULL && strncmp(nm, "__cyreg_", 8) == 0
+                && (datas[i].is_ref_data || datas[i].size == 8)) {
                 const char *p = nm + 8;
                 const char *e = strstr(p, "__");
                 size_t klen = e ? (size_t)(e - p) : strlen(p);

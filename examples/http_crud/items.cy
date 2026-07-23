@@ -1,9 +1,14 @@
-/* items.cy — inventory table with Flask-style attribute routes.
+/* items.cy — inventory table with ASP.NET-style HTTP attributes.
  *
- *   ROUTE("GET", "/api/items/{id}", items_get)
- *       →  int id = req->argInt("id")
+ *   [[HttpGet("/api/items/{id}")]]
+ *   static Response* get_item(Request* req) {
+ *       int id = req->argInt("id");
+ *       ...
+ *   }
  *
- * No central switch.  Routes self-register via [[registry("routes")]].
+ * No central switch / ROUTE table.  The compiler synthesizes a
+ * [[registry("routes")]] RouteReg for each [[HttpGet]] / [[HttpPost]] / …
+ * (legacy ROUTE("GET", path, fn) still works).
  */
 #include "httpserve.h"
 #include "sqlite.h"
@@ -25,14 +30,16 @@ void items_boot(void) {
                   "sis", "Gadget", 3, "bin B");
 }
 
-/* ── handlers ─────────────────────────────────────────────────────────── */
+/* ── handlers (self-register via [[HttpGet]] / [[HttpPost]] / …) ──────── */
 
+[[HttpGet("/health")]]
 static Response* health(Request* req) {
     (void)req;
     owned auto ok = { "ok": true, "service": "http_crud" };
     return resp_ok(ok.json());
 }
 
+[[HttpGet("/api/items")]]
 static Response* list_items(Request* req) {
     try {
         String q = req->arg("q");
@@ -53,6 +60,7 @@ static Response* list_items(Request* req) {
     }
 }
 
+[[HttpGet("/api/items/{id}")]]
 static Response* get_item(Request* req) {
     int id = req->argInt("id");
     if (id <= 0) return resp_bad_request("id required");
@@ -65,6 +73,7 @@ static Response* get_item(Request* req) {
     }
 }
 
+[[HttpPost("/api/items")]]
 static Response* create_item(Request* req) {
     if (req->body == 0) return resp_bad_request("JSON body required");
     if (req->body.name == 0) return resp_bad_request("name is required");
@@ -84,6 +93,7 @@ static Response* create_item(Request* req) {
     }
 }
 
+[[HttpPut("/api/items/{id}")]]
 static Response* update_item(Request* req) {
     int id = req->argInt("id");
     if (id <= 0) return resp_bad_request("id required");
@@ -119,6 +129,7 @@ static Response* update_item(Request* req) {
     }
 }
 
+[[HttpDelete("/api/items/{id}")]]
 static Response* delete_item(Request* req) {
     int id = req->argInt("id");
     if (id <= 0) return resp_bad_request("id required");
@@ -130,12 +141,3 @@ static Response* delete_item(Request* req) {
         return resp_500(e.msg);
     }
 }
-
-/* ── self-registering routes (no central table) ───────────────────────── */
-
-ROUTE("GET",    "/health",           health);
-ROUTE("GET",    "/api/items",        list_items);
-ROUTE("POST",   "/api/items",        create_item);
-ROUTE("GET",    "/api/items/{id}",   get_item);
-ROUTE("PUT",    "/api/items/{id}",   update_item);
-ROUTE("DELETE", "/api/items/{id}",   delete_item);

@@ -34,7 +34,12 @@
  * Scope: plain HTTP/1.1 keep-alive, non-blocking sockets, one OS thread.
  */
 
+/* AOT with -ffibers already ships minicoro via mir-aot-runtime.c
+   (CHANFIBERS).  Defining MINICORO_IMPL here would multiply-define mco_*.
+   JIT loads only this TU's symbols, so we still need the implementation. */
+#ifndef CHANFIBERS
 #define MINICORO_IMPL
+#endif
 #include "minicoro.h"
 
 #include "httpserve.h"
@@ -58,6 +63,8 @@ extern int *__errno_location(void);
 #define SOCK_STREAM   1
 #define SOL_SOCKET    1
 #define SO_REUSEADDR  2
+#define IPPROTO_TCP   6
+#define TCP_NODELAY   1
 #define SIG_IGN_PTR   ((void*)1)
 #define SIGPIPE       13
 #define F_SETFL       4
@@ -109,35 +116,65 @@ static long content_length_of(char *buf, long header_end) {
     return 0;
 }
 
-/* Case-insensitive scan for an explicit "Connection: close" request header.
-   HTTP/1.1 defaults to keep-alive; only an explicit close opts out. */
-static int wants_close(char *buf, long header_end) {
+/* Case-insensitive ASCII equality for len chars (no terminator required). */
+static int ci_eq_n(const char *a, const char *b, long n) {
+    for (long j = 0; j < n; j++) {
+        char x = a[j], y = b[j];
+        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
+        if (x != y) return 0;
+    }
+    return 1;
+}
+
+/* Request-line is HTTP/1.0?  (ApacheBench defaults to HTTP/1.0.) */
+static int is_http_10(char *buf, long header_end) {
+    long line_end = 0;
+    while (line_end < header_end && !(buf[line_end] == '\r' && line_end + 1 < header_end
+                                      && buf[line_end + 1] == '\n'))
+        line_end++;
+    for (long i = 0; i + 8 <= line_end; i++) {
+        if (ci_eq_n(buf + i, "HTTP/1.0", 8)) return 1;
+    }
+    return 0;
+}
+
+/* Does the Connection header token-list contain `token` (e.g. "close")? */
+static int connection_has(char *buf, long header_end, const char *token) {
     const char *key = "connection:";
     long klen = 11;
+    long tlen = 0;
+    while (token[tlen]) tlen++;
     for (long i = 0; i + klen <= header_end; i++) {
-        int match = 1;
-        for (long j = 0; j < klen; j++) {
-            char a = buf[i + j];
-            char b = key[j];
-            if (a >= 'A' && a <= 'Z') a = a + 32;
-            if (a != b) { match = 0; break; }
-        }
-        if (!match) continue;
+        if (!ci_eq_n(buf + i, key, klen)) continue;
+        /* Only match at start of a header line. */
+        if (i > 0 && buf[i - 1] != '\n') continue;
         long k = i + klen;
         while (k < header_end && buf[k] == ' ') k++;
-        const char *v = "close";
-        if (k + 5 <= header_end) {
-            int vm = 1;
-            for (long j = 0; j < 5; j++) {
-                char a = buf[k + j];
-                if (a >= 'A' && a <= 'Z') a = a + 32;
-                if (a != v[j]) { vm = 0; break; }
-            }
-            if (vm) return 1;
+        long vend = k;
+        while (vend < header_end && buf[vend] != '\r' && buf[vend] != '\n') vend++;
+        /* Scan comma-separated tokens. */
+        long p = k;
+        while (p < vend) {
+            while (p < vend && (buf[p] == ' ' || buf[p] == ',' || buf[p] == '\t')) p++;
+            long q = p;
+            while (q < vend && buf[q] != ',' && buf[q] != ' ' && buf[q] != '\t') q++;
+            if (q - p == tlen && ci_eq_n(buf + p, token, tlen)) return 1;
+            p = q;
         }
         return 0;
     }
     return 0;
+}
+
+/* Should we close after this response?
+   HTTP/1.0 defaults to close (unless Connection: keep-alive) — this is what
+   ApacheBench sends without -k, and it will hang waiting for EOF if we keep
+   the socket open.  HTTP/1.1 defaults to keep-alive unless Connection: close. */
+static int wants_close(char *buf, long header_end) {
+    if (is_http_10(buf, header_end))
+        return !connection_has(buf, header_end, "keep-alive");
+    return connection_has(buf, header_end, "close");
 }
 
 /* recv that parks the fiber (never the OS thread) while no data is ready.
@@ -308,6 +345,10 @@ static void accept_fiber(mco_coro *co) {
             continue;
         }
         fcntl(cfd, F_SETFL, O_NONBLOCK);
+        {
+            int one = 1;
+            setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, 4);
+        }
 
         int i;
         for (i = 0; i < MAX_CONNS; i++) if (!g_conns[i].used) break;
@@ -367,15 +408,18 @@ int serve_fibers(int port) {
     fflush(stdout);
 
     /* Single-OS-thread scheduler: resume every suspended fiber round-robin.
-       Sleeps 1ms only when there is nothing to do (idle server stays cool). */
+       The accept fiber is almost always suspended (parks on EAGAIN), so it
+       must NOT count as "busy" — otherwise we never sleep and burn 100% CPU
+       on an idle server (and SIGTERM teardown can look like a hang).
+       Sleep when there are no live connection fibers. */
     for (;;) {
-        int busy = 0;
+        int live = 0;
 
-        if (mco_status(acc) == MCO_SUSPENDED) { mco_resume(acc); busy = 1; }
+        if (mco_status(acc) == MCO_SUSPENDED)
+            mco_resume(acc);
 
         for (int i = 0; i < MAX_CONNS; i++) {
             if (!g_conns[i].used || g_conns[i].co == 0) continue;
-            busy = 1;
             if (mco_status(g_conns[i].co) == MCO_SUSPENDED)
                 mco_resume(g_conns[i].co);
             if (mco_status(g_conns[i].co) == MCO_DEAD) {
@@ -383,9 +427,12 @@ int serve_fibers(int port) {
                 g_conns[i].co   = 0;
                 g_conns[i].used = 0;
                 g_conns[i].cfd  = -1;
+                continue;
             }
+            live++;
         }
-        if (!busy) usleep(1000);
+        if (live == 0)
+            usleep(1000);
     }
     /* not reached */
     return 0;

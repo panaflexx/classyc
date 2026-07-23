@@ -354,7 +354,7 @@ class Map<K, V> {
 
     /* Pointer into the dense value array — mutate class values in place
      * (Get/ValAt return copies).  Invalidated by rehash/growth. */
-    V* ValMut(int index) __attribute__((da_ignore)) {
+    V* ValMut(int index) __mirc_attribute__((da_ignore)) {
         if (index < 0 || index >= this->count)
             throw(OutOfBoundsException, "Map.ValMut oob");
         return this->vals + index;
@@ -362,7 +362,7 @@ class Map<K, V> {
 
     /* Lookup + mut pointer.  Throws KeyException if missing (same as Get) so
      * [] GetMut-lvalue never builds a MEM op from a null pointer. */
-    V* GetMut(K key) __attribute__((da_ignore)) {
+    V* GetMut(K key) __mirc_attribute__((da_ignore)) {
         int idx = this->find_index(key);
         if (idx < 0) throw(KeyException, "Map.GetMut missing key");
         return this->vals + idx;
@@ -513,7 +513,7 @@ class Map<K, V> {
     /* ───────────────────── Accessors (extended) ───────────────────── */
     /* Value for `key`, inserting `fallback` when absent.  Single probe on
      * both hit and miss paths (was find_index + Set = two on miss). */
-    V GetOrAdd(K key, V fallback) __attribute__((da_ignore)) {
+    V GetOrAdd(K key, V fallback) __mirc_attribute__((da_ignore)) {
         this->ensure_table();
         int slot = this->find_slot(key);
         int idx = this->table[slot];
@@ -523,12 +523,12 @@ class Map<K, V> {
     }
     /* True if any value equals `val`.  String values compare by content (MAP_EQ),
      * matching key equality and C# Dictionary.ContainsValue for strings. */
-    bool ContainsValue(V val) const __attribute__((da_ignore)) {
+    bool ContainsValue(V val) const __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->count; i++)
             if (MAP_EQ(*(this->vals + (i)), val)) return true;
         return false;
     }
-    int AddOrUpdate(K key, V val, V(*updater)(V)) __attribute__((da_ignore)) {
+    int AddOrUpdate(K key, V val, V(*updater)(V)) __mirc_attribute__((da_ignore)) {
         int idx = this->find_index(key);
         if (idx >= 0) {
             /* ValAt deep-copies move-only V into the updater arg path. */
@@ -562,44 +562,44 @@ class Map<K, V> {
     }
 
     /* ── Higher-order: Where / Any / All ─── */
-    Map<K, V> Where(int(*pred)(K, V)) const __attribute__((da_ignore)) {
+    Map<K, V> Where(int(*pred)(K, V)) const __mirc_attribute__((da_ignore)) {
         auto r = Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
             if (pred(*(this->keys + (i)), *(this->vals + (i))))
                 r.Set(*(this->keys + (i)), *(this->vals + (i)));
         return move r;
     }
-    Map<K, V> WhereKeys(int(*pred)(K)) const __attribute__((da_ignore)) {
+    Map<K, V> WhereKeys(int(*pred)(K)) const __mirc_attribute__((da_ignore)) {
         auto r = Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
             if (pred(*(this->keys + (i))))
                 r.Set(*(this->keys + (i)), *(this->vals + (i)));
         return move r;
     }
-    Map<K, V> WhereValues(int(*pred)(V)) const __attribute__((da_ignore)) {
+    Map<K, V> WhereValues(int(*pred)(V)) const __mirc_attribute__((da_ignore)) {
         auto r = Map<K, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
             if (pred(*(this->vals + (i))))
                 r.Set(*(this->keys + (i)), *(this->vals + (i)));
         return move r;
     }
-    int Any(int(*pred)(K, V)) const __attribute__((da_ignore)) {
+    int Any(int(*pred)(K, V)) const __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->count; i++)
             if (pred(*(this->keys + (i)), *(this->vals + (i)))) return 1;
         return 0;
     }
-    int All(int(*pred)(K, V)) const __attribute__((da_ignore)) {
+    int All(int(*pred)(K, V)) const __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->count; i++)
             if (!pred(*(this->keys + (i)), *(this->vals + (i)))) return 0;
         return 1;
     }
-    Map<K, W> SelectValues<W>(W(*fn)(K, V)) const __attribute__((da_ignore)) {
+    Map<K, W> SelectValues<W>(W(*fn)(K, V)) const __mirc_attribute__((da_ignore)) {
         auto r = Map<K, W>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
             r.Set(*(this->keys + (i)), fn(*(this->keys + (i)), *(this->vals + (i))));
         return move r;
     }
-    Map<G, V> SelectKeys<G>(G(*fn)(K, V)) const __attribute__((da_ignore)) {
+    Map<G, V> SelectKeys<G>(G(*fn)(K, V)) const __mirc_attribute__((da_ignore)) {
         auto r = Map<G, V>(this->count > 0 ? this->count : 4);
         for (int i = 0; i < this->count; i++)
             r.Set(fn(*(this->keys + (i)), *(this->vals + (i))), *(this->vals + (i)));
@@ -609,7 +609,7 @@ class Map<K, V> {
      * nested List shells live in the map dense buffer (Phase B).  Get/ValAt
      * deep-Copy a bucket; mutate in place via GetMut/ValMut.
      * One probe per element (was Contains + Set + GetMut = three). */
-    Map<G, List<V>> GroupBy<G>(G(*keySelector)(K, V)) const __attribute__((da_ignore)) {
+    Map<G, List<V>> GroupBy<G>(G(*keySelector)(K, V)) const __mirc_attribute__((da_ignore)) {
         auto result = Map<G, List<V>>();
         for (int i = 0; i < this->count; i++) {
             G gk = keySelector(*(this->keys + (i)), *(this->vals + (i)));
@@ -656,7 +656,7 @@ class Map<K, V> {
      *
      *   dict cfg = settings->ToDict();   // {"limit":10,"name":"prod"}
      */
-    dict ToDict() const __attribute__((da_ignore)) {
+    dict ToDict() const __mirc_attribute__((da_ignore)) {
         dict obj = dict_create_object();
         const char* kt = nameof<K>();
         int k_is_str = (strcmp(kt, "String") == 0 || strcmp(kt, "char") == 0);
@@ -729,7 +729,7 @@ class Map<K, V> {
  * One probe per element (was Contains + Set + GetMut = three).
  */
 Map<G, List<T>> GroupBy<T, G>(List<T>* self, G(*keySelector)(T))
-    __attribute__((da_ignore)) {
+    __mirc_attribute__((da_ignore)) {
     auto result = Map<G, List<T>>();
     if (self) {
         for (int i = 0; i < self->Count(); i++) {
@@ -753,7 +753,7 @@ Map<G, List<T>> GroupBy<T, G>(List<T>* self, G(*keySelector)(T))
  * of one free generic cannot call another free generic's specialization
  * (unresolved reference in __genfn_ListGroupBy_* — val-032). */
 Map<G, List<T>> ListGroupBy<T, G>(List<T>* self, G(*keySelector)(T))
-    __attribute__((da_ignore)) {
+    __mirc_attribute__((da_ignore)) {
     auto result = Map<G, List<T>>();
     if (self) {
         for (int i = 0; i < self->Count(); i++) {

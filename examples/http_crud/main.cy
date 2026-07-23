@@ -1,37 +1,30 @@
 /* http_crud — tiny inventory API, attribute-routed.
  *
- * Controllers (items.cy) register themselves with ROUTE() / [[registry]].
- * This file is only the entry point: dispatch + boot + server mode.
+ * Controllers (items.cy) register handlers with [[HttpGet]] / [[HttpPost]] / …
+ * This file is only the entry point: dispatch + boot + server mode selection.
+ *
+ * Modes:
+ *   test       in-process CRUD (no sockets)
+ *   blocking   serve(port)          — single-thread accept → handle
+ *   fibers     serve_fibers(port)   — one fiber per connection, 1 OS thread
+ *   workers    serve_workers(port,N)— multi-OS-thread pool + Chan fan-out
  *
  * Self-test (no sockets):
  *
- *   ./bin/classyc -I include -l sqlite3 \
- *       examples/http-serve.c \
+ *   ./bin/classyc -I include -I ext/ccchan -ffibers -l sqlite3 \
+ *       examples/http-serve.c examples/http-serve-fibers.c \
+ *       examples/http-serve-workers.cy \
  *       examples/http_crud/main.cy examples/http_crud/items.cy -eg -- test
  *
- * Blocking server:
+ * Blocking / fibers / workers:
  *
- *   ./bin/classyc -I include -l sqlite3 \
- *       examples/http-serve.c \
- *       examples/http_crud/main.cy examples/http_crud/items.cy -eg
- *
- * Fiber server (concurrent clients, one OS thread):
- *
- *   ./bin/classyc -I include -I ext/ccchan -l sqlite3 \
- *       examples/http-serve-fibers.c \
- *       examples/http_crud/main.cy examples/http_crud/items.cy -eg -- fibers
- *
- * curl:
- *   curl -s http://127.0.0.1:8080/api/items
- *   curl -s http://127.0.0.1:8080/api/items/1
- *   curl -s -X POST -d '{"name":"Sprocket","qty":5}' http://127.0.0.1:8080/api/items
- *   curl -s -X PUT  -d '{"qty":99}' http://127.0.0.1:8080/api/items/1
- *   curl -s -X DELETE http://127.0.0.1:8080/api/items/2
+ *   … -eg -- --port=8080
+ *   … -eg -- fibers --port=8080
+ *   … -eg -- workers --workers=4 --port=8080
  */
 
 #include "httpserve.h"
 #include <stdio.h>
-#include <string.h>
 
 extern void items_boot(void);
 
@@ -39,16 +32,20 @@ Response* app_handle(Request* req) {
     return route_dispatch(req);
 }
 
+/* ── self-test ────────────────────────────────────────────────────────── */
+
 static void show(const char* label, Request* req) {
     owned Response* r = route_dispatch(req);
-    printf("  %-22s → %d  %s\n", label, r->status,
-           r->body != NULL ? (char*)r->body : "");
+    int st = r->status;
+    String body = r->body;
+    if ((char*)body == NULL) body = "";
+    printf(f"  {label} → {st}  {body}\n");
 }
 
 static int selftest(void) {
     printf("routes:\n");
     for (RouteReg** p = __start_cyreg_routes; p < __stop_cyreg_routes; p++)
-        printf("  %-6s %s\n", (*p)->method, (*p)->path);
+        printf(f"  {(*p)->method} {(*p)->path}\n");
 
     printf("\nCRUD:\n");
     {
@@ -85,25 +82,45 @@ static int selftest(void) {
     return 0;
 }
 
+/* ── CLI ──────────────────────────────────────────────────────────────── */
+
 int main(int argc, char** argv) {
-    int fibers = 0, test = 0, port = 8080;
+    int fibers = 0, workers = 0, test = 0, port = 8080, nworkers = 4;
+
+    /* char** isn't a for-in collection yet (no Count/Get / array size), so
+       bind each argv[i] as a String and use .equals / .starts_with. */
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "fibers") || !strcmp(argv[i], "--fibers")) fibers = 1;
-        else if (!strcmp(argv[i], "test") || !strcmp(argv[i], "--test")) test = 1;
-        else if (!strncmp(argv[i], "--port=", 7)) port = atoi(argv[i] + 7);
+        String s = argv[i];
+        if (s.equals("--")) continue;   /* classyc -eg -- separator */
+        if (s.equals("test")    || s.equals("--test"))    test = 1;
+        else if (s.equals("fibers")  || s.equals("--fibers"))  fibers = 1;
+        else if (s.equals("workers") || s.equals("--workers")) workers = 1;
+        else if (s.starts_with("--port="))
+            port = atoi((char*) s.substr(7, 16));
+        else if (s.starts_with("--workers=")) {
+            workers = 1;
+            nworkers = atoi((char*) s.substr(10, 8));
+            if (nworkers < 1) nworkers = 1;
+        }
     }
 
     items_boot();
 
     if (test) return selftest();
 
+    String mode = workers ? "workers" : (fibers ? "fibers" : "blocking");
     printf("════════════════════════════════════════\n");
     printf("  http_crud · attribute routes\n");
-    printf("  %s · :%d\n", fibers ? "fibers" : "blocking", port);
+    if (workers)
+        printf(f"  {mode} · :{port} · {nworkers} OS threads\n");
+    else
+        printf(f"  {mode} · :{port}\n");
     for (RouteReg** p = __start_cyreg_routes; p < __stop_cyreg_routes; p++)
-        printf("    %-6s %s\n", (*p)->method, (*p)->path);
+        printf(f"    {(*p)->method} {(*p)->path}\n");
     printf("════════════════════════════════════════\n");
     fflush(stdout);
 
-    return fibers ? serve_fibers(port) : serve(port);
+    if (workers) return serve_workers(port, nworkers);
+    if (fibers)  return serve_fibers(port);
+    return serve(port);
 }

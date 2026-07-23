@@ -113,9 +113,11 @@ while [ $# -gt 0 ]; do
     -I*|-D*|-U*|-std=*|-O*|-w|-pedantic|-fsigned-char|-fno-*)
       c2m_flags+=("$arg") ;;
     # -ffibers: opt-in go/await syntax for classyc, and pull the fiber/channel
-    # runtime (cyfiber) into the AOT runtime object via -DCHANFIBERS.
+    # runtime (cyfiber) into the AOT runtime object via -DCHANFIBERS.  Also
+    # pass -DCHANFIBERS to classyc so TUs like http-serve-fibers.c can skip
+    # MINICORO_IMPL (mir-aot-runtime already provides mco_*).
     -ffibers)
-      c2m_flags+=("$arg")
+      c2m_flags+=("$arg" "-DCHANFIBERS")
       chanfibers=1 ;;
     # linker flags that take a separate argument
     -L|-l)

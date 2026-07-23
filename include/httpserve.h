@@ -128,18 +128,38 @@ static Response* resp_500(String msg)         { return new Response(500, "Intern
 /* ── server ↔ app contract ───────────────────────────────────────────── */
 
 extern Response* app_handle(Request* req);
-extern int serve(int port);
-extern int serve_fibers(int port);
+extern int serve(int port);                      /* http-serve.c — blocking */
+extern int serve_fibers(int port);               /* http-serve-fibers.c */
+extern int serve_workers(int port, int nworkers); /* http-serve-workers.cy (-ffibers) */
+
+/* Shared listen / one-shot client helpers (http-serve.c).
+   http_listen binds+listens and returns the listen fd, or -1 on error.
+   http_handle_client reads one request, calls app_handle, writes the response
+   (does not close cfd — the caller owns the fd). */
+extern int  http_listen(int port);
+extern void http_handle_client(int cfd);
 
 /* ── attribute routing ─────────────────────────────────────────────────
  *
+ * Prefer C23 attributes on the handler (ASP.NET / Spring style).  The
+ * compiler synthesizes a [[registry("routes")]] RouteReg for each one:
+ *
+ *     [[HttpGet("/api/items/{id}")]]
  *     static Response* items_get(Request* req) {
  *         int id = req->argInt("id");
  *         ...
  *     }
- *     ROUTE("GET",  "/api/items",      items_list);
- *     ROUTE("GET",  "/api/items/{id}", items_get);
- *     ROUTE("POST", "/api/items",      items_create);
+ *
+ *     [[HttpPost("/api/items")]]
+ *     static Response* items_create(Request* req) { ... }
+ *
+ * Supported attributes (one string path arg, except HttpRoute):
+ *     [[HttpGet(path)]]  [[HttpPost(path)]]  [[HttpPut(path)]]
+ *     [[HttpDelete(path)]]  [[HttpPatch(path)]]
+ *     [[HttpRoute(method, path)]]   // e.g. [[HttpRoute("OPTIONS", "/")]]
+ *
+ * Legacy macro (still works — expands to the same registry static):
+ *     ROUTE("GET", "/api/items/{id}", items_get);
  *
  *     Response* app_handle(Request* req) { return route_dispatch(req); }
  */
@@ -153,13 +173,16 @@ typedef struct {
 extern RouteReg* __start_cyreg_routes[];
 extern RouteReg* __stop_cyreg_routes[];
 
+/* Legacy: explicit ROUTE table entry (prefer [[HttpGet]] / etc. on the fn). */
 #define ROUTE(method, path, fn) \
     [[registry("routes")]] static RouteReg __cy_route_##fn = { (method), (path), (fn) }
 
 /* Match a Flask-style template against a path; build captures as "k=v&k2=v2".
-   Returns 1 on full match. */
-static int route_match(const char* pattern, const char* path, String* out_params) {
-    if (pattern == NULL || path == NULL) return 0;
+   On match returns the capture String (return-by-value so the String arena
+   keeps it — do NOT write through String*, which dangles after return).
+   On mismatch returns NULL. */
+static String route_match(const char* pattern, const char* path) {
+    if (pattern == NULL || path == NULL) return NULL;
     String caps = "";
     int ncap = 0;
     const char* p = pattern;
@@ -169,14 +192,14 @@ static int route_match(const char* pattern, const char* path, String* out_params
         if (*p == '{') {
             const char* pe = p + 1;
             while (*pe && *pe != '}') pe++;
-            if (*pe != '}') return 0;
+            if (*pe != '}') return NULL;
             int klen = (int)(pe - (p + 1));
-            if (klen <= 0) return 0;
+            if (klen <= 0) return NULL;
 
             const char* se = s;
             while (*se && *se != '/') se++;
             int vlen = (int)(se - s);
-            if (vlen <= 0) return 0;
+            if (vlen <= 0) return NULL;
 
             /* Append k=v (values are path segments — no '&'/'='). */
             char keybuf[64], valbuf[256];
@@ -194,12 +217,11 @@ static int route_match(const char* pattern, const char* path, String* out_params
             s = se;
             continue;
         }
-        if (*p == 0 || *s == 0 || *p != *s) return 0;
+        if (*p == 0 || *s == 0 || *p != *s) return NULL;
         p++;
         s++;
     }
-    *out_params = caps;
-    return 1;
+    return caps;
 }
 
 static Response* route_dispatch(Request* req) {
@@ -213,8 +235,9 @@ static Response* route_dispatch(Request* req) {
             continue;
         }
 
-        String caps = "";
-        if (route_match(r->path, (char*)req->path, &caps)) {
+        String caps = route_match(r->path, (char*)req->path);
+        if ((char*)caps != NULL) {
+            /* Class field: c2m_str_own copies into the Request's private heap. */
             req->params = caps;
             return r->handler(req);
         }

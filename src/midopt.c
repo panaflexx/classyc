@@ -42,6 +42,18 @@ static int midopt_node_has_ops (node_code_t code) {
   }
 }
 
+/* True when func_def->attr is a real decl_t (not NULL, not the generic-template
+   sentinel -1, and not PRECHECK_DA_IGNORE which stashes da_ignore before
+   create_decl).  Casting either sentinel to decl_t and reading it crashes. */
+static int midopt_decl_ready_p (node_t n) {
+  if (n == NULL || n->attr == NULL) return 0;
+  if (n->attr == (void *) ((intptr_t) -1)) return 0;
+#ifdef PRECHECK_DA_IGNORE
+  if (n->attr == PRECHECK_DA_IGNORE) return 0;
+#endif
+  return 1;
+}
+
 /* True if this FUNC_DEF is a class method (has class_scope on its type). */
 static int midopt_class_method_p (node_t func_def) {
   decl_t d;
@@ -49,7 +61,7 @@ static int midopt_class_method_p (node_t func_def) {
   struct func_type *ft;
 
   if (func_def == NULL || func_def->code != N_FUNC_DEF) return 0;
-  if (func_def->attr == NULL || func_def->attr == (void *) ((intptr_t) -1)) return 0;
+  if (!midopt_decl_ready_p (func_def)) return 0;
   d = (decl_t) func_def->attr;
   t = d->decl_spec.type;
   if (t == NULL || t->mode != TM_FUNC) return 0;
@@ -89,7 +101,7 @@ static void midopt_mark_keep (node_t f) {
   decl_t d;
 
   if (f == NULL || f->code != N_FUNC_DEF) return;
-  if (f->attr == NULL || f->attr == (void *) ((intptr_t) -1)) return;
+  if (!midopt_decl_ready_p (f)) return;
   if (!midopt_class_method_p (f)) return; /* free funcs not tracked as dead */
   if (midopt_keep_has (f)) return;
   VARR_PUSH (node_t, midopt_keep, f);
@@ -341,7 +353,7 @@ static void midopt_collect_uses_body (c2m_ctx_t c2m_ctx, node_t func_def) {
   struct func_type *ft;
 
   if (func_def == NULL || func_def->code != N_FUNC_DEF) return;
-  if (func_def->attr != NULL && func_def->attr != (void *) ((intptr_t) -1)) {
+  if (midopt_decl_ready_p (func_def)) {
     d = (decl_t) func_def->attr;
     if (d->decl_spec.type != NULL && d->decl_spec.type->mode == TM_FUNC) {
       ft = d->decl_spec.type->u.func_type;
@@ -2241,8 +2253,7 @@ static void midopt_mark_dead_methods (c2m_ctx_t c2m_ctx, node_t n, int *n_method
 static void midopt_seed_from_free_funcs (c2m_ctx_t c2m_ctx, node_t n) {
   if (n == NULL) return;
 
-  if (n->code == N_FUNC_DEF && n->attr != NULL
-      && n->attr != (void *) ((intptr_t) -1)
+  if (n->code == N_FUNC_DEF && midopt_decl_ready_p (n)
       && !midopt_class_method_p (n)) {
     /* Always "live": scan body for method refs (no enclosing class_tag). */
     midopt_collect_uses (c2m_ctx, FUNC_DEF_BLOCK (n), NULL);
@@ -2317,6 +2328,7 @@ static int midopt_trivial_scalar_getter_p (c2m_ctx_t c2m_ctx, node_t func_def) {
   int n_stmt = 0;
 
   if (func_def == NULL || func_def->code != N_FUNC_DEF) return 0;
+  if (!midopt_decl_ready_p (func_def)) return 0;
   d = (decl_t) func_def->attr;
   if (d == NULL || d->decl_spec.type == NULL || d->decl_spec.type->mode != TM_FUNC) return 0;
   ft = d->decl_spec.type->u.func_type;

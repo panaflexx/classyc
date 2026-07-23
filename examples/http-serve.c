@@ -76,8 +76,9 @@ static long content_length_of(char *buf, long header_end) {
 }
 
 /* Read one HTTP request off the socket, dispatch it through app_handle(), and
-   write the response back.  Tokenises the request in place. */
-static void handle_client(int cfd) {
+   write the response back.  Tokenises the request in place.
+   Does not close cfd — callers (serve loop / worker pool) own the fd. */
+void http_handle_client(int cfd) {
     long cap = 8192, len = 0;
     char *buf = (char *) malloc(cap);
     if (buf == NULL) return;
@@ -142,12 +143,12 @@ static void handle_client(int cfd) {
     free(buf);
 }
 
-/* serve — bind, listen, and loop accepting connections forever. */
-int serve(int port) {
+/* http_listen — bind + listen on 0.0.0.0:port.  Returns the listen fd, or -1. */
+int http_listen(int port) {
     signal(SIGPIPE, SIG_IGN_PTR);   /* a peer that hung up must not kill us */
 
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sfd < 0) { printf("socket() failed\n"); return 1; }
+    if (sfd < 0) { printf("socket() failed\n"); return -1; }
 
     int one = 1;
     setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &one, 4);
@@ -161,13 +162,20 @@ int serve(int port) {
     if (bind(sfd, &addr, 16) < 0) {
         printf("bind() failed (port %d in use?)\n", port);
         close(sfd);
-        return 1;
+        return -1;
     }
     if (listen(sfd, 128) < 0) {
         printf("listen() failed\n");
         close(sfd);
-        return 1;
+        return -1;
     }
+    return sfd;
+}
+
+/* serve — single-worker blocking accept loop. */
+int serve(int port) {
+    int sfd = http_listen(port);
+    if (sfd < 0) return 1;
 
     printf("ClassyC http-serve listening on http://127.0.0.1:%d\n", port);
     fflush(stdout);
@@ -175,7 +183,7 @@ int serve(int port) {
     while (1) {
         int cfd = accept(sfd, 0, 0);
         if (cfd < 0) continue;
-        handle_client(cfd);
+        http_handle_client(cfd);
         close(cfd);
     }
     /* not reached */

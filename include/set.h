@@ -312,11 +312,11 @@ class Set<T> {
 
     /* ───────────────────── Higher-order ───────────────────── */
 
-    void ForEach(void(*action)(T)) const __attribute__((da_ignore)) {
+    void ForEach(void(*action)(T)) const __mirc_attribute__((da_ignore)) {
         for (int i = 0; i < this->count; i++) action(this->dense[i]);
     }
 
-    Set<T> Filter(int(*pred)(T)) const __attribute__((da_ignore)) {
+    Set<T> Filter(int(*pred)(T)) const __mirc_attribute__((da_ignore)) {
         auto r = Set<T>(this->count);
         for (int i = 0; i < this->count; i++)
             if (pred(this->dense[i])) r.Add(this->dense[i]);

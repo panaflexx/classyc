@@ -590,6 +590,10 @@ typedef struct flowctx {
   int                 dead_p;
   int                 quiet_p;
   int                 verbose_p;
+  /* Set when the enclosing N_FUNC_DEF carries __attribute__((da_ignore))
+     (decl->da_ignore_p).  Suppresses definite-assignment diagnostics for
+     every local in the body — list.h/map.h/set.h methods are annotated. */
+  int                 func_da_ignore_p;
   /* Set by transfer_return when the returned expression itself is an
      acquire form (`return new T(...)`, `return malloc(...)`, `return
      detach <acquire>`), even if no intermediate binding was tracked.
@@ -670,23 +674,27 @@ static int decl_has_real_init_p (node_t init) {
   return init != NULL && init->code != N_IGNORE;
 }
 
-/* Scan declaration attributes for cleanup / da_ignore markers. */
+/* Scan declaration attributes for cleanup / da_ignore markers.
+   da_ignore also comes from decl->da_ignore_p (set by create_decl from
+   binding or function-level attrs); this path covers raw SPEC_DECL_ATTRS. */
 static void candidate_scan_attrs (node_t n, int *has_cleanup_p, int *da_ignore_p) {
   *has_cleanup_p = 0;
   *da_ignore_p = 0;
   node_t attrs = SPEC_DECL_ATTRS (n);
+  if (attrs != NULL && attr_list_has_da_ignore (attrs))
+    *da_ignore_p = 1;
+  /* Also honor the bit create_decl already set (covers edge cases). */
+  if (n->attr != NULL && n->attr != (void *) ((intptr_t) -1)) {
+    decl_t d = (decl_t) n->attr;
+    if (d->da_ignore_p) *da_ignore_p = 1;
+  }
   if (attrs == NULL || attrs->code != N_LIST) return;
   for (node_t aa = NL_HEAD (attrs->u.ops); aa != NULL; aa = NL_NEXT (aa)) {
     if (aa->code != N_ATTR) continue;
     node_t aname = NL_HEAD (aa->u.ops);
-    if (aname != NULL && aname->code == N_ID && aname->u.s.s != NULL) {
-      if (strcmp (aname->u.s.s, "cleanup") == 0) {
-        *has_cleanup_p = 1;
-      } else if (strcmp (aname->u.s.s, "da_ignore") == 0
-                 || strcmp (aname->u.s.s, "classyc_da_ignore") == 0) {
-        *da_ignore_p = 1;
-      }
-    }
+    if (aname != NULL && aname->code == N_ID && aname->u.s.s != NULL
+        && strcmp (aname->u.s.s, "cleanup") == 0)
+      *has_cleanup_p = 1;
   }
 }
 
@@ -2216,28 +2224,27 @@ static void analyze (flowctx_t *ctx, node_t n) {
       /* Definite-assignment (da) checks: UNINIT / MAYBE -> warning.
          Only emit on the final diagnostic pass (diag_active_p).
          Covers both ownership-tracked heap bindings (`new`/`malloc`) and
-         pure-DA local pointers (`int *p;`).  Header files and
-         `__attribute__((da_ignore))` bindings are suppressed so list/set/map
-         internals stay quiet while user code still gets the diagnostic.
+         pure-DA local pointers (`int *p;`).  Suppressed by:
+           - binding-level `__attribute__((da_ignore))` (c->da_ignore_p)
+           - function-level `__attribute__((da_ignore))` on the method/fn
+             (ctx->func_da_ignore_p) — list/set/map annotate methods this way
          Softened to warning (not error) so runtime safety guards can still
-         catch the wild use under -fexceptions (bugs/010-uninit-read.cy). */
-      if (!c->da_ignore_p && !c->param_p && diag_active_p (ctx)) {
-        const char *fname = c->acquire_pos.fname;
-        int is_header = (fname && strstr (fname, ".h") != NULL);
-        if (!is_header && !c->warned_p) {
-          if (c->da_state == DA_UNINIT) {
-            warning (ctx->c2m_ctx, POS (n),
-                     "use of uninitialized value `%s`",
-                     c->name);
-            /* Do not mark warned_p for DA: a later ownership diagnostic
-               (UAF/leak) can still fire.  Suppress only re-emitting the
-               same uninit note by reusing warned for da_only. */
-            if (c->da_only_p) diag_mark_warned (ctx, c);
-          } else if (c->da_state == DA_MAYBE) {
-            warning (ctx->c2m_ctx, POS (n),
-                     "possible use of uninitialized value `%s`",
-                     c->name);
-          }
+         catch the wild use under -fexceptions (bugs/010-uninit-read.cy).
+         No blanket ".h" silence: the attribute is the intentional contract. */
+      if (!c->da_ignore_p && !ctx->func_da_ignore_p && !c->param_p
+          && diag_active_p (ctx) && !c->warned_p) {
+        if (c->da_state == DA_UNINIT) {
+          warning (ctx->c2m_ctx, POS (n),
+                   "use of uninitialized value `%s`",
+                   c->name);
+          /* Do not mark warned_p for DA: a later ownership diagnostic
+             (UAF/leak) can still fire.  Suppress only re-emitting the
+             same uninit note by reusing warned for da_only. */
+          if (c->da_only_p) diag_mark_warned (ctx, c);
+        } else if (c->da_state == DA_MAYBE) {
+          warning (ctx->c2m_ctx, POS (n),
+                   "possible use of uninitialized value `%s`",
+                   c->name);
         }
       }
     }
@@ -3450,6 +3457,12 @@ static void analyze_function (c2m_ctx_t c2m_ctx, node_t func_def) {
   ctx.dead_p    = 0;
   ctx.quiet_p   = 0;
   ctx.verbose_p = verbose_p;
+  ctx.func_da_ignore_p = 0;
+  if (func_def != NULL && func_def->attr != NULL
+      && func_def->attr != (void *) ((intptr_t) -1)) {
+    decl_t fdecl = (decl_t) func_def->attr;
+    if (fdecl->da_ignore_p) ctx.func_da_ignore_p = 1;
+  }
   ctx.returns_owned_inline_p   = 0;
   ctx.returns_release_fn_inline = NULL;
 
