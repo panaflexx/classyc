@@ -1880,10 +1880,14 @@ static token_t get_next_pptoken_1 (c2m_ctx_t c2m_ctx, int header_p) {
         fclose (cs->f);
         cs->f = NULL;
       }
-      eof_s = VARR_LENGTH (stream_t, streams) == 0 ? NULL : VARR_POP (stream_t, streams);
-      if (VARR_LENGTH (stream_t, streams) == 0) {
+      /* If this is the last stream, leave it on the stack so cs stays valid for
+         any continued reads (e.g. error-recovery loops in token_concat).  The
+         stream will be cleaned up by finish_streams at the end. */
+      if (VARR_LENGTH (stream_t, streams) <= 1) {
+        eof_s = NULL;
         return new_token (c2m_ctx, pos, "<EOU>", T_EOU, N_IGNORE);
       }
+      eof_s = VARR_POP (stream_t, streams);
       cs = VARR_LAST (stream_t, streams);
       if (cs->f == NULL && cs->fname != NULL && !string_stream_p (cs)) {
         if ((cs->f = fopen (cs->fname, "rb")) == NULL) {
@@ -3356,8 +3360,9 @@ static token_t token_concat (c2m_ctx_t c2m_ctx, token_t t1, token_t t2) {
     t = NULL;
     next = get_next_pptoken (c2m_ctx);
   }
-  while (next->code == T_EOU) next = get_next_pptoken (c2m_ctx);
-  if (next->code != T_EOFILE) {
+  /* T_EOU means there is no more input at all; treat it like EOF for paste
+     scanning so we don't spin reading past the end of the translation unit. */
+  if (next->code != T_EOFILE && next->code != T_EOU) {
     error (c2m_ctx, t1->pos, "wrong result of ##: %s", reverse (temp_string));
     remove_string_stream (c2m_ctx);
   }
@@ -9342,6 +9347,29 @@ D (stmt) {
     }
     record_stop (c2m_ctx, mark, TRUE); /* not a go statement: rewind */
   }
+  /* Detect `go` used as a fiber statement without -ffibers and give a clear
+     diagnostic instead of falling through to a confusing "expected ';'" error.
+     We preserve the soft-keyword rollback discipline: `go` followed by `=`, `;`,
+     `(`, `[`, or `.` is still an ordinary identifier use.  Recover by parsing
+     the operand as a normal expression statement so compilation can continue. */
+  if (!c2m_options->fibers_p && C_SOFT ("go")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t gpos = curr_token->pos;
+    M_SOFT ("go");
+    if (!C ('=') && !C (';') && !C ('(') && !C ('[') && !C ('.')) {
+      error (c2m_ctx, gpos, "use -ffibers to enable `go` / `await` fiber syntax");
+      if (C (';')) {
+        op1 = new_node (c2m_ctx, N_IGNORE);
+      } else {
+        P (expr);
+        op1 = r;
+      }
+      record_stop (c2m_ctx, mark, FALSE); /* commit recovery parse */
+      PT (';');
+      return new_pos_node2 (c2m_ctx, N_EXPR, gpos, l, op1);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not a go statement: rewind */
+  }
   /* await [expr] ; : pure cooperative yield point (opt-in, -ffibers).  The
      optional expression is evaluated first (e.g. a try_recv), then the fiber
      yields.  Channel parking itself is explicit (Chan<T> send/recv park
@@ -9360,6 +9388,27 @@ D (stmt) {
       record_stop (c2m_ctx, mark, FALSE); /* commit: await <expr> */
       PT (';');
       return new_pos_node2 (c2m_ctx, N_AWAIT, apos, l, op1);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not an await statement: rewind */
+  }
+  /* Detect `await` used as a fiber statement without -ffibers.  Unlike `go`,
+     bare `await;` is valid fiber syntax, so we also catch that case; `await`
+     followed by `=`, `(`, `[`, or `.` is still an ordinary identifier use. */
+  if (!c2m_options->fibers_p && C_SOFT ("await")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t apos = curr_token->pos;
+    M_SOFT ("await");
+    if (!C ('=') && !C ('(') && !C ('[') && !C ('.')) {
+      error (c2m_ctx, apos, "use -ffibers to enable `go` / `await` fiber syntax");
+      if (C (';')) {
+        op1 = new_node (c2m_ctx, N_IGNORE);
+      } else {
+        P (expr);
+        op1 = r;
+      }
+      record_stop (c2m_ctx, mark, FALSE); /* commit recovery parse */
+      PT (';');
+      return new_pos_node2 (c2m_ctx, N_EXPR, apos, l, op1);
     }
     record_stop (c2m_ctx, mark, TRUE); /* not an await statement: rewind */
   }

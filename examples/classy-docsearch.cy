@@ -64,7 +64,11 @@
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
+#if !defined(__APPLE__)
 #include <dirent.h>
+#else
+#include <fts.h>
+#endif
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -716,6 +720,7 @@ void ingest_file(const char* path, List<Doc*>* corpus, Map<String, Term*>* inv) 
     }
 }
 
+#if !defined(__APPLE__)
 /* Collect every candidate path (no scan ceiling — Google mode). */
 void collect_paths(const char* path, int depth, List<String>* out) {
     if (depth > 8) return;
@@ -765,6 +770,71 @@ void collect_paths(const char* path, int depth, List<String>* out) {
     }
     closedir(d);
 }
+#else
+/* macOS 10.12+ — use the standard fts(3) API from <fts.h> (BSD/macOS stdlib) */
+/* to avoid the hostile Apple SDK <dirent.h> that ClassyC cannot parse. */
+void collect_paths(const char* root, int maxdepth, List<String>* out) {
+    if (maxdepth > 8) return;
+
+    char *paths[2] = { (char *)root, NULL };
+    FTS *tree = fts_open(paths, FTS_LOGICAL | FTS_NOCHDIR, NULL);
+    if (!tree) return;
+
+    FTSENT *node;
+    while ((node = fts_read(tree)) != NULL) {
+        if (node->fts_level > 8) {
+            fts_set(tree, node, FTS_SKIP);
+            continue;
+        }
+        int info = node->fts_info;
+        if (info == FTS_DNR || info == FTS_NS || info == FTS_ERR)
+            continue;
+
+        const char* name = node->fts_name;
+        if (!name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+            continue;
+
+        /* Skip translation trees — same content in other languages. */
+        if (strcmp(name, "locale") == 0 || strcmp(name, "i18n") == 0 ||
+            strcmp(name, "icons") == 0 || strcmp(name, "pixmaps") == 0 ||
+            strcmp(name, "js") == 0 || strcmp(name, "_static") == 0) {
+            if (info == FTS_D) fts_set(tree, node, FTS_SKIP);
+            continue;
+        }
+
+        const char* full = node->fts_path;
+        if (!full || strlen(full) >= MAX_PATH) continue;
+
+        struct stat st;
+        if (node->fts_statp) {
+            st = *node->fts_statp;
+        } else if (stat(full, &st) != 0) {
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            /* man locale dirs like man/fr/ man/de/ — still skip pure i18n piles */
+            if (strlen(name) == 2 && name[0] >= 'a' && name[0] <= 'z' &&
+                name[1] >= 'a' && name[1] <= 'z' &&
+                strstr(root, "/man") != NULL && strstr(root, "/man/man") == NULL) {
+                fts_set(tree, node, FTS_SKIP);
+                continue;
+            }
+            /* fts already descends automatically */
+        } else if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
+            g_files_seen++;
+            if (looks_indexable(name) && path_safe(full))
+                out.Add(str_dup_c(full));
+            if ((g_files_seen % 2000) == 0) {
+                fprintf(stderr, "\r  scanned %d files, %d candidates…",
+                        g_files_seen, out.Count());
+                fflush(stderr);
+            }
+        }
+    }
+    fts_close(tree);
+}
+#endif
 
 int section_id(const char* path) {
     if (!path) return 0;
