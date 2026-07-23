@@ -3,10 +3,12 @@
 > **Status:** v1 SHIPPED (2026-07) — `-ffibers` enables `go` / `await`; explicit
 > runtime in `include/cyfiber.h` + `include/chan.h`; works JIT (`-eg`) and AOT
 > (`classyc-aot.sh -ffibers`).  Validation: `cy-validate/val-053-go-fibers.cy`,
-> demo: `examples/classy-go-chan.cy`.  Remaining: TLS, select, work stealing.
+> demo: `examples/classy-go-chan.cy`.  **TLS shipped** (emulated N1 — see
+> `TLS-IMPLEMENTATION.md`).  Remaining: select, work stealing; optional ELF LE.
 >
 > **Related:** `ext/ccchan/`, `include/cyfiber.h`, `include/chan.h`, `src/cyfiber.c`,
-> `examples/classy-go-chan.cy`, `cy-validate/val-053-go-fibers.cy`, `classyc-aot.sh`
+> `examples/classy-go-chan.cy`, `cy-validate/val-053-go-fibers.cy`, `classyc-aot.sh`,
+> `TLS-IMPLEMENTATION.md`, `cy-validate/val-054-tls.cy`
 
 ---
 
@@ -46,11 +48,11 @@ ClassyC already has working **library-level** CSP pieces under the JIT:
 
 | Piece | Today |
 |--------|--------|
-| Channels | `ext/ccchan/cchan.h` (buffered/unbuffered, select, timeouts) |
-| Fibers (C) | `minicoro.h` + try/yield pattern (`examples/classy-cchan-fibers.cy`) |
+| Channels | `ext/ccchan/cchan.h` + `Chan<T>` / `include/chan.h` |
+| Fibers (C) | minicoro via `cyfiber` (host gcc) or `.cy` includes minicoro |
 | Threads | `pthread_*` (resolve from host under JIT; AOT links `-lpthread`) |
-| `_Thread_local` | **Parsed only** — warning: *"Thread local is not implemented"* → shared static |
-| Language | No `go` / `await` / `chan T` yet |
+| `_Thread_local` | **Shipped (N1 emulated)** — `MIR_tls_*` + `mir_tls_addr`; JIT+AOT; see `TLS-IMPLEMENTATION.md` |
+| Language | `go` / `await` with `-ffibers`; `Chan<T>` library |
 
 **Goal:** make the **compiler** support real TLS, a cooperative fiber runtime, and Go-style `go subroutine(...)` + channels, for both:
 
@@ -507,19 +509,20 @@ gcc -no-pie -o prog file.o mir-aot-runtime.o -lm -lpthread -ldl
 - [ ] **Work stealing** across workers (v1 pins fibers — no steal)  
 - [ ] **Real atomics** in ClassyC (removes mutex counters in demos)  
 - [ ] **LSP:** highlight `go`/`await`; don’t treat as identifiers when soft keywords  
-- [ ] **cy-validate** matrix: TLS, multi-worker fibers, go+chan, AOT binary  
-- [ ] Retire `MCO_PTHREAD_TLS` once Tier B TLS is default  
+- [x] **cy-validate** matrix: TLS (`val-054`), multi-worker fibers, go+chan (`val-053`)  
+- [x] Retire `MCO_PTHREAD_TLS` from fiber demos / `cyfiber.h` (N1 ClassyC TLS + host gcc TLS)  
 
 ---
 
 ## Implementation order (summary checklist)
 
 ### A. TLS
-1. [ ] Confirm strategy vs upstream: **c2mir will not give us TLS for free** ([#394](https://github.com/vnmakarov/mir/issues/394) open; c2mir README lists TLS as unimplemented)  
-2. [ ] **Fiber path:** worker-local current + `MCO_PTHREAD_TLS` until user TLS works  
-3. [ ] **Tier A** in ClassyC: lower `_Thread_local` → pthread_key helpers (fixes #394-class bugs)  
-4. [ ] **Tier B** (optional later): MIR TLS items + `%fs` + `b2obj` `.tdata`/`.tbss`  
-5. [ ] Tests: issue #394 program, JIT + `classyc-aot.sh`  
+1. [x] Confirm strategy vs upstream: implement in ClassyC MIR fork ([#394](https://github.com/vnmakarov/mir/issues/394) still open upstream)  
+2. [x] **Fiber path:** host `cyfiber` uses real gcc TLS; `.cy` minicoro demos use ClassyC TLS (no `MCO_PTHREAD_TLS`)  
+3. [x] **N1 emulated:** `MIR_tls_*` + `mir_tls_addr` (see `TLS-IMPLEMENTATION.md`)  
+4. [ ] **N2 (optional later):** ELF LE `.tdata`/`.tbss` + `TPOFF` in `b2obj`  
+5. [x] Tests: `examples/test-tls.cy`, `val-054-tls.cy`, multi-worker `classy-cchan-fibers.cy`  
+
 
 ### B. Runtime
 6. [x] `include/cyfiber.h` + `src/cyfiber.c` (spawn/yield/park/workers)  
@@ -573,8 +576,8 @@ gcc -no-pie -o prog file.o mir-aot-runtime.o -lm -lpthread -ldl
 
 | Test | JIT | AOT |
 |------|-----|-----|
-| Distinct `_Thread_local` addresses across pthreads | ✓ | ✓ |
-| Multi-worker fibers (no `MCO_PTHREAD_TLS`) | ✓ | ✓ |
+| Distinct `_Thread_local` addresses across pthreads | ✓ (`val-054`, `test-tls`) | ✓ |
+| Multi-worker fibers (no `MCO_PTHREAD_TLS`) | ✓ (`classy-cchan-fibers`, `val-053`) | ✓ (host cyfiber) |
 | `go` + `await` channel pipeline | ✓ (val-053) | ✓ (val-053) |
 | Loop yield prevents single-fiber starvation (smoke) | n/a — explicit yields only | n/a |
 | Close/drain semantics | ✓ | ✓ |

@@ -162,6 +162,15 @@ if [ -f "$csrc_dir/mir-aot-runtime.c" ]; then
   run "${rt_cmd[@]}"
   link_objects+=("$rt_obj")
 fi
+# Emulated TLS runtime (mir_tls_addr / mir_tls_base) for N1 AOT
+if [ -f "${mir_dir}/mir-tls.c" ]; then
+  tls_obj="$workdir/mir-tls.o"
+  tls_cmd=("$CC" -O2 -c -I "${mir_dir}" "${mir_dir}/mir-tls.c" -o "$tls_obj")
+  [ "$debug" -eq 1 ] && tls_cmd=("$CC" -O2 -g -c -I "${mir_dir}" "${mir_dir}/mir-tls.c" -o "$tls_obj")
+  echo "${tls_cmd[@]}"
+  run "${tls_cmd[@]}"
+  link_objects+=("$tls_obj")
+fi
 
 # --with-mir: link the MIR core (mir.o + mir-gen.o), but NOT c2mir.o (which the
 # bootstrap compiles from source itself).  Prefer standalone objects next to the

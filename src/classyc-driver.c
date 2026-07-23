@@ -679,6 +679,11 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "cy_chan_size") == 0) return (void *) cy_chan_size;
     if (strcmp (name, "cy_chan_capacity") == 0) return (void *) cy_chan_capacity;
     if (strcmp (name, "cy_chan_dispose") == 0) return (void *) cy_chan_dispose;
+    /* Emulated TLS runtime (also bound via _MIR_builtin_func as mir.tls_addr) */
+    if (strcmp (name, "mir.tls_addr") == 0 || strcmp (name, "mir_tls_addr") == 0)
+      return (void *) mir_tls_addr;
+    if (strcmp (name, "mir.tls_base") == 0 || strcmp (name, "mir_tls_base") == 0)
+      return (void *) mir_tls_base;
     /* String '+' concatenation / basic-type auto-cast helpers */
     if (strcmp (name, "c2m_str_concat") == 0) return (void *) c2m_str_concat;
     if (strcmp (name, "c2m_str_from_int") == 0) return (void *) c2m_str_from_int;

@@ -2,6 +2,8 @@
 
 #define C2M_STR_API
 #include "cstring.h"
+#define C2M_OBJ_API
+#include "cobjarena.h"
 #define C2M_DICT_API
 #include "dict.h"
 #define C2M_EXC_API

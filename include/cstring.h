@@ -47,6 +47,13 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* pthread is used only to sweep a thread's registry at thread exit (TSD
+   destructor).  Define C2M_STR_NO_PTHREAD to opt out (thread-exit leftovers
+   then leak; atexit still sweeps the main thread). */
+#ifndef C2M_STR_NO_PTHREAD
+#include <pthread.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -74,15 +81,36 @@ extern "C" {
  * by routing them through an allocator that does not track).  For now the
  * default behavior (atexit cleanup) is always safe; scope release is opt-in.
  *
- * NOTE: the registry is a simple process-global list and is not thread-safe.
- * Generated single-threaded programs (the common case) are fine; multithreaded
- * use should guard these calls or move to per-thread registries.
+ * NOTE: the registry is PER-THREAD (C11 _Thread_local).  The positional
+ * checkpoint/release model is inherently single-threaded, so each OS thread
+ * owns an independent registry stack and all operations are race-free by
+ * construction (no locks).  A String allocated on thread A must not be
+ * released on thread B: hand it across with c2m_str_detach (on A) followed
+ * by c2m_str_attach (on B).  Main-thread leftovers are swept at exit via
+ * atexit(); spawned-thread leftovers are swept by a pthread TSD destructor
+ * at thread exit.
  * ========================================================================== */
 
-C2M_STR_API void **c2m__str_registry = NULL;
-C2M_STR_API size_t c2m__str_reg_len = 0;
-C2M_STR_API size_t c2m__str_reg_cap = 0;
+C2M_STR_API _Thread_local void **c2m__str_registry = NULL;
+C2M_STR_API _Thread_local size_t c2m__str_reg_len = 0;
+C2M_STR_API _Thread_local size_t c2m__str_reg_cap = 0;
 C2M_STR_API int c2m__str_atexit_registered = 0;
+
+#ifndef C2M_STR_NO_PTHREAD
+C2M_STR_API pthread_key_t c2m__str_tls_key;
+C2M_STR_API pthread_once_t c2m__str_tls_once = PTHREAD_ONCE_INIT;
+C2M_STR_API void c2m_str_cleanup (void);
+/* TSD destructor: sweep the exiting thread's registry.  __thread variables
+   are still live while TSD destructors run, so this sees valid state. */
+C2M_STR_API void c2m__str_tls_dtor (void *p) {
+  (void) p;
+  c2m_str_cleanup ();
+  (void) pthread_setspecific (c2m__str_tls_key, NULL); /* disarm: no re-run */
+}
+C2M_STR_API void c2m__str_tls_init (void) {
+  (void) pthread_key_create (&c2m__str_tls_key, c2m__str_tls_dtor);
+}
+#endif
 
 /* Free every tracked String allocation and reset the registry. */
 C2M_STR_API void c2m_str_cleanup (void) {
@@ -98,8 +126,13 @@ C2M_STR_API void *c2m__str_track (void *p) {
   if (p == NULL) return NULL;
   if (!c2m__str_atexit_registered) {
     c2m__str_atexit_registered = 1;
-    atexit (c2m_str_cleanup);
+    atexit (c2m_str_cleanup); /* sweeps the calling (main) thread's registry */
   }
+#ifndef C2M_STR_NO_PTHREAD
+  /* Arm the per-thread exit sweep (idempotent, cheap). */
+  (void) pthread_once (&c2m__str_tls_once, c2m__str_tls_init);
+  (void) pthread_setspecific (c2m__str_tls_key, (void *) 1);
+#endif
   if (c2m__str_reg_len == c2m__str_reg_cap) {
     size_t ncap = c2m__str_reg_cap == 0 ? 64 : c2m__str_reg_cap * 2;
     void **n = (void **) realloc (c2m__str_registry, ncap * sizeof (void *));

@@ -63,9 +63,12 @@ typedef struct {
 #define CY_EXC_ARITHMETIC         3
 #define CY_EXC_RUNTIME            4
 
-static jmp_buf        cy__exc_frames[CY_EXC_MAX_DEPTH];
-static int            cy__exc_depth = 0;
-static cy_exception_t cy__exc_current = {0, 0, 0, 0};
+/* Per-thread exception state: each OS thread gets its own try/catch frame
+   stack and current-exception cell, so throws on one thread never disturb
+   handlers on another (no heap state, so no thread-exit sweep is needed). */
+static _Thread_local jmp_buf        cy__exc_frames[CY_EXC_MAX_DEPTH];
+static _Thread_local int            cy__exc_depth = 0;
+static _Thread_local cy_exception_t cy__exc_current = {0, 0, 0, 0};
 
 /* Push a new frame; return a pointer to its jmp_buf for the inline setjmp(). */
 C2M_EXC_API void *cy_exc_push (void) {

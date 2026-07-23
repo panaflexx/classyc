@@ -391,6 +391,15 @@ typedef struct {
     void       *item_addr;
 } bss_entry_t;
 
+/* TLS image pieces for ELF .tdata / .tbss (N2 local-exec) */
+typedef struct {
+    const char *name;       /* may be NULL for padding */
+    uint8_t    *bytes;      /* tdata only; NULL for tbss */
+    size_t      size;
+    size_t      tls_offset; /* offset within combined TLS image */
+    int         is_bss;     /* 1 = .tbss */
+} tls_entry_t;
+
 /* A single relocation to emit */
 typedef struct {
     size_t      offset;     /* offset within the target section (.text or .data) */
@@ -485,6 +494,9 @@ static const char *map_symbol(const char *name) {
         { "mir.atomic_fetch_or",   "mir_aot_atomic_fetch_or" },
         { "mir.atomic_fetch_xor",  "mir_aot_atomic_fetch_xor" },
         { "mir.atomic_cas",        "mir_aot_atomic_cas" },
+        /* Emulated TLS (N1); real ELF LE is N2 — see TLS-IMPLEMENTATION.md */
+        { "mir.tls_addr",          "mir_tls_addr" },
+        { "mir.tls_base",          "mir_tls_base" },
     };
     for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
         if (strcmp(name, map[i].from) == 0) return map[i].to;
@@ -544,6 +556,8 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     func_entry_t *funcs = NULL;  size_t n_funcs = 0, cap_funcs = 0;
     data_entry_t *datas = NULL;  size_t n_datas = 0, cap_datas = 0;
     bss_entry_t  *bsses = NULL;  size_t n_bsses = 0, cap_bsses = 0;
+    tls_entry_t  *tlss = NULL;   size_t n_tlss = 0, cap_tlss = 0;
+    size_t tdata_size = 0, tbss_size = 0;
     elf_reloc_t  *relocs = NULL; size_t n_relocs = 0, cap_relocs = 0;
     name_set_t exports = {0};
     name_set_t imports = {0};
@@ -619,6 +633,29 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
              * Pure-bss objects (named bss + optional anon bss) still go to
              * .bss.  Mixed objects go entirely to .data (bss pieces as zeros).
              */
+            case MIR_tls_data_item:
+            case MIR_tls_bss_item: {
+                /* N2 LE: symbol metadata; full template image emitted once per module. */
+                int is_bss = (item->item_type == MIR_tls_bss_item);
+                size_t sz = is_bss ? (size_t) item->u.tls_bss->len
+                                   : item->u.tls_data->nel
+                                         * _MIR_type_size (ctx, item->u.tls_data->el_type);
+                const char *nm = is_bss ? item->u.tls_bss->name : item->u.tls_data->name;
+                if (nm == NULL) break; /* anonymous padding — image still holds zeros */
+                if (n_tlss >= cap_tlss) {
+                    cap_tlss = cap_tlss ? cap_tlss * 2 : 16;
+                    tlss = realloc (tlss, cap_tlss * sizeof (tls_entry_t));
+                }
+                tls_entry_t *te = &tlss[n_tlss++];
+                te->name = nm;
+                te->size = sz;
+                te->tls_offset = MIR_tls_item_offset (item);
+                te->is_bss = is_bss;
+                te->bytes = NULL;
+                DBG ("  tls sym: %s off=%u size=%zu", nm, (unsigned) te->tls_offset, sz);
+                break;
+            }
+
             case MIR_data_item:
             case MIR_ref_data_item:
             case MIR_bss_item:
@@ -825,6 +862,26 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         n_datas = w;
     }
 
+    /* ----- Phase 1c: N2 native TLS image (.tdata) -----
+       Concatenate each module's TLS template into one .tdata buffer.
+       Named TLS symbols keep their per-module offsets (load_module_tls layout). */
+    uint8_t *tdata_buf = NULL;
+    {
+      for (MIR_module_t module = DLIST_HEAD (MIR_module_t, *MIR_get_module_list (ctx));
+           module != NULL; module = DLIST_NEXT (MIR_module_t, module)) {
+        if (module->tls_module_id == 0 || module->tls_template == NULL || module->tls_size == 0)
+          continue;
+        size_t old = tdata_size;
+        /* One module image for v1 AOT (typical single TU). */
+        tdata_size = module->tls_size;
+        tdata_buf = realloc (tdata_buf, tdata_size ? tdata_size : 1);
+        memcpy (tdata_buf, module->tls_template, module->tls_size);
+        (void) old;
+        DBG ("  .tdata image: %zu bytes (mod_id=%u)", tdata_size,
+             (unsigned) module->tls_module_id);
+      }
+    }
+
     /* ----- Phase 2: assign offsets within sections ----- */
     DBG("phase 1b done: %zu funcs, %zu datas, %zu bsses", n_funcs, n_datas, n_bsses);
     DBG("phase 2: assigning section offsets and building buffers");
@@ -966,6 +1023,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t nm_text       = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".text");
     size_t nm_data       = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".data");
     size_t nm_bss        = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".bss");
+    size_t nm_tdata      = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".tdata");
     size_t nm_rela_text  = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.text");
     size_t nm_rela_data  = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.data");
     size_t nm_symtab     = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".symtab");
@@ -979,16 +1037,21 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t nm_rela_debug_info = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.debug_info");
     size_t nm_rela_debug_line = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.debug_line");
 
-    /* Dynamic [[registry]] sections follow the fixed set.  Each registry gets a
-       PROGBITS section `cyreg_<NAME>` (index NUM_SECTIONS+2k) and a matching
-       `.rela.cyreg_<NAME>` (index NUM_SECTIONS+2k+1). */
-    size_t total_sections = NUM_SECTIONS + 2 * n_cyr;
+    /* Dynamic sections: optional .tdata then [[registry]] cyreg_* pairs. */
+    size_t sec_tdata = 0;
+    size_t n_extra = 2 * n_cyr;
+    if (tdata_size > 0 || n_tlss > 0) {
+        sec_tdata = NUM_SECTIONS;
+        n_extra += 1;
+    }
+    size_t total_sections = NUM_SECTIONS + n_extra;
+    size_t cyr_base = NUM_SECTIONS + (sec_tdata ? 1 : 0);
     for (size_t k = 0; k < n_cyr; k++) {
         char snm[160], rnm[168];
         snprintf(snm, sizeof snm, "cyreg_%s", cyr[k].name);
         snprintf(rnm, sizeof rnm, ".rela.cyreg_%s", cyr[k].name);
-        cyr[k].sec_idx      = NUM_SECTIONS + 2 * k;
-        cyr[k].rela_sec_idx = NUM_SECTIONS + 2 * k + 1;
+        cyr[k].sec_idx      = cyr_base + 2 * k;
+        cyr[k].rela_sec_idx = cyr_base + 2 * k + 1;
         cyr[k].nm      = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, snm);
         cyr[k].rela_nm = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, rnm);
     }
@@ -1122,6 +1185,28 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         s.st_size = bsses[i].len;
         SYM_MAP_ADD(bsses[i].name, n_syms);
         SYMTAB_PUSH(s);
+    }
+
+    /* TLS symbols (STT_TLS) in .tdata */
+    if (sec_tdata) {
+        for (size_t i = 0; i < n_tlss; i++) {
+            if (!tlss[i].name) continue;
+            int found = 0;
+            for (size_t j = 0; j < n_sym_map; j++)
+                if (strcmp (sym_map[j].name, tlss[i].name) == 0) { found = 1; break; }
+            if (found) continue;
+            size_t dummy;
+            int is_exported = name_set_find (&exports, tlss[i].name, &dummy);
+            Elf64_Sym s = {0};
+            s.st_name = strtab_add (&strtab, &strtab_size, &strtab_cap, tlss[i].name);
+            s.st_info = ELF64_ST_INFO (is_exported ? STB_GLOBAL : STB_LOCAL, STT_TLS);
+            s.st_shndx = (Elf64_Section) sec_tdata;
+            s.st_value = tlss[i].tls_offset;
+            s.st_size = tlss[i].size;
+            SYM_MAP_ADD (tlss[i].name, n_syms);
+            SYMTAB_PUSH (s);
+            DBG ("  TLS sym %s st_value=%zu", tlss[i].name, tlss[i].tls_offset);
+        }
     }
 
     /* [[registry]] entry symbols: LOCAL STT_OBJECT pointers living in their
@@ -1909,6 +1994,14 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t data_off = off;
     off += data_size;
 
+    /* .tdata (TLS init image) */
+    size_t tdata_off = 0;
+    if (sec_tdata && tdata_size > 0) {
+        off = align8 (off);
+        tdata_off = off;
+        off += tdata_size;
+    }
+
     /* .rela.text */
     off = align8(off);
     size_t rela_text_off = off;
@@ -2011,6 +2104,16 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     shdrs[SEC_BSS].sh_offset    = data_off + data_size; /* no file space */
     shdrs[SEC_BSS].sh_size      = bss_size;
     shdrs[SEC_BSS].sh_addralign = 8;
+
+    /* optional: .tdata (SHF_TLS) at sec_tdata */
+    if (sec_tdata) {
+        shdrs[sec_tdata].sh_name      = nm_tdata;
+        shdrs[sec_tdata].sh_type      = SHT_PROGBITS;
+        shdrs[sec_tdata].sh_flags     = SHF_ALLOC | SHF_WRITE | SHF_TLS;
+        shdrs[sec_tdata].sh_offset    = tdata_off;
+        shdrs[sec_tdata].sh_size      = tdata_size;
+        shdrs[sec_tdata].sh_addralign = 8;
+    }
 
     /* 4: .rela.text */
     shdrs[SEC_RELA_TEXT].sh_name      = nm_rela_text;
@@ -2177,8 +2280,15 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     /* .data */
     if (data_size) write(fd, data_buf, data_size);
 
+    /* .tdata */
+    if (sec_tdata && tdata_size) {
+        size_t cur = data_off + data_size;
+        if (tdata_off > cur) write_padding (fd, tdata_off - cur);
+        write (fd, tdata_buf, tdata_size);
+    }
+
     /* padding to rela_text_off */
-    { size_t cur = data_off + data_size;
+    { size_t cur = (sec_tdata && tdata_size) ? (tdata_off + tdata_size) : (data_off + data_size);
       if (rela_text_off > cur) write_padding(fd, rela_text_off - cur); }
 
     /* .rela.text */
@@ -2285,6 +2395,8 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     for (size_t i = 0; i < n_datas; i++) free(datas[i].bytes);
     free(datas);
     free(bsses);
+    free(tlss);
+    free(tdata_buf);
     free(relocs);
     for (size_t i = 0; i < exports.n; i++) free(exports.names[i]);
     free(exports.names);
@@ -2350,6 +2462,10 @@ int main(int argc, char **argv) {
     MIR_read(ctx, fp);
     fclose(fp);
     DBG("MIR_read done");
+
+    /* N2: ELF local-exec TLS — keep TLS item refs for TPOFF codegen; do not
+       rewrite to mir_tls_addr (emulated).  Must be set before MIR_load_module. */
+    MIR_set_tls_native_aot (ctx, 1);
 
     /* Load all modules */
     size_t n_modules = 0, n_funcs_total = 0;

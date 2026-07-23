@@ -983,7 +983,8 @@ int main(void) {
 
 Run: `./bin/classyc -I include -ffibers examples/classy-go-chan.cy -eg`
 AOT: `./classyc-aot.sh -I include -ffibers examples/classy-go-chan.cy -o prog`
-Design doc + roadmap (TLS, select, work stealing): `FIBERS.md`.
+Design doc + roadmap (select, work stealing): `FIBERS.md`.
+TLS (C11 `_Thread_local`): shipped as emulated MIR TLS — `TLS-IMPLEMENTATION.md`.
 
 ### HTTP/HTTPS Fetch (`include/httpclient.h`)
 A header-only client to call a JSON API in one line. Responses come back the
@@ -1013,7 +1014,7 @@ See `examples/classy-fetch.cy` for the full tour (response headers, custom
 request headers, batch fetch, 404 handling).
 
 ### Full C11 Base + Useful Extensions
-- All standard C11 features (minus atomics/complex/VLA/TLS)
+- All standard C11 features (minus complex/VLA; atomics and `_Thread_local` are supported — see `CLASSY-ATOMICS.md`, `TLS-IMPLEMENTATION.md`)
 - Statement expressions, labels as values, range cases, binary literals, etc.
 - Powerful MIR builtins for JIT specialization (`__builtin_prop_*`, `__builtin_jcall`, overflow helpers)
 - Method overloading (resolved at compile time)

@@ -360,6 +360,8 @@ static const char *map_symbol (const char *name) {
     { "mir.atomic_fetch_or",   "mir_aot_atomic_fetch_or" },
     { "mir.atomic_fetch_xor",  "mir_aot_atomic_fetch_xor" },
     { "mir.atomic_cas",        "mir_aot_atomic_cas" },
+    { "mir.tls_addr",          "mir_tls_addr" },
+    { "mir.tls_base",          "mir_tls_base" },
   };
   for (size_t i = 0; i < sizeof (map) / sizeof (map[0]); i++)
     if (strcmp (name, map[i].from) == 0) return map[i].to;
@@ -505,6 +507,13 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
         DBG ("  func: %s  code_len=%zu", f->name, fe->code_len);
         break;
       }
+      /* N1: TLS items use emulated mir_tls_* at runtime; not process-global
+         data/bss.  N2 may emit Mach-O TLS later (see TLS-IMPLEMENTATION.md). */
+      case MIR_tls_data_item:
+      case MIR_tls_bss_item:
+        DBG ("  tls item skipped in b2objmac N1 (emulated TLS): %s",
+             MIR_item_name (ctx, item));
+        break;
       case MIR_data_item: {
         MIR_data_t d = item->u.data;
         size_t sz = d->nel * _MIR_type_size (ctx, d->el_type);

@@ -22,17 +22,14 @@
  *   ./bin/classyc -I ext/ccchan -w examples/classy-cchan-fibers.cy -eg \
  *       --workers=4 --fibers=64 --seconds=2
  *
- * ClassyC does not implement real `_Thread_local` storage (it warns and shares
- * one cell across pthreads). minicoro needs true per-thread `mco_current_co`,
- * so this example enables MCO_PTHREAD_TLS (pthread_key) before including
- * minicoro. Without that, --workers>1 corrupts resume state and asserts.
+ * Multi-OS-thread workers need real per-thread `mco_current_co`. ClassyC now
+ * implements C11 `_Thread_local` (emulated TLS — see TLS-IMPLEMENTATION.md), so
+ * minicoro's default TLS path works without MCO_PTHREAD_TLS.
  * Pthreads resolve from the host `classyc` process — no -l pthread needed.
  *
  * @expect: exit 0 and print "FIBER CHANNEL SMOKE PASSED"
  */
 
-/* Real TLS via pthread_key — required under ClassyC for multi-OS-thread fibers */
-#define MCO_PTHREAD_TLS
 #define MINICORO_IMPL
 #include "minicoro.h"
 
@@ -54,7 +51,7 @@
 #define MAX_BOOK         32
 #define FIBER_STACK      (64 * 1024)
 
-static int g_nworkers = 2;    /* multi-OS-thread; needs MCO_PTHREAD_TLS under ClassyC */
+static int g_nworkers = 2;    /* multi-OS-thread; uses ClassyC _Thread_local TLS */
 static int g_nfibers  = 24;   /* total fibers (traders + matchers + sinks) */
 static int g_seconds  = 1;    /* sustained run length */
 

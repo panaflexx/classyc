@@ -5,12 +5,17 @@
  *
  *   acceptor fiber ──accept──► one connection fiber per client fd
  *
- * Why fibers and not pthreads: the ClassyC String arena is process-global
- * (no per-thread storage yet — see FIBERS.md Phase 1), so OS-thread
- * parallelism over application code is unsafe today.  Cooperative fibers
- * give real request interleaving (recv/send waits overlap) with zero
+ * Why fibers and not pthreads: the ClassyC String arena is PER-THREAD
+ * (_Thread_local) but not fiber-local, so fibers on one OS thread still
+ * share that thread's arena.  Cooperative fibers give real request
+ * interleaving (recv/send waits overlap) on one OS thread with zero
  * shared-state risk, because app_handle() always runs to completion
- * without yielding.
+ * without yielding.  (Multi-OS-thread servers are now possible — each
+ * thread owns its arena — but require app code to hand Strings across
+ * threads via detach/attach.)
+ *
+ * (C11 `_Thread_local` works in ClassyC now — see TLS-IMPLEMENTATION.md —
+ * so minicoro uses real TLS for mco_current_co without MCO_PTHREAD_TLS.)
  *
  * Load-bearing hygiene — fibers and the positional String arena:
  * arena checkpoints free by POSITION, so they are only safe across fibers
@@ -20,16 +25,15 @@
  * yield-free block per request.  Applications must follow the same rule:
  * never call mco_yield from inside app_handle().
  *
- * Build (with an app providing main() + app_handle()):
+ * Build (with an app providing main() + app_handle() + ROUTE()s):
  *
  *   ./bin/classyc -I include -I ext/ccchan \
- *       examples/http-serve.c examples/http-serve-fibers.c \
- *       examples/beyond-demo/classyc-db-server.cy -eg
+ *       examples/http-serve-fibers.c examples/http_crud/main.cy \
+ *       examples/http_crud/items.cy -eg
  *
- * Scope: plain HTTP/1.1, one request per connection (Connection: close).
+ * Scope: plain HTTP/1.1 keep-alive, non-blocking sockets, one OS thread.
  */
 
-#define MCO_PTHREAD_TLS
 #define MINICORO_IMPL
 #include "minicoro.h"
 

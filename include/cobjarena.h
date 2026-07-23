@@ -22,11 +22,20 @@
  * reclaimed automatically when the scope ends.  An atexit() net guarantees a
  * leak-free normal exit with zero user effort.
  *
- * NOTE: like the String registry this is a process-global list and is not
- * thread-safe; single-threaded programs (the common case) are fine.
+ * NOTE: the registry is PER-THREAD (C11 _Thread_local), mirroring the String
+ * registry: each OS thread owns an independent LIFO stack, so checkpoint /
+ * release_to need no locks.  An object tracked on thread A must not be
+ * released on thread B — hand it across with c2m_obj_detach (A) +
+ * c2m_obj_track (B).  Main-thread leftovers are swept at exit via atexit();
+ * spawned-thread leftovers are swept by a pthread TSD destructor at thread
+ * exit (define C2M_OBJ_NO_PTHREAD to opt out).
  * ========================================================================== */
 
 #include <stdlib.h>
+
+#ifndef C2M_OBJ_NO_PTHREAD
+#include <pthread.h>
+#endif
 
 #ifndef C2M_OBJ_API
 #define C2M_OBJ_API static
@@ -39,10 +48,24 @@ typedef struct {
   c2m_obj_dtor_t dtor;
 } c2m__obj_entry;
 
-C2M_OBJ_API c2m__obj_entry *c2m__obj_registry = NULL;
-C2M_OBJ_API size_t c2m__obj_reg_len = 0;
-C2M_OBJ_API size_t c2m__obj_reg_cap = 0;
+C2M_OBJ_API _Thread_local c2m__obj_entry *c2m__obj_registry = NULL;
+C2M_OBJ_API _Thread_local size_t c2m__obj_reg_len = 0;
+C2M_OBJ_API _Thread_local size_t c2m__obj_reg_cap = 0;
 C2M_OBJ_API int c2m__obj_atexit_registered = 0;
+
+#ifndef C2M_OBJ_NO_PTHREAD
+C2M_OBJ_API pthread_key_t c2m__obj_tls_key;
+C2M_OBJ_API pthread_once_t c2m__obj_tls_once = PTHREAD_ONCE_INIT;
+C2M_OBJ_API void c2m_obj_cleanup (void);
+C2M_OBJ_API void c2m__obj_tls_dtor (void *p) {
+  (void) p;
+  c2m_obj_cleanup ();
+  (void) pthread_setspecific (c2m__obj_tls_key, NULL); /* disarm: no re-run */
+}
+C2M_OBJ_API void c2m__obj_tls_init (void) {
+  (void) pthread_key_create (&c2m__obj_tls_key, c2m__obj_tls_dtor);
+}
+#endif
 
 /* Destroy and drop a single entry (dtor owns the free; NULL dtor => plain free). */
 C2M_OBJ_API void c2m__obj_destroy_one (c2m__obj_entry e) {
@@ -72,8 +95,12 @@ C2M_OBJ_API void *c2m_obj_track (void *p, c2m_obj_dtor_t dtor) {
   if (p == NULL) return NULL;
   if (!c2m__obj_atexit_registered) {
     c2m__obj_atexit_registered = 1;
-    atexit (c2m_obj_cleanup);
+    atexit (c2m_obj_cleanup); /* sweeps the calling (main) thread's registry */
   }
+#ifndef C2M_OBJ_NO_PTHREAD
+  (void) pthread_once (&c2m__obj_tls_once, c2m__obj_tls_init);
+  (void) pthread_setspecific (c2m__obj_tls_key, (void *) 1);
+#endif
   if (c2m__obj_reg_len == c2m__obj_reg_cap) {
     size_t ncap = c2m__obj_reg_cap == 0 ? 64 : c2m__obj_reg_cap * 2;
     c2m__obj_entry *n

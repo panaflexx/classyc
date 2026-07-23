@@ -8028,11 +8028,7 @@ D (sc_spec) {
   } else if (MP (T_REGISTER, pos)) {
     r = new_pos_node (c2m_ctx, N_REGISTER, pos);
   } else if (MP (T_THREAD_LOCAL, pos)) {
-    if (c2m_options->pedantic_p)
-      error (c2m_ctx, pos, "Thread local is not implemented");
-    else
-      warning (c2m_ctx, pos,
-               "Thread local is not implemented -- program might not work as assumed");
+    /* Real TLS: MIR_tls_* items + mir_tls_addr (see TLS-IMPLEMENTATION.md). */
     r = new_pos_node (c2m_ctx, N_THREAD_LOCAL, pos);
   } else {
     if (record_level == 0) syntax_error (c2m_ctx, "a storage specifier");
@@ -27490,6 +27486,8 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
   MIR_type_t t;
   MIR_item_t data = NULL; /* to remove a warning */
   struct expr *e;
+  int tls_p
+    = !local_p && var.decl != NULL && var.decl->decl_spec.thread_local_p;
 
   if (var.mir_op.mode == MIR_OP_REG) { /* scalar initialization: */
     assert (local_p && offset == 0 && VARR_LENGTH (init_el_t, init_els) - init_start == 1);
@@ -27578,7 +27576,8 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
                 || val.mir_op.mode == MIR_OP_REF);
       }
       if (rel_offset < init_el.offset) { /* fill the gap: */
-        data = MIR_new_bss (ctx, global_name, init_el.offset - rel_offset);
+        data = tls_p ? MIR_new_tls_bss (ctx, global_name, init_el.offset - rel_offset)
+                     : MIR_new_bss (ctx, global_name, init_el.offset - rel_offset);
         if (global_name != NULL) var.decl->u.item = data;
         global_name = NULL;
       }
@@ -27588,9 +27587,11 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
 
         if ((def = e->def_node) == NULL) { /* constant address */
           mir_size_t s = e->c.i_val;
-          data = MIR_new_data (ctx, global_name, MIR_T_P, 1, &s);
+          data = tls_p ? MIR_new_tls_data (ctx, global_name, MIR_T_P, 1, &s)
+                       : MIR_new_data (ctx, global_name, MIR_T_P, 1, &s);
           data_size = _MIR_type_size (ctx, MIR_T_P);
         } else if (def->code == N_LABEL_ADDR) {
+          /* Label addresses in TLS are not supported in N1; fall through as normal data. */
           data = MIR_new_lref_data (ctx, global_name,
                                     get_label (c2m_ctx,
                                                ((struct expr *) def->attr)->u.label_addr_target),
@@ -27660,7 +27661,12 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
         default: assert (FALSE);
         }
         if (start_offset == 0 && data_size == el_size) {
-          data = MIR_new_data (ctx, global_name, t, 1, &u);
+          data = tls_p ? MIR_new_tls_data (ctx, global_name, t, 1, &u)
+                       : MIR_new_data (ctx, global_name, t, 1, &u);
+        } else if (tls_p) {
+          /* TLS: emit whole object as byte image when bitfield packing applies. */
+          data = MIR_new_tls_data (ctx, global_name, MIR_T_U8, data_size - start_offset,
+                                   &u.data[start_offset]);
         } else {
           for (mir_size_t byte_num = start_offset; byte_num < data_size; byte_num++) {
             if (byte_num == start_offset)
@@ -27673,7 +27679,11 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
         data_size = raw_type_size (c2m_ctx, init_el.el_type);
         str_len = val.mir_op.u.str.len;
         if (data_size < str_len) {
-          data = MIR_new_data (ctx, global_name, MIR_T_U8, data_size, val.mir_op.u.str.s);
+          data = tls_p ? MIR_new_tls_data (ctx, global_name, MIR_T_U8, data_size, val.mir_op.u.str.s)
+                       : MIR_new_data (ctx, global_name, MIR_T_U8, data_size, val.mir_op.u.str.s);
+        } else if (tls_p) {
+          data = MIR_new_tls_data (ctx, global_name, MIR_T_U8, str_len, val.mir_op.u.str.s);
+          if (data_size > str_len) MIR_new_tls_bss (ctx, NULL, data_size - str_len);
         } else {
           data = MIR_new_string_data (ctx, global_name, val.mir_op.u.str);
           if (data_size > str_len) MIR_new_bss (ctx, NULL, data_size - str_len);
@@ -27688,7 +27698,8 @@ static void gen_initializer (c2m_ctx_t c2m_ctx, size_t init_start, op_t var,
       rel_offset = init_el.offset + data_size;
     }
     if (rel_offset < size || size == 0) { /* fill the tail: */
-      data = MIR_new_bss (ctx, global_name, size - rel_offset);
+      data = tls_p ? MIR_new_tls_bss (ctx, global_name, size - rel_offset)
+                   : MIR_new_bss (ctx, global_name, size - rel_offset);
       if (global_name != NULL) var.decl->u.item = data;
     }
     VARR_DESTROY (MIR_op_t, pregen_vals);
@@ -31369,16 +31380,23 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       if (declarator->code == N_DECL && decl->decl_spec.type->mode != TM_FUNC
           && !decl->decl_spec.typedef_p && !decl->decl_spec.extern_p && !decl->asm_p) {
         if (initializer->code == N_IGNORE) {
-          if (decl->scope != top_scope && decl->decl_spec.static_p) {
+          if (decl->decl_spec.thread_local_p
+              && (decl->scope == top_scope || decl->decl_spec.static_p)) {
+            decl->u.item
+              = MIR_new_tls_bss (ctx, name, raw_type_size (c2m_ctx, decl->decl_spec.type));
+          } else if (decl->scope != top_scope && decl->decl_spec.static_p) {
             decl->u.item = MIR_new_bss (ctx, name, raw_type_size (c2m_ctx, decl->decl_spec.type));
           } else if (decl->scope == top_scope
                      && symbol_find (c2m_ctx, S_REGULAR, id, top_scope, &sym)
                      && ((curr_decl = sym.def_node->attr)->u.item == NULL
-                         || curr_decl->u.item->item_type != MIR_bss_item)) {
+                         || (curr_decl->u.item->item_type != MIR_bss_item
+                             && curr_decl->u.item->item_type != MIR_tls_bss_item))) {
             for (i = 0; i < VARR_LENGTH (node_t, sym.defs); i++) {
               curr_node = VARR_GET (node_t, sym.defs, i);
               curr_decl = curr_node->attr;
-              if ((curr_decl->u.item != NULL && curr_decl->u.item->item_type == MIR_bss_item)
+              if ((curr_decl->u.item != NULL
+                   && (curr_decl->u.item->item_type == MIR_bss_item
+                       || curr_decl->u.item->item_type == MIR_tls_bss_item))
                   || SPEC_DECL_INIT (curr_node)->code != N_IGNORE)
                 break;
             }
