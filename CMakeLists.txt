@@ -55,14 +55,16 @@ add_subdirectory(${MIRDIR})
 add_executable(classyc
     src/classyc.c
     src/classyc-driver.c
+    src/cyfiber.c
 )
 
 target_include_directories(classyc PRIVATE
     ${CMAKE_SOURCE_DIR}/${MIRDIR}
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/ext/ccchan
 )
 
-target_link_libraries(classyc PRIVATE mir_static)
+target_link_libraries(classyc PRIVATE mir_static pthread)
 
 # Define NDEBUG for release-like builds (matches your manual command)
 target_compile_definitions(classyc PRIVATE $<$<NOT:$<CONFIG:Debug>>:NDEBUG>)
@@ -94,7 +96,7 @@ else()
         $<$<CONFIG:RelWithDebInfo>:-O3>
     )
 
-  target_link_libraries(classyc PRIVATE m)
+  target_link_libraries(classyc PRIVATE m pthread)
 endif()
 
 # ------------------ classyc-lsp Language Server ------------------

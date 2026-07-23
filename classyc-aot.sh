@@ -77,6 +77,7 @@ keep=0
 verbose=0
 debug=0            # -g: build a debug (DWARF) binary
 with_mir=0         # link the MIR core (mir.o + mir-gen.o)
+chanfibers=0       # -ffibers: compile mir-aot-runtime.c with -DCHANFIBERS
 
 # Initialize all arrays properly (critical with `set -u`)
 c2m_flags=()
@@ -111,6 +112,11 @@ while [ $# -gt 0 ]; do
       c2m_flags+=("$arg" "$1") ;;
     -I*|-D*|-U*|-std=*|-O*|-w|-pedantic|-fsigned-char|-fno-*)
       c2m_flags+=("$arg") ;;
+    # -ffibers: opt-in go/await syntax for classyc, and pull the fiber/channel
+    # runtime (cyfiber) into the AOT runtime object via -DCHANFIBERS.
+    -ffibers)
+      c2m_flags+=("$arg")
+      chanfibers=1 ;;
     # linker flags that take a separate argument
     -L|-l)
       shift; [ $# -gt 0 ] || { echo "$prog: $arg needs an argument" >&2; exit 1; }
@@ -150,6 +156,7 @@ if [ -f "$csrc_dir/mir-aot-runtime.c" ]; then
   rt_obj="$workdir/mir-aot-runtime.o"
   rt_cmd=("$CC" -O2)
   [ "$debug" -eq 1 ] && rt_cmd+=(-g)
+  [ "$chanfibers" -eq 1 ] && rt_cmd+=(-DCHANFIBERS -I ext/ccchan)
   rt_cmd+=(-c -I include -I "${mir_dir}" "$csrc_dir/mir-aot-runtime.c" -o "$rt_obj")
   echo "${rt_cmd[@]}"
   run "${rt_cmd[@]}"

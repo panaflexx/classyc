@@ -752,7 +752,9 @@ typedef enum {
   N_ANY,    /* any<I>(expr) — wrap a concrete C* as an erased Any<I>* handle */
     N_TRY,      /* try block { ... } followed by one or more catch clauses    */
     N_CATCH,    /* catch(Class? var) { handler } — a single clause of an N_TRY */
-    N_THROW     /* throw(id, message) → cy_exc_throw(longjmp frame)            */
+    N_THROW,    /* throw(id, message) → cy_exc_throw(longjmp frame)            */
+    N_GO,       /* go f(args); — spawn a fiber (-ffibers) → cy_spawn8 pack     */
+    N_AWAIT     /* await [expr]; — pure cooperative yield (-ffibers) → cy_yield */
   } node_code_t;
 
 #undef REP_SEP
@@ -9327,6 +9329,44 @@ D (stmt) {
     }
     record_stop (c2m_ctx, mark, TRUE); /* not an attach statement: rewind */
   }
+  /* go <call-expr> ; : spawn a fiber running the call (opt-in, -ffibers).
+     Soft keyword with the same rollback discipline as defer/delete, so `go`
+     stays usable as an ordinary identifier when -ffibers is off (or when an
+     operator follows).  The operand must check as a direct plain-function
+     call with ≤8 GP-class args (see check N_GO). */
+  if (c2m_options->fibers_p && C_SOFT ("go")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t gpos = curr_token->pos;
+    M_SOFT ("go");
+    if (!C ('=') && !C (';') && !C ('(') && !C ('[') && !C ('.')
+        && (op1 = TRY (expr)) != err_node && C (';')) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit: this is a go statement */
+      PT (';');
+      return new_pos_node2 (c2m_ctx, N_GO, gpos, l, op1);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not a go statement: rewind */
+  }
+  /* await [expr] ; : pure cooperative yield point (opt-in, -ffibers).  The
+     optional expression is evaluated first (e.g. a try_recv), then the fiber
+     yields.  Channel parking itself is explicit (Chan<T> send/recv park
+     internally); await is only the scheduler state check + yield. */
+  if (c2m_options->fibers_p && C_SOFT ("await")) {
+    size_t mark = record_start (c2m_ctx);
+    pos_t apos = curr_token->pos;
+    M_SOFT ("await");
+    if (C (';')) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit: bare yield */
+      PT (';');
+      return new_pos_node1 (c2m_ctx, N_AWAIT, apos, l);
+    }
+    if (!C ('=') && !C ('(') && !C ('[') && !C ('.')
+        && (op1 = TRY (expr)) != err_node && C (';')) {
+      record_stop (c2m_ctx, mark, FALSE); /* commit: await <expr> */
+      PT (';');
+      return new_pos_node2 (c2m_ctx, N_AWAIT, apos, l, op1);
+    }
+    record_stop (c2m_ctx, mark, TRUE); /* not an await statement: rewind */
+  }
   if (C ('{')) {
     P (compound_stmt);
     if (NL_HEAD (l->u.ops) != NULL) { /* replace empty label list */
@@ -17209,6 +17249,8 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         NODE_CASE (TRY)
         NODE_CASE (CATCH)
         NODE_CASE (THROW)
+        NODE_CASE (GO)
+        NODE_CASE (AWAIT)
         *stmt_p = TRUE;
         break;
         REP8 (NODE_CASE, IGNORE, CASE, DEFAULT, LABEL, LIST, SHARE, TYPEDEF, EXTERN)
@@ -17679,6 +17721,24 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           }
         }
         vararg_slot++;
+      }
+    }
+
+    /* `go` argument predicate (-ffibers): the cy_spawn8 trampoline passes args
+       as raw I64 slots, so only GP-class values are allowed: integers, enums,
+       bool, pointers (incl. String, class*, dict).  Floats and by-value
+       aggregates (struct/union/class/array/slice) are rejected. */
+    static int go_gp_type_p (c2m_ctx_t c2m_ctx, struct type *t) {
+      if (t == NULL) return FALSE;
+      switch (t->mode) {
+      case TM_BASIC:
+        return t->u.basic_type != TP_FLOAT && t->u.basic_type != TP_DOUBLE
+               && t->u.basic_type != TP_LDOUBLE && t->u.basic_type != TP_VOID
+               && t->u.basic_type != TP_UNDEF && t->u.basic_type != TP_GENERIC;
+      case TM_ENUM:
+      case TM_PTR:
+      case TM_DICT: return TRUE;
+      default: return FALSE;
       }
     }
 
@@ -22740,6 +22800,68 @@ if (base != NULL && base->code == N_ID) {
     check (c2m_ctx, stmt, r);
     break;
   }
+  case N_GO: {
+    /* go f(args); (-ffibers): the operand must be a direct call to a plain
+       function with at most 8 GP-class arguments (cy_spawn8 trampoline ABI).
+       The call itself is checked normally — gen discards its result and does
+       not emit it; it emits cy_spawn8(fn, nargs, args...) instead. */
+    node_t labels = NL_HEAD (r->u.ops);
+    node_t call = NL_NEXT (labels);
+    node_t func, args, fdef;
+    struct expr *fe;
+    int nargs = 0, direct_p = FALSE;
+
+    check_labels (c2m_ctx, labels, r);
+    if (call->code != N_CALL) {
+      error (c2m_ctx, POS (r), "go: operand must be a function call (go f(args);)");
+      break;
+    }
+    check (c2m_ctx, call, r);
+    func = NL_HEAD (call->u.ops);
+    fe = func->attr;
+    fdef = fe != NULL ? fe->def_node : NULL;
+    if (func->code == N_ID && fdef != NULL) {
+      if (fdef->code == N_FUNC_DEF) {
+        direct_p = TRUE;
+      } else {
+        decl_t fd = fdef->attr;
+        if (fd != NULL && fd->decl_spec.type != NULL
+            && fd->decl_spec.type->mode == TM_FUNC)
+          direct_p = TRUE; /* extern function declaration */
+      }
+    }
+    if (!direct_p) {
+      error (c2m_ctx, POS (r),
+             "go: only direct calls to plain functions are supported "
+             "(wrap methods/function pointers in a plain function)");
+      break;
+    }
+    args = NL_EL (call->u.ops, 1);
+    for (node_t a = NL_HEAD (args->u.ops); a != NULL; a = NL_NEXT (a)) {
+      struct expr *ae = a->attr;
+      nargs++;
+      if (!go_gp_type_p (c2m_ctx, ae != NULL ? ae->type : NULL)) {
+        error (c2m_ctx, POS (r),
+               "go: argument %d must have an integer or pointer type "
+               "(floating-point and by-value aggregates cannot ride the fiber pack)",
+               nargs);
+        break;
+      }
+    }
+    if (nargs > 8)
+      error (c2m_ctx, POS (r), "go: too many arguments (%d, max 8)", nargs);
+    break;
+  }
+  case N_AWAIT: {
+    /* await [expr]; (-ffibers): evaluate the optional expression, then yield
+       the fiber.  Pure yield — channel parking is explicit in Chan<T>. */
+    node_t labels = NL_HEAD (r->u.ops);
+    node_t expr = NL_NEXT (labels);
+
+    check_labels (c2m_ctx, labels, r);
+    if (expr != NULL) check (c2m_ctx, expr, r);
+    break;
+  }
   case N_DELETE: {
     /* delete <ptr>: run the pointed-to object's destructor (if its class defines
        one) and free the heap storage.  r->attr caches the resolved destructor
@@ -23276,6 +23398,9 @@ struct gen_ctx {
   MIR_item_t cy_obj_track_proto, cy_obj_track_item;         /* void cy_obj_track(ptr)          */
   MIR_item_t cy_obj_note_free_proto, cy_obj_note_free_item; /* void cy_obj_note_free(ptr,line) */
   MIR_item_t cy_obj_check_proto, cy_obj_check_item;         /* void cy_obj_check(ptr,line)     */
+  /* -ffibers go/await runtime (cyfiber.h) — lazily imported on first use */
+  MIR_item_t cy_spawn8_proto, cy_spawn8_item; /* void cy_spawn8(fn,nargs,a0..a7) */
+  MIR_item_t cy_yield_proto, cy_yield_item;   /* void cy_yield(void)             */
   int exc_depth;                                        /* try nesting depth (label uids) */
   /* Midopt R-LICM memo: proven loop-invariant call nodes mapped to the op that
      holds their once-evaluated pre-header value (see gen_hoist_* helpers). */
@@ -23459,6 +23584,10 @@ struct gen_ctx {
 #define cy_obj_note_free_item gen_ctx->cy_obj_note_free_item
 #define cy_obj_check_proto gen_ctx->cy_obj_check_proto
 #define cy_obj_check_item gen_ctx->cy_obj_check_item
+#define cy_spawn8_proto gen_ctx->cy_spawn8_proto
+#define cy_spawn8_item gen_ctx->cy_spawn8_item
+#define cy_yield_proto gen_ctx->cy_yield_proto
+#define cy_yield_item gen_ctx->cy_yield_item
 #define exc_depth gen_ctx->exc_depth
 #define hoist_nodes gen_ctx->hoist_nodes
 #define hoist_ops gen_ctx->hoist_ops
@@ -25348,7 +25477,7 @@ static void gen_run_defers (c2m_ctx_t c2m_ctx, size_t from) {
    few helpers whose historical proto name differs from the import name,
    e.g. import "setjmp" with proto "__cy_setjmp_p").  MIR interns both the
    proto name and the parameter names, so the stack buffers here are safe. */
-#define RT_IMPORT_MAX_ARGS 8
+#define RT_IMPORT_MAX_ARGS 10
 
 /* Import-only variant: used when several imports share one proto
    (e.g. c2m_str_from_int/uint/bool/char all use __c2m_str_from_i64_p). */
@@ -25472,6 +25601,21 @@ static void exception_ensure_imports (c2m_ctx_t c2m_ctx) {
      so it captures that frame.  Declared to return a 64-bit value (the int
      result is zero/sign-extended in the return register on supported ABIs). */
   rt_import (c2m_ctx, "setjmp", "cy_setjmp", &cy_setjmp_proto, &cy_setjmp_item, 1, "buf");
+}
+
+/* -ffibers go/await runtime (cyfiber.h, bound by the driver's import_resolver
+   under JIT and by mir-aot-runtime.c CHANFIBERS under AOT).  Lazily imported
+   on the first `go` / `await` in a TU — without -ffibers these never fire,
+   so programs see no fiber runtime pollution. */
+static void fiber_ensure_imports (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+
+  if (cy_spawn8_item != NULL) return;
+  /* void cy_spawn8(void *fn, long nargs, long a0, …, long a7) */
+  rt_import (c2m_ctx, "cy_spawn8", NULL, &cy_spawn8_proto, &cy_spawn8_item, 0,
+             "fn nargs a0 a1 a2 a3 a4 a5 a6 a7");
+  /* void cy_yield(void) */
+  rt_import (c2m_ctx, "cy_yield", NULL, &cy_yield_proto, &cy_yield_item, 0, "");
 }
 
 /* Emit cy_exc_throw(id, msg, file, line).  Never returns (it longjmps or
@@ -25736,7 +25880,7 @@ static void gen_obj_guard_check (c2m_ctx_t c2m_ctx, op_t ptr_op, long line) {
    wrapper below is a thin call to one of them).  Both allocate the result temp
    before filling the operand array, matching the hand-written call sites they
    replaced, so the emitted MIR is unchanged. */
-#define GEN_RT_MAX_ARGS 8
+#define GEN_RT_MAX_ARGS 10
 
 /* res = (*proto/item)(arg_ops[0..nargs-1]) for a helper returning one I64 value.
    Returns the result temp; callers that ignore it (void-returning-but-discarded
@@ -32846,6 +32990,46 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     assert (false_label == NULL && true_label == NULL);
     VARR_PUSH (node_t, defer_stmts, NL_EL (r->u.ops, 1));
     break;
+  case N_GO: {
+    /* go f(args); → cy_spawn8((void *) f, nargs, a0, …, a7).  check() validated
+       the shape (direct plain-function call, ≤8 GP-class args); the args are
+       captured BY VALUE into the heap pack — the fiber never touches the
+       spawner's stack. */
+    node_t call = NL_EL (r->u.ops, 1);
+    node_t func = NL_HEAD (call->u.ops);
+    node_t args = NL_EL (call->u.ops, 1);
+    struct expr *fe = func->attr;
+    decl_t fd = fe->def_node->attr;
+    MIR_op_t aops[10];
+    size_t nargs = 0;
+
+    assert (false_label == NULL && true_label == NULL);
+    fiber_ensure_imports (c2m_ctx);
+    aops[0] = MIR_new_ref_op (ctx, fd->u.item);
+    for (node_t a = NL_HEAD (args->u.ops); a != NULL; a = NL_NEXT (a)) {
+      op_t av = gen (c2m_ctx, a, NULL, NULL, TRUE, NULL, NULL);
+      av = force_val (c2m_ctx, av, FALSE);
+      if (get_op_type (c2m_ctx, av) != MIR_T_I64)
+        av = promote (c2m_ctx, av, MIR_T_I64, FALSE);
+      av = force_reg (c2m_ctx, av, MIR_T_I64);
+      aops[2 + nargs++] = av.mir_op;
+    }
+    aops[1] = MIR_new_int_op (ctx, (mir_llong) nargs);
+    for (size_t i = nargs; i < 8; i++) aops[2 + i] = MIR_new_int_op (ctx, 0);
+    gen_rt_call_void (c2m_ctx, cy_spawn8_proto, cy_spawn8_item, 10, aops);
+    break;
+  }
+  case N_AWAIT: {
+    /* await [expr]; → evaluate the optional expression (result discarded),
+       then cy_yield() — a pure cooperative yield / fiber state check. */
+    node_t e = NL_EL (r->u.ops, 1);
+
+    assert (false_label == NULL && true_label == NULL);
+    if (e != NULL) top_gen (c2m_ctx, e, NULL, NULL, NULL);
+    fiber_ensure_imports (c2m_ctx);
+    gen_rt_call_void (c2m_ctx, cy_yield_proto, cy_yield_item, 0, NULL);
+    break;
+  }
   case N_DELETE: {
     /* delete <ptr>: run the destructor (if any) then free the heap object.
        delete <dict>: call dict_destroy(d) which handles arena-backed and
@@ -33940,6 +34124,7 @@ static void gen_mir (c2m_ctx_t c2m_ctx, node_t r) {
   VARR_CREATE (node_t, defer_stmts, alloc, 16);
   memset_proto = memset_item = memcpy_proto = memcpy_item = NULL;
   memcmp_proto = memcmp_item = NULL;
+  cy_spawn8_proto = cy_spawn8_item = cy_yield_proto = cy_yield_item = NULL;
   /* Forward-declare every class method MIR item before generating any body,
      so cross-class refs emitted while gen-ing an earlier class still have a
      non-null MIR_op_t target (resolved to the real definition at
@@ -33980,6 +34165,7 @@ static const char *get_node_name (node_code_t code) {
     C (IN); C (COALESCE); C (FORIN); C (NEW); C (DEFER); C (DELETE); C (LAMBDA); C (INTERFACE);
     C (ANY);
     C (TRY); C (CATCH); C (THROW);
+    C (GO); C (AWAIT);
     /* Arena-ownership keywords (see Memory Management in README). */
     C (DETACH); C (ATTACH); C (UNOWNED);
     /* Managed-ownership keywords (owned/move/readonly layer). */

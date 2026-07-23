@@ -948,6 +948,43 @@ throw(MyKeyError, "key missing");
 ```
 (See `examples/test-customexception.cy` and `examples/classy-exceptions.cy`.)
 
+### Go-style Fibers & Channels (`-ffibers`, opt-in)
+Cooperative, stackful fibers (minicoro) and typed channels (cchan), Go flavor.
+Fully opt-in: without `-ffibers` nothing changes — `go`/`await` stay ordinary
+identifiers and no fiber runtime is referenced.
+
+```c
+#include "chan.h"          // Chan<T> + cyfiber runtime decls
+
+void worker(Chan<int> *ch) {
+    for (int i = 0; i < 100; i++) ch->send(i);   // parks if full
+    ch->close();
+}
+
+int main(void) {
+    auto ch = new Chan<int>(16);   // buffered; new Chan<int>() = rendezvous
+    go worker(ch);                 // spawn fiber (args value-packed)
+    int sum = 0, v = 0;
+    while (ch->recv(&v)) sum += v; // false after close+drain (Go ok-idiom)
+    add_scheduler(1);              // explicit runtime: init + run
+    delete ch;
+    return sum == 4950 ? 0 : 1;
+}
+```
+
+- `go f(args);` — direct plain-function call; args captured **by value**
+  (max 8, integer/pointer types only).
+- `await;` / `await expr;` — pure cooperative yield; channel parking is
+  explicit inside `Chan<T>` ops (`try` + yield, never OS-thread blocking).
+- `add_scheduler(n)` — `n<=1`: single-thread scheduler on the caller;
+  `n>1`: pool of `n` pthread workers, fibers pinned to workers.
+- `Chan<T>`: `send` **throws** on send-after-close, `close` throws on double
+  close; `try_send/try_recv`, `send/recv_timeout`, `len/cap/closed`.
+
+Run: `./bin/classyc -I include -ffibers examples/classy-go-chan.cy -eg`
+AOT: `./classyc-aot.sh -I include -ffibers examples/classy-go-chan.cy -o prog`
+Design doc + roadmap (TLS, select, work stealing): `FIBERS.md`.
+
 ### HTTP/HTTPS Fetch (`include/httpclient.h`)
 A header-only client to call a JSON API in one line. Responses come back the
 classy way: `status` as an int, `headers` as a `dict`, `body` as a `String`,

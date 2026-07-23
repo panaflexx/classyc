@@ -1,7 +1,42 @@
 # FIBERS.md — TLS, Fibers & Channels for ClassyC
 
-> **Status:** design checklist (not implemented).  
-> **Related:** `ext/ccchan/`, `examples/classy-cchan.cy`, `examples/classy-cchan-fibers.cy`, `classyc-aot.sh`, `src/b2obj.c`, `src/mir-aot-runtime.c`
+> **Status:** v1 SHIPPED (2026-07) — `-ffibers` enables `go` / `await`; explicit
+> runtime in `include/cyfiber.h` + `include/chan.h`; works JIT (`-eg`) and AOT
+> (`classyc-aot.sh -ffibers`).  Validation: `cy-validate/val-053-go-fibers.cy`,
+> demo: `examples/classy-go-chan.cy`.  Remaining: TLS, select, work stealing.
+>
+> **Related:** `ext/ccchan/`, `include/cyfiber.h`, `include/chan.h`, `src/cyfiber.c`,
+> `examples/classy-go-chan.cy`, `cy-validate/val-053-go-fibers.cy`, `classyc-aot.sh`
+
+---
+
+## What v1 shipped (deltas from the original plan below)
+
+- `go f(args);` — soft keyword (opt-in `-ffibers`), lowers to
+  `cy_spawn8(fn, nargs, a0..a7)`: args captured **by value** into a heap pack,
+  called through a fixed-arity trampoline.  Constraints (checked): direct
+  plain-function call only (wrap methods), ≤8 args, GP-class only
+  (integer/pointer/`String`/class*/dict — no floats, no by-value aggregates).
+- `await;` / `await expr;` — **pure cooperative yield** (`cy_yield`); channel
+  parking is explicit inside `Chan<T>` ops, not via `await`.  `await` outside
+  a fiber pumps the single-thread scheduler (so `main` can park on channels).
+- `Chan<T>` (`include/chan.h`) — library class over the cyfiber runtime:
+  `Chan<T>()` = unbuffered rendezvous, `Chan<T>(cap)` = buffered.
+  `send` **throws** `RuntimeException` on send-after-close; `close` throws on
+  double close; `recv(&v)` → bool ok-idiom; `try_*`/`*_timeout`/`len`/`cap`/`closed`.
+- Explicit runtime: `add_scheduler(n)` = `cy_sched_init(n)` + `cy_sched_run()`
+  (alias `add_schedular`).  `n<=1`: caller-thread scheduler; `n>1`: pinned
+  worker pool (one pthread per worker, fibers never migrate).
+- Unbuffered rendezvous is implemented in cyfiber itself (mutex + 1-slot
+  mailbox, parked by yield) — cchan's try_recv on empty unbuffered channels
+  does not register a receiver, so a try/yield loop over cchan deadlocks.
+- Runtime lives: JIT → host-compiled `src/cyfiber.c` in the driver binary,
+  bound via `import_resolver`.  AOT → `src/mir-aot-runtime.c` under
+  `#ifdef CHANFIBERS` (`classyc-aot.sh -ffibers` adds `-DCHANFIBERS`).
+- Loop back-edge auto-yields were NOT added (v1 keeps yields explicit only).
+- Also fixed en route: MIR binary IO for the atomic opcodes (reader guard +
+  AFENCE zero-operand serialization) and `mir.atomic_*` AOT symbol mapping
+  in `b2obj`/`b2objmac` + `mir-aot-runtime.c` — AOT+atomics works now.
 
 ---
 
@@ -487,22 +522,22 @@ gcc -no-pie -o prog file.o mir-aot-runtime.o -lm -lpthread -ldl
 5. [ ] Tests: issue #394 program, JIT + `classyc-aot.sh`  
 
 ### B. Runtime
-6. [ ] `include/cyfiber.h` + `src/cyfiber.c` (spawn/yield/park/workers)  
-7. [ ] Channel park wrappers on cchan  
-8. [ ] AOT link of `cyfiber.o` from `classyc-aot.sh`  
-9. [ ] Example without language sugar  
+6. [x] `include/cyfiber.h` + `src/cyfiber.c` (spawn/yield/park/workers)  
+7. [x] Channel park wrappers on cchan (+ own rendezvous path for cap==0)  
+8. [x] AOT link of the fiber runtime (`mir-aot-runtime.c` `#ifdef CHANFIBERS`)  
+9. [x] Example without language sugar (`sketch/fibers/fib-smoke*.cy`)  
 
 ### C. Language
-10. [ ] Parse `go` / `await`  
-11. [ ] Lower `go` → `cy_spawn`  
-12. [ ] Lower `await` → park ops  
-13. [ ] Loop back-edge `cy_maybe_yield`  
-14. [ ] `Chan<T>` / `include/chan.h`  
-15. [ ] Examples + `cy-validate`  
+10. [x] Parse `go` / `await` (soft keywords, `-ffibers` only)  
+11. [x] Lower `go` → `cy_spawn8` value pack (N_GO, direct plain-fn calls, ≤8 GP args)  
+12. [x] Lower `await` → pure `cy_yield` (parking is explicit, not via await)  
+13. [ ] Loop back-edge `cy_maybe_yield` (deferred — v1 keeps yields explicit)  
+14. [x] `Chan<T>` / `include/chan.h` (send-on-closed throws)  
+15. [x] Examples + `cy-validate` (`examples/classy-go-chan.cy`, `val-053`)  
 
 ### D. Product
-16. [ ] README + this `FIBERS.md` as living checklist  
-17. [ ] AOT + JIT parity script in `examples/` or `cy-validate/`  
+16. [x] this `FIBERS.md` as living checklist (README section still open)  
+17. [x] AOT + JIT parity: `val-053` passes under both  
 
 ---
 
@@ -540,10 +575,12 @@ gcc -no-pie -o prog file.o mir-aot-runtime.o -lm -lpthread -ldl
 |------|-----|-----|
 | Distinct `_Thread_local` addresses across pthreads | ✓ | ✓ |
 | Multi-worker fibers (no `MCO_PTHREAD_TLS`) | ✓ | ✓ |
-| `go` + `await` channel pipeline | ✓ | ✓ |
-| Loop yield prevents single-fiber starvation (smoke) | ✓ | ✓ |
+| `go` + `await` channel pipeline | ✓ (val-053) | ✓ (val-053) |
+| Loop yield prevents single-fiber starvation (smoke) | n/a — explicit yields only | n/a |
 | Close/drain semantics | ✓ | ✓ |
-| No regress existing `cy-validate` | ✓ | optional |
+| Rendezvous (cap 0) fiber↔fiber, one worker | ✓ | ✓ |
+| send-on-closed / double-close throws | ✓ | ✓ |
+| No regress existing `cy-validate` (55 files) | ✓ | atomics ✓ |
 
 Commands:
 

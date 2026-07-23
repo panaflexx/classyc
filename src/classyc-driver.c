@@ -15,6 +15,9 @@
 #include "cobjarena.h"
 /* Include cyexc.h for the try/catch/throw exception runtime */
 #include "cyexc.h"
+/* Include cyfiber.h for the fiber/channel runtime (go/await/Chan; -ffibers).
+   The implementation is compiled from src/cyfiber.c into this binary. */
+#include "cyfiber.h"
 
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -302,6 +305,7 @@ static void init_options (int argc, char *argv[]) {
   options.no_midopt_p = FALSE; /* midopt on by default; -fno-midopt disables */
   options.safety_errors_p = FALSE; /* -fsafety-errors: definite null/OOB as errors */
   options.dump_mir_stats_p = FALSE; /* -fdump-mir-stats: MIR func/insn/call counts after gen */
+  options.fibers_p = FALSE; /* -ffibers: opt-in go/await fiber syntax */
   gen_debug_level = -1;
   VARR_CREATE (char, temp_string, &default_alloc, 0);
   VARR_CREATE (char_ptr_t, headers, &default_alloc, 0);
@@ -364,6 +368,10 @@ static void init_options (int argc, char *argv[]) {
       options.safety_errors_p = FALSE;
     } else if (strcmp (argv[i], "-fdump-mir-stats") == 0) {
       options.dump_mir_stats_p = TRUE;
+    } else if (strcmp (argv[i], "-ffibers") == 0) {
+      options.fibers_p = TRUE;
+    } else if (strcmp (argv[i], "-fno-fibers") == 0) {
+      options.fibers_p = FALSE;
     } else if (strcmp (argv[i], "-pedantic") == 0) {
       options.pedantic_p = TRUE;
     } else if (strcmp (argv[i], "-g") == 0) {
@@ -444,6 +452,7 @@ static void init_options (int argc, char *argv[]) {
       fprintf (stderr, "  -fpedantic -- assume strict standard input C code\n");
       fprintf (stderr, "  -fno-ownership -- disable ownership analysis (no leak/UAF/double-free diagnostics)\n");
       fprintf (stderr, "  -fobject-guards -- runtime use-after-free / double-free guards on `new` class objects (opt-in)\n");
+      fprintf (stderr, "  -ffibers -- enable `go` / `await` fiber syntax (opt-in; runtime: cyfiber.h / chan.h)\n");
       fprintf (stderr, "  -w -- do not print any warnings\n");
       fprintf (stderr, "  -g -- emit source-level debug info (source locations, types, variables)\n");
       fprintf (stderr, "  -S, -c -- generate corresponding textual or binary MIR files\n");
@@ -646,6 +655,30 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "cy_obj_track") == 0) return (void *) cy_obj_track;
     if (strcmp (name, "cy_obj_note_free") == 0) return (void *) cy_obj_note_free;
     if (strcmp (name, "cy_obj_check") == 0) return (void *) cy_obj_check;
+    /* Fiber / channel runtime (cyfiber.h, compiled from src/cyfiber.c) */
+    if (strcmp (name, "cy_sched_init") == 0) return (void *) cy_sched_init;
+    if (strcmp (name, "cy_sched_run") == 0) return (void *) cy_sched_run;
+    if (strcmp (name, "cy_sched_shutdown") == 0) return (void *) cy_sched_shutdown;
+    if (strcmp (name, "add_scheduler") == 0) return (void *) add_scheduler;
+    if (strcmp (name, "add_schedular") == 0) return (void *) add_schedular;
+    if (strcmp (name, "cy_spawn") == 0) return (void *) cy_spawn;
+    if (strcmp (name, "cy_spawn8") == 0) return (void *) cy_spawn8;
+    if (strcmp (name, "cy_yield") == 0) return (void *) cy_yield;
+    if (strcmp (name, "cy_self") == 0) return (void *) cy_self;
+    if (strcmp (name, "cy_fiber_outstanding") == 0) return (void *) cy_fiber_outstanding;
+    if (strcmp (name, "cy_sleep_ms") == 0) return (void *) cy_sleep_ms;
+    if (strcmp (name, "cy_chan_create") == 0) return (void *) cy_chan_create;
+    if (strcmp (name, "cy_chan_send_park") == 0) return (void *) cy_chan_send_park;
+    if (strcmp (name, "cy_chan_recv_park") == 0) return (void *) cy_chan_recv_park;
+    if (strcmp (name, "cy_chan_try_send") == 0) return (void *) cy_chan_try_send;
+    if (strcmp (name, "cy_chan_try_recv") == 0) return (void *) cy_chan_try_recv;
+    if (strcmp (name, "cy_chan_send_timeout") == 0) return (void *) cy_chan_send_timeout;
+    if (strcmp (name, "cy_chan_recv_timeout") == 0) return (void *) cy_chan_recv_timeout;
+    if (strcmp (name, "cy_chan_close") == 0) return (void *) cy_chan_close;
+    if (strcmp (name, "cy_chan_is_closed") == 0) return (void *) cy_chan_is_closed;
+    if (strcmp (name, "cy_chan_size") == 0) return (void *) cy_chan_size;
+    if (strcmp (name, "cy_chan_capacity") == 0) return (void *) cy_chan_capacity;
+    if (strcmp (name, "cy_chan_dispose") == 0) return (void *) cy_chan_dispose;
     /* String '+' concatenation / basic-type auto-cast helpers */
     if (strcmp (name, "c2m_str_concat") == 0) return (void *) c2m_str_concat;
     if (strcmp (name, "c2m_str_from_int") == 0) return (void *) c2m_str_from_int;

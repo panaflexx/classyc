@@ -349,6 +349,17 @@ static const char *map_symbol (const char *name) {
     { "mir.ui2d",         "mir_aot_ui2d" },
     { "mir.ui2ld",        "mir_aot_ui2ld" },
     { "mir.ld2i",         "mir_aot_ld2i" },
+    /* seq_cst atomic helpers (mir-gen-atomic.c builtins): mir-aot-runtime.c */
+    { "mir.atomic_load",       "mir_aot_atomic_load" },
+    { "mir.atomic_store",      "mir_aot_atomic_store" },
+    { "mir.atomic_fence",      "mir_aot_atomic_fence" },
+    { "mir.atomic_xchg",       "mir_aot_atomic_xchg" },
+    { "mir.atomic_fetch_add",  "mir_aot_atomic_fetch_add" },
+    { "mir.atomic_fetch_sub",  "mir_aot_atomic_fetch_sub" },
+    { "mir.atomic_fetch_and",  "mir_aot_atomic_fetch_and" },
+    { "mir.atomic_fetch_or",   "mir_aot_atomic_fetch_or" },
+    { "mir.atomic_fetch_xor",  "mir_aot_atomic_fetch_xor" },
+    { "mir.atomic_cas",        "mir_aot_atomic_cas" },
   };
   for (size_t i = 0; i < sizeof (map) / sizeof (map[0]); i++)
     if (strcmp (name, map[i].from) == 0) return map[i].to;

@@ -8,6 +8,20 @@
 #include "cyexc.h"
 
 /* ------------------------------------------------------------------ */
+/*  Fiber / channel runtime (go/await/Chan, -ffibers).                   */
+/*                                                                      */
+/*  classyc-aot.sh compiles this file with -DCHANFIBERS (and            */
+/*  -I ext/ccchan) when the program is built with -ffibers, which pulls */
+/*  in the same cyfiber implementation that the JIT driver binds via    */
+/*  its import_resolver (see src/cyfiber.c).  Programs compiled without */
+/*  -ffibers never reference cy_* symbols, so nothing is linked in.     */
+/* ------------------------------------------------------------------ */
+#ifdef CHANFIBERS
+#define CYFIBER_IMPLEMENTATION
+#include "cyfiber.h"
+#endif
+
+/* ------------------------------------------------------------------ */
 /*  Stack-trace helpers for the self-hosted (ClassyC-compiled) build.   */
 /*                                                                      */
 /*  classyc-stacktrace.h normally bootstraps a manual stack walk with   */
@@ -24,6 +38,86 @@ float       mir_aot_ui2f  (uint64_t i)    { return (float) i; }
 double      mir_aot_ui2d  (uint64_t i)    { return (double) i; }
 long double mir_aot_ui2ld (uint64_t i)    { return (long double) i; }
 int64_t     mir_aot_ld2i  (long double l) { return (int64_t) l; }
+
+/* ------------------------------------------------------------------ */
+/*  seq_cst atomic builtins (mir-gen-atomic.c emits calls to these via  */
+/*  the "mir.atomic_*" names, which b2obj maps to mir_aot_atomic_*).    */
+/*  Same semantics as the JIT-side helpers: width-aware, seq_cst.       */
+/* ------------------------------------------------------------------ */
+uint64_t mir_aot_atomic_load (void *p, uint64_t size) {
+    switch ((int) size) {
+    case 1: return (uint64_t) __atomic_load_n ((uint8_t *) p, __ATOMIC_SEQ_CST);
+    case 2: return (uint64_t) __atomic_load_n ((uint16_t *) p, __ATOMIC_SEQ_CST);
+    case 4: return (uint64_t) __atomic_load_n ((uint32_t *) p, __ATOMIC_SEQ_CST);
+    default: return __atomic_load_n ((uint64_t *) p, __ATOMIC_SEQ_CST);
+    }
+}
+
+void mir_aot_atomic_store (void *p, uint64_t v, uint64_t size) {
+    switch ((int) size) {
+    case 1: __atomic_store_n ((uint8_t *) p, (uint8_t) v, __ATOMIC_SEQ_CST); break;
+    case 2: __atomic_store_n ((uint16_t *) p, (uint16_t) v, __ATOMIC_SEQ_CST); break;
+    case 4: __atomic_store_n ((uint32_t *) p, (uint32_t) v, __ATOMIC_SEQ_CST); break;
+    default: __atomic_store_n ((uint64_t *) p, v, __ATOMIC_SEQ_CST); break;
+    }
+}
+
+void mir_aot_atomic_fence (void) { __atomic_thread_fence (__ATOMIC_SEQ_CST); }
+
+uint64_t mir_aot_atomic_xchg (void *p, uint64_t v, uint64_t size) {
+    switch ((int) size) {
+    case 1: return (uint64_t) __atomic_exchange_n ((uint8_t *) p, (uint8_t) v, __ATOMIC_SEQ_CST);
+    case 2: return (uint64_t) __atomic_exchange_n ((uint16_t *) p, (uint16_t) v, __ATOMIC_SEQ_CST);
+    case 4: return (uint64_t) __atomic_exchange_n ((uint32_t *) p, (uint32_t) v, __ATOMIC_SEQ_CST);
+    default: return __atomic_exchange_n ((uint64_t *) p, v, __ATOMIC_SEQ_CST);
+    }
+}
+
+#define MIR_AOT_ATOMIC_RMW(name, op)                                                     \
+  uint64_t name (void *p, uint64_t v, uint64_t size) {                                   \
+      switch ((int) size) {                                                              \
+      case 1: return (uint64_t) op ((uint8_t *) p, (uint8_t) v, __ATOMIC_SEQ_CST);       \
+      case 2: return (uint64_t) op ((uint16_t *) p, (uint16_t) v, __ATOMIC_SEQ_CST);     \
+      case 4: return (uint64_t) op ((uint32_t *) p, (uint32_t) v, __ATOMIC_SEQ_CST);     \
+      default: return op ((uint64_t *) p, v, __ATOMIC_SEQ_CST);                          \
+      }                                                                                  \
+  }
+
+MIR_AOT_ATOMIC_RMW (mir_aot_atomic_fetch_add, __atomic_fetch_add)
+MIR_AOT_ATOMIC_RMW (mir_aot_atomic_fetch_sub, __atomic_fetch_sub)
+MIR_AOT_ATOMIC_RMW (mir_aot_atomic_fetch_and, __atomic_fetch_and)
+MIR_AOT_ATOMIC_RMW (mir_aot_atomic_fetch_or,  __atomic_fetch_or)
+MIR_AOT_ATOMIC_RMW (mir_aot_atomic_fetch_xor, __atomic_fetch_xor)
+
+/* Returns previous *p.  Strong CAS, seq_cst. */
+uint64_t mir_aot_atomic_cas (void *p, uint64_t expected, uint64_t desired, uint64_t size) {
+    switch ((int) size) {
+    case 1: {
+        uint8_t e = (uint8_t) expected;
+        __atomic_compare_exchange_n ((uint8_t *) p, &e, (uint8_t) desired, 0,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        return (uint64_t) e;
+    }
+    case 2: {
+        uint16_t e = (uint16_t) expected;
+        __atomic_compare_exchange_n ((uint16_t *) p, &e, (uint16_t) desired, 0,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        return (uint64_t) e;
+    }
+    case 4: {
+        uint32_t e = (uint32_t) expected;
+        __atomic_compare_exchange_n ((uint32_t *) p, &e, (uint32_t) desired, 0,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        return (uint64_t) e;
+    }
+    default: {
+        uint64_t e = expected;
+        __atomic_compare_exchange_n ((uint64_t *) p, &e, desired, 0,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        return e;
+    }
+    }
+}
 
 #ifdef __APPLE__
 #include <stdio.h>

@@ -32,6 +32,7 @@ struct c2mir_options {
   int no_midopt_p; /* -fno-midopt: skip mid-level optimizer (check→gen). Default off = midopt runs. */
   int safety_errors_p; /* -fsafety-errors: midopt definite null/OOB/div0 → error (default: warning) */
   int dump_mir_stats_p; /* -fdump-mir-stats: print per-module MIR func/insn/call counts after gen */
+  int fibers_p; /* -ffibers: enable `go` / `await` soft keywords (fiber runtime is explicit: cyfiber.h/chan.h) */
   size_t module_num;
   FILE *prepro_output_file; /* non-null for prepro_only_p */
   const char *output_file_name;
