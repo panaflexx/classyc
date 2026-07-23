@@ -2,18 +2,27 @@
  * b2objmac.c - Convert a binary MIR (.bmir) file to a Mach-O 64-bit object file.
  *
  * This is the macOS counterpart of b2obj.c (which produces ELF objects).
- * It reads a .bmir file, generates x86-64 machine code via the MIR code
- * generator, and writes a Mach-O MH_OBJECT file that can be linked with
- * the macOS system linker (ld).
+ * It reads a .bmir file, generates machine code via the MIR code generator,
+ * and writes a Mach-O MH_OBJECT file that can be linked with the macOS
+ * system linker (ld).
  *
  * Usage:  b2objmac <input.bmir> <output.o>
  *
- * Relocation mapping (ELF -> Mach-O x86-64):
- *   R_X86_64_PC32  -> X86_64_RELOC_SIGNED      (PC-relative 32-bit)
- *   R_X86_64_64    -> X86_64_RELOC_UNSIGNED     (absolute 64-bit)
+ * Architectures (selected at compile time with #ifdef):
+ *   __x86_64__  (incl. macOS 10.12): Intel Mach-O, X86_64 + TLV relocs
+ *   __aarch64__ (Apple Silicon):     ARM64 Mach-O, ARM64 + TLVP relocs
  *
- * macOS 10.12 compatibility: no APFS-only APIs, no @available guards,
- * plain POSIX I/O, no Mach-O LC_BUILD_VERSION (uses LC_VERSION_MIN_MACOSX).
+ * TLS (macOS AOT — N1 emulated, both x64 and arm64):
+ *   Codegen rewrites TLS to mir_tls_addr() before RA (call-safe).
+ *   Object emits template(s) + strong `__mir_tls_aot_regs` for bootstrap.
+ *   (Native Mach-O TLV is deferred until pre-RA lowering exists.)
+ *
+ * PIE-safe addresses (x86_64):
+ *   Local movabs → leaq sym(%rip)  (string literals / .lc*)
+ *   External movabs → movq GOTPCREL
+ *
+ * macOS 10.12 compatibility: no APFS-only APIs, LC_VERSION_MIN_MACOSX,
+ * arm64-only blocks behind #if defined(__aarch64__).
  */
 
 #include <stdio.h>
@@ -28,7 +37,25 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach-o/reloc.h>
+#if defined(__aarch64__)
+/* Apple Silicon — never compiled on macOS 10.12 (Intel-only). */
+#include <mach-o/arm64/reloc.h>
+#ifndef CPU_TYPE_ARM64
+#define CPU_TYPE_ARM64 ((cpu_type_t) 0x0100000c)
+#endif
+#ifndef CPU_SUBTYPE_ARM64_ALL
+#define CPU_SUBTYPE_ARM64_ALL ((cpu_subtype_t) 0)
+#endif
+#else
+/* Intel macOS (including 10.12): x86_64 Mach-O. */
 #include <mach-o/x86_64/reloc.h>
+#endif
+/* Thread-local section types: present on 10.12+ SDKs; define if missing. */
+#ifndef S_THREAD_LOCAL_REGULAR
+#define S_THREAD_LOCAL_REGULAR 0x11
+#define S_THREAD_LOCAL_ZEROFILL 0x12
+#define S_THREAD_LOCAL_VARIABLES 0x13
+#endif
 
 #include "mir-alloc-default.c"
 #include "mir-gen.h" /* mir.h included transitively */
@@ -299,7 +326,8 @@ typedef struct {
     int64_t     addend;
     int         in_data;    /* 0 = __text reloc, 1 = __data reloc */
     int         is_movabs;  /* 1 = reloc sits on a `movabs reg,imm64' immediate */
-    int         is_got;     /* 1 = rewritten into a GOT-relative load (GOT_LOAD) */
+    int         is_got;     /* 1 = rewritten into GOT-relative load (external) */
+    int         is_lea;     /* 1 = rewritten into leaq sym(%rip) (local, PIE-safe) */
 } mach_reloc_t;
 
 /* ================================================================== */
@@ -411,15 +439,32 @@ static const char *macho_mangle (const char *name) {
 }
 
 static int elf_reloc_to_macho (int elf_type) {
+#if defined(__aarch64__)
+  /* MIR stores arm64 Mach-O-oriented codes (see mir.h R_ARM64_*). */
+  switch (elf_type) {
+  case R_ARM64_UNSIGNED: return ARM64_RELOC_UNSIGNED;
+  case R_ARM64_BRANCH26: return ARM64_RELOC_BRANCH26;
+  case R_ARM64_PAGE21: return ARM64_RELOC_PAGE21;
+  case R_ARM64_PAGEOFF12: return ARM64_RELOC_PAGEOFF12;
+  case R_ARM64_TLVP_LOAD_PAGE21: return ARM64_RELOC_TLVP_LOAD_PAGE21;
+  case R_ARM64_TLVP_LOAD_PAGEOFF12: return ARM64_RELOC_TLVP_LOAD_PAGEOFF12;
+  case R_AARCH64_ABS64: return ARM64_RELOC_UNSIGNED;
+  default:
+    fprintf (stderr, "warning: unknown arm64 reloc type %d, treating as UNSIGNED\n", elf_type);
+    return ARM64_RELOC_UNSIGNED;
+  }
+#else
   switch (elf_type) {
   case R_X86_64_PC32: return X86_64_RELOC_SIGNED;
   case R_X86_64_64:   return X86_64_RELOC_UNSIGNED;
   case R_X86_64_GOTPCREL: return X86_64_RELOC_GOT_LOAD; /* GOT-relative load */
+  case R_X86_64_TLV: return X86_64_RELOC_TLV; /* thread-local variable */
   case 4: return 2; /* R_X86_64_PLT32 -> X86_64_RELOC_BRANCH */
   default:
     fprintf (stderr, "warning: unknown ELF reloc type %d, treating as SIGNED\n", elf_type);
     return X86_64_RELOC_SIGNED;
   }
+#endif
 }
 
 /* ================================================================== */
@@ -507,12 +552,10 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
         DBG ("  func: %s  code_len=%zu", f->name, fe->code_len);
         break;
       }
-      /* N1: TLS items use emulated mir_tls_* at runtime; not process-global
-         data/bss.  N2 may emit Mach-O TLS later (see TLS-IMPLEMENTATION.md). */
       case MIR_tls_data_item:
       case MIR_tls_bss_item:
-        DBG ("  tls item skipped in b2objmac N1 (emulated TLS): %s",
-             MIR_item_name (ctx, item));
+        /* N2 Mach-O TLS: collected in phase 1c (__thread_data / __thread_vars). */
+        DBG ("  tls item (native Mach-O TLV): %s", MIR_item_name (ctx, item));
         break;
       case MIR_data_item: {
         MIR_data_t d = item->u.data;
@@ -583,6 +626,93 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   }
 
   DBG ("phase 1b done: %zu funcs, %zu datas, %zu bsses", n_funcs, n_datas, n_bsses);
+
+  /* ----- Phase 1c: N1 emulated TLS for AOT -----
+     Emit per-module template + strong `__mir_tls_aot_regs` so mir_tls_addr()
+     bootstraps at first use (see mir-tls.c).  Code is lowered to mir_tls_addr
+     before RA (safe for printf args).  No Mach-O TLV sections in this path. */
+  typedef struct {
+    uint32_t id;
+    uint32_t size;
+    char tmpl_name[64];
+    uint8_t *tmpl;
+  } tls_mod_t;
+  tls_mod_t *tls_mods = NULL;
+  size_t n_tls_mods = 0, cap_tls_mods = 0;
+  /* Keep zero TLS section sizes so later layout code is a no-op. */
+  typedef struct {
+    const char *name;
+    size_t size;
+    size_t desc_offset;
+    size_t init_offset;
+    int is_bss;
+    uint8_t *init_bytes;
+  } tls_sym_t;
+  tls_sym_t *tlss = NULL;
+  size_t n_tlss = 0;
+  uint8_t *tdata_buf = NULL;
+  size_t tdata_size = 0, tbss_size = 0, tvars_size = 0;
+  uint8_t *tvars_buf = NULL;
+  {
+    for (MIR_module_t module = DLIST_HEAD (MIR_module_t, *MIR_get_module_list (ctx));
+         module != NULL; module = DLIST_NEXT (MIR_module_t, module)) {
+      if (module->tls_module_id == 0 || module->tls_template == NULL || module->tls_size == 0)
+        continue;
+      if (n_tls_mods >= cap_tls_mods) {
+        cap_tls_mods = cap_tls_mods ? cap_tls_mods * 2 : 4;
+        tls_mods = realloc (tls_mods, cap_tls_mods * sizeof (tls_mod_t));
+      }
+      tls_mod_t *tm = &tls_mods[n_tls_mods++];
+      tm->id = module->tls_module_id;
+      tm->size = (uint32_t) module->tls_size;
+      snprintf (tm->tmpl_name, sizeof (tm->tmpl_name), "mir_tls_tmpl_%u", tm->id);
+      tm->tmpl = malloc (tm->size ? tm->size : 1);
+      memcpy (tm->tmpl, module->tls_template, tm->size);
+      DBG ("  tls module id=%u size=%u tmpl=%s", tm->id, tm->size, tm->tmpl_name);
+
+      /* Append template as named __data */
+      if (n_datas >= cap_datas) {
+        cap_datas = cap_datas ? cap_datas * 2 : 32;
+        datas = realloc (datas, cap_datas * sizeof (data_entry_t));
+      }
+      data_entry_t *de = &datas[n_datas++];
+      de->name = strdup (tm->tmpl_name);
+      de->size = tm->size;
+      de->bytes = malloc (tm->size ? tm->size : 1);
+      memcpy (de->bytes, tm->tmpl, tm->size);
+      de->data_offset = 0;
+      de->is_ref_data = 0;
+      de->ref_item = NULL;
+      de->ref_disp = 0;
+      de->item_addr = NULL;
+    }
+    /* Build __mir_tls_aot_regs: {id, size, tmpl*}... {0,0,NULL} */
+    if (n_tls_mods > 0) {
+      size_t ent = 16; /* uint32 id, uint32 size, uint64 ptr */
+      size_t tab_sz = (n_tls_mods + 1) * ent;
+      uint8_t *tab = calloc (1, tab_sz);
+      for (size_t i = 0; i < n_tls_mods; i++) {
+        memcpy (tab + i * ent, &tls_mods[i].id, 4);
+        memcpy (tab + i * ent + 4, &tls_mods[i].size, 4);
+        /* pointer bytes left 0; reloc filled later via is_ref_data style */
+      }
+      if (n_datas >= cap_datas) {
+        cap_datas = cap_datas ? cap_datas * 2 : 32;
+        datas = realloc (datas, cap_datas * sizeof (data_entry_t));
+      }
+      data_entry_t *de = &datas[n_datas++];
+      de->name = strdup ("__mir_tls_aot_regs");
+      de->size = tab_sz;
+      de->bytes = tab;
+      de->data_offset = 0;
+      de->is_ref_data = 0;
+      de->ref_item = NULL;
+      de->ref_disp = 0;
+      de->item_addr = NULL;
+      /* Stash module list for reloc emission after data offsets known */
+      DBG ("phase 1c: __mir_tls_aot_regs %zu bytes, %zu modules", tab_sz, n_tls_mods);
+    }
+  }
 
   /* ----- Phase 2: assign offsets within sections ----- */
   DBG ("phase 2: assigning section offsets");
@@ -668,13 +798,61 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     data_size += datas[i].size;
   }
 
+  /* N1 AOT: relocate __mir_tls_aot_regs[i].tmpl → mir_tls_tmpl_<id> */
+  for (size_t mi = 0; mi < n_tls_mods; mi++) {
+    size_t regs_off = (size_t) -1;
+    for (size_t i = 0; i < n_datas; i++) {
+      if (datas[i].name && strcmp (datas[i].name, "__mir_tls_aot_regs") == 0) {
+        regs_off = datas[i].data_offset;
+        break;
+      }
+    }
+    if (regs_off == (size_t) -1) break;
+    char *tmpl_sym = (char *) macho_mangle (tls_mods[mi].tmpl_name);
+    if (n_relocs >= cap_relocs) {
+      cap_relocs = cap_relocs ? cap_relocs * 2 : 64;
+      relocs = realloc (relocs, cap_relocs * sizeof (mach_reloc_t));
+    }
+    mach_reloc_t *mr = &relocs[n_relocs++];
+    mr->offset = regs_off + mi * 16 + 8; /* ptr field */
+    mr->symbol = tmpl_sym;
+#if defined(__aarch64__)
+    mr->type = R_ARM64_UNSIGNED;
+#else
+    mr->type = R_X86_64_64;
+#endif
+    mr->addend = 0;
+    mr->in_data = 1;
+    mr->is_movabs = 0;
+    mr->is_got = 0;
+    mr->is_lea = 0;
+  }
+
   /* cyreg sections live in the segment right after __data (addresses ascend;
      __bss zerofill stays last).  Section numbers are known now; the vmaddrs
      depend on the FINAL text_size (Phase 2c may add branch stubs), so they are
      computed later (see "finalize cyreg/bss addresses").  n_cyr==0 leaves
      everything exactly as before. */
+  /* Section numbering (1-based):
+       1 __text
+       2 __data
+       3..2+n_cyr  cyreg_*
+       then optional __thread_data, __thread_vars (Mach-O TLS, x64+arm64)
+       then __bss last (zerofill)
+  */
+  size_t n_tls_sects = 0;
+  if (tdata_size > 0) n_tls_sects++;
+  if (tvars_size > 0) n_tls_sects++;
+  if (tbss_size > 0) n_tls_sects++;
   for (size_t k = 0; k < n_cyr; k++) cyr[k].n_sect = 3 + k; /* __text=1,__data=2 */
-  size_t bss_sect = 3 + n_cyr;        /* __bss is the last section */
+  size_t sect_thread_data = 0, sect_thread_vars = 0, sect_thread_bss = 0;
+  {
+    size_t s = 3 + n_cyr;
+    if (tdata_size > 0) sect_thread_data = s++;
+    if (tvars_size > 0) sect_thread_vars = s++;
+    if (tbss_size > 0) sect_thread_bss = s++;
+  }
+  size_t bss_sect = 3 + n_cyr + n_tls_sects; /* __bss is the last section */
 
   /* __bss: just total size (8-byte aligned per item) */
   size_t bss_size = 0;
@@ -708,13 +886,14 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       mr->addend  = cr.addend;
       mr->in_data = 0;
       mr->is_got  = 0;
-      /* An absolute 64-bit reloc that sits on the immediate of a
-       * `movabs reg, imm64' (REX.W + B8+rd) is the code generator taking the
-       * *address* of a symbol.  On macOS the address of an external symbol
-       * cannot be referenced directly from read-only __text; it must be loaded
-       * through the GOT.  Record that this is such a site so Phase 2c can
-       * rewrite it into a `movq sym@GOTPCREL(%rip), reg' (see below). */
+      mr->is_lea  = 0;
+      /* Absolute 64-bit on a `movabs reg, imm64' is an address materialization.
+       * On macOS __text must not hold absolute addresses (PIE): rewrite later to
+       *   leaq  sym(%rip), reg     for local symbols  (e.g. .lc string literals)
+       *   movq  sym@GOTPCREL(%rip) for external symbols
+       */
       mr->is_movabs = 0;
+#if !defined(__aarch64__)
       if (cr.type == R_X86_64_64 && cr.offset >= 2) {
         const uint8_t *code = (const uint8_t *) funcs[fi].code;
         uint8_t rex = code[cr.offset - 2];
@@ -722,6 +901,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
         if ((rex == 0x48 || rex == 0x49) && op >= 0xB8 && op <= 0xBF)
           mr->is_movabs = 1;
       }
+#endif
     }
   }
 
@@ -737,11 +917,16 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     mach_reloc_t *mr = &relocs[n_relocs++];
     mr->offset  = datas[i].data_offset;
     mr->symbol  = target_name;
+#if defined(__aarch64__)
+    mr->type    = R_ARM64_UNSIGNED; /* absolute 64-bit pointer */
+#else
     mr->type    = R_X86_64_64; /* absolute 64-bit */
+#endif
     mr->addend  = datas[i].ref_disp;
     mr->in_data = 1;
     mr->is_movabs = 0;
     mr->is_got  = 0;
+    mr->is_lea  = 0;
   }
 
   DBG ("phase 2b done: %zu relocations", n_relocs);
@@ -756,36 +941,37 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   for (size_t i = 0; i < n_funcs; i++) name_set_find_or_add (&defined_names, macho_mangle (funcs[i].name));
   for (size_t i = 0; i < n_datas; i++) if (datas[i].name) name_set_find_or_add (&defined_names, macho_mangle (datas[i].name));
   for (size_t i = 0; i < n_bsses; i++) if (bsses[i].name) name_set_find_or_add (&defined_names, macho_mangle (bsses[i].name));
+  for (size_t i = 0; i < n_tlss; i++)
+    if (tlss[i].name) name_set_find_or_add (&defined_names, macho_mangle (tlss[i].name));
 
   /*
-   * Classify every external __text reference (symbol not defined in this
-   * object):
+   * Classify every __text absolute reference:
    *
-   *   - References that load a symbol's *address* into a register are emitted
-   *     by the code generator as `movabs reg, imm64' (is_movabs).  On macOS
-   *     the address of an external symbol (e.g. the FILE* variable __stderrp,
-   *     or any other extern data symbol) must be obtained through the GOT, so
-   *     we rewrite those into `movq sym@GOTPCREL(%rip), reg' below and emit an
-   *     X86_64_RELOC_GOT_LOAD relocation.  This is the fix for fprintf(stderr,
-   *     ...) and all other extern-data references crashing at runtime.
+   *   - movabs of a *local* symbol address (string .lc*, data, bss): rewrite to
+   *     `leaq sym(%rip), reg' (PIE-safe).  Without this, printf formats are
+   *     absolute addresses and print trash under modern macOS PIE.
    *
-   *   - All other external references are call/jump targets reached through the
-   *     constant pool; for those we synthesize a local branch stub (jmp rel32)
-   *     so __text needs no absolute relocations.
+   *   - movabs of an *external* symbol (e.g. __stderrp): rewrite to
+   *     `movq sym@GOTPCREL(%rip), reg'.
+   *
+   *   - Other external refs (calls via const pool): local branch stub (jmp/b).
    */
   size_t orig_n_relocs = n_relocs;
   for (size_t i = 0; i < orig_n_relocs; i++) {
-    if (relocs[i].in_data) continue; /* data relocations are fine */
+    if (relocs[i].in_data) continue;
     size_t dummy;
-    if (!name_set_find (&defined_names, relocs[i].symbol, &dummy)) {
-      /* External symbol referenced from __text. */
-      if (relocs[i].is_movabs) {
-        /* Address-of-symbol load: route through the GOT (see rewrite below)
-         * instead of a branch stub. */
-        relocs[i].is_got = 1;
-        continue;
-      }
-      /* Call/jump target: synthesize a branch stub. */
+    int local = name_set_find (&defined_names, relocs[i].symbol, &dummy);
+#if !defined(__aarch64__)
+    if (relocs[i].is_movabs) {
+      if (local)
+        relocs[i].is_lea = 1; /* leaq sym(%rip) */
+      else
+        relocs[i].is_got = 1; /* GOT load */
+      continue;
+    }
+#endif
+    if (!local) {
+      /* External call/jump target: synthesize a branch stub. */
       int found = 0;
       for (size_t j = 0; j < n_stubs; j++) {
         if (strcmp (stubs[j].name, relocs[i].symbol) == 0) { found = 1; break; }
@@ -797,7 +983,11 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
         }
         stubs[n_stubs].name = relocs[i].symbol;
         stubs[n_stubs].stub_offset = text_size;
+#if defined(__aarch64__)
+        text_size += 4; /* b imm26 */
+#else
         text_size += 5; /* jmp rel32 */
+#endif
         n_stubs++;
       }
     }
@@ -824,36 +1014,33 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   for (size_t i = 0; i < n_funcs; i++)
     memcpy (text_buf + funcs[i].text_offset, funcs[i].code, funcs[i].code_len);
 
-  /* Rewrite external address-of loads into GOT-relative loads.
+#if !defined(__aarch64__)
+  /* Rewrite movabs address loads (x86_64).  All stay 10 bytes (7 insn + 3 nops).
    *
-   * The code generator emitted, for `&extern_sym':
-   *     48/49 B8+rd <imm64>           movabs reg, imm64      (10 bytes)
-   * which on macOS would need an illegal absolute relocation in __text.  We
-   * turn it into:
-   *     48/4C 8B <modrm> <disp32>     movq sym@GOTPCREL(%rip), reg  (7 bytes)
-   *     90 90 90                      padding nops                 (3 bytes)
-   * and relocate the disp32 with X86_64_RELOC_GOT_LOAD.  The GOT slot holds the
-   * symbol's address, so `reg' ends up with exactly the value the original
-   * movabs would have produced - any following dereference keeps working.
-   * The instruction stays 10 bytes wide, so no other offsets shift. */
+   * External (is_got):
+   *     48/4C 8B /r disp32     movq sym@GOTPCREL(%rip), reg
+   * Local (is_lea) — string literals / local data (PIE-safe):
+   *     48/4C 8D /r disp32     leaq sym(%rip), reg
+   */
   for (size_t i = 0; i < orig_n_relocs; i++) {
-    if (!relocs[i].is_got) continue;
+    if (!relocs[i].is_got && !relocs[i].is_lea) continue;
     size_t imm = relocs[i].offset;   /* offset of the imm64 within __text */
     size_t istart = imm - 2;         /* REX prefix of the movabs */
     uint8_t rex = text_buf[istart];
     uint8_t op  = text_buf[istart + 1];
     int reg = (int) (((rex & 1) << 3) | (op - 0xB8)); /* dest register 0..15 */
     text_buf[istart]     = (uint8_t) (0x48 | ((reg >= 8) ? 0x04 : 0x00)); /* REX.W(+R) */
-    text_buf[istart + 1] = 0x8B;                                         /* mov r64,r/m64 */
+    text_buf[istart + 1] = relocs[i].is_lea ? 0x8D : 0x8B;              /* lea vs mov */
     text_buf[istart + 2] = (uint8_t) (((reg & 7) << 3) | 0x05);          /* mod=00 rm=RIP */
     memset (text_buf + istart + 3, 0, 4);                                /* disp32 (linker) */
-    text_buf[istart + 7] = 0x90;                                         /* nop padding */
+    text_buf[istart + 7] = 0x90;
     text_buf[istart + 8] = 0x90;
     text_buf[istart + 9] = 0x90;
-    relocs[i].offset = istart + 3;        /* relocation sits on the disp32 */
-    relocs[i].type   = R_X86_64_GOTPCREL; /* -> X86_64_RELOC_GOT_LOAD */
+    relocs[i].offset = istart + 3;
+    relocs[i].type   = relocs[i].is_lea ? R_X86_64_PC32 : R_X86_64_GOTPCREL;
     relocs[i].addend = 0;
   }
+#endif
 
   /* Build __data data buffer */
   uint8_t *data_buf = calloc (1, data_size ? data_size : 1);
@@ -866,6 +1053,12 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   for (size_t i = 0; i < orig_n_relocs; i++) {
     mach_reloc_t *mr = &relocs[i];
     uint8_t *buf = mr->in_data ? data_buf : text_buf;
+#if defined(__aarch64__)
+    if (mr->type == R_ARM64_UNSIGNED || mr->type == R_AARCH64_ABS64) {
+      int64_t addend = mr->addend;
+      memcpy (buf + mr->offset, &addend, 8);
+    }
+#else
     if (mr->type == R_X86_64_64) {
       int64_t addend = mr->addend;
       memcpy (buf + mr->offset, &addend, 8);
@@ -873,26 +1066,39 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       int32_t addend = (int32_t) mr->addend;
       memcpy (buf + mr->offset, &addend, 4);
     }
+#endif
   }
 
   /* Write stubs and add branch relocations for them */
   for (size_t i = 0; i < n_stubs; i++) {
     size_t off = stubs[i].stub_offset;
+#if defined(__aarch64__)
+    uint32_t bimm = 0x14000000; /* b #0 */
+    memcpy (text_buf + off, &bimm, 4);
+#else
     text_buf[off] = 0xE9; /* jmp rel32 */
     memset (text_buf + off + 1, 0, 4);
+#endif
 
     if (n_relocs >= cap_relocs) {
       cap_relocs = cap_relocs ? cap_relocs * 2 : 64;
       relocs = realloc (relocs, cap_relocs * sizeof (mach_reloc_t));
     }
     mach_reloc_t *mr = &relocs[n_relocs++];
+#if defined(__aarch64__)
+    mr->offset  = off;
+    mr->symbol  = stubs[i].name;
+    mr->type    = R_ARM64_BRANCH26;
+#else
     mr->offset  = off + 1;
     mr->symbol  = stubs[i].name;
     mr->type    = 4; /* R_X86_64_PLT32 -> X86_64_RELOC_BRANCH */
-    mr->addend  = 0; 
+#endif
+    mr->addend  = 0;
     mr->in_data = 0;
     mr->is_movabs = 0;
     mr->is_got  = 0;
+    mr->is_lea  = 0;
   }
   /* ----- Phase 3: build symbol table and string table ----- */
   DBG ("phase 3: building symbol table and string table");
@@ -973,7 +1179,8 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     MACH_SECT_BSS  = 3,
   };
 
-  /* Finalize cyreg/bss addresses now that text_size is final (post-stubs). */
+  /* Finalize cyreg/TLS/bss addresses now that text_size is final (post-stubs). */
+  uint64_t tdata_addr = 0, tvars_addr = 0, tbss_addr = 0;
   {
     uint64_t a = text_size + data_size;
     for (size_t k = 0; k < n_cyr; k++) {
@@ -982,7 +1189,22 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       a += cyr[k].size;
     }
     cyreg_total = a - (text_size + data_size);
-    bss_addr = align_up (text_size + data_size + cyreg_total, 8);
+    if (tdata_size > 0) {
+      a = align_up (a, 8);
+      tdata_addr = a;
+      a += tdata_size;
+    }
+    if (tvars_size > 0) {
+      a = align_up (a, 8);
+      tvars_addr = a;
+      a += tvars_size;
+    }
+    if (tbss_size > 0) {
+      a = align_up (a, 8);
+      tbss_addr = a;
+      a += tbss_size;
+    }
+    bss_addr = align_up (a, 8);
   }
 
   size_t n_local_syms = n_syms;
@@ -1022,6 +1244,8 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     if (found) continue;
     size_t dummy;
     int is_exported = name_set_find (&exports, datas[i].name, &dummy);
+    /* Strong override of weak empty table in mir-tls.c (Mach-O: ___mir_tls_aot_regs). */
+    if (strcmp (datas[i].name, "__mir_tls_aot_regs") == 0) is_exported = 1;
     struct nlist_64 s = {0};
     const char *mname = macho_mangle (datas[i].name);
     s.n_un.n_strx = STRTAB_ADD (mname);
@@ -1051,6 +1275,40 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     s.n_value = bss_addr + bsses[i].bss_offset;
     SYM_MAP_ADD (mname, n_syms);
     SYMTAB_PUSH (s);
+  }
+
+  /* --- TLS: variable symbol → descriptor in __thread_vars;
+     name$tlv$init → storage in __thread_data / __thread_bss (clang layout). */
+  for (size_t i = 0; i < n_tlss; i++) {
+    if (!tlss[i].name || sect_thread_vars == 0) continue;
+    size_t dummy;
+    int is_exported = name_set_find (&exports, tlss[i].name, &dummy);
+    struct nlist_64 s = {0};
+    const char *mname = macho_mangle (tlss[i].name);
+    s.n_un.n_strx = STRTAB_ADD (mname);
+    s.n_type = N_SECT | (is_exported ? N_EXT : 0);
+    s.n_sect = (uint8_t) sect_thread_vars;
+    s.n_desc = 0;
+    s.n_value = tvars_addr + tlss[i].desc_offset;
+    SYM_MAP_ADD (mname, n_syms);
+    SYMTAB_PUSH (s);
+
+    char init_name[512];
+    snprintf (init_name, sizeof (init_name), "%s$tlv$init", tlss[i].name);
+    const char *minit = macho_mangle (init_name);
+    struct nlist_64 si = {0};
+    si.n_un.n_strx = STRTAB_ADD (minit);
+    si.n_type = N_SECT; /* local, like clang */
+    if (tlss[i].is_bss) {
+      si.n_sect = (uint8_t) sect_thread_bss;
+      si.n_value = tbss_addr + tlss[i].init_offset;
+    } else {
+      si.n_sect = (uint8_t) sect_thread_data;
+      si.n_value = tdata_addr + tlss[i].init_offset;
+    }
+    si.n_desc = 0;
+    SYM_MAP_ADD (minit, n_syms);
+    SYMTAB_PUSH (si);
   }
 
   /* --- [[registry]] entry symbols: LOCAL pointers in their cyreg section --- */
@@ -1211,10 +1469,21 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     ri.r_symbolnum = sym_idx;
     ri.r_extern = 1;
     ri.r_type = mach_type;
+#if defined(__aarch64__)
+    /* arm64: most instruction relocs are 4-byte; UNSIGNED pointer is 8-byte. */
+    ri.r_length = (mach_type == ARM64_RELOC_UNSIGNED) ? 3 : 2;
+    ri.r_pcrel = (mach_type == ARM64_RELOC_BRANCH26
+                  || mach_type == ARM64_RELOC_PAGE21
+                  || mach_type == ARM64_RELOC_GOT_LOAD_PAGE21
+                  || mach_type == ARM64_RELOC_TLVP_LOAD_PAGE21) ? 1 : 0;
+#else
     ri.r_length = (mach_type == X86_64_RELOC_UNSIGNED) ? 3 : 2; /* 3=8byte, 2=4byte */
+    /* PC-relative: SIGNED (incl. LEA from R_X86_64_PC32), BRANCH, GOT_LOAD, TLV */
     ri.r_pcrel = (mach_type == X86_64_RELOC_SIGNED
                   || mach_type == X86_64_RELOC_BRANCH
-                  || mach_type == X86_64_RELOC_GOT_LOAD) ? 1 : 0;
+                  || mach_type == X86_64_RELOC_GOT_LOAD
+                  || mach_type == X86_64_RELOC_TLV) ? 1 : 0;
+#endif
 
     if (relocs[i].in_data)
       reloc_data[rd_idx++] = ri;
@@ -1234,7 +1503,11 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       ri.r_address = (int32_t) cyr[k].rel[r].off;
       ri.r_symbolnum = sym_idx;
       ri.r_extern = 1;
+#if defined(__aarch64__)
+      ri.r_type = ARM64_RELOC_UNSIGNED;
+#else
       ri.r_type = X86_64_RELOC_UNSIGNED;
+#endif
       ri.r_length = 3;
       ri.r_pcrel = 0;
       cyr[k].rbuf[r] = ri;
@@ -1262,8 +1535,9 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
 
   /* Count load commands */
   uint32_t ncmds = 4; /* LC_SEGMENT_64, LC_SYMTAB, LC_DYSYMTAB, LC_VERSION_MIN_MACOSX */
+  size_t n_all_sects = 3 + n_cyr + n_tls_sects; /* text,data,cyreg*,[tls],bss */
   size_t sizeofcmds = sizeof (struct segment_command_64)
-                     + sizeof (struct section_64) * (3 + n_cyr)  /* __text,__data,cyreg*,__bss */
+                     + sizeof (struct section_64) * n_all_sects
                      + sizeof (struct symtab_command)
                      + sizeof (struct dysymtab_command)
                      + sizeof (struct version_min_command);
@@ -1285,8 +1559,20 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   }
   size_t cyreg_file_end = cyreg_run;
 
+  /* Native TLS file content after cyreg (x64 + arm64) */
+  size_t tdata_file_off = 0, tvars_file_off = 0;
+  size_t tls_file_end = cyreg_file_end;
+  if (tdata_size > 0) {
+    tdata_file_off = align_up (tls_file_end, 8);
+    tls_file_end = tdata_file_off + tdata_size;
+  }
+  if (tvars_size > 0) {
+    tvars_file_off = align_up (tls_file_end, 8);
+    tls_file_end = tvars_file_off + tvars_size;
+  }
+
   /* Relocation entries follow section data */
-  size_t reloc_text_off = cyreg_file_end;
+  size_t reloc_text_off = tls_file_end;
   size_t reloc_data_off = reloc_text_off + n_reloc_text * sizeof (struct relocation_info);
 
   /* cyreg relocations follow the __data relocations. */
@@ -1296,8 +1582,13 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     cyreg_reloc_run += cyr[k].nrel * sizeof (struct relocation_info);
   }
 
+  /* __thread_vars: 2 UNSIGNED relocs per TLS symbol (bootstrap + $tlv$init). */
+  size_t tvars_reloc_off = cyreg_reloc_run;
+  size_t tvars_reloc_bytes = n_tlss * 2 * sizeof (struct relocation_info);
+  size_t after_tvars_relocs = tvars_reloc_off + tvars_reloc_bytes;
+
   /* Symbol table */
-  size_t symtab_off = cyreg_reloc_run;
+  size_t symtab_off = after_tvars_relocs;
   symtab_off = align_up (symtab_off, 8);
 
   /* String table */
@@ -1312,15 +1603,24 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   struct segment_command_64 seg_cmd;
   memset (&seg_cmd, 0, sizeof (seg_cmd));
   seg_cmd.cmd = LC_SEGMENT_64;
-  seg_cmd.cmdsize = sizeof (struct segment_command_64) + (3 + n_cyr) * sizeof (struct section_64);
+  seg_cmd.cmdsize = (uint32_t) (sizeof (struct segment_command_64)
+                                + n_all_sects * sizeof (struct section_64));
   strncpy (seg_cmd.segname, "__TEXT", 16);
   seg_cmd.vmaddr = 0;
-  seg_cmd.vmsize = n_cyr ? (bss_addr + bss_size) : (text_size + data_size + bss_size);
+  /* vmsize must cover every section's addr+size (incl. zerofill). */
+  {
+    uint64_t vend = bss_addr + bss_size;
+    if (tbss_size > 0 && tbss_addr + tbss_size > vend) vend = tbss_addr + tbss_size;
+    if (tvars_size > 0 && tvars_addr + tvars_size > vend) vend = tvars_addr + tvars_size;
+    if (tdata_size > 0 && tdata_addr + tdata_size > vend) vend = tdata_addr + tdata_size;
+    if (vend < text_size + data_size) vend = text_size + data_size;
+    seg_cmd.vmsize = vend;
+  }
   seg_cmd.fileoff = text_file_off;
-  seg_cmd.filesize = n_cyr ? (cyreg_file_end - text_file_off) : (text_size + data_size);
+  seg_cmd.filesize = tls_file_end - text_file_off;
   seg_cmd.maxprot = 7;  /* rwx */
   seg_cmd.initprot = 7; /* rwx */
-  seg_cmd.nsects = (uint32_t)(3 + n_cyr);
+  seg_cmd.nsects = (uint32_t) n_all_sects;
   seg_cmd.flags = 0;
 
   /* Section 1: __TEXT,__text */
@@ -1360,7 +1660,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   memset (&sec_bss, 0, sizeof (sec_bss));
   strncpy (sec_bss.sectname, "__bss", 16);
   strncpy (sec_bss.segname, "__DATA", 16);
-  sec_bss.addr = n_cyr ? bss_addr : (text_size + data_size);
+  sec_bss.addr = bss_addr ? bss_addr : (text_size + data_size);
   sec_bss.size = bss_size;
   sec_bss.offset = 0; /* S_NO_DATA */
   sec_bss.align = 3;  /* 2^3 = 8-byte alignment */
@@ -1405,8 +1705,13 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   struct mach_header_64 mhdr;
   memset (&mhdr, 0, sizeof (mhdr));
   mhdr.magic = MH_MAGIC_64;
+#if defined(__aarch64__)
+  mhdr.cputype = CPU_TYPE_ARM64;
+  mhdr.cpusubtype = CPU_SUBTYPE_ARM64_ALL;
+#else
   mhdr.cputype = CPU_TYPE_X86_64;
   mhdr.cpusubtype = CPU_SUBTYPE_X86_64_ALL;
+#endif
   mhdr.filetype = MH_OBJECT;
   mhdr.ncmds = ncmds;
   mhdr.sizeofcmds = (uint32_t)sizeofcmds;
@@ -1439,11 +1744,49 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     sc->flags = S_REGULAR;
   }
 
+  struct section_64 sec_tdata, sec_tvars;
+  memset (&sec_tdata, 0, sizeof (sec_tdata));
+  memset (&sec_tvars, 0, sizeof (sec_tvars));
+  if (tdata_size > 0) {
+    strncpy (sec_tdata.sectname, "__thread_data", 16);
+    strncpy (sec_tdata.segname, "__DATA", 16);
+    sec_tdata.addr = tdata_addr;
+    sec_tdata.size = tdata_size;
+    sec_tdata.offset = (uint32_t) tdata_file_off;
+    sec_tdata.align = 3;
+    sec_tdata.flags = S_THREAD_LOCAL_REGULAR;
+  }
+  if (tvars_size > 0) {
+    strncpy (sec_tvars.sectname, "__thread_vars", 16);
+    strncpy (sec_tvars.segname, "__DATA", 16);
+    sec_tvars.addr = tvars_addr;
+    sec_tvars.size = tvars_size;
+    sec_tvars.offset = (uint32_t) tvars_file_off;
+    sec_tvars.align = 3;
+    sec_tvars.flags = S_THREAD_LOCAL_VARIABLES;
+    sec_tvars.nreloc = (uint32_t) (n_tlss * 2);
+    sec_tvars.reloff = (uint32_t) (n_tlss ? tvars_reloc_off : 0);
+  }
+  struct section_64 sec_tbss;
+  memset (&sec_tbss, 0, sizeof (sec_tbss));
+  if (tbss_size > 0) {
+    strncpy (sec_tbss.sectname, "__thread_bss", 16);
+    strncpy (sec_tbss.segname, "__DATA", 16);
+    sec_tbss.addr = tbss_addr;
+    sec_tbss.size = tbss_size;
+    sec_tbss.offset = 0; /* zerofill */
+    sec_tbss.align = 3;
+    sec_tbss.flags = S_THREAD_LOCAL_ZEROFILL;
+  }
+
   /* Load commands */
   write (fd, &seg_cmd, sizeof (seg_cmd));
   write (fd, &sec_text, sizeof (sec_text));
   write (fd, &sec_data, sizeof (sec_data));
   for (size_t k = 0; k < n_cyr; k++) write (fd, &cyreg_secs[k], sizeof (struct section_64));
+  if (tdata_size > 0) write (fd, &sec_tdata, sizeof (sec_tdata));
+  if (tvars_size > 0) write (fd, &sec_tvars, sizeof (sec_tvars));
+  if (tbss_size > 0) write (fd, &sec_tbss, sizeof (sec_tbss));
   write (fd, &sec_bss, sizeof (sec_bss));
   write (fd, &sym_cmd, sizeof (sym_cmd));
   write (fd, &dysym_cmd, sizeof (dysym_cmd));
@@ -1471,6 +1814,17 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       if (cyr[k].size) write (fd, cyr[k].buf, cyr[k].size);
       cur = cyr[k].file_off + cyr[k].size;
     }
+    if (tdata_size > 0) {
+      if (tdata_file_off > cur) write_padding (fd, tdata_file_off - cur);
+      write (fd, tdata_buf, tdata_size);
+      cur = tdata_file_off + tdata_size;
+    }
+    if (tvars_size > 0) {
+      if (tvars_file_off > cur) write_padding (fd, tvars_file_off - cur);
+      write (fd, tvars_buf, tvars_size);
+      cur = tvars_file_off + tvars_size;
+    }
+    (void) cur;
   }
 
   /* __text relocation entries */
@@ -1485,9 +1839,58 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   for (size_t k = 0; k < n_cyr; k++)
     if (cyr[k].nrel) write (fd, cyr[k].rbuf, cyr[k].nrel * sizeof (struct relocation_info));
 
+  /* __thread_vars relocs (clang): per descriptor
+       +0  UNSIGNED → __tlv_bootstrap
+       +16 UNSIGNED → name$tlv$init */
+  if (n_tlss > 0) {
+    size_t boot_idx = 0;
+    for (size_t j = 0; j < n_sym_map; j++) {
+      if (strcmp (sym_map[j].name, "__tlv_bootstrap") == 0
+          || strcmp (sym_map[j].name, "___tlv_bootstrap") == 0) {
+        boot_idx = sym_map[j].idx;
+        break;
+      }
+    }
+#if defined(__aarch64__)
+    const int abs_reloc = ARM64_RELOC_UNSIGNED;
+#else
+    const int abs_reloc = X86_64_RELOC_UNSIGNED;
+#endif
+    for (size_t i = 0; i < n_tlss; i++) {
+      struct relocation_info ri;
+      memset (&ri, 0, sizeof (ri));
+      ri.r_address = (int32_t) tlss[i].desc_offset;
+      ri.r_symbolnum = boot_idx;
+      ri.r_extern = 1;
+      ri.r_type = abs_reloc;
+      ri.r_length = 3;
+      ri.r_pcrel = 0;
+      write (fd, &ri, sizeof (ri));
+
+      char init_name[512];
+      snprintf (init_name, sizeof (init_name), "%s$tlv$init", tlss[i].name);
+      const char *minit = macho_mangle (init_name);
+      size_t init_idx = 0;
+      for (size_t j = 0; j < n_sym_map; j++) {
+        if (strcmp (sym_map[j].name, minit) == 0) {
+          init_idx = sym_map[j].idx;
+          break;
+        }
+      }
+      memset (&ri, 0, sizeof (ri));
+      ri.r_address = (int32_t) (tlss[i].desc_offset + 16);
+      ri.r_symbolnum = init_idx;
+      ri.r_extern = 1;
+      ri.r_type = abs_reloc;
+      ri.r_length = 3;
+      ri.r_pcrel = 0;
+      write (fd, &ri, sizeof (ri));
+    }
+  }
+
   /* Padding to symbol table */
   {
-    size_t cur = cyreg_reloc_run;
+    size_t cur = after_tvars_relocs;
     if (symtab_off > cur) write_padding (fd, symtab_off - cur);
   }
 
@@ -1526,6 +1929,12 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   free (datas);
   free (bsses);
   free (relocs);
+  free (tdata_buf);
+  free (tvars_buf);
+  for (size_t i = 0; i < n_tlss; i++) free (tlss[i].init_bytes);
+  free (tlss);
+  for (size_t i = 0; i < n_tls_mods; i++) free (tls_mods[i].tmpl);
+  free (tls_mods);
   for (size_t i = 0; i < exports.n; i++) free (exports.names[i]);
   free (exports.names);
   for (size_t i = 0; i < imports.n; i++) free (imports.names[i]);
@@ -1586,6 +1995,12 @@ int main (int argc, char **argv) {
   MIR_read (ctx, fp);
   fclose (fp);
   DBG ("MIR_read done");
+
+  /* macOS AOT uses N1 emulated TLS (mir_tls_addr) so RA sees the helper call
+     and does not clobber live args (e.g. printf format in %rdi).  Native
+     Mach-O TLV (post-RA call *thunk) is unsafe until lowered pre-RA.
+     JIT also uses emulated TLS.  We emit __mir_tls_aot_regs + template below. */
+  MIR_set_tls_native_aot (ctx, 0);
 
   /* Load all modules */
   size_t n_modules = 0, n_funcs_total = 0;

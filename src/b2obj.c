@@ -974,7 +974,11 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         elf_reloc_t *er = &relocs[n_relocs++];
         er->offset = datas[i].data_offset;
         er->symbol = target_name;
+#if defined(__aarch64__)
+        er->type = R_AARCH64_ABS64;
+#else
         er->type = R_X86_64_64;
+#endif
         er->addend = datas[i].ref_disp;
         er->in_data = 1;
         /* The 8 bytes in data_buf are already zero (calloc) */
@@ -1326,7 +1330,11 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
             for (size_t j = 0; j < n_sym_map; j++)
                 if (strcmp(sym_map[j].name, cyr[k].rel[r].sym) == 0) { sym_idx = sym_map[j].idx; break; }
             cyr[k].rbuf[r].r_offset = cyr[k].rel[r].off;
+#if defined(__aarch64__)
+            cyr[k].rbuf[r].r_info   = ELF64_R_INFO(sym_idx, R_AARCH64_ABS64);
+#else
             cyr[k].rbuf[r].r_info   = ELF64_R_INFO(sym_idx, R_X86_64_64);
+#endif
             cyr[k].rbuf[r].r_addend = cyr[k].rel[r].add;
         }
     }
@@ -1960,7 +1968,11 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         for (size_t i = 0; i < n_dw_relocs; i++) {
             Elf64_Rela r = {0};
             r.r_offset = dw_relocs[i].offset;
+#if defined(__aarch64__)
+            r.r_info = ELF64_R_INFO(text_sym_idx, R_AARCH64_ABS64);
+#else
             r.r_info = ELF64_R_INFO(text_sym_idx, R_X86_64_64);
+#endif
             r.r_addend = dw_relocs[i].addend;
             if (dw_relocs[i].in_line)
                 rela_dbline[dl_idx++] = r;
@@ -2249,7 +2261,11 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     ehdr.e_ident[EI_VERSION] = EV_CURRENT;
     ehdr.e_ident[EI_OSABI]   = ELFOSABI_NONE;
     ehdr.e_type      = ET_REL;
+#if defined(__aarch64__)
+    ehdr.e_machine   = EM_AARCH64;
+#else
     ehdr.e_machine   = EM_X86_64;
+#endif
     ehdr.e_version   = EV_CURRENT;
     ehdr.e_ehsize    = sizeof(Elf64_Ehdr);
     ehdr.e_shentsize = sizeof(Elf64_Shdr);
