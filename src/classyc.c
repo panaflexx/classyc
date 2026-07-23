@@ -30,10 +30,15 @@
 #include <setjmp.h>
 #include <math.h>
 #include <wchar.h>
+#include <sys/stat.h>
+#include <limits.h>
 #if defined(_WIN32)
 #include <io.h>
 #else
 #include <unistd.h>
+#endif
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
 #endif
 #include "mir-alloc.h"
 #include "mir.h"
@@ -10650,7 +10655,7 @@ static void add_standard_includes (c2m_ctx_t c2m_ctx) {
   }
   add_string_stream (c2m_ctx, "<exception-prelude>", exception_prelude);
   /* Header-extensible String builtin table (re-registers stock methods + documents
-     the [[builtin_method]] form).  Requires -I include so the file resolves. */
+     the [[builtin_method]] form).  Resolves via auto-discovered include/. */
   add_string_stream (c2m_ctx, "<string-builtins>",
                      "#include \"string_builtins.h\"\n");
 }
@@ -34665,16 +34670,127 @@ static void print_node (c2m_ctx_t c2m_ctx, FILE *f, node_t n, int indent, int at
   }
 }
 
+/* True if dir exists and looks like the ClassyC include tree (has list.h or cstring.h). */
+static int classyc_include_dir_p (const char *dir) {
+  char probe[PATH_MAX];
+  struct stat st;
+  size_t n;
+
+  if (dir == NULL || dir[0] == '\0') return 0;
+  if (stat (dir, &st) != 0 || !S_ISDIR (st.st_mode)) return 0;
+  n = strlen (dir);
+  if (n + 16 >= sizeof (probe)) return 0;
+  memcpy (probe, dir, n);
+  probe[n] = '/';
+  strcpy (probe + n + 1, "list.h");
+  if (stat (probe, &st) == 0 && S_ISREG (st.st_mode)) return 1;
+  strcpy (probe + n + 1, "cstring.h");
+  return stat (probe, &st) == 0 && S_ISREG (st.st_mode);
+}
+
+/* Push dir into header search lists if not already present.  `path` must outlive
+   the compile (caller owns lifetime — typically MIR_malloc). */
+static void push_include_dir (c2m_ctx_t c2m_ctx, const char *path) {
+  size_t i, n;
+
+  if (path == NULL || path[0] == '\0') return;
+  n = VARR_LENGTH (char_ptr_t, headers);
+  for (i = 0; i < n; i++) {
+    const char *p = VARR_GET (char_ptr_t, headers, i);
+    if (p != NULL && strcmp (p, path) == 0) return;
+  }
+  n = VARR_LENGTH (char_ptr_t, system_headers);
+  for (i = 0; i < n; i++) {
+    const char *p = VARR_GET (char_ptr_t, system_headers, i);
+    if (p != NULL && strcmp (p, path) == 0) return;
+  }
+  VARR_PUSH (char_ptr_t, headers, path);
+  VARR_PUSH (char_ptr_t, system_headers, path);
+}
+
+/* Resolve executable directory into out (no trailing slash).  Returns 0 on success. */
+static int classyc_exe_dir (char *out, size_t out_sz) {
+  char path[PATH_MAX], resolved[PATH_MAX];
+  char *slash;
+
+  if (out_sz < 2) return -1;
+  path[0] = '\0';
+#if defined(__APPLE__)
+  {
+    uint32_t sz = (uint32_t) sizeof (path);
+    if (_NSGetExecutablePath (path, &sz) != 0) return -1;
+  }
+#elif defined(__linux__)
+  {
+    ssize_t n = readlink ("/proc/self/exe", path, sizeof (path) - 1);
+    if (n < 0) return -1;
+    path[n] = '\0';
+  }
+#else
+  (void) path;
+  return -1;
+#endif
+  if (realpath (path, resolved) != NULL) {
+    strncpy (path, resolved, sizeof (path) - 1);
+    path[sizeof (path) - 1] = '\0';
+  }
+  slash = strrchr (path, '/');
+  if (slash == NULL) return -1;
+  *slash = '\0';
+  if (strlen (path) + 1 > out_sz) return -1;
+  strcpy (out, path);
+  return 0;
+}
+
+/* If base/rel is a ClassyC include dir, MIR_malloc a copy and push it. */
+static void try_push_include_rel (c2m_ctx_t c2m_ctx, MIR_alloc_t alloc, const char *base,
+                                  const char *rel) {
+  char cand[PATH_MAX];
+  char *copy;
+  size_t n;
+
+  if (base == NULL || rel == NULL) return;
+  if (snprintf (cand, sizeof (cand), "%s/%s", base, rel) >= (int) sizeof (cand)) return;
+  if (!classyc_include_dir_p (cand)) return;
+  n = strlen (cand) + 1;
+  copy = MIR_malloc (alloc, n);
+  if (copy == NULL) return;
+  memcpy (copy, cand, n);
+  push_include_dir (c2m_ctx, copy);
+}
+
 static void init_include_dirs (c2m_ctx_t c2m_ctx) {
   MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
   int MIR_UNUSED added_p = FALSE;
+  char exe_dir[PATH_MAX], cwd[PATH_MAX];
+  int i;
 
   VARR_CREATE (char_ptr_t, headers, alloc, 0);
   VARR_CREATE (char_ptr_t, system_headers, alloc, 0);
-  for (size_t i = 0; i < c2m_options->include_dirs_num; i++) {
-    VARR_PUSH (char_ptr_t, headers, c2m_options->include_dirs[i]);
-    VARR_PUSH (char_ptr_t, system_headers, c2m_options->include_dirs[i]);
+  for (size_t j = 0; j < c2m_options->include_dirs_num; j++) {
+    VARR_PUSH (char_ptr_t, headers, c2m_options->include_dirs[j]);
+    VARR_PUSH (char_ptr_t, system_headers, c2m_options->include_dirs[j]);
   }
+
+  /* Auto-discover ClassyC's own include/ (so -I include is usually unnecessary).
+     Prefer paths next to the binary (build tree: bin/classyc → ../include;
+     install: .../bin → ../include or share), then cwd.  Extra paths: CFLAGS -I… */
+  if (classyc_exe_dir (exe_dir, sizeof (exe_dir)) == 0) {
+    static const char *const rels[]
+      = {"../include", "include", "../../include", "../share/classyc/include", NULL};
+    for (i = 0; rels[i] != NULL; i++) try_push_include_rel (c2m_ctx, alloc, exe_dir, rels[i]);
+  }
+  if (getcwd (cwd, sizeof (cwd)) != NULL) try_push_include_rel (c2m_ctx, alloc, cwd, "include");
+
+  /* Site packages (installed ClassyC libs / third-party cy headers). */
+#if defined(__APPLE__) || defined(__unix__)
+  {
+    struct stat st;
+    if (stat ("/usr/local/cy", &st) == 0 && S_ISDIR (st.st_mode))
+      push_include_dir (c2m_ctx, "/usr/local/cy");
+  }
+#endif
+
   VARR_PUSH (char_ptr_t, headers, NULL);
 #if defined(__APPLE__) || defined(__unix__)
   VARR_PUSH (char_ptr_t, system_headers, "/usr/local/include");
@@ -34708,8 +34824,6 @@ static void init_include_dirs (c2m_ctx_t c2m_ctx) {
 #if defined(__APPLE__) || defined(__unix__)
   VARR_PUSH (char_ptr_t, system_headers, "/usr/include");
 #endif
-// FIXME: Hardcoded user path
-  VARR_PUSH (char_ptr_t, system_headers, "/home/rdavenpo/src/MIR/classyc/include");
   VARR_PUSH (char_ptr_t, system_headers, NULL);
   header_dirs = (const char **) VARR_ADDR (char_ptr_t, headers);
   system_header_dirs = (const char **) VARR_ADDR (char_ptr_t, system_headers);
