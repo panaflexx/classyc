@@ -9,14 +9,22 @@ static void target_init_arg_vars (c2m_ctx_t c2m_ctx MIR_UNUSED,
                                   target_arg_info_t *arg_info MIR_UNUSED) {}
 
 static int target_return_by_addr_p (c2m_ctx_t c2m_ctx, struct type *ret_type) {
-  return ((ret_type->mode == TM_STRUCT || ret_type->mode == TM_UNION)
+  /* ClassyC classes are aggregates like struct/union for AAPCS64. */
+  return ((ret_type->mode == TM_STRUCT || ret_type->mode == TM_UNION
+           || ret_type->mode == TM_CLASS)
           && type_size (c2m_ctx, ret_type) > 2 * 8);
 }
 
 static int reg_aggregate_size (c2m_ctx_t c2m_ctx, struct type *type) {
   size_t size;
 
-  if (type->mode != TM_STRUCT && type->mode != TM_UNION) return -1;
+  /* TM_CLASS must match TM_STRUCT: otherwise all class returns fall into the
+     simple RBLK path where an empty/zero-size type gets proto size 0 vs call
+     size 1 (see simple_add_call_res_op), which MIR rejects as
+     "different sizes (0 vs 1) of arg and param block memory".  x86_64 already
+     classifies TM_CLASS; aarch64 historically only listed struct/union. */
+  if (type->mode != TM_STRUCT && type->mode != TM_UNION && type->mode != TM_CLASS)
+    return -1;
   return (size = type_size (c2m_ctx, type)) <= 2 * 8 ? (int) size : -1;
 }
 

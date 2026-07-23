@@ -25110,7 +25110,9 @@ static void MIR_UNUSED simple_add_res_proto (c2m_ctx_t c2m_ctx, struct type *ret
   } else {
     var.name = RET_ADDR_NAME;
     var.type = MIR_T_RBLK;
+    /* Must match simple_add_call_res_op: MIR rejects RBLK size 0 vs 1. */
     var.size = type_size (c2m_ctx, ret_type);
+    if (var.size == 0) var.size = 1;
     VARR_PUSH (MIR_var_t, arg_vars, var);
   }
 }
@@ -25199,7 +25201,10 @@ static void MIR_UNUSED simple_add_arg_proto (c2m_ctx_t c2m_ctx, const char *name
             : get_mir_type (c2m_ctx, arg_type));
   var.name = name;
   var.type = type;
-  if (type == MIR_T_BLK) var.size = type_size (c2m_ctx, arg_type);
+  if (type == MIR_T_BLK) {
+    var.size = type_size (c2m_ctx, arg_type);
+    if (var.size == 0) var.size = 1; /* keep in sync with call-site BLK disp */
+  }
   VARR_PUSH (MIR_var_t, arg_vars, var);
 }
 
@@ -25207,6 +25212,7 @@ static void MIR_UNUSED simple_add_call_arg_op (c2m_ctx_t c2m_ctx, struct type *a
                                                void *arg_info MIR_UNUSED, op_t arg) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_type_t type;
+  mir_size_t bsize;
 
   type = (arg_type->mode == TM_STRUCT || arg_type->mode == TM_UNION || arg_type->mode == TM_CLASS
             ? MIR_T_BLK
@@ -25216,9 +25222,10 @@ static void MIR_UNUSED simple_add_call_arg_op (c2m_ctx_t c2m_ctx, struct type *a
   } else {
     assert (arg.mir_op.mode == MIR_OP_MEM);
     arg = mem_to_address (c2m_ctx, arg, TRUE);
+    bsize = type_size (c2m_ctx, arg_type);
+    if (bsize == 0) bsize = 1;
     VARR_PUSH (MIR_op_t, call_ops,
-               MIR_new_mem_op (c2m_ctx->ctx, MIR_T_BLK, type_size (c2m_ctx, arg_type),
-                               arg.mir_op.u.reg, 0, 1));
+               MIR_new_mem_op (c2m_ctx->ctx, MIR_T_BLK, bsize, arg.mir_op.u.reg, 0, 1));
   }
 }
 
