@@ -28501,28 +28501,50 @@ static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_t
   op_t res = zero_op;
   int i, n;
 
-  int agg_ret_p = (agg_dest != NULL
-                   && (ft->ret_type->mode == TM_STRUCT || ft->ret_type->mode == TM_UNION
-                       || ft->ret_type->mode == TM_CLASS));
+  int is_agg_ret = (ft->ret_type->mode == TM_STRUCT || ft->ret_type->mode == TM_UNION
+                    || ft->ret_type->mode == TM_CLASS);
   int agg_by_addr_p = 0;
+  int need_post_scatter_p = 0;
   VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, proto));
   VARR_PUSH (MIR_op_t, call_ops, func_op);
   target_init_arg_vars (c2m_ctx, &arg_info);
-  if (agg_ret_p && target_return_by_addr_p (c2m_ctx, ft->ret_type)) {
+  if (agg_dest != NULL && is_agg_ret && target_return_by_addr_p (c2m_ctx, ft->ret_type)) {
     /* Aggregate returned via a hidden pointer: instead of routing through the
        call arg area (which the synthetic for-in/protocol call sites never sized
        during check), construct the result directly in the caller-supplied
        destination slot.  Push an RBLK operand pointing at &agg_dest. */
     op_t addr = mem_to_address (c2m_ctx, *agg_dest, TRUE);
-    MIR_op_t rblk = MIR_new_mem_op (ctx, MIR_T_RBLK, type_size (c2m_ctx, ft->ret_type),
-                                    addr.mir_op.u.reg, 0, 1);
+    mir_size_t rsz = type_size (c2m_ctx, ft->ret_type);
+    if (rsz == 0) rsz = 1;
+    MIR_op_t rblk = MIR_new_mem_op (ctx, MIR_T_RBLK, rsz, addr.mir_op.u.reg, 0, 1);
     VARR_PUSH (MIR_op_t, call_ops, rblk);
     res = *agg_dest;
     n = 0;
     agg_by_addr_p = 1;
   } else {
     n = target_add_call_res_op (c2m_ctx, ft->ret_type, &arg_info, 0);
-    if (n > 0 && !agg_ret_p) {
+    if (n == 0) {
+      /* RBLK return (classes always; large structs).  Expose the buffer as a
+         plain MEM op.  Previously we left res as zero_op when agg_dest was
+         NULL — MIR then saw a garbage/undeclared reg in the caller. */
+      res = new_op (NULL, VARR_LAST (MIR_op_t, call_ops));
+      assert (res.mir_op.mode == MIR_OP_MEM && res.mir_op.u.mem.type == MIR_T_RBLK);
+      res.mir_op = MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, res.mir_op.u.mem.base, 0, 1);
+    } else if (n > 0 && is_agg_ret) {
+      /* Small aggregate in registers: need a memory slot to scatter into. */
+      if (agg_dest != NULL) {
+        res = *agg_dest;
+      } else {
+        mir_size_t csize = type_size (c2m_ctx, ft->ret_type);
+        if (csize == 0) csize = 1;
+        res = get_new_temp (c2m_ctx, MIR_T_I64);
+        MIR_append_insn (ctx, curr_func,
+                         MIR_new_insn (ctx, MIR_ALLOCA, res.mir_op,
+                                       MIR_new_int_op (ctx, (long long) csize)));
+        res.mir_op = MIR_new_mem_op (ctx, MIR_T_UNDEF, 0, res.mir_op.u.reg, 0, 1);
+      }
+      need_post_scatter_p = 1;
+    } else if (n > 0) {
       assert (n == 1);
       res = new_op (NULL, VARR_LAST (MIR_op_t, call_ops));
     }
@@ -28548,11 +28570,10 @@ static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_t
                                       VARR_LENGTH (MIR_op_t, call_ops) - ops_start,
                                       VARR_ADDR (MIR_op_t, call_ops) + ops_start);
     emit_insn (c2m_ctx, ci);
-    if (agg_ret_p && !agg_by_addr_p) {
-      /* Small aggregate returned in registers: scatter the result registers into
-         the destination slot, then expose the slot as the result. */
-      target_gen_post_call_res_code (c2m_ctx, ft->ret_type, *agg_dest, ci, ops_start);
-      res = *agg_dest;
+    if (need_post_scatter_p && !agg_by_addr_p) {
+      /* Small aggregate returned in registers: scatter into res (agg_dest or
+         a fresh ALLOCA slot). */
+      target_gen_post_call_res_code (c2m_ctx, ft->ret_type, res, ci, ops_start);
     }
   }
   VARR_TRUNC (MIR_op_t, call_ops, ops_start);
