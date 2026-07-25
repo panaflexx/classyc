@@ -21,6 +21,11 @@
  *   Local movabs → leaq sym(%rip)  (string literals / .lc*)
  *   External movabs → movq GOTPCREL
  *
+ * PIE-safe addresses (arm64, via mir-gen-aarch64 object mode):
+ *   Local REF → adrp+add (PAGE21/PAGEOFF12)
+ *   Import REF → adrp+ldr GOT (GOT_LOAD_PAGE*)
+ *   Direct bl → BRANCH26 (stubs only for BRANCH26 to externals)
+ *
  * macOS 10.12 compatibility: no APFS-only APIs, LC_VERSION_MIN_MACOSX,
  * arm64-only blocks behind #if defined(__aarch64__).
  */
@@ -446,6 +451,8 @@ static int elf_reloc_to_macho (int elf_type) {
   case R_ARM64_BRANCH26: return ARM64_RELOC_BRANCH26;
   case R_ARM64_PAGE21: return ARM64_RELOC_PAGE21;
   case R_ARM64_PAGEOFF12: return ARM64_RELOC_PAGEOFF12;
+  case R_ARM64_GOT_LOAD_PAGE21: return ARM64_RELOC_GOT_LOAD_PAGE21;
+  case R_ARM64_GOT_LOAD_PAGEOFF12: return ARM64_RELOC_GOT_LOAD_PAGEOFF12;
   case R_ARM64_TLVP_LOAD_PAGE21: return ARM64_RELOC_TLVP_LOAD_PAGE21;
   case R_ARM64_TLVP_LOAD_PAGEOFF12: return ARM64_RELOC_TLVP_LOAD_PAGEOFF12;
   case R_AARCH64_ABS64: return ARM64_RELOC_UNSIGNED;
@@ -971,6 +978,11 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     }
 #endif
     if (!local) {
+#if defined(__aarch64__)
+      /* Only direct branches need PLT-style stubs.  PAGE/GOT/UNSIGNED address
+         materialization is fixed up by the linker on the instruction itself. */
+      if (relocs[i].type != R_ARM64_BRANCH26) continue;
+#endif
       /* External call/jump target: synthesize a branch stub. */
       int found = 0;
       for (size_t j = 0; j < n_stubs; j++) {
@@ -997,6 +1009,9 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   for (size_t i = 0; i < orig_n_relocs; i++) {
     if (relocs[i].in_data) continue;
     if (relocs[i].is_got) continue; /* handled via GOT, not a stub */
+#if defined(__aarch64__)
+    if (relocs[i].type != R_ARM64_BRANCH26) continue;
+#endif
     size_t dummy;
     if (!name_set_find (&defined_names, relocs[i].symbol, &dummy)) {
       for (size_t j = 0; j < n_stubs; j++) {
