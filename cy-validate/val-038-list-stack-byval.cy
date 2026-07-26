@@ -21,6 +21,7 @@ void check(int cond, const char *label) {
 }
 
 int dtors = 0;
+[[copyable_no_release]] /* counting dtor only */
 class Pt {
     int x;
     Pt(int x) { this.x = x; }

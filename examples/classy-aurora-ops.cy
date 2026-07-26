@@ -50,6 +50,7 @@ class OpsConfig {
     int    max_wing;
 };
 
+[[copyable_no_release]] /* quiet dtor by design — by-value List element; see BY-VALUE.md P1 */
 class Ship {
     int     id;
     String  callsign;

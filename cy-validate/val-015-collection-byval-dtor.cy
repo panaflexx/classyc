@@ -19,6 +19,7 @@ void check(int cond, const char *label) {
 }
 
 int tag_dtors = 0;
+[[copyable_no_release]] /* counting dtor only — no owned resource */
 class Tag {
     int id;
     Tag(int id) { this->id = id; }
@@ -27,6 +28,7 @@ class Tag {
 };
 
 int item_dtors = 0;
+[[copyable_no_release]]
 class Item {
     int id;
     Item(int id) { this->id = id; }
@@ -35,6 +37,7 @@ class Item {
 };
 
 int key_dtors = 0;
+[[copyable_no_release]]
 class Key {
     int id;
     Key(int id) { this->id = id; }
@@ -85,10 +88,10 @@ int main() {
     delete km;
     check(key_dtors - key_before == 2, "Map<Key,int> runs 2 key dtors on delete");
 
-    /* NOTE: there is no stack/value form of a generic collection to validate.
-     * List/Set/Map are reference types instantiated only with `new` (a bare
-     * `Map<K,V> m = ...` value expression does not parse); ownership cleanup
-     * therefore always runs through the heap `delete` path exercised above. */
+    /* NOTE: stack/value forms of generic collections exist now
+     * (`auto m = Map<K,V>();`, `b = move a` — see val-038/val-039/val-040);
+     * this file still exercises the heap `delete` path for element-dtor
+     * accounting. */
 
     printf("\n=== %d passed, %d failed ===\n", passed, failed);
     return failed;

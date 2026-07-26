@@ -119,8 +119,10 @@ List<Pilot*> OrderByPace(List<Pilot*>* src) {
 void print_banner(Pilot* p) { p.Banner(); }
 
 /* By-value DTO — inline in List<LapSample>, not List<LapSample*>.
- * Prefer no user dtor for list elements: Where/Filter/Sort pass T by value.
- * Use List<T*>.owns() when T needs a real destructor.  See BY-VALUE.md. */
+ * No user dtor on list elements: the compiler REJECTS dtor-bearing element
+ * types unless marked [[copyable_no_release]] (Where/Filter/Sort pass T by
+ * value; bitwise relocation would double-free).  Use List<T*>.owns() when T
+ * needs a real destructor.  See BY-VALUE.md. */
 class LapSample {
     int lap;
     int ms;
@@ -131,7 +133,7 @@ class LapSample {
         this.ms = ms;
         this.faction = faction;
     }
-    /* no ~LapSample — trivially relocatable DTO for List by-value */
+    /* no ~LapSample — pure DTO; fine as List by-value element */
 
     int IsQuick() { return ms < 62000; }
     String ToString() {

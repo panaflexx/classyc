@@ -4,6 +4,7 @@
 
 int track_dtor_count = 0;
 
+[[copyable_no_release]] /* counting dtor only — no owned resource; see BY-VALUE.md P1 */
 class Track {
     int id;
     Track(int id) { this->id = id; }

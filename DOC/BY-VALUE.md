@@ -203,6 +203,9 @@ Scope exit LIFO (typical):
 | `ClassName(args)` prvalue construction | check/gen `N_CALL` when callee is class |
 | Brace-init `new List<Pt>{ Pt(...), ... }` | uses prvalue path + Add protocol |
 | Tests | `val-038-list-stack-byval.cy`, `val-039-brace-init-move.cy`, `val-015-*`, `examples/test-list-byval.cy` |
+| **P0 done** — prvalue temp dtors at consuming call | `class_prvalue_call_p` + `gen_class_temp_dtor` in `classyc.c`; `val-056` |
+| **P1 done** — by-value element gate + `[[copyable_no_release]]` | parse-time class registry + gate in `get_or_create_specialization`; `val-056` |
+| **P5 done** — C-array element dtors at scope exit | `create_decl` RAII for `TM_ARR` of dtor-class (constant bound); `val-056` |
 
 ### Helpers already in `classyc.c`
 
@@ -227,13 +230,30 @@ Class prvalue path (sketch of current behavior):
 //   → yield MIR_OP_MEM of aggregate
 ```
 
-**Gap:** temp is **not** always registered for end-of-full-expression `~T` after the value has been copied into a list (or after a call). POD is fine; nontrivial `~T` is the bug class for **P0**.
+**~~Gap~~ (FIXED):** temp is **not** always registered for end-of-full-expression `~T` after the value has been copied into a list (or after a call). POD is fine; nontrivial `~T` is the bug class for **P0**.
+
+**Resolution (compiler-validated):** `Add(T(...))` / brace-init were already balanced (the container adopts the temp's bits and destroys it once). The real leaks were **by-value call arguments** (`take(Box(7))`) and **prvalue method receivers** (`Pt(1,2).getX()`) — fixed by emitting `~T` for the temp right after the consuming call, except (a) adopting protocol methods (`Add`/`Set`/`Insert`/`Push`/`Enqueue` on a move-only collection — the container owns it) and (b) calls returning a pointer (result may alias the temp — kept alive, conservative).
 
 ---
 
 ## 4. Remaining phases
 
-### P0 — Class prvalue temporary lifetimes  🔴 **correctness**
+> **Status: P0, P1, P2 and the P5 array item are landed** (val-056 + gate
+> diagnostics; suite 58/58 green).  Remaining: P3 (optional clone polish),
+> P5 leftovers (bare `T(...);` statement temps, ctor-arg prvalues).
+
+### P0 — Class prvalue temporary lifetimes  ✅ **DONE** (refined scope)
+
+> **What validation showed:** the doc's original worry (`Add(T(...))` temp
+> leaks) did **not** reproduce — Add/brace-init were already balanced. The
+> actual leaks, confirmed with strict ctor/dtor probes
+> (`sketch/probe-p0-prvalue-lifetime.cy`, `probe-p0b-arg-leak.cy`), were:
+> `take(Box(7))` prvalue call args and `Box(9).getId()` prvalue receivers.
+> Both now destroy the temp exactly once after the consuming call
+> (`val-056`).  Remaining known edges (documented, low value): a bare
+> `Box(7);` expression-statement temp still leaks; class-prvalue args to a
+> *ctor* of another prvalue (`Box(Box2(1))`) are not destroyed; calls
+> returning pointers intentionally keep the temp alive.
 
 #### Goal
 
@@ -358,17 +378,34 @@ int main() {
 }
 ```
 
-#### Done criteria (P0)
+#### Done criteria (P0) — status
 
-- [ ] `Add(T(...))` with counting dtor: no leak of temps; no double-free
-- [ ] Brace-init `new List<T>{ T(...), T(...) }` same
-- [ ] `take(T(...))` destroys
-- [ ] `val-038` / `val-039` still pass
-- [ ] `examples/test-list-byval.cy` still pass
+- [x] `Add(T(...))` with counting dtor: no leak of temps; no double-free *(was already balanced — verified)*
+- [x] Brace-init `new List<T>{ T(...), T(...) }` same *(verified)*
+- [x] `take(T(...))` destroys *(fixed — temp dtor after the call)*
+- [x] `val-038` / `val-039` still pass
+- [x] `examples/test-list-byval.cy` still pass
 
 ---
 
-### P1 — Element relocatable / triviality gate  🔴 **safety**
+### P1 — Element relocatable / triviality gate  ✅ **DONE**
+
+> Shipped as an **error** with the `[[copyable_no_release]]` opt-out, as
+> designed below.  Implementation notes: the gate lives in
+> `get_or_create_specialization` (single choke point for `List`/`Set`/`Map`)
+> and resolves element classes through a **parse-time class registry**
+> (`parsed_classes` / `copyable_no_release_classes` VARRs in `parse_ctx`) because
+> class symbols only enter check-time scopes after specialization runs.
+> Map checks both `K` and `V`; pointer elements and nested `__generic_*`
+> collections are exempt.  Counting-dtor test/example classes were
+> annotated: `val-015` (Tag/Item/Key), `val-038`/`val-039` (Pt),
+> `val-052` (Ship), `examples/test-list-byval.cy` (Track),
+> `examples/classy-aurora-ops.cy` (Ship),
+> `examples/classy-space-trader-2000.cy` (Planet/Outpost/Trader).
+> Regression coverage: `val-056` (positive) +
+> `sketch/probe-p1-relocate-gate.cy` (negative — must not compile).
+> The original double-free repro (`Where` on `List<Owns>` → SIGABRT,
+> `sketch/probe-p1b-transform-doublefree.cy`) is now rejected at compile time.
 
 #### Goal
 
@@ -388,7 +425,7 @@ If `~T` frees a unique resource still aliased in two slots → **double-free**.
 | Kind | Rule | Examples |
 |------|------|----------|
 | **Trivial / safe** | no user dtor, or only scalars + `String` | `int`, `LapSample` POD, `Pt` with quiet `~` optional |
-| **Attribute opt-in** | `[[trivially_relocatable]]` | intentional POD-with-dtor-for-counting |
+| **Attribute opt-in** | `[[copyable_no_release]]` | intentional POD-with-dtor-for-counting |
 | **Unsafe by value** | user dtor frees unique resource, or owns raw ptr | `FileHandle`, `Buffer` with `free` in `~` |
 
 #### Compiler behavior (recommended)
@@ -397,12 +434,13 @@ If `~T` frees a unique resource still aliased in two slots → **double-free**.
 // At List<T> / Set<T> / Map K,V specialization or first method check:
 if (element is TM_CLASS
     && class_has_dtor_p(T)
-    && !is_trivially_relocatable(T)
+    && !is_copyable_no_release(T)
     && !is_move_only_collection(T)) {   // don't confuse List itself
   error(...,
-    "type '%s' has a destructor and is not trivially relocatable; "
-    "List/Set/Map store elements by bitwise copy. "
-    "Use List<%s*>.owns(), or mark [[trivially_relocatable]] if bitwise moves are safe",
+    "type '%s' has a destructor and is not marked [[copyable_no_release]]; "
+    "List/Set/Map store elements by bitwise copy, so each copy would run ~T. "
+    "Use List<%s*>.owns(), or mark [[copyable_no_release]] if the destructor "
+    "does not release unique resources (counting/log-only)",
     name, name);
 }
 ```
@@ -410,7 +448,7 @@ if (element is TM_CLASS
 Attribute (parser + type flag):
 
 ```c
-[[trivially_relocatable]]
+[[copyable_no_release]]
 class Probe {
     int id;
     ~Probe() { /* counting only — no free of shared bits */ }
@@ -431,7 +469,7 @@ Ship **error** once attribute exists; **warning** is OK for first PR if you want
 Counting-dtor tests should use:
 
 ```c
-[[trivially_relocatable]]
+[[copyable_no_release]]
 class Track {
     int id;
     ~Track() { count++; }
@@ -454,7 +492,7 @@ class Pod { int x; Pod(int x) { this.x = x; } };
 // List<Pod> compiles
 
 // Positive: attribute
-[[trivially_relocatable]]
+[[copyable_no_release]]
 class Counted {
     int x;
     Counted(int x) { this.x = x; }
@@ -476,16 +514,16 @@ class Counted {
 
 For automated suite: keep negative case in a separate file run with “expect fail”, or only document until runner supports expected-fail.
 
-#### Done criteria (P1)
+#### Done criteria (P1) — status
 
-- [ ] Non-relocatable + dtor as List element → diagnostic
-- [ ] POD / `String` / pointer elements unchanged
-- [ ] Existing byval tests annotated `[[trivially_relocatable]]` if they have counting dtors
-- [ ] Map/Set share the same helper
+- [x] Non-relocatable + dtor as List element → diagnostic
+- [x] POD / `String` / pointer elements unchanged
+- [x] Existing byval tests annotated `[[copyable_no_release]]` if they have counting dtors
+- [x] Map/Set share the same helper
 
 ---
 
-### P2 — Documented memory contract + showcase  🟡 **usability**
+### P2 — Documented memory contract + showcase  ✅ **DONE**
 
 #### House style block (paste into GENERICSMEM + README)
 
@@ -529,11 +567,11 @@ owned auto heap = new List<int>();
 | `README.md` collections blurb | Point at this file + GENERICSMEM |
 | `include/list.h` banner | Keep move-only + brace samples (already partially done) |
 
-#### Done criteria (P2)
+#### Done criteria (P2) — status
 
-- [ ] GENERICSMEM TL;DR matches dual path
-- [ ] neon-grid comments not lying
-- [ ] Cross-link: README → `BY-VALUE.md` / GENERICSMEM
+- [x] GENERICSMEM TL;DR matches dual path
+- [x] neon-grid comments not lying
+- [x] Cross-link: README → `BY-VALUE.md` / GENERICSMEM
 
 ---
 
@@ -565,12 +603,14 @@ Document: class keys = memcmp / byte `==` only; prefer `int`/`String` keys.
 
 ---
 
-### P5 — Edge polish (later)
+### P5 — Edge polish (partially done)
 
 | Item | Notes |
 |------|--------|
-| `arr[i] = T(...)` on C arrays | prvalue / assign lowering |
-| Nested ctor `T(-p.getX(), …)` | earlier f-string/method nesting bugs |
+| `arr[i] = T(...)` on C arrays | ✅ elements now destroyed at scope exit (constant bound; VLAs exempt) — `val-056` |
+| Nested ctor `T(-p.getX(), …)` | ✅ already works (verified with probe — struck) |
+| Bare `T(...);` expression-statement temps | still leaks (low value) |
+| Class-prvalue arg to another prvalue's ctor (`Box(Box2(1))`) | not destroyed (edge) |
 | `ToJson` on `List<class>` | keep `ToJsonArrayBy`; no auto object schema required |
 | Sort + element with String | arena makes it usually OK; don’t promise deep move semantics |
 
@@ -685,27 +725,31 @@ And dtor counts under prvalue Add are exact (P0).
 
 5. **Auto + class value:** `auto x = List<int>()` works via class-name call detection in auto inference — keep that path when refactoring prvalues.
 
+6. **Parse-time resolution for the P1 gate:** class symbols enter check-time scopes only *after* `get_or_create_specialization` runs, so the gate resolves element classes through a parse-time registry (`parsed_classes` / `copyable_no_release_classes` VARRs fed by the declaration parser), not `find_def`.
+
+7. **Every new `struct expr` field must be initialized in `create_expr`** (reg_malloc is not zero-fill).  `hoist_call_p` was added without an initializer; garbage bits randomly marked plain calls as loop-invariant-pure, and the while back-edge then reused a stale pre-header value → infinite loop (`gcc/20010129-1.c`).  See CLASSYC-FINDINGS.md §10.
+
 ---
 
 ## 11. Checklist (copy into PR / notes)
 
 ```text
 P0 prvalue lifetime
-[ ] Strict dtor-count repro
-[ ] Relocate or full-expr destroy
-[ ] val-040 green
-[ ] val-038/039/test-list-byval green
+[x] Strict dtor-count repro            (sketch/probe-p0-*.cy)
+[x] Relocate or full-expr destroy      (temp dtor after consuming call)
+[x] val-056 green                      (val-040/041 names were taken)
+[x] val-038/039/test-list-byval green
 
 P1 element gate
-[ ] class_is_safe_byvalue_element_p (+ attribute if ready)
-[ ] Gate List/Set/Map specialization
-[ ] Annotate counting-dtor test types
-[ ] val-041 or documented expected-fail
+[x] class_is_safe_byvalue_element_p equivalent (parse-time registry + gate)
+[x] Gate List/Set/Map specialization
+[x] Annotate counting-dtor test types
+[x] val-056 + negative probe (probe-p1 must not compile)
 
 P2 docs
-[ ] GENERICSMEM TL;DR dual path
-[ ] neon-grid caveats updated
-[ ] README link to BY-VALUE.md
+[x] GENERICSMEM TL;DR dual path          (+ gate row/rule added)
+[x] neon-grid caveats updated            (comment now reflects enforcement)
+[x] README link to BY-VALUE.md           (Memory Management → .owns() section)
 ```
 
 ---

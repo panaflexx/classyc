@@ -36,6 +36,7 @@ class Peer<T> {
 
 /* ── domain DTO for ListView ────────────────────────────────────────────── */
 
+[[copyable_no_release]]
 class Ship {
     int    id;
     int    credits;

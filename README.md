@@ -382,8 +382,10 @@ Rules of thumb:
 - **Exactly one owner per object** for `T*`. Views from `Where`/`Copy`/`Take`
   never steal `.owns()`.
 - **By-value elements** already destroy via `__destroy` (no `.owns()`).
-- Prefer **quiet** destructors on types stored by value (side-effect `printf`/`free`
-  in `~T` multiplies under `Copy`/`Where`).
+- **Dtor-bearing element types are gated:** a class whose destructor frees a
+  unique resource is a *compile error* as a by-value element (bitwise
+  relocation would double-free). Mark quiet dtors (counting/logging, `String`
+  fields) `[[copyable_no_release]]`, or use `List<T*>.owns()`.
 
 See `include/list.h`, `set.h`, and `map.h`.
 
@@ -847,6 +849,10 @@ diagnostics:
 - **Redundant `delete` of an `owned` binding** — a `warning`: the compiler
   already releases it at scope exit, so an explicit `delete` is unnecessary
   (and would risk a double free).
+- **Non-relocatable by-value elements** — an `error`: `List`/`Set`/`Map`
+  relocate class elements bitwise, so an element type with a resource-freeing
+  destructor is rejected unless marked `[[copyable_no_release]]` (use
+  pointer elements with `.owns()`/`.ownsValues()` instead).
 
 Soft-keyword notes: `move` and `readonly` are **expression-leading** soft
 keywords — like `detach`/`new`, they only shadow an identifier when they start
@@ -1279,6 +1285,14 @@ objects they point to — `delete list` frees only the container. Mark it `.owns
 to transfer ownership: deleting the collection then runs each element's
 destructor and frees it, with no manual cleanup loop.
 
+> **By-value vs pointer elements:** small DTOs can also live *by value* in a
+> stack collection (`auto laps = List<LapSample>(); laps.Add(LapSample(...));`)
+> — the container owns a heap buffer, elements are stored inline, and `~List`
+> destroys them at scope exit. Collections are move-only (`b = move a`). A
+> class whose destructor frees a unique resource is **rejected** as a by-value
+> element unless marked `[[copyable_no_release]]` (use `List<T*>.owns()`
+> for those). Full contract: [`DOC/BY-VALUE.md`](DOC/BY-VALUE.md).
+
 ```c
 auto library = new List<Track*>().owns();   // owns the Tracks
 library->Add(new Track("Kashmir", 508));
@@ -1349,11 +1363,15 @@ array), Phase 2), a lightweight **SQLite wrapper** (`include/sqlite.h`) with
 `dict`-row binding and `List<dict>` result sets, and a **gunicorn-style HTTP
 server** library (`include/httpserve.h`).
 In-progress directions include Phase 3 of the JSON binder (`Map<K,V>*` and
-pointer-to-class elements, plus per-field annotations), full-expression temp
-dtors, and AOT dead-code elimination.
+pointer-to-class elements, plus per-field annotations) and AOT dead-code
+elimination. Landed on the correctness side: **class prvalue temporary
+destructors** (`take(Box(7))`, `Box(9).getId()` — temps now destroyed exactly
+once after the consuming call), the **`[[copyable_no_release]]` element
+gate** for by-value containers, and **scope-exit dtors for C arrays of
+dtor-bearing classes** (`Pt arr[2];`).
 
 The behavior described in this README is exercised by the executable validation
-suite in **[`cy-validate/`](cy-validate/)** (**53** `val-*.cy` files; run
+suite in **[`cy-validate/`](cy-validate/)** (**58** `val-*.cy` files; run
 `sh cy-validate/run-validate.sh`). Bug regressions: `sh bugs/run-bugs.sh`.
 Known rough edges and their workarounds are catalogued in
 **[`cy-validate/SHORTCOMINGS.md`](cy-validate/SHORTCOMINGS.md)**.
@@ -1404,8 +1422,9 @@ Contributions, bug reports, and wild ideas are welcome!
   prvalue bind, value-returning LINQ transforms (including **GroupBy** →
   `Map<G, List<V>>` and stack **Select**), nested `List<List<T>>` /
   `Map<G, List<V>>`, GetMut/`[]` lvalues, capturing **Find** / **Sort** /
-  **Select**. Remaining: full-expression temp dtors. See `CLASSYC-CLEANUP.md`
-  and `BY-VALUE.md`.
+  **Select**. Also landed: class prvalue temp dtors at the consuming call,
+  the `[[copyable_no_release]]` element gate, and C-array element dtors.
+  See `CLASSYC-CLEANUP.md` and `BY-VALUE.md`.
 - ~~Uncaught exception → clean exit~~ **(landed)** — print + `exit(1)`; shift-range
   safety traps; `sh bugs/run-bugs.sh`.
 - Richer `List<T>` / `Map<K,V>` syntactic sugar and initializer syntax (more Pythonic comprehensions, better literal support).

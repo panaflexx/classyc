@@ -210,9 +210,10 @@ README:
 List<int> nums = {1, 2, 3};
 nums = nums.Filter((int x) => x > 1).Map((int x) => x * 2);
 ```
-* `List<int> nums = {1,2,3}` (value, non-pointer) still warns
-  `assigning integer without cast to pointer` — `List<T>` is a reference type;
-  use the heap idiom `new List<int>{...}` and `->`.
+* `List<int> nums = {1,2,3}` (value, non-pointer): **FIXED** — stack/value
+  collections now exist (`auto xs = List<int>();`, `b = move a`, brace-init
+  `new List<Pt>{ Pt(1,2) }`; validated in `val-038`/`val-039`/`val-040`).
+  The heap idiom `new List<int>{...}` and `->` still works too.
 * `Map` now **exists** on `List<T>` (`include/list.h`), as a same-type transform
   `List<T>* Map(T(*fn)(T))` that chains with `Filter`/`ForEach`. (A cross-type
   `T -> U` map would need a second type parameter; for that, use the lowercase
@@ -232,9 +233,9 @@ Wizard w = Wizard(5, 1, 'L');   // now works: in-place ctor + ~Wizard() at scope
 Stack value-construction with constructor arguments now works for plain
 classes: `Point p = Point(1, 2);` runs the constructor in place and the
 destructor at scope exit (RAII, no `new`/`delete` needed).  The **generic
-collections** (`List<T>` / `Set<T>` / `Map<K,V>`) remain reference types only —
-instantiate them with `new` (a bare `Map<K,V> m = ...` value expression does
-not parse).
+collections** (`List<T>` / `Set<T>` / `Map<K,V>`) also have a stack/value
+form now (`auto xs = List<Pt>();`, move-only transfer; `val-038`–`val-040`)
+in addition to the heap `new` form.
 
 ---
 

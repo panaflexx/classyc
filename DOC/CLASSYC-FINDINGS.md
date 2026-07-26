@@ -308,6 +308,34 @@ reason to treat `List*` as a C array of Lists.
 * `examples/test-generic-ptr-args.cy`: `List<char*>*` bracket Get/Set  
 * `sh bugs/run-bugs.sh` available  
 
+## 10. Uninitialized `expr` bit-field → phantom LICM hang (2026-07-25) [validated]
+
+**Bug:** `gcc/20010129-1.c` hung at -O1+ (infinite loop in `foo`'s while).
+
+**Root cause:** `create_expr` (`classyc.c`) does not zero-fill (`reg_malloc`),
+and `hoist_call_p` was added to `struct expr` (midopt R-LICM) without being
+initialized there.  Garbage in that bit randomly marked ordinary calls
+(`baz1`, even `abort`) as "loop-invariant pure": gen then memoized the
+call's pre-header result (`gen_hoist_store`) and the while back-edge
+condition reused the **stale** value instead of re-calling — the loop guard
+never changed → infinite loop.  Flaky/body-dependent because it depended on
+heap garbage (an unrelated inner `for` changed the allocation layout and
+flipped the bit).
+
+**Fix:** one line — `e->hoist_call_p = FALSE;` in `create_expr`.  Any new
+`struct expr` field must be initialized there (the function already warns
+about zero-fill for `def_node`).
+
+**Verified:** 20010129-1.c exits 0 at -O1/-O2/-O3; full sweep of 655
+gcc c-tests: 0 hangs / 0 crashes; cy-validate 58/58 green.
+
+**Known separate issue (upstream, not classyc):** at `-O0`, any
+address-of-local (`void *p = &n;`) trips
+`mir-gen.c: transform_addr: Assertion 'loc > ST1_HARD_REG'`.  Reproduces
+with upstream `c2m` too — pre-existing MIR backend bug, out of classyc scope.
+
+---
+
 Related: [`CLASSYC-CLEANUP.md`](CLASSYC-CLEANUP.md), [`BY-VALUE.md`](BY-VALUE.md),
 [`GENERICSMEM.md`](GENERICSMEM.md), [`LAMBDA-CAPTURE.md`](LAMBDA-CAPTURE.md),
 [`sketch/OPEN-ISSUES-PRIORITY.md`](sketch/OPEN-ISSUES-PRIORITY.md).

@@ -5057,6 +5057,8 @@ struct parse_ctx {
   VARR (generic_method_tmpl_t) * generic_method_templates;
   VARR (generic_method_spec_t) * generic_method_specs;
   VARR (cstr_t) * generic_in_progress;
+  VARR (node_t) * copyable_no_release_classes; /* N_CLASS nodes marked [[copyable_no_release]] */
+  VARR (node_t) * parsed_classes;      /* every N_CLASS definition/forward decl (parse-time) */
   /* Method type params currently being parsed (Select<U>): treated like outer
      class type params for nested-specialization placeholder purposes. */
   int n_method_type_params;
@@ -5092,6 +5094,8 @@ struct parse_ctx {
 #define generic_method_templates parse_ctx->generic_method_templates
 #define generic_method_specs parse_ctx->generic_method_specs
 #define generic_in_progress parse_ctx->generic_in_progress
+#define copyable_no_release_classes parse_ctx->copyable_no_release_classes
+#define parsed_classes parse_ctx->parsed_classes
 #define n_method_type_params parse_ctx->n_method_type_params
 #define method_type_params parse_ctx->method_type_params
 
@@ -5716,6 +5720,32 @@ static int attr_list_has_da_ignore (node_t attrs) {
     if (aname != NULL && aname->code == N_ID && aname->u.s.s != NULL
         && (strcmp (aname->u.s.s, "da_ignore") == 0
             || strcmp (aname->u.s.s, "classyc_da_ignore") == 0))
+      return 1;
+  }
+  return 0;
+}
+
+/* True if `attrs` names `copyable_no_release`: the user asserts the class
+   is safe to store by value in List/Set/Map — bitwise copies may each run
+   ~T, so the dtor must not release unique resources (e.g. counting/log-only).
+   Same list shapes as attr_list_has_da_ignore. */
+static int attr_list_has_copyable_no_release (node_t attrs) {
+  if (attrs == NULL) return 0;
+  if (attrs->code == N_ATTR) {
+    node_t aname = NL_HEAD (attrs->u.ops);
+    return (aname != NULL && aname->code == N_ID && aname->u.s.s != NULL
+            && strcmp (aname->u.s.s, "copyable_no_release") == 0);
+  }
+  if (attrs->code != N_LIST) return 0;
+  for (node_t aa = NL_HEAD (attrs->u.ops); aa != NULL; aa = NL_NEXT (aa)) {
+    if (aa->code == N_LIST) {
+      if (attr_list_has_copyable_no_release (aa)) return 1;
+      continue;
+    }
+    if (aa->code != N_ATTR) continue;
+    node_t aname = NL_HEAD (aa->u.ops);
+    if (aname != NULL && aname->code == N_ID && aname->u.s.s != NULL
+        && strcmp (aname->u.s.s, "copyable_no_release") == 0)
       return 1;
   }
   return 0;
@@ -6400,6 +6430,72 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
       if (ip && strcmp(ip, spec_name)==0) return build_id(c2m_ctx, spec_name, pos);
     }
   }
+  /* P1 by-value element gate: List/Set/Map store class elements BY VALUE and
+     bitwise-copy them (Add/Sort/Insert/Where/Copy can alias two slots).
+     An element whose destructor frees a unique resource would double-free.
+     Refuse dtor-bearing class elements unless the class is marked
+     [[copyable_no_release]] (dtor does not release unique resources).
+     Pointer elements and nested move-only collections (__generic_List/Map/Set)
+     are exempt. */
+  if (strcmp (base_name, "List") == 0 || strcmp (base_name, "Set") == 0
+      || strcmp (base_name, "Map") == 0) {
+    int n_check = strcmp (base_name, "Map") == 0 ? 2 : 1;
+    for (int ai = 0; ai < n_check && ai < n_args; ai++) {
+      node_t ta = args[ai];
+      node_t cdef = NULL;
+      int is_ptr = 0, marked = 0, has_dtor = 0;
+      while (ta != NULL && ta->code == N_POINTER) {
+        is_ptr = 1;
+        ta = NL_HEAD (ta->u.ops);
+      }
+      if (is_ptr || ta == NULL || ta->code != N_ID || ta->u.s.s == NULL) continue;
+      if (strncmp (ta->u.s.s, "__generic_", 10) == 0) continue; /* nested collection */
+      /* Resolve the element class via the parse-time registry: class symbols
+         enter check-time scopes only later, but every class definition was
+         recorded by the declaration parser.  Multiple entries per name are
+         possible (forward decl + definition): any marked node exempts, any
+         dtor-bearing definition trips the gate. */
+      for (size_t pi = 0; pi < VARR_LENGTH (node_t, parsed_classes); pi++) {
+        node_t pc = VARR_GET (node_t, parsed_classes, pi);
+        node_t cid = TAG_ID (pc);
+        node_t mlist;
+        int this_marked = 0;
+        if (cid == NULL || cid->code != N_ID || cid->u.s.s == NULL
+            || strcmp (cid->u.s.s, ta->u.s.s) != 0)
+          continue;
+        cdef = pc;
+        if (copyable_no_release_classes != NULL)
+          for (size_t ri = 0; ri < VARR_LENGTH (node_t, copyable_no_release_classes); ri++)
+            if (VARR_GET (node_t, copyable_no_release_classes, ri) == pc) {
+              this_marked = 1;
+              break;
+            }
+        if (this_marked) marked = 1;
+        mlist = TAG_MEMBER_LIST (pc);
+        if (mlist != NULL && mlist->code == N_LIST)
+          for (node_t mem = NL_HEAD (mlist->u.ops); mem != NULL; mem = NL_NEXT (mem)) {
+            node_t mid;
+            if (mem->code != N_FUNC_DEF) continue;
+            mid = DECL_ID (FUNC_DEF_DECL (mem));
+            if (mid != NULL && mid->code == N_ID && mid->u.s.s != NULL
+                && strncmp (mid->u.s.s, "__dtor_", 7) == 0) {
+              has_dtor = 1;
+              break;
+            }
+          }
+      }
+      if (cdef == NULL || marked || !has_dtor) continue;
+      error (c2m_ctx, pos,
+             "type '%s' has a destructor and is not marked [[copyable_no_release]]; "
+             "%s stores elements by bitwise copy (Add/Sort/Where/Copy), so each "
+             "copy would run ~%s and double-free unique resources. "
+             "Use pointer elements with .owns()/.ownsValues(), or mark the class "
+             "[[copyable_no_release]] if the destructor does not release unique "
+             "resources (counting/log-only)",
+             ta->u.s.s, base_name, ta->u.s.s);
+    }
+  }
+
   VARR_PUSH (cstr_t, generic_in_progress, spec_name);
 
   /* Collect local/nested class type args for later hoist into top_scope
@@ -7924,6 +8020,22 @@ D (declaration) {
           // Add implicit typedef to the spec list
           node_t typedef_node = new_pos_node (c2m_ctx, N_TYPEDEF, POS (spec_node));
           op_prepend (c2m_ctx, spec, typedef_node);
+          break;
+        }
+      }
+    }
+
+    /* Parse-time class registry (by name) for the by-value element gate in
+       get_or_create_specialization: at specialization time class symbols are
+       not yet in check-time scopes, so the gate consults this list instead.
+       [[copyable_no_release]] class Foo { ... } also marks the N_CLASS. */
+    if (is_class_typedef) {
+      int marked = (lead_attrs != NULL && attr_list_has_copyable_no_release (lead_attrs));
+      for (node_t spec_node = NL_HEAD (spec->u.ops); spec_node != NULL;
+           spec_node = NL_NEXT (spec_node)) {
+        if (spec_node->code == N_CLASS) {
+          VARR_PUSH (node_t, parsed_classes, spec_node);
+          if (marked) VARR_PUSH (node_t, copyable_no_release_classes, spec_node);
           break;
         }
       }
@@ -10856,6 +10968,8 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (generic_method_tmpl_t, generic_method_templates, alloc, 4);
   VARR_CREATE (generic_method_spec_t, generic_method_specs, alloc, 8);
   VARR_CREATE (cstr_t, generic_in_progress, alloc, 8);
+  VARR_CREATE (node_t, copyable_no_release_classes, alloc, 4);
+  VARR_CREATE (node_t, parsed_classes, alloc, 16);
   n_method_type_params = 0;
   for (int i = 0; i < 4; i++) method_type_params[i] = NULL;
   builtin_methods_init (alloc);
@@ -17083,6 +17197,57 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           }
         }
       }
+      /* P5: stack arrays of dtor-bearing class elements (`Pt arr[2];`) leak
+         their elements at scope exit (arrays never got the RAII treatment
+         above, which requires a plain TM_CLASS).  Synthesize per-element
+         `arr[i].__dtor_T()` calls (reverse order, like C++) as the decl's
+         dtor_call so the defer machinery runs them at every scope exit.
+         Constant bound only — VLAs of class elements are not destroyed. */
+      if (decl_node->code == N_SPEC_DECL && declarator->code == N_DECL && id != NULL
+          && id->code == N_ID && scope != NULL && scope->code == N_BLOCK && !param_p
+          && !decl->decl_spec.typedef_p && !decl->decl_spec.static_p
+          && !decl->decl_spec.extern_p && !decl->decl_spec.thread_local_p
+          && decl->decl_spec.type->mode == TM_ARR
+          && decl->decl_spec.type->u.arr_type != NULL
+          && decl->decl_spec.type->u.arr_type->el_type != NULL
+          && decl->decl_spec.type->u.arr_type->el_type->mode == TM_CLASS
+          && decl->decl_spec.type->u.arr_type->el_type->u.tag_type != NULL) {
+        struct arr_type *at = decl->decl_spec.type->u.arr_type;
+        struct expr *asz = at->size != NULL ? at->size->attr : NULL;
+        node_t etag = at->el_type->u.tag_type;
+        node_t ecid = NL_HEAD (etag->u.ops);
+        long long anel = (asz != NULL && asz->const_p) ? asz->c.i_val : 0;
+        char dnm[320];
+        node_t arr_dtor_id;
+        if (ecid != NULL && ecid->code == N_ID && anel > 0 && anel <= 4096) {
+          snprintf (dnm, sizeof (dnm), "__dtor_%s", ecid->u.s.s);
+          arr_dtor_id = build_id (c2m_ctx, dnm, POS (id));
+          if (find_def (c2m_ctx, S_REGULARS, arr_dtor_id, scope, NULL) != NULL
+              || find_def (c2m_ctx, S_REGULARS, arr_dtor_id, top_scope, NULL) != NULL) {
+            node_t blk = new_node (c2m_ctx, N_LIST);
+            int arr_ok = TRUE;
+            unsigned arr_saved;
+            for (long long ai = anel - 1; ai >= 0; ai--) {
+              node_t dc
+                = new_pos_node2 (c2m_ctx, N_CALL, POS (id),
+                                 new_pos_node2 (c2m_ctx, N_FIELD, POS (id),
+                                                new_pos_node2 (c2m_ctx, N_IND, POS (id),
+                                                               copy_node (c2m_ctx, id),
+                                                               new_i_node (c2m_ctx, (long) ai,
+                                                                           POS (id))),
+                                                build_id (c2m_ctx, dnm, POS (id))),
+                                 new_node (c2m_ctx, N_LIST));
+              arr_saved = n_errors;
+              check (c2m_ctx, dc, decl_node);
+              if (n_errors != arr_saved) { arr_ok = FALSE; break; }
+              op_append (c2m_ctx, blk,
+                         new_pos_node2 (c2m_ctx, N_EXPR, POS (id),
+                                        new_node (c2m_ctx, N_LIST), dc));
+            }
+            if (arr_ok) decl->dtor_call = blk;
+          }
+        }
+      }
       if (initializer == NULL || initializer->code == N_IGNORE) return;
       if (incomplete_type_p (c2m_ctx, decl->decl_spec.type)
           && (decl->decl_spec.type->mode != TM_ARR
@@ -17209,6 +17374,10 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       e->def_node = NULL;
       e->const_p = e->const_addr_p = e->builtin_call_p = FALSE;
       e->elide_oob_p = FALSE;
+      /* hoist_call_p MUST be cleared: reg_malloc garbage here randomly marks
+         calls as "loop-invariant pure", making gen reuse a stale pre-header
+         value at a loop back-edge (infinite loop — gcc/20010129-1.c). */
+      e->hoist_call_p = FALSE;
       e->bind_p = e->lenient_p = FALSE;
       e->own_deref_class = DEREF_GUARD_DEFAULT;
       e->mut_sub_p = 0;
@@ -29297,6 +29466,67 @@ static void gen_hoist_store (c2m_ctx_t c2m_ctx, node_t call, op_t op) {
   hoist_n++;
 }
 
+/* ── P0: class prvalue temporary destruction ─────────────────────────────
+   `ClassName(args)` value temporaries live in the reusable call-arg area
+   and were never destroyed: `take(Box(7))` and `Pt(1,2).getX()` leaked any
+   resource the temp owned (BY-VALUE.md P0, refined: Add/brace-init were
+   already balanced — the container adopts the temp's bits).
+
+   Fix: when a call consumes a class prvalue (as a by-value argument or as
+   the receiver of a method call), emit `~T` for the temp right after the
+   call.  Two deliberate exceptions (temp kept alive, as before):
+     - adopting protocol methods (List/Set/Map Add/Set/Insert/Push/Enqueue
+       on a move-only collection): the container now owns the value and its
+       dtor will run __destroy — destroying the temp too would double-free;
+     - calls returning a pointer (e.g. `Owns(1).str()`, `p.withX(3)`
+       chaining): the result may alias the temp's storage. */
+
+/* TRUE iff NODE is a `ClassName(args)` value-construction call producing a
+   stack temporary (same guard as the prvalue gen in case N_CALL). */
+static int class_prvalue_call_p (node_t n) {
+  struct expr *e;
+  if (n == NULL || n->code != N_CALL) return FALSE;
+  e = n->attr;
+  return (e != NULL && e->builtin_call_p && e->type != NULL && e->type->mode == TM_CLASS
+          && NL_HEAD (n->u.ops) != NULL && NL_HEAD (n->u.ops)->code == N_ID);
+}
+
+/* Emit `__dtor_<Class>(addr)` for a class prvalue temporary. */
+static void gen_class_temp_dtor (c2m_ctx_t c2m_ctx, struct type *class_type, op_t addr) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  node_t ddef;
+  decl_t dd;
+  struct func_type *dft;
+  MIR_item_t dproto;
+  char dpname[64];
+  size_t dops;
+
+  if (class_type == NULL || class_type->mode != TM_CLASS) return;
+  ddef = find_class_dtor_def (c2m_ctx, class_type->u.tag_type);
+  if (ddef == NULL || ddef->code != N_FUNC_DEF || ddef->attr == NULL) return;
+  dd = ddef->attr;
+  if (dd->u.item == NULL) return;
+  dft = dd->decl_spec.type->u.func_type;
+  collect_args_and_func_types (c2m_ctx, dft);
+  sprintf (dpname, "__tempdtorproto%d", new_proto_count++);
+  dproto = MIR_new_proto_arr (ctx, dpname,
+                              VARR_LENGTH (MIR_type_t, proto_info.ret_types),
+                              VARR_ADDR (MIR_type_t, proto_info.ret_types),
+                              VARR_LENGTH (MIR_var_t, proto_info.arg_vars),
+                              VARR_ADDR (MIR_var_t, proto_info.arg_vars));
+  move_item_to_module_start (curr_func->module, dproto);
+  dops = VARR_LENGTH (MIR_op_t, call_ops);
+  VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, dproto));
+  VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, dd->u.item));
+  VARR_PUSH (MIR_op_t, call_ops, addr.mir_op);
+  emit_insn (c2m_ctx,
+             MIR_new_insn_arr (ctx, MIR_CALL,
+                               VARR_LENGTH (MIR_op_t, call_ops) - dops,
+                               VARR_ADDR (MIR_op_t, call_ops) + dops));
+  VARR_TRUNC (MIR_op_t, call_ops, dops);
+}
+
 static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_t false_label,
                  int val_p, op_t *desirable_dest, int *expect_res) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
@@ -31319,6 +31549,20 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
           if (try_open_code_dense_accessor (c2m_ctx, acc_def, this_op, uargs, i, NULL,
                                             &oc_res, sflags)) {
             res = oc_res;
+            /* P0: destroy a prvalue receiver temp (e.g. `List<int>().Count()`),
+               unless the accessor returns a pointer that may alias the temp's
+               storage (GetMut & co. — keep the temp alive, as before). */
+            if (class_prvalue_call_p (mobj)) {
+              decl_t acc_d = acc_def->attr;
+              struct type *acc_ret
+                = (acc_d != NULL && acc_d->decl_spec.type != NULL)
+                    ? acc_d->decl_spec.type->u.func_type->ret_type
+                    : NULL;
+              struct expr *mobj_e2 = mobj->attr;
+              if ((acc_ret == NULL || acc_ret->mode != TM_PTR) && mobj_e2 != NULL
+                  && class_has_dtor_p (c2m_ctx, mobj_e2->type))
+                gen_class_temp_dtor (c2m_ctx, mobj_e2->type, this_op);
+            }
             goto finish;
           }
           /* Predicate said open-codeable but emit failed — fall through to
@@ -31660,6 +31904,35 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       param_list = func_type->u.func_type->param_list;
       param = NL_HEAD (param_list->u.ops);
       int arg_num = 0;
+      /* P0: class-prvalue args/receiver temps to destroy after this call. */
+      node_t pv_nodes[32];
+      op_t pv_ops[32];
+      int pv_recv_p[32], n_pv = 0;
+      /* Pointer-returning calls may alias the temp in their result — keep
+         the temp alive (conservative; same as before P0). */
+      int ret_ptr_p = func_type->u.func_type->ret_type != NULL
+                      && func_type->u.func_type->ret_type->mode == TM_PTR;
+      /* Adopting protocol method on a move-only collection?  The container
+         takes over the value — its dtor owns it, do not also destroy the
+         temp (would double-free). */
+      int adopting_call_p = FALSE;
+      if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
+        node_t mobj = NL_HEAD (func->u.ops);
+        node_t mid = mobj != NULL ? NL_NEXT (mobj) : NULL;
+        struct expr *mobj_e = mobj != NULL ? mobj->attr : NULL;
+        struct type *mt = mobj_e != NULL ? mobj_e->type : NULL;
+        struct type *mc = (mt != NULL && mt->mode == TM_CLASS) ? mt
+                          : (mt != NULL && mt->mode == TM_PTR && mt->u.ptr_type != NULL
+                             && mt->u.ptr_type->mode == TM_CLASS)
+                            ? mt->u.ptr_type
+                            : NULL;
+        if (mc != NULL && mid != NULL && mid->code == N_ID && mid->u.s.s != NULL
+            && class_is_move_only_collection_p (c2m_ctx, mc)
+            && (strcmp (mid->u.s.s, "Add") == 0 || strcmp (mid->u.s.s, "Set") == 0
+                || strcmp (mid->u.s.s, "Insert") == 0 || strcmp (mid->u.s.s, "Push") == 0
+                || strcmp (mid->u.s.s, "Enqueue") == 0))
+          adopting_call_p = TRUE;
+      }
       /* Instance method: param list starts with the synthetic `this` pointer.
          Null-check that receiver once at the call site (body treats `this` as
          DEREF_GUARD_SAFE).  Elide when ownership stamped SAFE on the receiver
@@ -31679,6 +31952,23 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         e = arg->attr;
         struct_p = e->type->mode == TM_STRUCT || e->type->mode == TM_UNION || e->type->mode == TM_CLASS;
         op2 = gen (c2m_ctx, arg, NULL, NULL, !struct_p, NULL, NULL);
+        /* P0: capture class-prvalue temps (by-value arg, or the injected
+           N_ADDR receiver of a method call on a prvalue) for destruction
+           right after the call. */
+        if (n_pv < 32 && !ret_ptr_p) {
+          node_t pvn = NULL;
+          if (arg->code == N_ADDR && class_prvalue_call_p (NL_HEAD (arg->u.ops)))
+            pvn = NL_HEAD (arg->u.ops); /* method receiver temp */
+          else if (struct_p && class_prvalue_call_p (arg))
+            pvn = arg; /* by-value class argument temp */
+          if (pvn != NULL
+              && class_has_dtor_p (c2m_ctx, ((struct expr *) pvn->attr)->type)) {
+            pv_nodes[n_pv] = pvn;
+            pv_ops[n_pv] = op2;
+            pv_recv_p[n_pv] = (arg->code == N_ADDR);
+            n_pv++;
+          }
+        }
         if (method_this_null_check_p && arg_num == 1 && !struct_p) {
           int elide = (arg->code == N_ADDR)
                       || (e != NULL && e->own_deref_class == DEREF_GUARD_SAFE);
@@ -31730,6 +32020,19 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       MIR_append_insn (ctx, curr_func, call_insn);
       res = target_gen_post_call_res_code (c2m_ctx, func_type->u.func_type->ret_type, res,
                                            call_insn, ops_start);
+      /* P0: destroy class-prvalue temporaries consumed by this call (LIFO),
+         before the call-arg area is reused.  Adopted values (Add/Set/…) are
+         owned by the container now; the receiver temp is always destroyed. */
+      for (int _pvi = n_pv - 1; _pvi >= 0; _pvi--) {
+        struct type *pt;
+        op_t addr;
+        if (adopting_call_p && !pv_recv_p[_pvi]) continue;
+        pt = ((struct expr *) pv_nodes[_pvi]->attr)->type;
+        addr = pv_ops[_pvi].mir_op.mode == MIR_OP_MEM
+                 ? mem_to_address (c2m_ctx, pv_ops[_pvi], TRUE)
+                 : pv_ops[_pvi];
+        gen_class_temp_dtor (c2m_ctx, pt, addr);
+      }
     }
     curr_call_arg_area_offset = saved_call_arg_area_offset_before_args;
     VARR_TRUNC (MIR_op_t, call_ops, ops_start);

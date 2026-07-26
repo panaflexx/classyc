@@ -16,7 +16,7 @@ and [`CLASSYC-CLEANUP.md`](CLASSYC-CLEANUP.md).
 | scalars | ✅ | ✅ | ✅ | inline |
 | `String` | ✅ | ✅ | ✅ | content hash/eq for keys |
 | pointers / `MyClass*` | ✅ | ✅ | ✅ | identity; optional `.owns()` |
-| **by-value class** | ✅ | ✅ | ✅ | inline + `__destroy` on Clear/delete |
+| **by-value class** | ✅ | ✅ | ✅ | inline + `__destroy` on Clear/delete; dtor-bearing `T` needs `[[copyable_no_release]]` |
 
 | Shell (the collection object) | Status |
 |-------------------------------|--------|
@@ -51,7 +51,11 @@ auto top   = quick.Take(3);
 Rule of thumb:
 
 * **Shell** — prefer stack value; `owned`/`new` when it must escape.  
-* **Elements** — POD/DTO by value; domain objects as `T*` with **one** `.owns()` owner.  
+* **Elements** — POD/DTO by value; domain objects as `T*` with **one** `.owns()` owner.
+  A class with a **resource-freeing destructor** is a compile error as a
+  by-value element (bitwise relocation would double-free) — mark it
+  `[[copyable_no_release]]` if its dtor is quiet (counting/log-only), or use
+  `List<T*>.owns()` (BY-VALUE.md P1).  
 * **Views** — never copy `_owns_ptrs` onto Where/Copy/Take results.
 
 ---
@@ -67,6 +71,8 @@ A `List<T>` buffer is `sizeof(T) * capacity`.
 
 Prefer **no user dtor** (or only quiet counters) on list-element DTOs if the type
 is bitwise relocated; use `List<T*>.owns()` when `T` needs a real destructor.
+The compiler **enforces** this: a dtor-bearing class element is rejected unless
+marked `[[copyable_no_release]]`.
 
 ---
 

@@ -36,6 +36,7 @@ enum Faction { free_traders = 0, imperial = 1, corsair = 2, syndicate = 3 };
 enum Goods   { ore = 0, spice = 1, tech = 2, weapons = 3, food = 4, luxury = 5,
                fuel = 6, meds = 7, scrap = 8, datachips = 9, artifacts = 10, water = 11 };
 
+[[copyable_no_release]] /* empty dtor — safe by-value List element */
 class Planet {
     int    id;
     String name;
@@ -64,6 +65,7 @@ class Planet {
     }
 };
 
+[[copyable_no_release]] /* empty dtor */
 class Outpost {
     int    id;
     String callsign;
@@ -99,6 +101,7 @@ class Outpost {
     }
 };
 
+[[copyable_no_release]] /* empty dtor */
 class Trader {
     int     id;
     String  name;
