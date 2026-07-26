@@ -5038,6 +5038,50 @@ typedef struct {
 
 DEF_VARR (iface_t);
 
+/* ── type_kind: compile-time category of a type for memory / copy policy ──
+ *
+ * Shared fact used by specialization gates, list/map element policy (later),
+ * ownership analysis, midopt, and diagnostics.  Not a nameof/typeof string —
+ * a semantic lattice of how T may be stored and destroyed.
+ *
+ *   TK_POD              scalars/enums/no-dtor pure data; bitwise multi-copy OK
+ *   TK_QUIET_VALUE      dtor present but does not release unique resources
+ *                       (counting/log-only, or [[copyable_no_release]] waiver)
+ *   TK_ARENA_VALUE      String-like; known arena / field copy policy
+ *   TK_UNIQUE_RESOURCE  dtor frees/deletes unique stuff — NOT List-by-value
+ *   TK_MOVE_ONLY        List/Map/Set shells — transfer with move, not assign
+ *   TK_POINTER          raw pointer type (elements handled via .owns() path)
+ *   TK_OPAQUE           cannot prove quiet vs unique — reject by-value elements
+ *
+ * Payoff:
+ *   Bug detection  — reject List<Owns>, double-free shapes, wrong owns()
+ *   Fun errors     — kind-specific messages with the right fix-it
+ *   Optimization   — POD/QUIET: memcpy + elide redundant destroys; UNIQUE:
+ *                    force pointer path; MOVE_ONLY: keep move-only checks
+ *   Ownership      — skip quiet by-value locals; track UNIQUE/pointers only
+ */
+typedef enum {
+  TK_POD = 0,
+  TK_QUIET_VALUE,
+  TK_ARENA_VALUE,
+  TK_UNIQUE_RESOURCE,
+  TK_MOVE_ONLY,
+  TK_POINTER,
+  TK_OPAQUE,
+} type_kind_t;
+
+/* Per-class parse-time cache: N_CLASS node → kind + attributes. */
+typedef struct class_type_meta {
+  node_t class_node;
+  type_kind_t kind;
+  unsigned copyable_no_release_p : 1; /* [[copyable_no_release]] on the class */
+  unsigned kind_valid_p : 1;
+  unsigned has_user_dtor_p : 1;
+  unsigned dtor_releases_p : 1; /* dtor AST calls free/delete/… */
+} class_type_meta_t;
+
+DEF_VARR (class_type_meta_t);
+
 struct parse_ctx {
   int record_level;
   size_t next_token_index;
@@ -5057,7 +5101,7 @@ struct parse_ctx {
   VARR (generic_method_tmpl_t) * generic_method_templates;
   VARR (generic_method_spec_t) * generic_method_specs;
   VARR (cstr_t) * generic_in_progress;
-  VARR (node_t) * copyable_no_release_classes; /* N_CLASS nodes marked [[copyable_no_release]] */
+  VARR (class_type_meta_t) * class_type_metas; /* type_kind cache + class attrs */
   VARR (node_t) * parsed_classes;      /* every N_CLASS definition/forward decl (parse-time) */
   /* Method type params currently being parsed (Select<U>): treated like outer
      class type params for nested-specialization placeholder purposes. */
@@ -5094,7 +5138,7 @@ struct parse_ctx {
 #define generic_method_templates parse_ctx->generic_method_templates
 #define generic_method_specs parse_ctx->generic_method_specs
 #define generic_in_progress parse_ctx->generic_in_progress
-#define copyable_no_release_classes parse_ctx->copyable_no_release_classes
+#define class_type_metas parse_ctx->class_type_metas
 #define parsed_classes parse_ctx->parsed_classes
 #define n_method_type_params parse_ctx->n_method_type_params
 #define method_type_params parse_ctx->method_type_params
@@ -5749,6 +5793,315 @@ static int attr_list_has_copyable_no_release (node_t attrs) {
       return 1;
   }
   return 0;
+}
+
+/* ── type_kind core (parse-time AST + check-time type API) ─────────────── */
+
+static const char *type_kind_name (type_kind_t k) {
+  switch (k) {
+  case TK_POD: return "POD";
+  case TK_QUIET_VALUE: return "QUIET_VALUE";
+  case TK_ARENA_VALUE: return "ARENA_VALUE";
+  case TK_UNIQUE_RESOURCE: return "UNIQUE_RESOURCE";
+  case TK_MOVE_ONLY: return "MOVE_ONLY";
+  case TK_POINTER: return "POINTER";
+  case TK_OPAQUE: return "OPAQUE";
+  default: return "?";
+  }
+}
+
+/* By-value List/Set/Map elements: only kinds that tolerate multi-owner
+   bitwise copies (each live slot may run ~T). */
+static int type_kind_ok_byvalue_element_p (type_kind_t k) {
+  return k == TK_POD || k == TK_QUIET_VALUE || k == TK_ARENA_VALUE;
+}
+
+/* Ownership pass cares about heap / unique resources, not quiet DTOs. */
+static int type_kind_tracks_resource_p (type_kind_t k) {
+  return k == TK_UNIQUE_RESOURCE || k == TK_MOVE_ONLY || k == TK_POINTER;
+}
+
+/* Midopt / gen: may use bulk memcpy of element slots without deep clone. */
+static int type_kind_bitwise_copy_safe_p (type_kind_t k) {
+  return k == TK_POD || k == TK_QUIET_VALUE || k == TK_ARENA_VALUE || k == TK_POINTER;
+}
+
+static class_type_meta_t *class_type_meta_find_ctx (c2m_ctx_t c2m_ctx, node_t class_node) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  if (class_node == NULL || parse_ctx == NULL || class_type_metas == NULL) return NULL;
+  for (size_t i = 0; i < VARR_LENGTH (class_type_meta_t, class_type_metas); i++) {
+    class_type_meta_t *m = &VARR_ADDR (class_type_meta_t, class_type_metas)[i];
+    if (m->class_node == class_node) return m;
+  }
+  return NULL;
+}
+
+static class_type_meta_t *class_type_meta_find_by_name (c2m_ctx_t c2m_ctx, const char *name) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  if (name == NULL || parse_ctx == NULL || class_type_metas == NULL) return NULL;
+  for (size_t i = 0; i < VARR_LENGTH (class_type_meta_t, class_type_metas); i++) {
+    class_type_meta_t *m = &VARR_ADDR (class_type_meta_t, class_type_metas)[i];
+    node_t cid;
+    if (m->class_node == NULL) continue;
+    cid = TAG_ID (m->class_node);
+    if (cid != NULL && cid->code == N_ID && cid->u.s.s != NULL
+        && strcmp (cid->u.s.s, name) == 0)
+      return m;
+  }
+  return NULL;
+}
+
+/* Walk dtor body: true if any call looks like a unique-resource release.
+   Shallow structural walk of blocks/lists/calls only. */
+static int ast_calls_unique_release_p (node_t n) {
+  node_t ch;
+  if (n == NULL) return 0;
+  if (n->code == N_DELETE) return 1;
+  if (n->code == N_CALL) {
+    node_t callee = CALL_FUNC (n);
+    node_t args;
+    const char *fn;
+    if (callee != NULL && callee->code == N_ID && callee->u.s.s != NULL) {
+      fn = callee->u.s.s;
+      if (strcmp (fn, "free") == 0 || strcmp (fn, "fclose") == 0
+          || strcmp (fn, "pclose") == 0 || strcmp (fn, "closedir") == 0
+          || strcmp (fn, "munmap") == 0 || strcmp (fn, "dlclose") == 0
+          || strcmp (fn, "close") == 0)
+        return 1;
+    }
+    args = CALL_ARGS (n);
+    if (args != NULL && args->code == N_LIST)
+      for (ch = NL_HEAD (args->u.ops); ch != NULL; ch = NL_NEXT (ch))
+        if (ast_calls_unique_release_p (ch)) return 1;
+    return 0;
+  }
+  if (n->code == N_FUNC_DEF)
+    return ast_calls_unique_release_p (FUNC_DEF_BLOCK (n));
+  if (n->code == N_BLOCK || n->code == N_LIST) {
+    for (ch = NL_HEAD (n->u.ops); ch != NULL; ch = NL_NEXT (ch))
+      if (ast_calls_unique_release_p (ch)) return 1;
+    return 0;
+  }
+  /* Expression statements wrap the call: N_EXPR (attrs, expr) */
+  if (n->code == N_EXPR || n->code == N_RETURN) {
+    for (ch = NL_HEAD (n->u.ops); ch != NULL; ch = NL_NEXT (ch))
+      if (ast_calls_unique_release_p (ch)) return 1;
+  }
+  return 0;
+}
+
+static int class_ast_find_dtor (node_t class_node, node_t *dtor_out) {
+  node_t mlist, mem, mid;
+  if (dtor_out) *dtor_out = NULL;
+  if (class_node == NULL || class_node->code != N_CLASS) return 0;
+  mlist = TAG_MEMBER_LIST (class_node);
+  if (mlist == NULL || mlist->code != N_LIST) return 0;
+  for (mem = NL_HEAD (mlist->u.ops); mem != NULL; mem = NL_NEXT (mem)) {
+    if (mem->code != N_FUNC_DEF) continue;
+    mid = DECL_ID (FUNC_DEF_DECL (mem));
+    if (mid != NULL && mid->code == N_ID && mid->u.s.s != NULL
+        && strncmp (mid->u.s.s, "__dtor_", 7) == 0) {
+      if (dtor_out) *dtor_out = mem;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Declarator is a pointer field: N_DECL with N_POINTER in the decl list. */
+static int declarator_has_pointer_p (node_t decl) {
+  node_t dl, x;
+  if (decl == NULL) return 0;
+  if (decl->code == N_POINTER) return 1;
+  if (decl->code != N_DECL) return 0;
+  dl = NL_EL (decl->u.ops, 1); /* declarator list */
+  if (dl == NULL) return 0;
+  if (dl->code == N_POINTER) return 1;
+  if (dl->code != N_LIST) return 0;
+  for (x = NL_HEAD (dl->u.ops); x != NULL; x = NL_NEXT (x)) {
+    if (x->code == N_POINTER) return 1;
+    if (x->code == N_FUNC) return 0; /* method, not a data field */
+  }
+  return 0;
+}
+
+/* One-level scan of a type-spec list for String. */
+static int specs_look_string_p (node_t specs) {
+  node_t ch;
+  if (specs == NULL) return 0;
+  if (specs->code == N_SHARE) specs = NL_HEAD (specs->u.ops);
+  if (specs == NULL) return 0;
+  if (specs->code == N_STRING) return 1;
+  if (specs->code == N_ID && specs->u.s.s != NULL
+      && strcmp (specs->u.s.s, "String") == 0)
+    return 1;
+  if (specs->code != N_LIST) return 0;
+  for (ch = NL_HEAD (specs->u.ops); ch != NULL; ch = NL_NEXT (ch)) {
+    if (ch->code == N_STRING) return 1;
+    if (ch->code == N_ID && ch->u.s.s != NULL && strcmp (ch->u.s.s, "String") == 0)
+      return 1;
+  }
+  return 0;
+}
+
+/* One-level scan for nested UNIQUE/OPAQUE/MOVE_ONLY class type names. */
+static int specs_name_unique_class_p (c2m_ctx_t c2m_ctx, node_t specs) {
+  node_t ch;
+  if (specs == NULL) return 0;
+  if (specs->code == N_SHARE) specs = NL_HEAD (specs->u.ops);
+  if (specs == NULL) return 0;
+  if (specs->code == N_ID && specs->u.s.s != NULL) {
+    class_type_meta_t *m = class_type_meta_find_by_name (c2m_ctx, specs->u.s.s);
+    if (m != NULL && m->kind_valid_p
+        && (m->kind == TK_UNIQUE_RESOURCE || m->kind == TK_OPAQUE
+            || m->kind == TK_MOVE_ONLY))
+      return 1;
+    return 0;
+  }
+  if (specs->code != N_LIST) return 0;
+  for (ch = NL_HEAD (specs->u.ops); ch != NULL; ch = NL_NEXT (ch)) {
+    if (ch->code == N_ID && ch->u.s.s != NULL) {
+      class_type_meta_t *m = class_type_meta_find_by_name (c2m_ctx, ch->u.s.s);
+      if (m != NULL && m->kind_valid_p
+          && (m->kind == TK_UNIQUE_RESOURCE || m->kind == TK_OPAQUE
+              || m->kind == TK_MOVE_ONLY))
+        return 1;
+    }
+  }
+  return 0;
+}
+
+static void class_ast_scan_fields (c2m_ctx_t c2m_ctx, node_t class_node,
+                                   int *has_raw_ptr_p, int *has_string_p,
+                                   int *has_unique_nested_p) {
+  node_t mlist, mem;
+  *has_raw_ptr_p = *has_string_p = *has_unique_nested_p = 0;
+  if (class_node == NULL) return;
+  mlist = TAG_MEMBER_LIST (class_node);
+  if (mlist == NULL || mlist->code != N_LIST) return;
+  for (mem = NL_HEAD (mlist->u.ops); mem != NULL; mem = NL_NEXT (mem)) {
+    node_t specs, declr;
+    if (mem->code != N_MEMBER) continue;
+    declr = MEMBER_DECL (mem);
+    if (declr == NULL || declr->code == N_IGNORE) continue;
+    /* Methods: N_DECL with N_FUNC in the declarator list — skip. */
+    if (declr->code == N_DECL) {
+      node_t dl = NL_EL (declr->u.ops, 1);
+      int is_method = 0;
+      if (dl != NULL && dl->code == N_LIST)
+        for (node_t x = NL_HEAD (dl->u.ops); x != NULL; x = NL_NEXT (x))
+          if (x->code == N_FUNC) { is_method = 1; break; }
+      if (is_method) continue;
+    }
+    specs = MEMBER_SPECS (mem);
+    if (declarator_has_pointer_p (declr) && !specs_look_string_p (specs))
+      *has_raw_ptr_p = 1;
+    if (specs_look_string_p (specs)) *has_string_p = 1;
+    if (specs_name_unique_class_p (c2m_ctx, specs)) *has_unique_nested_p = 1;
+  }
+}
+
+/* Classify a class from its AST (available at parse end of the class body). */
+static type_kind_t class_compute_kind_from_ast (c2m_ctx_t c2m_ctx, node_t class_node,
+                                                int copyable_no_release_p,
+                                                int *has_dtor_out, int *dtor_rel_out) {
+  node_t cid, dtor = NULL;
+  const char *nm;
+  int has_dtor, dtor_rel, has_raw_ptr, has_string, has_unique_nested;
+
+  if (has_dtor_out) *has_dtor_out = 0;
+  if (dtor_rel_out) *dtor_rel_out = 0;
+  if (class_node == NULL || class_node->code != N_CLASS) return TK_OPAQUE;
+
+  cid = TAG_ID (class_node);
+  nm = (cid != NULL && cid->code == N_ID) ? cid->u.s.s : NULL;
+  /* Monomorphized collection shells (and template mangles). */
+  if (nm != NULL
+      && (strncmp (nm, "__generic_List_", 15) == 0
+          || strncmp (nm, "__generic_Map_", 14) == 0
+          || strncmp (nm, "__generic_Set_", 14) == 0))
+    return TK_MOVE_ONLY;
+
+  /* Explicit waiver: multi-owner bitwise copy + multi-dtor is intentional. */
+  if (copyable_no_release_p) {
+    has_dtor = class_ast_find_dtor (class_node, &dtor);
+    if (has_dtor_out) *has_dtor_out = has_dtor;
+    if (dtor_rel_out) *dtor_rel_out = 0;
+    return TK_QUIET_VALUE;
+  }
+
+  has_dtor = class_ast_find_dtor (class_node, &dtor);
+  dtor_rel = (has_dtor && dtor != NULL && ast_calls_unique_release_p (dtor));
+  if (has_dtor_out) *has_dtor_out = has_dtor;
+  if (dtor_rel_out) *dtor_rel_out = dtor_rel;
+
+  class_ast_scan_fields (c2m_ctx, class_node, &has_raw_ptr, &has_string,
+                         &has_unique_nested);
+
+  if (!has_dtor) {
+    /* No dtor: double-free via ~T cannot happen. Nested UNIQUE values still
+       poison the fold. Raw pointer fields without dtor are treated as borrowed
+       (POD) so classic C DTOs with char* views stay List-friendly. */
+    if (has_unique_nested) return TK_UNIQUE_RESOURCE;
+    if (has_string && !has_raw_ptr) return TK_ARENA_VALUE;
+    return TK_POD;
+  }
+
+  /* User dtor present. */
+  if (dtor_rel || has_unique_nested) return TK_UNIQUE_RESOURCE;
+  /* Raw pointer field + dtor: likely unique owner (Owns { char* p; ~ free }). */
+  if (has_raw_ptr) return TK_UNIQUE_RESOURCE;
+  /* Side-effect-only dtor (counting/log) + safe fields → auto QUIET.
+     This is what lets test/counting classes avoid the attribute. */
+  if (!dtor_rel) return TK_QUIET_VALUE;
+  return TK_OPAQUE;
+}
+
+/* Register / update meta when a class is parsed. */
+static void class_type_meta_register (c2m_ctx_t c2m_ctx, node_t class_node,
+                                      int copyable_no_release_p) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  class_type_meta_t m, *existing;
+  int has_dtor = 0, dtor_rel = 0;
+
+  if (parse_ctx == NULL || class_node == NULL || class_node->code != N_CLASS) return;
+  if (class_type_metas == NULL) return;
+
+  existing = class_type_meta_find_ctx (c2m_ctx, class_node);
+  memset (&m, 0, sizeof (m));
+  m.class_node = class_node;
+  m.copyable_no_release_p = copyable_no_release_p ? 1 : 0;
+  m.kind = class_compute_kind_from_ast (c2m_ctx, class_node, copyable_no_release_p,
+                                        &has_dtor, &dtor_rel);
+  m.kind_valid_p = 1;
+  m.has_user_dtor_p = has_dtor ? 1 : 0;
+  m.dtor_releases_p = dtor_rel ? 1 : 0;
+  if (existing != NULL) {
+    *existing = m;
+    return;
+  }
+  VARR_PUSH (class_type_meta_t, class_type_metas, m);
+}
+
+/* Human-facing fix-it for by-value element rejection. */
+static const char *type_kind_byvalue_fixit (type_kind_t k) {
+  switch (k) {
+  case TK_UNIQUE_RESOURCE:
+    return "this type's destructor releases unique resources; "
+           "use List<T*>.owns() / Map with .ownsValues(), or redesign as a pure DTO";
+  case TK_MOVE_ONLY:
+    return "move-only collection shells cannot be stored as by-value elements of another "
+           "collection that bitwise-copies them; nest via pointers or redesign";
+  case TK_OPAQUE:
+    return "cannot prove the destructor is free of unique-resource release; "
+           "use List<T*>.owns(), make the type a DTO (no resource dtor), or mark "
+           "[[copyable_no_release]] only if multi-destroy is intentional (counting/log-only)";
+  case TK_POINTER:
+    return "use pointer element types with .owns() when the list should delete pointees";
+  default:
+    return "use pointer elements with .owns()/.ownsValues(), or mark [[copyable_no_release]] "
+           "if the destructor does not release unique resources";
+  }
 }
 
 /* Pre-check marker stashed on N_FUNC_DEF->attr before create_decl runs.
@@ -6430,69 +6783,44 @@ static node_t get_or_create_specialization (c2m_ctx_t c2m_ctx,
       if (ip && strcmp(ip, spec_name)==0) return build_id(c2m_ctx, spec_name, pos);
     }
   }
-  /* P1 by-value element gate: List/Set/Map store class elements BY VALUE and
-     bitwise-copy them (Add/Sort/Insert/Where/Copy can alias two slots).
-     An element whose destructor frees a unique resource would double-free.
-     Refuse dtor-bearing class elements unless the class is marked
-     [[copyable_no_release]] (dtor does not release unique resources).
-     Pointer elements and nested move-only collections (__generic_List/Map/Set)
-     are exempt. */
+  /* P1 by-value element gate (type_kind): List/Set/Map store class elements
+     BY VALUE and bitwise-copy them (Add/Sort/Insert/Where/Copy can alias two
+     slots).  Only POD / QUIET_VALUE / ARENA_VALUE are safe.  Pointer elements
+     and nested __generic_* collections are exempt (separate owns() path). */
   if (strcmp (base_name, "List") == 0 || strcmp (base_name, "Set") == 0
       || strcmp (base_name, "Map") == 0) {
     int n_check = strcmp (base_name, "Map") == 0 ? 2 : 1;
     for (int ai = 0; ai < n_check && ai < n_args; ai++) {
       node_t ta = args[ai];
-      node_t cdef = NULL;
-      int is_ptr = 0, marked = 0, has_dtor = 0;
+      class_type_meta_t *meta = NULL;
+      type_kind_t ek;
+      int is_ptr = 0;
       while (ta != NULL && ta->code == N_POINTER) {
         is_ptr = 1;
         ta = NL_HEAD (ta->u.ops);
       }
       if (is_ptr || ta == NULL || ta->code != N_ID || ta->u.s.s == NULL) continue;
       if (strncmp (ta->u.s.s, "__generic_", 10) == 0) continue; /* nested collection */
-      /* Resolve the element class via the parse-time registry: class symbols
-         enter check-time scopes only later, but every class definition was
-         recorded by the declaration parser.  Multiple entries per name are
-         possible (forward decl + definition): any marked node exempts, any
-         dtor-bearing definition trips the gate. */
-      for (size_t pi = 0; pi < VARR_LENGTH (node_t, parsed_classes); pi++) {
-        node_t pc = VARR_GET (node_t, parsed_classes, pi);
-        node_t cid = TAG_ID (pc);
-        node_t mlist;
-        int this_marked = 0;
-        if (cid == NULL || cid->code != N_ID || cid->u.s.s == NULL
-            || strcmp (cid->u.s.s, ta->u.s.s) != 0)
-          continue;
-        cdef = pc;
-        if (copyable_no_release_classes != NULL)
-          for (size_t ri = 0; ri < VARR_LENGTH (node_t, copyable_no_release_classes); ri++)
-            if (VARR_GET (node_t, copyable_no_release_classes, ri) == pc) {
-              this_marked = 1;
-              break;
-            }
-        if (this_marked) marked = 1;
-        mlist = TAG_MEMBER_LIST (pc);
-        if (mlist != NULL && mlist->code == N_LIST)
-          for (node_t mem = NL_HEAD (mlist->u.ops); mem != NULL; mem = NL_NEXT (mem)) {
-            node_t mid;
-            if (mem->code != N_FUNC_DEF) continue;
-            mid = DECL_ID (FUNC_DEF_DECL (mem));
-            if (mid != NULL && mid->code == N_ID && mid->u.s.s != NULL
-                && strncmp (mid->u.s.s, "__dtor_", 7) == 0) {
-              has_dtor = 1;
-              break;
-            }
-          }
+      /* Prefer the last meta for this name (definition over forward decl). */
+      if (class_type_metas != NULL) {
+        for (size_t pi = 0; pi < VARR_LENGTH (class_type_meta_t, class_type_metas); pi++) {
+          class_type_meta_t *m
+            = &VARR_ADDR (class_type_meta_t, class_type_metas)[pi];
+          node_t cid = m->class_node != NULL ? TAG_ID (m->class_node) : NULL;
+          if (cid != NULL && cid->code == N_ID && cid->u.s.s != NULL
+              && strcmp (cid->u.s.s, ta->u.s.s) == 0 && m->kind_valid_p)
+            meta = m;
+        }
       }
-      if (cdef == NULL || marked || !has_dtor) continue;
+      if (meta == NULL) continue; /* unknown / incomplete — allow; check may re-gate */
+      ek = meta->kind;
+      if (type_kind_ok_byvalue_element_p (ek)) continue;
       error (c2m_ctx, pos,
-             "type '%s' has a destructor and is not marked [[copyable_no_release]]; "
+             "type '%s' is %s and cannot be a by-value %s element; "
              "%s stores elements by bitwise copy (Add/Sort/Where/Copy), so each "
-             "copy would run ~%s and double-free unique resources. "
-             "Use pointer elements with .owns()/.ownsValues(), or mark the class "
-             "[[copyable_no_release]] if the destructor does not release unique "
-             "resources (counting/log-only)",
-             ta->u.s.s, base_name, ta->u.s.s);
+             "copy would run ~%s.  %s",
+             ta->u.s.s, type_kind_name (ek), base_name, base_name, ta->u.s.s,
+             type_kind_byvalue_fixit (ek));
     }
   }
 
@@ -8025,17 +8353,16 @@ D (declaration) {
       }
     }
 
-    /* Parse-time class registry (by name) for the by-value element gate in
-       get_or_create_specialization: at specialization time class symbols are
-       not yet in check-time scopes, so the gate consults this list instead.
-       [[copyable_no_release]] class Foo { ... } also marks the N_CLASS. */
+    /* Parse-time class registry + type_kind: specialization runs before class
+       symbols enter check-time scopes, so the by-value gate and ownership
+       consult class_type_metas.  [[copyable_no_release]] forces QUIET_VALUE. */
     if (is_class_typedef) {
       int marked = (lead_attrs != NULL && attr_list_has_copyable_no_release (lead_attrs));
       for (node_t spec_node = NL_HEAD (spec->u.ops); spec_node != NULL;
            spec_node = NL_NEXT (spec_node)) {
         if (spec_node->code == N_CLASS) {
           VARR_PUSH (node_t, parsed_classes, spec_node);
-          if (marked) VARR_PUSH (node_t, copyable_no_release_classes, spec_node);
+          class_type_meta_register (c2m_ctx, spec_node, marked);
           break;
         }
       }
@@ -10968,7 +11295,7 @@ static void parse_init (c2m_ctx_t c2m_ctx) {
   VARR_CREATE (generic_method_tmpl_t, generic_method_templates, alloc, 4);
   VARR_CREATE (generic_method_spec_t, generic_method_specs, alloc, 8);
   VARR_CREATE (cstr_t, generic_in_progress, alloc, 8);
-  VARR_CREATE (node_t, copyable_no_release_classes, alloc, 4);
+  VARR_CREATE (class_type_meta_t, class_type_metas, alloc, 16);
   VARR_CREATE (node_t, parsed_classes, alloc, 16);
   n_method_type_params = 0;
   for (int i = 0; i < 4; i++) method_type_params[i] = NULL;
@@ -12795,6 +13122,81 @@ static int class_is_move_only_collection_p (c2m_ctx_t c2m_ctx, struct type *type
   return (strncmp (nm, "__generic_List_", 15) == 0
           || strncmp (nm, "__generic_Map_", 14) == 0
           || strncmp (nm, "__generic_Set_", 14) == 0);
+}
+
+/* ── type_kind (T) — check-time API for semantic analysis & ownership ────
+ *
+ * Prefer the parse-time class_type_meta cache; refine MOVE_ONLY via the
+ * monomorphized-name check.  Scalars/String/pointers do not need a class meta.
+ *
+ * Consumers:
+ *   - specialization gate (parse-time kind on class metas)
+ *   - ownership.c: skip QUIET/POD by-value; track UNIQUE/POINTER
+ *   - midopt/gen (future): memcpy vs deep paths, destroy elision
+ *   - list.h/map.h (future): is_byvalue_element_ok<T>() style intrinsics
+ */
+static type_kind_t type_kind (c2m_ctx_t c2m_ctx, struct type *type) {
+  class_type_meta_t *meta;
+  node_t tag;
+  type_kind_t k;
+
+  if (type == NULL) return TK_OPAQUE;
+  switch (type->mode) {
+  case TM_BASIC:
+    if (type->u.basic_type == TP_STRING) return TK_ARENA_VALUE;
+    if (type->u.basic_type == TP_VOID) return TK_OPAQUE;
+    return TK_POD;
+  case TM_ENUM:
+    return TK_POD;
+  case TM_PTR:
+    return TK_POINTER;
+  case TM_ARR:
+    if (type->u.arr_type != NULL && type->u.arr_type->el_type != NULL)
+      return type_kind (c2m_ctx, type->u.arr_type->el_type);
+    return TK_OPAQUE;
+  case TM_STRUCT:
+  case TM_UNION:
+    return TK_POD;
+  case TM_CLASS:
+    tag = type->u.tag_type;
+    if (tag == NULL) return TK_OPAQUE;
+    if (class_is_move_only_collection_p (c2m_ctx, type)) return TK_MOVE_ONLY;
+    meta = class_type_meta_find_ctx (c2m_ctx, tag);
+    if (meta == NULL && TAG_ID (tag) != NULL && TAG_ID (tag)->code == N_ID)
+      meta = class_type_meta_find_by_name (c2m_ctx, TAG_ID (tag)->u.s.s);
+    if (meta != NULL && meta->kind_valid_p) {
+      k = meta->kind;
+      if (k != TK_MOVE_ONLY && class_is_move_only_collection_p (c2m_ctx, type))
+        return TK_MOVE_ONLY;
+      return k;
+    }
+    if (tag->code == N_CLASS) {
+      class_type_meta_register (c2m_ctx, tag, 0);
+      meta = class_type_meta_find_ctx (c2m_ctx, tag);
+      if (meta != NULL && meta->kind_valid_p) return meta->kind;
+    }
+    return class_has_dtor_p (c2m_ctx, type) ? TK_OPAQUE : TK_POD;
+  case TM_DICT:
+    return TK_UNIQUE_RESOURCE;
+  case TM_FUNC:
+  case TM_SLICE:
+  case TM_UNDEF:
+  default:
+    return TK_OPAQUE;
+  }
+}
+
+static int element_ok_byvalue_p (c2m_ctx_t c2m_ctx, struct type *type) {
+  return type_kind_ok_byvalue_element_p (type_kind (c2m_ctx, type));
+}
+
+static int type_is_unique_resource_p (c2m_ctx_t c2m_ctx, struct type *type) {
+  return type_kind (c2m_ctx, type) == TK_UNIQUE_RESOURCE;
+}
+
+static int type_is_quiet_or_pod_p (c2m_ctx_t c2m_ctx, struct type *type) {
+  type_kind_t k = type_kind (c2m_ctx, type);
+  return k == TK_POD || k == TK_QUIET_VALUE || k == TK_ARENA_VALUE;
 }
 
 static node_t process_tag (c2m_ctx_t c2m_ctx, node_t r, node_t id, node_t decl_list) {

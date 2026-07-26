@@ -1,15 +1,20 @@
 /* src/ownership.c — Ownership / lifetime analysis pass for ClassyC.
  *
- * STATUS: MINIMAL FIRST STAGE.  The pass now runs between check and gen, but
- * does no rewriting or diagnosis yet.  It walks the post-check AST, finds
- * every declaration the check pass marked `auto_defer_p = TRUE`, and \u2014 when
- * the user passes `-v`/`--verbose` \u2014 prints one line per candidate.  Returns
- * zero (no errors) unconditionally.
- *
  * Single-TU build model: this file is `#include`d from `src/classyc.c` near
  * the end, so it sees the full set of internal types (`c2m_ctx_t`, `node_t`,
  * `decl_t`, `struct decl`, the `N_*` enum, traversal macros, `c2m_options`,
  * etc.).  It MUST NOT be added to `CMakeLists.txt` as an independent source.
+ *
+ * type_kind integration (see classyc.c `type_kind` / `class_type_meta`):
+ *   - POD / QUIET_VALUE / ARENA_VALUE by-value locals are not unique-resource
+ *     candidates (their dtors may run many times safely, or not at all).
+ *   - UNIQUE_RESOURCE and POINTER bindings remain the focus of leak/UAF/move
+ *     analysis.
+ *   - MOVE_ONLY collection shells use move transfer, not shallow assign.
+ *   - Diagnostics and ownership reports mention type_kind so developers see
+ *     the same vocabulary as the List element gate.
+ *   - Optimization hook: when a candidate's type is quiet/POD, skip CFG
+ *     tracking for that binding (cheaper pass, less noise).
  *
  * ──────────────────────────────────────────────────────────────────────
  * Why a separate pass?
@@ -698,12 +703,29 @@ static void candidate_scan_attrs (node_t n, int *has_cleanup_p, int *da_ignore_p
   }
 }
 
+/* True if this decl's type is a quiet/POD by-value class (or arena value)
+ * that should not participate in unique-resource ownership tracking.
+ * Pointer types always may be tracked (TK_POINTER). */
+static int ow_decl_is_quiet_byvalue_p (c2m_ctx_t c2m_ctx, decl_t d) {
+  struct type *t;
+  type_kind_t k;
+  if (d == NULL || d->decl_spec.type == NULL) return 0;
+  t = d->decl_spec.type;
+  if (t->mode == TM_PTR) return 0; /* pointers: still track */
+  k = type_kind (c2m_ctx, t);
+  return type_kind_ok_byvalue_element_p (k);
+}
+
 static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) *out) {
-  /* c2m_ctx parameter present only so POS() macro expands correctly here. */
-  (void) c2m_ctx;
   if (n == NULL) return;
   if (n->code == N_SPEC_DECL) {
     decl_t d = (decl_t) n->attr;
+    int collected = 0;
+    int skip_own = (d != NULL && ow_decl_is_quiet_byvalue_p (c2m_ctx, d)
+                    && !(d->owned_p && !d->unowned_p));
+    /* type_kind filter: by-value POD/QUIET/ARENA are not unique-resource
+       ownership candidates (bug-detection focus stays on heap owners).
+       Still allow definite-assignment path for pointers below. */
     /* Two acquire-discovery paths:
         (1) check-pass-marked `auto_defer_p` bindings whose init matches a
             known acquire form (malloc-family or `new T(...)`);
@@ -712,27 +734,26 @@ static void collect_candidates (c2m_ctx_t c2m_ctx, node_t n, VARR (candidate_t) 
        Path (2) lets us track local bindings hooked to user wrappers like
        `auto x = make_buf(...);` without anyone marking them auto_defer_p
        in the check pass.  We only consider locals (scope != top_scope). */
-    int auto_defer_path = (d != NULL && d->auto_defer_p);
+    int auto_defer_path = (!skip_own && d != NULL && d->auto_defer_p);
     const char *ip_release_fn = NULL;
     /* Managed-ownership opt-in: a binding declared `owned` (or `move`-
        initialized from an owned value) joins the GC-like layer.  When its
        initializer isn't already a recognized acquire (the `new`-init case
        sets auto_defer_p too), this flag is what gets it collected — e.g.
        `auto y = move x;`. */
-    int owned_managed = (d != NULL && d->owned_p && !d->unowned_p);
+    int owned_managed = (!skip_own && d != NULL && d->owned_p && !d->unowned_p);
     /* `unowned <decl>` opts the binding out of ALL ownership tracking: the
        user takes manual responsibility, so we neither leak-warn nor
        auto-release it, and the interprocedural call-returned-owner path
        below must also skip it (auto_defer_p alone wouldn't, since that
        flag is never set for call/method initializers). */
     if (d != NULL && d->unowned_p) { auto_defer_path = 0; }
-    else if (!auto_defer_path && d != NULL && d->scope != NULL
+    else if (!skip_own && !auto_defer_path && d != NULL && d->scope != NULL
         && d->decl_spec.type != NULL && d->decl_spec.type->mode == TM_PTR
         && !d->decl_spec.typedef_p && !d->decl_spec.static_p
         && !d->decl_spec.thread_local_p) {
       ip_release_fn = summary_release_for_init (SPEC_DECL_INIT (n));
     }
-    int collected = 0;
     if (auto_defer_path || ip_release_fn != NULL || owned_managed) {
       node_t init = SPEC_DECL_INIT (n);
       const char *acquire, *release, *name;
@@ -3327,10 +3348,22 @@ static void emit_ownership_report (flowctx_t *ctx, node_t func_def,
     candidate_t *c = &a[i];
     if (c->param_p) continue;  /* params are not user-facing allocations */
     const char *indent = cname != NULL ? "    " : "  ";
-    fprintf (out, "%s%s = %s(...)  at %s:%d\n",
-             indent, c->name, c->acquire_fn,
-             c->acquire_pos.fname != NULL ? c->acquire_pos.fname : "?",
-             c->acquire_pos.lno);
+    const char *kname = NULL;
+    if (c->decl != NULL && c->decl->attr != NULL) {
+      decl_t cd = (decl_t) c->decl->attr;
+      if (cd != NULL && cd->decl_spec.type != NULL)
+        kname = type_kind_name (type_kind (c2m_ctx, cd->decl_spec.type));
+    }
+    if (kname != NULL)
+      fprintf (out, "%s%s = %s(...)  [%s]  at %s:%d\n",
+               indent, c->name, c->acquire_fn, kname,
+               c->acquire_pos.fname != NULL ? c->acquire_pos.fname : "?",
+               c->acquire_pos.lno);
+    else
+      fprintf (out, "%s%s = %s(...)  at %s:%d\n",
+               indent, c->name, c->acquire_fn,
+               c->acquire_pos.fname != NULL ? c->acquire_pos.fname : "?",
+               c->acquire_pos.lno);
     if (c->has_cleanup_p) {
       fprintf (out, "%s  → cleanup attribute handles release\n", indent);
     } else if (c->release_kind != NULL) {
