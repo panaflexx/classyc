@@ -32,7 +32,11 @@ extern long recv(int fd, void *buf, long len, int flags);
 extern long send(int fd, void *buf, long len, int flags);
 extern int  close(int fd);
 extern void *signal(int signum, void *handler);
-extern unsigned short htons(unsigned short hostshort);
+
+/* Avoid libc htons (Darwin maps it to OSSwapInt16, not a useful AOT symbol). */
+static unsigned short cy_htons(unsigned short x) {
+    return (unsigned short)((x << 8) | (x >> 8));
+}
 
 /* IPv4 socket address (16 bytes on LP64); we only set a few fields. */
 struct sockaddr_in {
@@ -156,7 +160,7 @@ int http_listen(int port) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port   = htons((unsigned short) port);
+    addr.sin_port   = cy_htons((unsigned short) port);
     addr.sin_addr   = 0;            /* INADDR_ANY */
 
     if (bind(sfd, &addr, 16) < 0) {

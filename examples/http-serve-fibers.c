@@ -56,8 +56,14 @@ extern int  close(int fd);
 extern int  fcntl(int fd, int cmd, long arg);
 extern int  usleep(unsigned int usec);
 extern void *signal(int signum, void *handler);
-extern unsigned short htons(unsigned short hostshort);
+/* errno: glibc has __errno_location; Darwin has __error. */
+#if defined(__APPLE__)
+extern int *__error(void);
+#define cy_errno() (*__error())
+#else
 extern int *__errno_location(void);
+#define cy_errno() (*__errno_location())
+#endif
 
 #define AF_INET       2
 #define SOCK_STREAM   1
@@ -69,7 +75,18 @@ extern int *__errno_location(void);
 #define SIGPIPE       13
 #define F_SETFL       4
 #define O_NONBLOCK    2048
+/* EAGAIN: 11 on Linux, 35 on Darwin (same as EWOULDBLOCK). */
+#if defined(__APPLE__)
+#define EAGAIN        35
+#else
 #define EAGAIN        11
+#endif
+
+/* Host→network 16-bit without libc htons (Darwin headers expand htons to
+   OSSwapInt16, which is not a linkable symbol for our AOT/JIT model). */
+static unsigned short cy_htons(unsigned short x) {
+    return (unsigned short)((x << 8) | (x >> 8));
+}
 
 #define MAX_CONNS     1024
 #define CONN_STACK    (64 * 1024)
@@ -184,7 +201,7 @@ static long nb_recv(int cfd, char *buf, long cap) {
         long n = recv(cfd, buf, cap, 0);
         if (n > 0) return n;
         if (n == 0) return 0;
-        if (*__errno_location() == EAGAIN) {
+        if (cy_errno() == EAGAIN) {
             mco_yield(mco_running());
             continue;
         }
@@ -198,7 +215,7 @@ static int nb_send_all(int cfd, char *buf, long len) {
     while (off < len) {
         long n = send(cfd, buf + off, len - off, 0);
         if (n > 0) { off += n; continue; }
-        if (n < 0 && *__errno_location() == EAGAIN) {
+        if (n < 0 && cy_errno() == EAGAIN) {
             mco_yield(mco_running());
             continue;
         }
@@ -380,7 +397,7 @@ int serve_fibers(int port) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port   = htons((unsigned short) port);
+    addr.sin_port   = cy_htons((unsigned short) port);
     addr.sin_addr   = 0;
 
     if (bind(sfd, &addr, 16) < 0) {

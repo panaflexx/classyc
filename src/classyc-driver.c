@@ -159,6 +159,14 @@ static const int slash = '/';
 static lib_t std_libs[] = {{"/usr/lib/libc.dylib", NULL}, {"/usr/lib/libm.dylib", NULL}};
 static const char *std_lib_dirs[] = {"/usr/lib"};
 static const char *lib_suffix = ".dylib";
+
+/* Darwin JIT shims for glibc-only / macro-expanded symbols. */
+static unsigned short cy_os_swap_int16 (unsigned short x) {
+  return (unsigned short) ((x << 8) | (x >> 8));
+}
+static unsigned short cy_htons_jit (unsigned short x) {
+  return (unsigned short) ((x << 8) | (x >> 8));
+}
 #endif
 
 #ifdef _WIN32
@@ -581,9 +589,21 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "stat") == 0) return stat;
     if (strcmp (name, "lstat") == 0) return lstat;
     if (strcmp (name, "fstat") == 0) return fstat;
-#if defined(__APPLE__) && defined(__aarch64__)
+#if defined(__APPLE__)
+    /* glibc-only names used by some examples; Darwin equivalents. */
+    if (strcmp (name, "__errno_location") == 0) {
+      extern int *__error (void);
+      return (void *) __error;
+    }
+    /* htons macros expand to OSSwapInt16; provide a real symbol for JIT. */
+    if (strcmp (name, "OSSwapInt16") == 0 || strcmp (name, "_OSSwapInt16") == 0)
+      return (void *) cy_os_swap_int16;
+    if (strcmp (name, "htons") == 0 || strcmp (name, "ntohs") == 0)
+      return (void *) cy_htons_jit;
+#if defined(__aarch64__)
     if (strcmp (name, "__nan") == 0) return __nan;
     if (strcmp (name, "_MIR_set_code") == 0) return _MIR_set_code;
+#endif
 #endif
 #endif
     /* Dict runtime functions (from dict.h, compiled statically) */

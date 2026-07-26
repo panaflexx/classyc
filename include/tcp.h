@@ -96,11 +96,18 @@ extern int    shutdown(int fd, int how);
 /* fcntl for non-blocking */
 extern int    fcntl(int fd, int cmd, ...);
 
-/* htons / htonl — byte order conversion */
-extern unsigned short htons(unsigned short hostshort);
-extern unsigned int   htonl(unsigned int hostlong);
-extern unsigned short ntohs(unsigned short netshort);
-extern unsigned int   ntohl(unsigned int netlong);
+/* htons / htonl — byte order conversion (local, LE hosts).
+   Avoids libc htons which on Darwin expands to OSSwapInt16 (not a
+   stable AOT/JIT import). */
+static unsigned short htons(unsigned short hostshort) {
+    return (unsigned short)((hostshort << 8) | (hostshort >> 8));
+}
+static unsigned int htonl(unsigned int hostlong) {
+    return ((hostlong & 0xff) << 24) | ((hostlong & 0xff00) << 8)
+         | ((hostlong >> 8) & 0xff00) | ((hostlong >> 24) & 0xff);
+}
+static unsigned short ntohs(unsigned short netshort) { return htons(netshort); }
+static unsigned int   ntohl(unsigned int netlong)   { return htonl(netlong); }
 
 /* inet_pton — address string to binary */
 extern int inet_pton(int af, char *src, void *dst);
