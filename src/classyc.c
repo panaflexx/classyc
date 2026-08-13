@@ -2211,45 +2211,68 @@ static node_t get_int_node_from_repr (c2m_ctx_t c2m_ctx, const char *repr, char 
    a simple length+prefix switch; correctness is verified by the existing
    kw_add path that populates the real str_tab at init time. */
 static token_code_t fast_keyword (const char *s, size_t len) {
-  if (len == 0 || len > 16) return T_STR;
+  /* Bucketed by length, then memcmp of exactly `len` bytes (s is NUL-terminated
+     so the read never runs past the identifier).  Every mapping here must match
+     the kw_add table in parse_init; anything not listed falls through to the
+     slow str_tab path, so this stays correct even if it is not exhaustive. */
+#define KW(lit, tc)             \
+  if (memcmp (s, (lit), len) == 0) return (tc)
   switch (len) {
   case 2:
-    if (s[0]=='i' && s[1]=='f') return T_IF;
-    if (s[0]=='d' && s[1]=='o') return T_DO;
+    KW ("if", T_IF);
+    KW ("do", T_DO);
     break;
   case 3:
-    if (s[0]=='i' && s[1]=='n' && s[2]=='t') return T_INT;
-    if (s[0]=='f' && s[1]=='o' && s[2]=='r') return T_FOR;
+    KW ("int", T_INT);
+    KW ("for", T_FOR);
     break;
   case 4:
-    if (s[0]=='c' && s[1]=='h' && s[2]=='a' && s[3]=='r') return T_CHAR;
-    if (s[0]=='v' && s[1]=='o' && s[2]=='i' && s[3]=='d') return T_VOID;
-    if (s[0]=='a' && s[1]=='u' && s[2]=='t' && s[3]=='o') return T_AUTO;
-    if (s[0]=='c' && s[1]=='a' && s[2]=='s' && s[3]=='e') return T_CASE;
-    if (s[0]=='e' && s[1]=='l' && s[2]=='s' && s[3]=='e') return T_ELSE;
-    if (s[0]=='e' && s[1]=='n' && s[2]=='u' && s[3]=='m') return T_ENUM;
-    if (s[0]=='d' && s[1]=='i' && s[2]=='c' && s[3]=='t') return T_DICT;
+    KW ("char", T_CHAR);
+    KW ("void", T_VOID);
+    KW ("auto", T_AUTO);
+    KW ("case", T_CASE);
+    KW ("else", T_ELSE);
+    KW ("enum", T_ENUM);
+    KW ("dict", T_DICT);
+    KW ("long", T_LONG);
+    KW ("goto", T_GOTO);
     break;
   case 5:
-    if (s[0]=='c' && s[1]=='l' && s[2]=='a' && s[3]=='s' && s[4]=='s') return T_CLASS;
-    if (s[0]=='c' && s[1]=='o' && s[2]=='n' && s[3]=='s' && s[4]=='t') return T_CONST;
-    if (s[0]=='f' && s[1]=='l' && s[2]=='o' && s[3]=='a' && s[4]=='t') return T_FLOAT;
-    if (s[0]=='s' && s[1]=='h' && s[2]=='o' && s[3]=='r' && s[4]=='t') return T_SHORT;
-    if (s[0]=='u' && s[1]=='n' && s[2]=='i' && s[3]=='o' && s[4]=='n') return T_UNION;
-    if (s[0]=='w' && s[1]=='h' && s[2]=='i' && s[3]=='l' && s[4]=='e') return T_WHILE;
+    KW ("class", T_CLASS);
+    KW ("const", T_CONST);
+    KW ("float", T_FLOAT);
+    KW ("short", T_SHORT);
+    KW ("union", T_UNION);
+    KW ("while", T_WHILE);
+    KW ("break", T_BREAK);
     break;
   case 6:
-    if (s[0]=='d' && s[1]=='o' && s[2]=='u' && s[3]=='b' && s[4]=='l' && s[5]=='e') return T_DOUBLE;
-    if (s[0]=='r' && s[1]=='e' && s[2]=='t' && s[3]=='u' && s[4]=='r' && s[5]=='n') return T_RETURN;
-    if (s[0]=='s' && s[1]=='t' && s[2]=='r' && s[3]=='u' && s[4]=='c' && s[5]=='t') return T_STRUCT;
-    if (s[0]=='s' && s[1]=='w' && s[2]=='i' && s[3]=='t' && s[4]=='c' && s[5]=='h') return T_SWITCH;
-    if (s[0]=='t' && s[1]=='y' && s[2]=='p' && s[3]=='e' && s[4]=='d' && s[5]=='e' && s[6]=='f') return T_TYPEDEF;
+    KW ("double", T_DOUBLE);
+    KW ("return", T_RETURN);
+    KW ("struct", T_STRUCT);
+    KW ("switch", T_SWITCH);
+    KW ("typeof", T_TYPEOF);
+    KW ("sizeof", T_SIZEOF);
+    KW ("extern", T_EXTERN);
+    KW ("static", T_STATIC);
+    KW ("signed", T_SIGNED);
+    KW ("inline", T_INLINE);
+    KW ("String", T_STRING);
     break;
   case 7:
-    if (s[0]=='t' && s[1]=='y' && s[2]=='p' && s[3]=='e' && s[4]=='o' && s[5]=='f') return T_TYPEOF;
+    KW ("typedef", T_TYPEDEF);
+    KW ("default", T_DEFAULT);
+    break;
+  case 8:
+    KW ("unsigned", T_UNSIGNED);
+    KW ("register", T_REGISTER);
+    KW ("restrict", T_RESTRICT);
+    KW ("continue", T_CONTINUE);
+    KW ("volatile", T_VOLATILE);
     break;
   }
   return T_STR; /* not a keyword */
+#undef KW
 }
 
 static token_t pptoken2token (c2m_ctx_t c2m_ctx, token_t t, int id2kw_p) {
@@ -2258,7 +2281,8 @@ static token_t pptoken2token (c2m_ctx_t c2m_ctx, token_t t, int id2kw_p) {
           && t->code != T_RDBLNO);
   if (t->code == T_NO_MACRO_IDENT) t->code = T_ID;
   if (t->code == T_ID && id2kw_p) {
-    token_code_t kw = fast_keyword (t->repr, strlen (t->repr));
+    size_t id_len = strlen (t->repr);
+    token_code_t kw = fast_keyword (t->repr, id_len);
     if (kw != T_STR) {
       t->code = kw;
       t->node_code = N_IGNORE;
@@ -2266,7 +2290,7 @@ static token_t pptoken2token (c2m_ctx_t c2m_ctx, token_t t, int id2kw_p) {
       return t;
     }
     /* fall back to the full table (rare non-keyword path) */
-    tab_str_t str = str_add (c2m_ctx, t->repr, strlen (t->repr) + 1, T_STR, 0, FALSE);
+    tab_str_t str = str_add (c2m_ctx, t->repr, id_len + 1, T_STR, 0, FALSE);
     if (str.key != T_STR) {
       t->code = (int) str.key;
       t->node_code = N_IGNORE;
@@ -4723,6 +4747,14 @@ static void pre_text_out (c2m_ctx_t c2m_ctx, token_t t) { /* NULL means end of o
  * in place of the single f-string token.  Note: macros are not expanded inside
  * `{ ... }` (the interpolated text is lexed directly, not run back through the
  * preprocessor). */
+
+/* Append a NUL-terminated string's characters (without the terminator) to a
+   VARR(char).  Shared by the source-text builders below (f-strings, Any class
+   and thunk synthesis). */
+static void varr_str_push (VARR (char) * to, const char *s) {
+  for (; *s != '\0'; s++) VARR_PUSH (char, to, *s);
+}
+
 static void fstring_record_expansion (c2m_ctx_t c2m_ctx, token_t fstr) {
   MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
   const char *raw = fstr->repr; /* e.g.  f"hello {name}"  */
@@ -4730,11 +4762,7 @@ static void fstring_record_expansion (c2m_ctx_t c2m_ctx, token_t fstr) {
   VARR (char) * exp;
   size_t i, end;
 
-#define FS_PUT_S(s)                                          \
-  do {                                                       \
-    for (const char *fs_p = (s); *fs_p != '\0'; fs_p++)      \
-      VARR_PUSH (char, exp, *fs_p);                          \
-  } while (0)
+#define FS_PUT_S(s) varr_str_push (exp, (s))
 #define FS_PUT_C(ch) VARR_PUSH (char, exp, (char) (ch))
 
   VARR_CREATE (char, exp, alloc, 256);
@@ -10610,11 +10638,7 @@ static node_t synthesize_any_class (c2m_ctx_t c2m_ctx, const char *iface_name, p
   }
   members = TAG_MEMBER_LIST (iface);
 
-#define SB_PUTS(s)                                            \
-  do {                                                        \
-    for (const char *_p = (s); *_p != '\0'; _p++)             \
-      VARR_PUSH (char, sb, *_p);                              \
-  } while (0)
+#define SB_PUTS(s) varr_str_push (sb, (s))
 
   VARR_CREATE (char, sb, alloc, 1024);
   SB_PUTS ("class ");
@@ -10859,11 +10883,7 @@ static node_t synthesize_any_thunks (c2m_ctx_t c2m_ctx, const char *iface_name,
   if (iface == NULL || iface->code != N_INTERFACE) return NULL;
   members = TAG_MEMBER_LIST (iface);
 
-#define SB_PUTS(s)                                            \
-  do {                                                        \
-    for (const char *_p = (s); *_p != '\0'; _p++)             \
-      VARR_PUSH (char, sb, *_p);                              \
-  } while (0)
+#define SB_PUTS(s) varr_str_push (sb, (s))
 
   VARR_CREATE (char, sb, alloc, 1024);
   SB_PUTS ("void* malloc(unsigned long);\n");

@@ -1114,6 +1114,53 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     sym_map_entry_t *sym_map = NULL;
     size_t n_sym_map = 0, cap_sym_map = 0;
 
+    /* Open-addressing index over sym_map so a name -> entry lookup is O(1).
+       Without it every relocation scanned the whole symbol table with strcmp,
+       making object emission O(n_relocs * n_symbols): on a large module that
+       quadratic term dominated the entire b2obj run (~20% of total time on
+       oggenc, far worse on bigger inputs).  Slots hold sym_map index + 1, so 0
+       means empty.  Kept ~50% loaded and rebuilt on growth. */
+    size_t *sym_idx_tab = NULL;
+    size_t sym_idx_cap = 0;
+
+    #define SYM_HASH(nm, h) do { \
+        const unsigned char *_s = (const unsigned char *) (nm); \
+        (h) = (size_t) 1469598103934665603ULL; \
+        for (; *_s != '\0'; _s++) { (h) ^= (size_t) *_s; (h) *= (size_t) 1099511628211ULL; } \
+    } while(0)
+
+    /* Insert entry `ix` of sym_map into the index (table must have room). */
+    /* Keep only the FIRST occurrence of a name, so a lookup returns the lowest
+       sym_map index -- exactly what the original linear strcmp scan returned.
+       sym_map can legitimately contain duplicate names, so this matters. */
+    #define SYM_IDX_INSERT(ix) do { \
+        size_t _h, _m = sym_idx_cap - 1, _p, _e; int _dup = 0; \
+        SYM_HASH(sym_map[(ix)].name, _h); \
+        for (_p = _h & _m; (_e = sym_idx_tab[_p]) != 0; _p = (_p + 1) & _m) \
+            if (strcmp(sym_map[_e - 1].name, sym_map[(ix)].name) == 0) { _dup = 1; break; } \
+        if (!_dup) sym_idx_tab[_p] = (ix) + 1; \
+    } while(0)
+
+    #define SYM_IDX_REBUILD() do { \
+        size_t _newcap = sym_idx_cap ? sym_idx_cap * 2 : 256; \
+        while (_newcap < n_sym_map * 2) _newcap *= 2; \
+        free(sym_idx_tab); \
+        sym_idx_tab = calloc(_newcap, sizeof(size_t)); \
+        sym_idx_cap = _newcap; \
+        for (size_t _i = 0; _i < n_sym_map; _i++) SYM_IDX_INSERT(_i); \
+    } while(0)
+
+    /* Look up `nm`; sets (found) and (out) to the sym_map slot. */
+    #define SYM_MAP_FIND(nm, found, out) do { \
+        (found) = 0; (out) = 0; \
+        if (sym_idx_cap != 0) { \
+            size_t _h, _m = sym_idx_cap - 1, _p, _e; \
+            SYM_HASH((nm), _h); \
+            for (_p = _h & _m; (_e = sym_idx_tab[_p]) != 0; _p = (_p + 1) & _m) \
+                if (strcmp(sym_map[_e - 1].name, (nm)) == 0) { (found) = 1; (out) = _e - 1; break; } \
+        } \
+    } while(0)
+
     #define SYM_MAP_ADD(nm, ix) do { \
         if (n_sym_map >= cap_sym_map) { \
             cap_sym_map = cap_sym_map ? cap_sym_map * 2 : 64; \
@@ -1122,6 +1169,8 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         sym_map[n_sym_map].name = (nm); \
         sym_map[n_sym_map].idx = (ix); \
         n_sym_map++; \
+        if (n_sym_map * 2 >= sym_idx_cap) SYM_IDX_REBUILD(); \
+        else SYM_IDX_INSERT(n_sym_map - 1); \
     } while(0)
 
     /* Global symbols: functions */
@@ -1160,8 +1209,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         if (!datas[i].name) continue;
         /* Check if already in sym_map (shouldn't be, but guard) */
         int found = 0;
-        for (size_t j = 0; j < n_sym_map; j++)
-            if (strcmp(sym_map[j].name, datas[i].name) == 0) { found = 1; break; }
+        { size_t _sm; SYM_MAP_FIND(datas[i].name, found, _sm); (void) _sm; }
         if (found) continue;
         size_t dummy;
         int is_exported = name_set_find(&exports, datas[i].name, &dummy);
@@ -1179,8 +1227,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     for (size_t i = 0; i < n_bsses; i++) {
         if (!bsses[i].name) continue;
         int found = 0;
-        for (size_t j = 0; j < n_sym_map; j++)
-            if (strcmp(sym_map[j].name, bsses[i].name) == 0) { found = 1; break; }
+        { size_t _sm; SYM_MAP_FIND(bsses[i].name, found, _sm); (void) _sm; }
         if (found) continue;
         size_t dummy;
         int is_exported = name_set_find(&exports, bsses[i].name, &dummy);
@@ -1199,8 +1246,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         for (size_t i = 0; i < n_tlss; i++) {
             if (!tlss[i].name) continue;
             int found = 0;
-            for (size_t j = 0; j < n_sym_map; j++)
-                if (strcmp (sym_map[j].name, tlss[i].name) == 0) { found = 1; break; }
+            { size_t _sm; SYM_MAP_FIND(tlss[i].name, found, _sm); (void) _sm; }
             if (found) continue;
             size_t dummy;
             int is_exported = name_set_find (&exports, tlss[i].name, &dummy);
@@ -1234,8 +1280,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
      * Also add any reloc symbol not yet in sym_map. */
     for (size_t i = 0; i < imports.n; i++) {
         int found = 0;
-        for (size_t j = 0; j < n_sym_map; j++)
-            if (strcmp(sym_map[j].name, imports.names[i]) == 0) { found = 1; break; }
+        { size_t _sm; SYM_MAP_FIND(imports.names[i], found, _sm); (void) _sm; }
         if (found) continue;
         Elf64_Sym s = {0};
         s.st_name = strtab_add(&strtab, &strtab_size, &strtab_cap, imports.names[i]);
@@ -1249,8 +1294,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     for (size_t i = 0; i < n_relocs; i++) {
         const char *rname = relocs[i].symbol;
         int found = 0;
-        for (size_t j = 0; j < n_sym_map; j++)
-            if (strcmp(sym_map[j].name, rname) == 0) { found = 1; break; }
+        { size_t _sm; SYM_MAP_FIND(rname, found, _sm); (void) _sm; }
         if (found) continue;
         Elf64_Sym s = {0};
         s.st_name = strtab_add(&strtab, &strtab_size, &strtab_cap, rname);
@@ -1309,12 +1353,8 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     for (size_t i = 0; i < n_relocs; i++) {
         /* Find symbol index */
         size_t sym_idx = 0;
-        for (size_t j = 0; j < n_sym_map; j++) {
-            if (strcmp(sym_map[j].name, relocs[i].symbol) == 0) {
-                sym_idx = sym_map[j].idx;
-                break;
-            }
-        }
+        { int _f; size_t _sm; SYM_MAP_FIND(relocs[i].symbol, _f, _sm); \
+          if (_f) sym_idx = sym_map[_sm].idx; }
         Elf64_Rela r = {0};
         r.r_offset = relocs[i].offset;
         r.r_info = ELF64_R_INFO(sym_idx, relocs[i].type);
@@ -2409,6 +2449,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     free(cyr);
     free(cyr_syms);
     free(sym_map);
+    free(sym_idx_tab);
     for (size_t i = 0; i < n_funcs; i++) free(funcs[i].code);
     free(funcs);
     for (size_t i = 0; i < n_datas; i++) free(datas[i].bytes);
@@ -2509,6 +2550,18 @@ int main(int argc, char **argv) {
     /* Initialize code generator and link */
     MIR_gen_init(ctx);
     MIR_gen_set_save_relocs(ctx, 1);
+    /* B2OBJ_GEN_DEBUG=<level>: surface the MIR generator's own diagnostics on
+       stderr.  Level 0 prints one line per function with its MIR insn count and
+       generation time -- the quickest way to spot a function whose codegen cost
+       is superlinear in its size.  Higher levels dump per-pass CFGs (very
+       verbose).  Off unless the variable is set. */
+    {
+        const char *gdbg = getenv("B2OBJ_GEN_DEBUG");
+        if (gdbg != NULL) {
+            MIR_gen_set_debug_file(ctx, stderr);
+            MIR_gen_set_debug_level(ctx, atoi(gdbg));
+        }
+    }
     {
         /* Optimisation level for code generation.  The MIR generator's default
            is 2 (GVN/CCP), but that pass can be extremely slow on large inputs

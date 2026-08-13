@@ -605,6 +605,10 @@ typedef struct flowctx {
      Drives returns_owned_p inference for thin-wrapper functions. */
   int                 returns_owned_inline_p;
   const char         *returns_release_fn_inline;
+  /* Set when the function body contains any goto / computed-goto: the
+     structural DA state is then unreliable, so uninitialized-store
+     diagnostics stay warnings instead of being escalated to errors. */
+  int                 body_has_goto_p;
 } flowctx_t;
 
 /* Emit-or-suppress helpers used by the transfer functions below.
@@ -2116,6 +2120,31 @@ static void analyze (flowctx_t *ctx, node_t n) {
        it as a re-acquisition. */
     node_t lhs = NL_HEAD (n->u.ops);
     node_t rhs = lhs != NULL ? NL_NEXT (lhs) : NULL;
+    /* Store through a *definitely* uninitialized pointer (`int *p; *p = 42;`).
+       Unlike an explicit NULL, an uninitialized pointer holds an indeterminate
+       value, so the runtime null-deref guard is not a reliable backstop — the
+       store lands at a garbage address and can corrupt arbitrary memory.  When
+       the flow analysis proves the receiver is uninitialized on *every* path
+       (DA_UNINIT, not the merge-uncertain DA_MAYBE), this is unambiguous UB, so
+       escalate it to a compile-time error.  A *read* through such a pointer
+       (bugs/010) intentionally stays a warning below so -fexceptions can catch
+       it at runtime.  Honors the same da_ignore / param suppressions. */
+    if (diag_active_p (ctx) && !ctx->body_has_goto_p && lhs != NULL
+        && (lhs->code == N_DEREF || lhs->code == N_IND || lhs->code == N_DEREF_FIELD)) {
+      node_t recv = NL_HEAD (lhs->u.ops);
+      int ridx = cand_lookup (ctx, id_resolves_to_decl (recv));
+      if (ridx >= 0) {
+        candidate_t *c = &VARR_ADDR (candidate_t, ctx->cands)[ridx];
+        if (c->da_state == DA_UNINIT && !c->da_ignore_p && !ctx->func_da_ignore_p
+            && !c->param_p && !c->warned_p) {
+          error (ctx->c2m_ctx, POS (lhs),
+                 "store through uninitialized pointer `%s`: its address is "
+                 "indeterminate — assign a valid target before dereferencing",
+                 c->name);
+          diag_mark_warned (ctx, c); /* suppress the weaker uninit warning below */
+        }
+      }
+    }
     if (rhs != NULL) analyze (ctx, rhs);
     if (lhs != NULL && lhs->code != N_ID) analyze (ctx, lhs);
     transfer_assign (ctx, n);
@@ -3389,6 +3418,23 @@ static void emit_ownership_report (flowctx_t *ctx, node_t func_def,
  * as soon as we see a return whose peeled expression is N_NEW, N_DETACH
  * or an N_CALL.  This is O(1) in practice for the common case.
  */
+/* True if the subtree contains any goto / computed-goto / label-address.
+   In such functions the structural (tree-walk) definite-assignment state is
+   not a sound under-approximation — a label can be reached by a jump that
+   bypasses an initializing assignment (e.g. SQLite's VDBE interpreter, one
+   ~10k-line function saturated with `goto`), so a binding that is really
+   assigned before use can look DA_UNINIT.  We therefore refuse to *escalate*
+   an uninitialized-store to a hard error when the enclosing function contains
+   any goto; the weaker advisory warning still fires. */
+static int subtree_has_goto_p (node_t n) {
+  if (n == NULL) return 0;
+  if (n->code == N_GOTO || n->code == N_INDIRECT_GOTO || n->code == N_LABEL_ADDR) return 1;
+  if (!ownership_node_has_ops (n->code)) return 0;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (subtree_has_goto_p (c)) return 1;
+  return 0;
+}
+
 static int func_might_return_owned_inline (node_t func_def) {
   if (func_def == NULL || func_def->code != N_FUNC_DEF) return 0;
   node_t block = FUNC_DEF_BLOCK (func_def);
@@ -3498,6 +3544,7 @@ static void analyze_function (c2m_ctx_t c2m_ctx, node_t func_def) {
   }
   ctx.returns_owned_inline_p   = 0;
   ctx.returns_release_fn_inline = NULL;
+  ctx.body_has_goto_p = subtree_has_goto_p (FUNC_DEF_BLOCK (func_def));
 
   if (verbose_p) cfg_dump (&cfg);
   cfg_dataflow (&ctx, &cfg);
