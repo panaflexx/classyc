@@ -58,14 +58,13 @@ find_tool () {
   fi
 }
 
-# OS-specific tool names and link flags.  b2obj emits non-PIC objects, so on
-# Linux we link with -no-pie to avoid text relocations in a PIE (DT_TEXTREL).
+# OS-specific tool names and link flags.  b2obj emits PIC via .mir.addrpool
+# (no ABS64 in .text), so Linux can use the default PIE toolchain.
 pie_flags=()
 if [ "$(uname -s)" = "Darwin" ]; then
     B2OBJ_DEFAULT="b2objmac"
 else
     B2OBJ_DEFAULT="b2obj"
-    pie_flags=(-no-pie)
 fi
 
 C2M=${C2M:-$(find_tool "bin/classyc")}

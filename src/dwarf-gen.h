@@ -10,6 +10,8 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* A simple growable byte buffer. */
 typedef struct {
@@ -176,5 +178,141 @@ static void dwbuf_patch_u32(dwbuf_t *b, size_t off, uint32_t v) {
 #define DW_ATE_unsigned     0x07
 #define DW_ATE_unsigned_char 0x08
 #define DW_ATE_UTF          0x10
+
+/* ---- .debug_frame (CFI) ----
+   MIR's FP prologue is not a classic push %rbp; gdb's heuristic often fails
+   and backtraces stall in frame 0.  Emit a template CIE/FDE so
+   DW_OP_call_frame_cfa (used as DW_AT_frame_base in b2obj) works and
+   unwind can leave JIT/AOT frames. */
+
+enum {
+  DW_CFA_nop = 0x00,
+  DW_CFA_def_cfa = 0x0c,      /* ULEB reg, ULEB offset */
+  DW_CFA_advance_loc = 0x40,  /* low 6 bits = code delta */
+  DW_CFA_offset = 0x80        /* low 6 bits = reg; ULEB factored offset */
+};
+
+/* One function's machine code for CFI generation. */
+typedef struct {
+  const uint8_t *code; /* may be NULL → CIE-default FDE only */
+  size_t code_len;
+  size_t text_offset;  /* addend for ABS64 reloc of FDE initial_location */
+} dwarf_frame_func_t;
+
+/* Relocation slot for an 8-byte absolute address in .debug_frame (FDE
+   initial_location).  Caller maps these to ELF RELA or Mach-O UNSIGNED. */
+typedef struct {
+  size_t offset;   /* offset within .debug_frame */
+  int64_t addend;  /* .text section offset of the function */
+} dwarf_frame_reloc_t;
+
+/* Emit .debug_frame into *out.  On success returns 0 and sets *out / *n_relocs
+   (*relocs is malloc'd; free with free()).  Empty func list still emits a CIE. */
+static int dwarf_emit_debug_frame (const dwarf_frame_func_t *funcs, size_t n_funcs,
+                                   dwbuf_t *out, dwarf_frame_reloc_t **relocs,
+                                   size_t *n_relocs) {
+  dwbuf_t b;
+  dwbuf_init (&b);
+  dwarf_frame_reloc_t *R = NULL;
+  size_t nR = 0, capR = 0;
+#define FR_PUSH(off, add)                                                                    \
+  do {                                                                                       \
+    if (nR >= capR) {                                                                        \
+      capR = capR ? capR * 2 : 16;                                                           \
+      R = (dwarf_frame_reloc_t *) realloc (R, capR * sizeof (dwarf_frame_reloc_t));          \
+    }                                                                                        \
+    R[nR].offset = (off);                                                                    \
+    R[nR].addend = (add);                                                                    \
+    nR++;                                                                                    \
+  } while (0)
+
+#if defined(__x86_64__) || defined(_M_X64)
+  /* MIR x86-64 keep_fp prologue (debug / spill-all):
+       48 89 6c 24 f8    mov  %rbp, -8(%rsp)
+       48 8d 6c 24 f8    lea  -8(%rsp), %rbp
+     CIE: CFA = rsp+8, RA at CFA-8.  Matching FDE advances through the two
+     5-byte insns.  Non-matching (leaf) FDEs keep CIE defaults. */
+  static const uint8_t fp_prologue[]
+    = {0x48, 0x89, 0x6c, 0x24, 0xf8, 0x48, 0x8d, 0x6c, 0x24, 0xf8};
+  size_t cie_off = b.len, len_pos = b.len;
+  dwbuf_u32 (&b, 0);          /* length, backpatched */
+  dwbuf_u32 (&b, 0xffffffff); /* CIE id */
+  dwbuf_u8 (&b, 1);           /* version */
+  dwbuf_u8 (&b, 0);           /* augmentation "" */
+  dwbuf_uleb (&b, 1);         /* code_alignment_factor */
+  dwbuf_sleb (&b, -8);        /* data_alignment_factor */
+  dwbuf_u8 (&b, 16);          /* return address column (rip) */
+  dwbuf_u8 (&b, DW_CFA_def_cfa);
+  dwbuf_uleb (&b, 7); /* rsp */
+  dwbuf_uleb (&b, 8); /* CFA = rsp+8 */
+  dwbuf_u8 (&b, DW_CFA_offset | 16);
+  dwbuf_uleb (&b, 1); /* ra at CFA + 1*(-8) */
+  while ((b.len - len_pos) % 8 != 0) dwbuf_u8 (&b, DW_CFA_nop);
+  dwbuf_patch_u32 (&b, len_pos, (uint32_t) (b.len - len_pos - 4));
+
+  for (size_t i = 0; i < n_funcs; i++) {
+    const dwarf_frame_func_t *fn = &funcs[i];
+    if (fn->code_len == 0) continue;
+    size_t fde_len_pos = b.len;
+    dwbuf_u32 (&b, 0);
+    /* CIE pointer: section-relative offset of CIE (DWARF32 .debug_frame). */
+    dwbuf_u32 (&b, (uint32_t) cie_off);
+    FR_PUSH (b.len, (int64_t) fn->text_offset);
+    dwbuf_u64 (&b, 0); /* initial_location (relocated to .text+offset) */
+    dwbuf_u64 (&b, (uint64_t) fn->code_len);
+    if (fn->code != NULL && fn->code_len >= sizeof (fp_prologue)
+        && memcmp (fn->code, fp_prologue, sizeof (fp_prologue)) == 0) {
+      dwbuf_u8 (&b, DW_CFA_advance_loc | 5);
+      dwbuf_u8 (&b, DW_CFA_offset | 6); /* rbp saved */
+      dwbuf_uleb (&b, 2);               /* at CFA + 2*(-8) */
+      dwbuf_u8 (&b, DW_CFA_advance_loc | 5);
+      dwbuf_u8 (&b, DW_CFA_def_cfa);
+      dwbuf_uleb (&b, 6);  /* rbp */
+      dwbuf_uleb (&b, 16); /* CFA = rbp+16 */
+    }
+    while ((b.len - fde_len_pos) % 8 != 0) dwbuf_u8 (&b, DW_CFA_nop);
+    dwbuf_patch_u32 (&b, fde_len_pos, (uint32_t) (b.len - fde_len_pos - 4));
+  }
+#elif defined(__aarch64__) || defined(__arm64__)
+  /* CIE: CFA = sp+0, RA = x30.  Full stp/mov FP prologue templates are a
+     later refinement; CIE defaults already fix frame-0 unwind. */
+  size_t cie_off = b.len, len_pos = b.len;
+  dwbuf_u32 (&b, 0);
+  dwbuf_u32 (&b, 0xffffffff);
+  dwbuf_u8 (&b, 1);
+  dwbuf_u8 (&b, 0);
+  dwbuf_uleb (&b, 4);  /* code_alignment_factor (instruction size) */
+  dwbuf_sleb (&b, -8); /* data_alignment_factor */
+  dwbuf_u8 (&b, 30);   /* return address register (x30/lr) */
+  dwbuf_u8 (&b, DW_CFA_def_cfa);
+  dwbuf_uleb (&b, 31); /* sp */
+  dwbuf_uleb (&b, 0);  /* CFA = sp+0 */
+  while ((b.len - len_pos) % 8 != 0) dwbuf_u8 (&b, DW_CFA_nop);
+  dwbuf_patch_u32 (&b, len_pos, (uint32_t) (b.len - len_pos - 4));
+
+  for (size_t i = 0; i < n_funcs; i++) {
+    const dwarf_frame_func_t *fn = &funcs[i];
+    if (fn->code_len == 0) continue;
+    size_t fde_len_pos = b.len;
+    dwbuf_u32 (&b, 0);
+    dwbuf_u32 (&b, (uint32_t) cie_off);
+    FR_PUSH (b.len, (int64_t) fn->text_offset);
+    dwbuf_u64 (&b, 0);
+    dwbuf_u64 (&b, (uint64_t) fn->code_len);
+    while ((b.len - fde_len_pos) % 8 != 0) dwbuf_u8 (&b, DW_CFA_nop);
+    dwbuf_patch_u32 (&b, fde_len_pos, (uint32_t) (b.len - fde_len_pos - 4));
+  }
+#else
+  (void) funcs;
+  (void) n_funcs;
+  /* Unsupported arch: empty .debug_frame is still valid. */
+#endif
+
+#undef FR_PUSH
+  *out = b;
+  *relocs = R;
+  *n_relocs = nR;
+  return 0;
+}
 
 #endif /* DWARF_GEN_H */

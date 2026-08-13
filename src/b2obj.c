@@ -402,11 +402,11 @@ typedef struct {
 
 /* A single relocation to emit */
 typedef struct {
-    size_t      offset;     /* offset within the target section (.text or .data) */
+    size_t      offset;     /* offset within the target section */
     const char *symbol;     /* symbol name */
     int         type;       /* ELF reloc type, e.g. R_X86_64_64 */
     int64_t     addend;
-    int         in_data;    /* 0 = .text reloc, 1 = .data reloc */
+    int         sect;       /* 0=.text, 1=.data, 2=.mir.addrpool */
 } elf_reloc_t;
 
 /* ================================================================== */
@@ -961,8 +961,33 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
             er->symbol = map_symbol(cr.symbol);
             er->type   = cr.type;
             er->addend = cr.addend;
-            er->in_data = 0;
+            er->sect = 0;
         }
+    }
+
+    /* Module-level .mir.addrpool (PIC GOT-shaped slots) from the generator. */
+    const uint8_t *addrpool_bytes = NULL;
+    size_t addrpool_len = 0;
+    const MIR_code_reloc_t *ap_relocs = NULL;
+    size_t n_ap_relocs = 0;
+    MIR_gen_get_addrpool (ctx, &addrpool_bytes, &addrpool_len, &ap_relocs, &n_ap_relocs);
+    uint8_t *addrpool_buf = NULL;
+    if (addrpool_len > 0) {
+        addrpool_buf = calloc (1, addrpool_len);
+        if (addrpool_bytes) memcpy (addrpool_buf, addrpool_bytes, addrpool_len);
+    }
+    for (size_t i = 0; i < n_ap_relocs; i++) {
+        if (ap_relocs[i].symbol == NULL) continue;
+        if (n_relocs >= cap_relocs) {
+            cap_relocs = cap_relocs ? cap_relocs * 2 : 64;
+            relocs = realloc (relocs, cap_relocs * sizeof (elf_reloc_t));
+        }
+        elf_reloc_t *er = &relocs[n_relocs++];
+        er->offset = ap_relocs[i].offset;
+        er->symbol = map_symbol (ap_relocs[i].symbol);
+        er->type = ap_relocs[i].type;
+        er->addend = ap_relocs[i].addend;
+        er->sect = 2; /* .mir.addrpool */
     }
 
     /* .data relocations from ref_data items */
@@ -983,11 +1008,12 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         er->type = R_X86_64_64;
 #endif
         er->addend = datas[i].ref_disp;
-        er->in_data = 1;
+        er->sect = 1;
         /* The 8 bytes in data_buf are already zero (calloc) */
     }
 
-    DBG("phase 2b done: %zu relocations", n_relocs);
+    DBG("phase 2b done: %zu relocations (addrpool=%zu bytes, %zu pool relocs)",
+        n_relocs, addrpool_len, n_ap_relocs);
     /* ----- Phase 3: build string tables and symbol table ----- */
 
     /*
@@ -1008,19 +1034,23 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         SEC_TEXT,        /* 1 */
         SEC_DATA,        /* 2 */
         SEC_BSS,         /* 3 */
-        SEC_RELA_TEXT,   /* 4 */
-        SEC_RELA_DATA,   /* 5 */
-        SEC_SYMTAB,      /* 6 */
-        SEC_STRTAB,      /* 7 */
-        SEC_SHSTRTAB,    /* 8 */
-        SEC_NOTE_STACK,  /* 9 */
-        SEC_DEBUG_INFO,  /* 10 — .debug_info */
-        SEC_DEBUG_ABBREV,/* 11 — .debug_abbrev */
-        SEC_DEBUG_LINE,  /* 12 — .debug_line */
-        SEC_DEBUG_STR,   /* 13 — .debug_str */
-        SEC_RELA_DEBUG_INFO, /* 14 — .rela.debug_info */
-        SEC_RELA_DEBUG_LINE, /* 15 — .rela.debug_line */
-        NUM_SECTIONS     /* 16 */
+        SEC_ADDRPOOL,    /* 4 — .mir.addrpool (PIC address slots) */
+        SEC_RELA_TEXT,   /* 5 */
+        SEC_RELA_DATA,   /* 6 */
+        SEC_RELA_ADDRPOOL, /* 7 */
+        SEC_SYMTAB,      /* 8 */
+        SEC_STRTAB,      /* 9 */
+        SEC_SHSTRTAB,    /* 10 */
+        SEC_NOTE_STACK,  /* 11 */
+        SEC_DEBUG_INFO,  /* 12 — .debug_info */
+        SEC_DEBUG_ABBREV,/* 13 — .debug_abbrev */
+        SEC_DEBUG_LINE,  /* 14 — .debug_line */
+        SEC_DEBUG_STR,   /* 15 — .debug_str */
+        SEC_DEBUG_FRAME, /* 16 — .debug_frame (CFI for backtraces) */
+        SEC_RELA_DEBUG_INFO,  /* 17 — .rela.debug_info */
+        SEC_RELA_DEBUG_LINE,  /* 18 — .rela.debug_line */
+        SEC_RELA_DEBUG_FRAME, /* 19 — .rela.debug_frame */
+        NUM_SECTIONS     /* 20 */
     };
 
     /* Build .shstrtab */
@@ -1030,9 +1060,11 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t nm_text       = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".text");
     size_t nm_data       = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".data");
     size_t nm_bss        = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".bss");
+    size_t nm_addrpool   = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, MIR_AOT_ADDRPOOL_NAME);
     size_t nm_tdata      = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".tdata");
     size_t nm_rela_text  = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.text");
     size_t nm_rela_data  = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.data");
+    size_t nm_rela_addrpool = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.mir.addrpool");
     size_t nm_symtab     = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".symtab");
     size_t nm_strtab     = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".strtab");
     size_t nm_shstrtab   = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".shstrtab");
@@ -1041,8 +1073,10 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t nm_debug_abbrev = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".debug_abbrev");
     size_t nm_debug_line   = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".debug_line");
     size_t nm_debug_str    = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".debug_str");
+    size_t nm_debug_frame  = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".debug_frame");
     size_t nm_rela_debug_info = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.debug_info");
     size_t nm_rela_debug_line = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.debug_line");
+    size_t nm_rela_debug_frame = strtab_add(&shstrtab, &shstrtab_size, &shstrtab_cap, ".rela.debug_frame");
 
     /* Dynamic sections: optional .tdata then [[registry]] cyreg_* pairs. */
     size_t sec_tdata = 0;
@@ -1091,7 +1125,8 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     /* Symbol 0: null */
     { Elf64_Sym s = {0}; SYMTAB_PUSH(s); }
 
-    /* Section symbols (local) for .text, .data, .bss */
+    /* Section symbols (local) for .text, .data, .bss, .mir.addrpool */
+    size_t addrpool_sec_sym_idx = 0;
     {
         Elf64_Sym s = {0};
         s.st_info = ELF64_ST_INFO(STB_LOCAL, STT_SECTION);
@@ -1103,6 +1138,10 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         SYMTAB_PUSH(s);
 
         s.st_shndx = SEC_BSS;
+        SYMTAB_PUSH(s);
+
+        s.st_shndx = SEC_ADDRPOOL;
+        addrpool_sec_sym_idx = n_syms;
         SYMTAB_PUSH(s);
     }
 
@@ -1172,6 +1211,9 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         if (n_sym_map * 2 >= sym_idx_cap) SYM_IDX_REBUILD(); \
         else SYM_IDX_INSERT(n_sym_map - 1); \
     } while(0)
+
+    /* PC32 text→pool targets this section symbol (index remapped after sort). */
+    SYM_MAP_ADD (MIR_AOT_ADDRPOOL_NAME, addrpool_sec_sym_idx);
 
     /* Global symbols: functions */
     for (size_t i = 0; i < n_funcs; i++) {
@@ -1340,15 +1382,18 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         free(old_to_new);
     }
 
-    /* ----- Build .rela.text and .rela.data ----- */
-    size_t n_rela_text = 0, n_rela_data = 0;
+    /* ----- Build .rela.text, .rela.data, .rela.mir.addrpool ----- */
+    size_t n_rela_text = 0, n_rela_data = 0, n_rela_pool = 0;
     for (size_t i = 0; i < n_relocs; i++) {
-        if (relocs[i].in_data) n_rela_data++; else n_rela_text++;
+        if (relocs[i].sect == 1) n_rela_data++;
+        else if (relocs[i].sect == 2) n_rela_pool++;
+        else n_rela_text++;
     }
 
     Elf64_Rela *rela_text = calloc(n_rela_text ? n_rela_text : 1, sizeof(Elf64_Rela));
     Elf64_Rela *rela_data = calloc(n_rela_data ? n_rela_data : 1, sizeof(Elf64_Rela));
-    size_t rt_idx = 0, rd_idx = 0;
+    Elf64_Rela *rela_pool = calloc(n_rela_pool ? n_rela_pool : 1, sizeof(Elf64_Rela));
+    size_t rt_idx = 0, rd_idx = 0, rp_idx = 0;
 
     for (size_t i = 0; i < n_relocs; i++) {
         /* Find symbol index */
@@ -1359,8 +1404,10 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         r.r_offset = relocs[i].offset;
         r.r_info = ELF64_R_INFO(sym_idx, relocs[i].type);
         r.r_addend = relocs[i].addend;
-        if (relocs[i].in_data)
+        if (relocs[i].sect == 1)
             rela_data[rd_idx++] = r;
+        else if (relocs[i].sect == 2)
+            rela_pool[rp_idx++] = r;
         else
             rela_text[rt_idx++] = r;
     }
@@ -1385,12 +1432,15 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     DBG("phase 3 done: %zu symbols", n_syms);
 
     /* ----- Phase 3b: Build DWARF debug sections (if debug info present) ----- */
-    dwbuf_t dw_abbrev, dw_info, dw_line, dw_str;
+    dwbuf_t dw_abbrev, dw_info, dw_line, dw_str, dw_frame;
     dwbuf_init(&dw_abbrev);
     dwbuf_init(&dw_info);
     dwbuf_init(&dw_line);
     dwbuf_init(&dw_str);
+    dwbuf_init(&dw_frame);
     int has_dwarf = 0;
+    dwarf_frame_reloc_t *frame_relocs = NULL;
+    size_t n_frame_relocs = 0;
 
     /* DWARF relocation tracking: records (offset_in_dwarf_section, addend_in_text, is_line) */
     typedef struct { size_t offset; int64_t addend; int in_line; /* 0=.debug_info, 1=.debug_line */ } dwarf_reloc_t;
@@ -1989,11 +2039,40 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         uint32_t line_total = (uint32_t)(dw_line.len - line_start - 4);
         dwbuf_patch_u32(&dw_line, line_start, line_total);
 
-        DBG("phase 3b done: .debug_info=%zu .debug_abbrev=%zu .debug_line=%zu .debug_str=%zu relocs=%zu",
-            dw_info.len, dw_abbrev.len, dw_line.len, dw_str.len, n_dw_relocs);
+        /* --- .debug_frame: CFI so DW_OP_call_frame_cfa / backtraces work --- */
+        {
+            dwarf_frame_func_t *ff = calloc (n_funcs ? n_funcs : 1, sizeof (dwarf_frame_func_t));
+            for (size_t fi = 0; fi < n_funcs; fi++) {
+                ff[fi].code = (const uint8_t *) funcs[fi].code;
+                ff[fi].code_len = funcs[fi].code_len;
+                ff[fi].text_offset = funcs[fi].text_offset;
+            }
+            dwarf_emit_debug_frame (ff, n_funcs, &dw_frame, &frame_relocs, &n_frame_relocs);
+            free (ff);
+        }
+
+        DBG("phase 3b done: .debug_info=%zu .debug_abbrev=%zu .debug_line=%zu .debug_str=%zu"
+            " .debug_frame=%zu relocs=%zu frame_relocs=%zu",
+            dw_info.len, dw_abbrev.len, dw_line.len, dw_str.len, dw_frame.len, n_dw_relocs,
+            n_frame_relocs);
     }
     }
 #endif /* !MIR_NO_DBINFO */
+
+    /* Even without full DWARF DIEs, emit .debug_frame when we have code so
+       linked AOT binaries can unwind MIR frames (CFI does not need -g). */
+    if (dw_frame.len == 0 && n_funcs > 0) {
+        dwarf_frame_func_t *ff = calloc (n_funcs ? n_funcs : 1, sizeof (dwarf_frame_func_t));
+        for (size_t fi = 0; fi < n_funcs; fi++) {
+            ff[fi].code = (const uint8_t *) funcs[fi].code;
+            ff[fi].code_len = funcs[fi].code_len;
+            ff[fi].text_offset = funcs[fi].text_offset;
+        }
+        dwarf_emit_debug_frame (ff, n_funcs, &dw_frame, &frame_relocs, &n_frame_relocs);
+        free (ff);
+        DBG ("phase 3b: .debug_frame only (no -g DIE info): %zu bytes, %zu relocs",
+             dw_frame.len, n_frame_relocs);
+    }
 
     /* Build .rela.debug_info and .rela.debug_line from collected DWARF relocs.
        All relocations point at the .text section symbol (index 1 in symtab)
@@ -2004,6 +2083,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     }
     Elf64_Rela *rela_dbinfo = calloc(n_rela_dbinfo ? n_rela_dbinfo : 1, sizeof(Elf64_Rela));
     Elf64_Rela *rela_dbline = calloc(n_rela_dbline ? n_rela_dbline : 1, sizeof(Elf64_Rela));
+    Elf64_Rela *rela_dbframe = calloc (n_frame_relocs ? n_frame_relocs : 1, sizeof (Elf64_Rela));
     {
         size_t di_idx = 0, dl_idx = 0;
         /* .text section symbol is at index 1 in symtab (SEC_TEXT section sym) */
@@ -2021,6 +2101,17 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
                 rela_dbline[dl_idx++] = r;
             else
                 rela_dbinfo[di_idx++] = r;
+        }
+        for (size_t i = 0; i < n_frame_relocs; i++) {
+            Elf64_Rela r = {0};
+            r.r_offset = frame_relocs[i].offset;
+#if defined(__aarch64__)
+            r.r_info = ELF64_R_INFO (text_sym_idx, R_AARCH64_ABS64);
+#else
+            r.r_info = ELF64_R_INFO (text_sym_idx, R_X86_64_64);
+#endif
+            r.r_addend = frame_relocs[i].addend;
+            rela_dbframe[i] = r;
         }
     }
 
@@ -2049,6 +2140,11 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t data_off = off;
     off += data_size;
 
+    /* .mir.addrpool (PIC address slots) */
+    off = align8 (off);
+    size_t addrpool_off = off;
+    off += addrpool_len;
+
     /* .tdata (TLS init image) */
     size_t tdata_off = 0;
     if (sec_tdata && tdata_size > 0) {
@@ -2068,6 +2164,12 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t rela_data_off = off;
     size_t rela_data_size = n_rela_data * sizeof(Elf64_Rela);
     off += rela_data_size;
+
+    /* .rela.mir.addrpool */
+    off = align8 (off);
+    size_t rela_pool_off = off;
+    size_t rela_pool_size = n_rela_pool * sizeof (Elf64_Rela);
+    off += rela_pool_size;
 
     /* .symtab */
     off = align8(off);
@@ -2104,6 +2206,11 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t debug_str_size = dw_str.len;
     off += debug_str_size;
 
+    off = align8(off);
+    size_t debug_frame_off = off;
+    size_t debug_frame_size = dw_frame.len;
+    off += debug_frame_size;
+
     /* .rela.debug_info */
     off = align8(off);
     size_t rela_dbinfo_off = off;
@@ -2115,6 +2222,12 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     size_t rela_dbline_off = off;
     size_t rela_dbline_size = n_rela_dbline * sizeof(Elf64_Rela);
     off += rela_dbline_size;
+
+    /* .rela.debug_frame */
+    off = align8 (off);
+    size_t rela_dbframe_off = off;
+    size_t rela_dbframe_size = n_frame_relocs * sizeof (Elf64_Rela);
+    off += rela_dbframe_size;
 
     /* [[registry]] cyreg_<NAME> PROGBITS + .rela.cyreg_<NAME> sections */
     for (size_t k = 0; k < n_cyr; k++) {
@@ -2160,6 +2273,14 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     shdrs[SEC_BSS].sh_size      = bss_size;
     shdrs[SEC_BSS].sh_addralign = 8;
 
+    /* 4: .mir.addrpool */
+    shdrs[SEC_ADDRPOOL].sh_name      = nm_addrpool;
+    shdrs[SEC_ADDRPOOL].sh_type      = SHT_PROGBITS;
+    shdrs[SEC_ADDRPOOL].sh_flags     = SHF_ALLOC | SHF_WRITE;
+    shdrs[SEC_ADDRPOOL].sh_offset    = addrpool_off;
+    shdrs[SEC_ADDRPOOL].sh_size      = addrpool_len;
+    shdrs[SEC_ADDRPOOL].sh_addralign = 16;
+
     /* optional: .tdata (SHF_TLS) at sec_tdata */
     if (sec_tdata) {
         shdrs[sec_tdata].sh_name      = nm_tdata;
@@ -2170,7 +2291,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         shdrs[sec_tdata].sh_addralign = 8;
     }
 
-    /* 4: .rela.text */
+    /* 5: .rela.text */
     shdrs[SEC_RELA_TEXT].sh_name      = nm_rela_text;
     shdrs[SEC_RELA_TEXT].sh_type      = SHT_RELA;
     shdrs[SEC_RELA_TEXT].sh_offset    = rela_text_off;
@@ -2180,7 +2301,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     shdrs[SEC_RELA_TEXT].sh_addralign = 8;
     shdrs[SEC_RELA_TEXT].sh_entsize   = sizeof(Elf64_Rela);
 
-    /* 5: .rela.data */
+    /* 6: .rela.data */
     shdrs[SEC_RELA_DATA].sh_name      = nm_rela_data;
     shdrs[SEC_RELA_DATA].sh_type      = SHT_RELA;
     shdrs[SEC_RELA_DATA].sh_offset    = rela_data_off;
@@ -2190,7 +2311,17 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     shdrs[SEC_RELA_DATA].sh_addralign = 8;
     shdrs[SEC_RELA_DATA].sh_entsize   = sizeof(Elf64_Rela);
 
-    /* 6: .symtab */
+    /* 7: .rela.mir.addrpool */
+    shdrs[SEC_RELA_ADDRPOOL].sh_name      = nm_rela_addrpool;
+    shdrs[SEC_RELA_ADDRPOOL].sh_type      = SHT_RELA;
+    shdrs[SEC_RELA_ADDRPOOL].sh_offset    = rela_pool_off;
+    shdrs[SEC_RELA_ADDRPOOL].sh_size      = rela_pool_size;
+    shdrs[SEC_RELA_ADDRPOOL].sh_link      = SEC_SYMTAB;
+    shdrs[SEC_RELA_ADDRPOOL].sh_info      = SEC_ADDRPOOL;
+    shdrs[SEC_RELA_ADDRPOOL].sh_addralign = 8;
+    shdrs[SEC_RELA_ADDRPOOL].sh_entsize   = sizeof (Elf64_Rela);
+
+    /* 8: .symtab */
     shdrs[SEC_SYMTAB].sh_name      = nm_symtab;
     shdrs[SEC_SYMTAB].sh_type      = SHT_SYMTAB;
     shdrs[SEC_SYMTAB].sh_offset    = symtab_off;
@@ -2255,7 +2386,15 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     shdrs[SEC_DEBUG_STR].sh_addralign = 1;
     shdrs[SEC_DEBUG_STR].sh_entsize   = 1;
 
-    /* 14: .rela.debug_info */
+    /* 14: .debug_frame */
+    shdrs[SEC_DEBUG_FRAME].sh_name      = nm_debug_frame;
+    shdrs[SEC_DEBUG_FRAME].sh_type      = SHT_PROGBITS;
+    shdrs[SEC_DEBUG_FRAME].sh_flags     = 0;
+    shdrs[SEC_DEBUG_FRAME].sh_offset    = debug_frame_off;
+    shdrs[SEC_DEBUG_FRAME].sh_size      = debug_frame_size;
+    shdrs[SEC_DEBUG_FRAME].sh_addralign = 8;
+
+    /* 15: .rela.debug_info */
     shdrs[SEC_RELA_DEBUG_INFO].sh_name      = nm_rela_debug_info;
     shdrs[SEC_RELA_DEBUG_INFO].sh_type      = SHT_RELA;
     shdrs[SEC_RELA_DEBUG_INFO].sh_offset    = rela_dbinfo_off;
@@ -2265,7 +2404,7 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     shdrs[SEC_RELA_DEBUG_INFO].sh_addralign = 8;
     shdrs[SEC_RELA_DEBUG_INFO].sh_entsize   = sizeof(Elf64_Rela);
 
-    /* 15: .rela.debug_line */
+    /* 16: .rela.debug_line */
     shdrs[SEC_RELA_DEBUG_LINE].sh_name      = nm_rela_debug_line;
     shdrs[SEC_RELA_DEBUG_LINE].sh_type      = SHT_RELA;
     shdrs[SEC_RELA_DEBUG_LINE].sh_offset    = rela_dbline_off;
@@ -2274,6 +2413,16 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     shdrs[SEC_RELA_DEBUG_LINE].sh_info      = SEC_DEBUG_LINE;
     shdrs[SEC_RELA_DEBUG_LINE].sh_addralign = 8;
     shdrs[SEC_RELA_DEBUG_LINE].sh_entsize   = sizeof(Elf64_Rela);
+
+    /* 17: .rela.debug_frame */
+    shdrs[SEC_RELA_DEBUG_FRAME].sh_name      = nm_rela_debug_frame;
+    shdrs[SEC_RELA_DEBUG_FRAME].sh_type      = SHT_RELA;
+    shdrs[SEC_RELA_DEBUG_FRAME].sh_offset    = rela_dbframe_off;
+    shdrs[SEC_RELA_DEBUG_FRAME].sh_size      = rela_dbframe_size;
+    shdrs[SEC_RELA_DEBUG_FRAME].sh_link      = SEC_SYMTAB;
+    shdrs[SEC_RELA_DEBUG_FRAME].sh_info      = SEC_DEBUG_FRAME;
+    shdrs[SEC_RELA_DEBUG_FRAME].sh_addralign = 8;
+    shdrs[SEC_RELA_DEBUG_FRAME].sh_entsize   = sizeof (Elf64_Rela);
 
     /* [[registry]] cyreg_<NAME> (SHF_ALLOC|SHF_WRITE PROGBITS) + its .rela */
     for (size_t k = 0; k < n_cyr; k++) {
@@ -2339,15 +2488,21 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     /* .data */
     if (data_size) write(fd, data_buf, data_size);
 
+    /* .mir.addrpool */
+    { size_t cur = data_off + data_size;
+      if (addrpool_off > cur) write_padding (fd, addrpool_off - cur); }
+    if (addrpool_len && addrpool_buf) write (fd, addrpool_buf, addrpool_len);
+
     /* .tdata */
     if (sec_tdata && tdata_size) {
-        size_t cur = data_off + data_size;
+        size_t cur = addrpool_off + addrpool_len;
         if (tdata_off > cur) write_padding (fd, tdata_off - cur);
         write (fd, tdata_buf, tdata_size);
     }
 
     /* padding to rela_text_off */
-    { size_t cur = (sec_tdata && tdata_size) ? (tdata_off + tdata_size) : (data_off + data_size);
+    { size_t cur = (sec_tdata && tdata_size) ? (tdata_off + tdata_size)
+                                            : (addrpool_off + addrpool_len);
       if (rela_text_off > cur) write_padding(fd, rela_text_off - cur); }
 
     /* .rela.text */
@@ -2360,8 +2515,13 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     /* .rela.data */
     if (rela_data_size) write(fd, rela_data, rela_data_size);
 
-    /* padding to symtab_off */
+    /* .rela.mir.addrpool */
     { size_t cur = rela_data_off + rela_data_size;
+      if (rela_pool_off > cur) write_padding (fd, rela_pool_off - cur); }
+    if (rela_pool_size) write (fd, rela_pool, rela_pool_size);
+
+    /* padding to symtab_off */
+    { size_t cur = rela_pool_off + rela_pool_size;
       if (symtab_off > cur) write_padding(fd, symtab_off - cur); }
 
     /* .symtab */
@@ -2392,9 +2552,18 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         write(fd, dw_str.data, debug_str_size);
     }
 
+    if (debug_frame_size > 0) {
+        size_t cur = debug_str_size > 0 ? debug_str_off + debug_str_size
+                   : debug_info_size > 0 ? debug_line_off + debug_line_size
+                   : shstrtab_off + shstrtab_size;
+        if (debug_frame_off > cur) write_padding (fd, debug_frame_off - cur);
+        write (fd, dw_frame.data, debug_frame_size);
+    }
+
     /* .rela.debug_info */
     if (rela_dbinfo_size > 0) {
-        { size_t cur = (debug_str_size > 0 ? debug_str_off + debug_str_size
+        { size_t cur = (debug_frame_size > 0 ? debug_frame_off + debug_frame_size
+                       : debug_str_size > 0 ? debug_str_off + debug_str_size
                                            : shstrtab_off + shstrtab_size);
           if (rela_dbinfo_off > cur) write_padding(fd, rela_dbinfo_off - cur); }
         write(fd, rela_dbinfo, rela_dbinfo_size);
@@ -2407,9 +2576,21 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
         write(fd, rela_dbline, rela_dbline_size);
     }
 
+    /* .rela.debug_frame */
+    if (rela_dbframe_size > 0) {
+        size_t cur = rela_dbline_size > 0 ? rela_dbline_off + rela_dbline_size
+                   : rela_dbinfo_size > 0 ? rela_dbinfo_off + rela_dbinfo_size
+                   : debug_frame_size > 0 ? debug_frame_off + debug_frame_size
+                   : shstrtab_off + shstrtab_size;
+        if (rela_dbframe_off > cur) write_padding (fd, rela_dbframe_off - cur);
+        write (fd, rela_dbframe, rela_dbframe_size);
+    }
+
     /* [[registry]] cyreg sections: PROGBITS pointer array + its relocations */
-    { size_t cur = (rela_dbline_size > 0 ? rela_dbline_off + rela_dbline_size
+    { size_t cur = (rela_dbframe_size > 0 ? rela_dbframe_off + rela_dbframe_size
+                  : rela_dbline_size > 0 ? rela_dbline_off + rela_dbline_size
                   : rela_dbinfo_size > 0 ? rela_dbinfo_off + rela_dbinfo_size
+                  : debug_frame_size > 0 ? debug_frame_off + debug_frame_size
                   : debug_str_size > 0   ? debug_str_off + debug_str_size
                   : shstrtab_off + shstrtab_size);
       for (size_t k = 0; k < n_cyr; k++) {
@@ -2441,6 +2622,8 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     free(data_buf);
     free(rela_text);
     free(rela_data);
+    free (rela_pool);
+    free (addrpool_buf);
     free(symtab);
     free(strtab);
     free(shstrtab);
@@ -2466,9 +2649,12 @@ static void create_object_file_from_module(MIR_context_t ctx, const char *output
     dwbuf_free(&dw_info);
     dwbuf_free(&dw_line);
     dwbuf_free(&dw_str);
+    dwbuf_free (&dw_frame);
     free(dw_relocs);
+    free (frame_relocs);
     free(rela_dbinfo);
     free(rela_dbline);
+    free (rela_dbframe);
 
     #undef SYMTAB_PUSH
     #undef SYM_MAP_ADD

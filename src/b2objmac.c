@@ -61,9 +61,14 @@
 #define S_THREAD_LOCAL_ZEROFILL 0x12
 #define S_THREAD_LOCAL_VARIABLES 0x13
 #endif
+/* Debug section attribute (DWARF); present on all modern Apple SDKs. */
+#ifndef S_ATTR_DEBUG
+#define S_ATTR_DEBUG 0x02000000
+#endif
 
 #include "mir-alloc-default.c"
 #include "mir-gen.h" /* mir.h included transitively */
+#include "dwarf-aot-emit.h"
 
 /* ELF GOT-relative relocation type (mir.h only defines PC32 and 64).  We use it
  * as an internal marker meaning "this reference must go through the GOT"; on
@@ -1531,26 +1536,72 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
 
   DBG ("  __text relocs: %zu, __data relocs: %zu", n_reloc_text, n_reloc_data);
 
+  /* ----- Phase 4b: DWARF + .debug_frame (x86_64 and aarch64) ----- */
+  /* Always emit CFI so backtraces leave MIR frames; full DIE/line when -g.
+     Shared with b2obj via dwarf-aot-emit.h (works on Intel 10.12 and arm64). */
+#if !MIR_NO_DBINFO
+  dwarf_aot_result_t dwarf;
+  memset (&dwarf, 0, sizeof (dwarf));
+  {
+    dwarf_aot_func_t *df = calloc (n_funcs ? n_funcs : 1, sizeof (dwarf_aot_func_t));
+    for (size_t i = 0; i < n_funcs; i++) {
+      df[i].name = funcs[i].name;
+      df[i].code = (const uint8_t *) funcs[i].code;
+      df[i].code_len = funcs[i].code_len;
+      df[i].text_offset = funcs[i].text_offset;
+      df[i].func = funcs[i].item != NULL ? funcs[i].item->u.func : NULL;
+    }
+    dwarf_aot_emit (ctx, text_size, df, n_funcs, &dwarf);
+    free (df);
+    DBG ("phase 4b: DWARF info=%zu abbrev=%zu line=%zu str=%zu frame=%zu relocs=%zu",
+         dwarf.info.len, dwarf.abbrev.len, dwarf.line.len, dwarf.str.len, dwarf.frame.len,
+         dwarf.n_relocs);
+  }
+  int has_dwarf_dies = (dwarf.info.len > 0);
+  int has_dwarf_frame = (dwarf.frame.len > 0);
+#else
+  int has_dwarf_dies = 0;
+  int has_dwarf_frame = 0;
+#endif
+
   /* ----- Phase 5: compute file layout and write Mach-O ----- */
   DBG ("phase 5: computing file layout and writing Mach-O");
 
   /*
-   * Mach-O object file layout:
+   * Mach-O MH_OBJECT layout (matches clang on 10.12+):
    *
    *   [mach_header_64]
-   *   [load commands: LC_SEGMENT_64, LC_SYMTAB, LC_DYSYMTAB, LC_VERSION_MIN_MACOSX]
-   *   [__TEXT,__text section data]
-   *   [__DATA,__data section data]
-   *   (__DATA,__bss has no file content)
-   *   [__text relocation entries]
-   *   [__data relocation entries]
+   *   [load commands: single LC_SEGMENT_64 (all sections), LC_SYMTAB,
+   *                    LC_DYSYMTAB, LC_VERSION_MIN_MACOSX]
+   *   [section data: __text / __data / cyreg / tls / __DWARF,__debug_*]
+   *   [relocations]
    *   [symbol table (nlist_64)]
    *   [string table]
+   *
+   * ld rejects MH_OBJECT with more than one LC_SEGMENT_64.  DWARF sections
+   * live in the same segment; each section_64 still names segname "__DWARF".
+   * Dual-arch: x86_64 (10.12+) and aarch64; reloc types selected by #ifdef.
    */
 
-  /* Count load commands */
+  /* DWARF sections (always at least .debug_frame when we have code) */
+  size_t n_dwarf_sects = 0;
+  if (has_dwarf_dies) n_dwarf_sects += 4; /* info, abbrev, line, str */
+  if (has_dwarf_frame) n_dwarf_sects += 1; /* frame */
+  /* Sizes for layout (zero when no DWARF / MIR_NO_DBINFO). */
+  size_t d_info_len = 0, d_abbrev_len = 0, d_line_len = 0, d_str_len = 0, d_frame_len = 0;
+  size_t d_n_relocs = 0;
+#if !MIR_NO_DBINFO
+  d_info_len = dwarf.info.len;
+  d_abbrev_len = dwarf.abbrev.len;
+  d_line_len = dwarf.line.len;
+  d_str_len = dwarf.str.len;
+  d_frame_len = dwarf.frame.len;
+  d_n_relocs = dwarf.n_relocs;
+#endif
+
+  /* Count load commands: one segment only (required for MH_OBJECT). */
   uint32_t ncmds = 4; /* LC_SEGMENT_64, LC_SYMTAB, LC_DYSYMTAB, LC_VERSION_MIN_MACOSX */
-  size_t n_all_sects = 3 + n_cyr + n_tls_sects; /* text,data,cyreg*,[tls],bss */
+  size_t n_all_sects = 3 + n_cyr + n_tls_sects + n_dwarf_sects; /* + __DWARF,* */
   size_t sizeofcmds = sizeof (struct segment_command_64)
                      + sizeof (struct section_64) * n_all_sects
                      + sizeof (struct symtab_command)
@@ -1586,8 +1637,27 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     tls_file_end = tvars_file_off + tvars_size;
   }
 
+  /* DWARF section data follows TLS content (before relocations). */
+  size_t dwarf_file_off = align_up (tls_file_end, 8);
+  size_t dbg_info_off = 0, dbg_abbrev_off = 0, dbg_line_off = 0, dbg_str_off = 0, dbg_frame_off = 0;
+  size_t dwarf_data_end = dwarf_file_off;
+  if (n_dwarf_sects > 0) {
+    size_t d = dwarf_file_off;
+    if (has_dwarf_dies) {
+      dbg_info_off = d; d += d_info_len;
+      dbg_abbrev_off = d; d += d_abbrev_len;
+      dbg_line_off = d; d += d_line_len;
+      dbg_str_off = d; d += d_str_len;
+    }
+    if (has_dwarf_frame) {
+      d = align_up (d, 8);
+      dbg_frame_off = d; d += d_frame_len;
+    }
+    dwarf_data_end = d;
+  }
+
   /* Relocation entries follow section data */
-  size_t reloc_text_off = tls_file_end;
+  size_t reloc_text_off = dwarf_data_end;
   size_t reloc_data_off = reloc_text_off + n_reloc_text * sizeof (struct relocation_info);
 
   /* cyreg relocations follow the __data relocations. */
@@ -1602,8 +1672,23 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   size_t tvars_reloc_bytes = n_tlss * 2 * sizeof (struct relocation_info);
   size_t after_tvars_relocs = tvars_reloc_off + tvars_reloc_bytes;
 
+  /* DWARF section relocs (UNSIGNED → __text section, r_extern=0). */
+  size_t n_reloc_dinfo = 0, n_reloc_dline = 0, n_reloc_dframe = 0;
+#if !MIR_NO_DBINFO
+  for (size_t i = 0; i < dwarf.n_relocs; i++) {
+    if (dwarf.relocs[i].sect == 0) n_reloc_dinfo++;
+    else if (dwarf.relocs[i].sect == 1) n_reloc_dline++;
+    else n_reloc_dframe++;
+  }
+#endif
+  size_t dbg_reloc_info_off = after_tvars_relocs;
+  size_t dbg_reloc_line_off = dbg_reloc_info_off + n_reloc_dinfo * sizeof (struct relocation_info);
+  size_t dbg_reloc_frame_off = dbg_reloc_line_off + n_reloc_dline * sizeof (struct relocation_info);
+  size_t after_dbg_relocs
+    = dbg_reloc_frame_off + n_reloc_dframe * sizeof (struct relocation_info);
+
   /* Symbol table */
-  size_t symtab_off = after_tvars_relocs;
+  size_t symtab_off = after_dbg_relocs;
   symtab_off = align_up (symtab_off, 8);
 
   /* String table */
@@ -1614,25 +1699,40 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
 
   /* ----- Build load commands ----- */
 
-  /* LC_SEGMENT_64 for the single segment encompassing all sections */
-  struct segment_command_64 seg_cmd;
-  memset (&seg_cmd, 0, sizeof (seg_cmd));
-  seg_cmd.cmd = LC_SEGMENT_64;
-  seg_cmd.cmdsize = (uint32_t) (sizeof (struct segment_command_64)
-                                + n_all_sects * sizeof (struct section_64));
-  strncpy (seg_cmd.segname, "__TEXT", 16);
-  seg_cmd.vmaddr = 0;
-  /* vmsize must cover every section's addr+size (incl. zerofill). */
+  /* DWARF section virtual addresses (contiguous after non-debug content). */
+  size_t dwarf_vm_base = 0;
   {
     uint64_t vend = bss_addr + bss_size;
     if (tbss_size > 0 && tbss_addr + tbss_size > vend) vend = tbss_addr + tbss_size;
     if (tvars_size > 0 && tvars_addr + tvars_size > vend) vend = tvars_addr + tvars_size;
     if (tdata_size > 0 && tdata_addr + tdata_size > vend) vend = tdata_addr + tdata_size;
     if (vend < text_size + data_size) vend = text_size + data_size;
+    dwarf_vm_base = (size_t) vend;
+  }
+
+  /* LC_SEGMENT_64: single segment for all sections (MH_OBJECT requirement). */
+  struct segment_command_64 seg_cmd;
+  memset (&seg_cmd, 0, sizeof (seg_cmd));
+  seg_cmd.cmd = LC_SEGMENT_64;
+  seg_cmd.cmdsize = (uint32_t) (sizeof (struct segment_command_64)
+                                + n_all_sects * sizeof (struct section_64));
+  /* Empty segname matches clang MH_OBJECT; sections carry their own names. */
+  memset (seg_cmd.segname, 0, 16);
+  seg_cmd.vmaddr = 0;
+  /* vmsize must cover every section's addr+size (incl. zerofill + DWARF). */
+  {
+    uint64_t vend = dwarf_vm_base;
+    if (n_dwarf_sects > 0) {
+      size_t dsz = 0;
+      if (has_dwarf_dies) dsz += d_info_len + d_abbrev_len + d_line_len + d_str_len;
+      if (has_dwarf_frame) dsz += d_frame_len;
+      vend += dsz;
+    }
     seg_cmd.vmsize = vend;
   }
   seg_cmd.fileoff = text_file_off;
-  seg_cmd.filesize = tls_file_end - text_file_off;
+  /* filesize covers all non-zerofill section bytes (code/data/tls/DWARF). */
+  seg_cmd.filesize = (n_dwarf_sects > 0 ? dwarf_data_end : tls_file_end) - text_file_off;
   seg_cmd.maxprot = 7;  /* rwx */
   seg_cmd.initprot = 7; /* rwx */
   seg_cmd.nsects = (uint32_t) n_all_sects;
@@ -1685,6 +1785,63 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   sec_bss.reserved1 = 0;
   sec_bss.reserved2 = 0;
   sec_bss.reserved3 = 0;
+
+  /* __DWARF,* section headers (same LC_SEGMENT_64 as code/data). */
+  struct section_64 sec_dinfo, sec_dabbrev, sec_dline, sec_dstr, sec_dframe;
+  memset (&sec_dinfo, 0, sizeof (sec_dinfo));
+  memset (&sec_dabbrev, 0, sizeof (sec_dabbrev));
+  memset (&sec_dline, 0, sizeof (sec_dline));
+  memset (&sec_dstr, 0, sizeof (sec_dstr));
+  memset (&sec_dframe, 0, sizeof (sec_dframe));
+  if (n_dwarf_sects > 0) {
+    uint64_t daddr = dwarf_vm_base;
+    if (has_dwarf_dies) {
+      strncpy (sec_dinfo.sectname, "__debug_info", 16);
+      strncpy (sec_dinfo.segname, "__DWARF", 16);
+      sec_dinfo.addr = daddr;
+      sec_dinfo.size = d_info_len;
+      sec_dinfo.offset = (uint32_t) dbg_info_off;
+      sec_dinfo.align = 0;
+      sec_dinfo.reloff = (uint32_t) (n_reloc_dinfo ? dbg_reloc_info_off : 0);
+      sec_dinfo.nreloc = (uint32_t) n_reloc_dinfo;
+      sec_dinfo.flags = S_REGULAR | S_ATTR_DEBUG;
+      daddr += d_info_len;
+      strncpy (sec_dabbrev.sectname, "__debug_abbrev", 16);
+      strncpy (sec_dabbrev.segname, "__DWARF", 16);
+      sec_dabbrev.addr = daddr;
+      sec_dabbrev.size = d_abbrev_len;
+      sec_dabbrev.offset = (uint32_t) dbg_abbrev_off;
+      sec_dabbrev.flags = S_REGULAR | S_ATTR_DEBUG;
+      daddr += d_abbrev_len;
+      strncpy (sec_dline.sectname, "__debug_line", 16);
+      strncpy (sec_dline.segname, "__DWARF", 16);
+      sec_dline.addr = daddr;
+      sec_dline.size = d_line_len;
+      sec_dline.offset = (uint32_t) dbg_line_off;
+      sec_dline.reloff = (uint32_t) (n_reloc_dline ? dbg_reloc_line_off : 0);
+      sec_dline.nreloc = (uint32_t) n_reloc_dline;
+      sec_dline.flags = S_REGULAR | S_ATTR_DEBUG;
+      daddr += d_line_len;
+      strncpy (sec_dstr.sectname, "__debug_str", 16);
+      strncpy (sec_dstr.segname, "__DWARF", 16);
+      sec_dstr.addr = daddr;
+      sec_dstr.size = d_str_len;
+      sec_dstr.offset = (uint32_t) dbg_str_off;
+      sec_dstr.flags = S_REGULAR | S_ATTR_DEBUG;
+      daddr += d_str_len;
+    }
+    if (has_dwarf_frame) {
+      strncpy (sec_dframe.sectname, "__debug_frame", 16);
+      strncpy (sec_dframe.segname, "__DWARF", 16);
+      sec_dframe.addr = daddr;
+      sec_dframe.size = d_frame_len;
+      sec_dframe.offset = (uint32_t) dbg_frame_off;
+      sec_dframe.align = 3; /* 8-byte */
+      sec_dframe.reloff = (uint32_t) (n_reloc_dframe ? dbg_reloc_frame_off : 0);
+      sec_dframe.nreloc = (uint32_t) n_reloc_dframe;
+      sec_dframe.flags = S_REGULAR | S_ATTR_DEBUG;
+    }
+  }
 
   /* LC_SYMTAB */
   struct symtab_command sym_cmd;
@@ -1794,7 +1951,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     sec_tbss.flags = S_THREAD_LOCAL_ZEROFILL;
   }
 
-  /* Load commands */
+  /* Load commands: one LC_SEGMENT_64 with all section headers, then symtab cmds. */
   write (fd, &seg_cmd, sizeof (seg_cmd));
   write (fd, &sec_text, sizeof (sec_text));
   write (fd, &sec_data, sizeof (sec_data));
@@ -1803,6 +1960,15 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   if (tvars_size > 0) write (fd, &sec_tvars, sizeof (sec_tvars));
   if (tbss_size > 0) write (fd, &sec_tbss, sizeof (sec_tbss));
   write (fd, &sec_bss, sizeof (sec_bss));
+  if (n_dwarf_sects > 0) {
+    if (has_dwarf_dies) {
+      write (fd, &sec_dinfo, sizeof (sec_dinfo));
+      write (fd, &sec_dabbrev, sizeof (sec_dabbrev));
+      write (fd, &sec_dline, sizeof (sec_dline));
+      write (fd, &sec_dstr, sizeof (sec_dstr));
+    }
+    if (has_dwarf_frame) write (fd, &sec_dframe, sizeof (sec_dframe));
+  }
   write (fd, &sym_cmd, sizeof (sym_cmd));
   write (fd, &dysym_cmd, sizeof (dysym_cmd));
   write (fd, &ver_cmd, sizeof (ver_cmd));
@@ -1839,6 +2005,39 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       write (fd, tvars_buf, tvars_size);
       cur = tvars_file_off + tvars_size;
     }
+    /* Patch DWARF absolute address slots with text addends, then write. */
+#if !MIR_NO_DBINFO
+    for (size_t i = 0; i < dwarf.n_relocs; i++) {
+      uint64_t add = (uint64_t) dwarf.relocs[i].addend;
+      size_t off = dwarf.relocs[i].offset;
+      uint8_t *base = NULL;
+      size_t blen = 0;
+      if (dwarf.relocs[i].sect == 0) {
+        base = dwarf.info.data; blen = dwarf.info.len;
+      } else if (dwarf.relocs[i].sect == 1) {
+        base = dwarf.line.data; blen = dwarf.line.len;
+      } else {
+        base = dwarf.frame.data; blen = dwarf.frame.len;
+      }
+      if (base != NULL && off + 8 <= blen) memcpy (base + off, &add, 8);
+    }
+#endif
+#if !MIR_NO_DBINFO
+    if (n_dwarf_sects > 0 && dwarf_file_off > cur)
+      write_padding (fd, dwarf_file_off - cur);
+    if (has_dwarf_dies) {
+      if (d_info_len) write (fd, dwarf.info.data, d_info_len);
+      if (d_abbrev_len) write (fd, dwarf.abbrev.data, d_abbrev_len);
+      if (d_line_len) write (fd, dwarf.line.data, d_line_len);
+      if (d_str_len) write (fd, dwarf.str.data, d_str_len);
+      cur = dbg_str_off + d_str_len;
+    }
+    if (has_dwarf_frame) {
+      if (dbg_frame_off > cur) write_padding (fd, dbg_frame_off - cur);
+      write (fd, dwarf.frame.data, d_frame_len);
+      cur = dbg_frame_off + d_frame_len;
+    }
+#endif
     (void) cur;
   }
 
@@ -1903,9 +2102,36 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     }
   }
 
+  /* DWARF section relocations: section-relative UNSIGNED against __text (sect 1).
+     Emit grouped by section (info, line, frame) so reloff/nreloc match headers.
+     Works on both x86_64 (10.12+) and aarch64. */
+#if !MIR_NO_DBINFO
+  if (n_reloc_dinfo + n_reloc_dline + n_reloc_dframe > 0) {
+#if defined(__aarch64__)
+    const int abs_r = ARM64_RELOC_UNSIGNED;
+#else
+    const int abs_r = X86_64_RELOC_UNSIGNED;
+#endif
+    for (int want = 0; want <= 2; want++) {
+      for (size_t i = 0; i < dwarf.n_relocs; i++) {
+        if (dwarf.relocs[i].sect != want) continue;
+        struct relocation_info ri;
+        memset (&ri, 0, sizeof (ri));
+        ri.r_address = (int32_t) dwarf.relocs[i].offset;
+        ri.r_symbolnum = 1; /* __text is first section (1-based) */
+        ri.r_extern = 0;
+        ri.r_type = abs_r;
+        ri.r_length = 3; /* 8 bytes */
+        ri.r_pcrel = 0;
+        write (fd, &ri, sizeof (ri));
+      }
+    }
+  }
+#endif
+
   /* Padding to symbol table */
   {
-    size_t cur = after_tvars_relocs;
+    size_t cur = after_dbg_relocs;
     if (symtab_off > cur) write_padding (fd, symtab_off - cur);
   }
 
@@ -1923,6 +2149,7 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   DBG ("  __bss:   %zu bytes, %zu items", bss_size, n_bsses);
   DBG ("  __text relocs: %zu entries", n_reloc_text);
   DBG ("  __data relocs: %zu entries", n_reloc_data);
+  DBG ("  DWARF: info=%zu frame=%zu relocs=%zu", d_info_len, d_frame_len, d_n_relocs);
   DBG ("  symtab: %zu symbols (local=%zu, extdef=%zu, undef=%zu)",
        n_syms, n_local_syms, n_extdef_syms, n_undef_syms);
 
@@ -1954,6 +2181,9 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   free (exports.names);
   for (size_t i = 0; i < imports.n; i++) free (imports.names[i]);
   free (imports.names);
+#if !MIR_NO_DBINFO
+  dwarf_aot_result_free (&dwarf);
+#endif
 
   #undef SYMTAB_PUSH
   #undef SYM_MAP_ADD
