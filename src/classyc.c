@@ -12273,6 +12273,8 @@ struct expr {
     mir_ullong u_val;
     mir_ldouble d_val;
   } c;
+  /* Unprototyped call (`T f();`) site-specific proto; NULL otherwise. */
+  MIR_item_t call_proto_item;
 };
 
 struct decl_spec {
@@ -17811,6 +17813,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       e->own_deref_class = DEREF_GUARD_DEFAULT;
       e->mut_sub_p = 0;
       e->c.i_val = 0;
+      e->call_proto_item = NULL;
       return e;
     }
 
@@ -26057,7 +26060,29 @@ static int target_gen_gather_arg (c2m_ctx_t c2m_ctx, const char *name, struct ty
 }
 #endif
 
-static void collect_args_and_func_types (c2m_ctx_t c2m_ctx, struct func_type *func_type) {
+/* C11 6.5.2.2p6 default argument promotions for unprototyped calls. */
+static struct type *default_arg_promoted_type (c2m_ctx_t c2m_ctx, struct type *type) {
+  struct type *res;
+
+  if (type->mode == TM_BASIC && type->u.basic_type == TP_FLOAT) {
+    res = create_type (c2m_ctx, NULL);
+    res->mode = TM_BASIC;
+    res->u.basic_type = TP_DOUBLE;
+  } else if (integer_type_p (type)) {
+    struct type prom = integer_promotion (type);
+
+    if (type->mode == TM_BASIC && prom.u.basic_type == type->u.basic_type) return type;
+    res = create_type (c2m_ctx, &prom);
+  } else {
+    return type;
+  }
+  set_type_layout (c2m_ctx, res);
+  return res;
+}
+
+/* first_actual_arg is the first CALL argument, or NULL for a definition. */
+static void collect_args_and_func_types (c2m_ctx_t c2m_ctx, struct func_type *func_type,
+                                         node_t first_actual_arg) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   node_t declarator, id, first_param, p;
   struct type *param_type;
@@ -26089,6 +26114,13 @@ static void collect_args_and_func_types (c2m_ctx_t c2m_ctx, struct func_type *fu
         name = get_param_name (c2m_ctx, param_type, id->u.s.s);
       }
       target_add_arg_proto (c2m_ctx, name, param_type, &arg_info, proto_info.arg_vars);
+    }
+  } else if (first_param == NULL && !func_type->dots_p) {
+    /* Unprototyped (`T f();`): proto from this call site's actual args. */
+    for (p = first_actual_arg; p != NULL; p = NL_NEXT (p)) {
+      param_type = default_arg_promoted_type (c2m_ctx, ((struct expr *) p->attr)->type);
+      set_type_layout (c2m_ctx, param_type);
+      target_add_arg_proto (c2m_ctx, "p", param_type, &arg_info, proto_info.arg_vars);
     }
   }
 }
@@ -28988,7 +29020,7 @@ static MIR_item_t gen_func_proto_item (c2m_ctx_t c2m_ctx, struct func_type *ft) 
   MIR_item_t proto;
   char pname[64];
 
-  collect_args_and_func_types (c2m_ctx, ft);
+  collect_args_and_func_types (c2m_ctx, ft, NULL);
   sprintf (pname, "__methproto%d", new_proto_count++);
   proto = MIR_new_proto_arr (ctx, pname, VARR_LENGTH (MIR_type_t, proto_info.ret_types),
                              VARR_ADDR (MIR_type_t, proto_info.ret_types),
@@ -29771,7 +29803,7 @@ static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm
 
     cdecl = ctor_def->attr;
     ft = cdecl->decl_spec.type->u.func_type;
-    collect_args_and_func_types (c2m_ctx, ft);
+    collect_args_and_func_types (c2m_ctx, ft, NULL);
     sprintf (pname, "__tolistproto%d", new_proto_count++);
     proto = MIR_new_proto_arr (ctx, pname,
                                VARR_LENGTH (MIR_type_t, proto_info.ret_types),
@@ -30000,7 +30032,7 @@ static void gen_class_temp_dtor (c2m_ctx_t c2m_ctx, struct type *class_type, op_
   dd = ddef->attr;
   if (dd->u.item == NULL) return;
   dft = dd->decl_spec.type->u.func_type;
-  collect_args_and_func_types (c2m_ctx, dft);
+  collect_args_and_func_types (c2m_ctx, dft, NULL);
   sprintf (dpname, "__tempdtorproto%d", new_proto_count++);
   dproto = MIR_new_proto_arr (ctx, dpname,
                               VARR_LENGTH (MIR_type_t, proto_info.ret_types),
@@ -30648,7 +30680,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             char dpname[64];
             size_t dops;
             op_t addr = mem_to_address (c2m_ctx, var, TRUE);
-            collect_args_and_func_types (c2m_ctx, dft);
+            collect_args_and_func_types (c2m_ctx, dft, NULL);
             sprintf (dpname, "__assigndtorproto%d", new_proto_count++);
             dproto = MIR_new_proto_arr (ctx, dpname,
                                         VARR_LENGTH (MIR_type_t, proto_info.ret_types),
@@ -31443,7 +31475,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       size_t ops_start;
       node_t param;
 
-      collect_args_and_func_types (c2m_ctx, ft);
+      collect_args_and_func_types (c2m_ctx, ft, NULL);
       sprintf (pname, "__ctorproto%d", new_proto_count++);
       proto = MIR_new_proto_arr (ctx, pname,
                                  VARR_LENGTH (MIR_type_t, proto_info.ret_types),
@@ -31654,7 +31686,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         this_ptr_type->u.ptr_type = call_expr->type;
         set_type_layout (c2m_ctx, this_ptr_type);
 
-        collect_args_and_func_types (c2m_ctx, ft);
+        collect_args_and_func_types (c2m_ctx, ft, NULL);
         sprintf (pname, "__valctorproto%d", new_proto_count++);
         proto = MIR_new_proto_arr (ctx, pname,
                                    VARR_LENGTH (MIR_type_t, proto_info.ret_types),
@@ -31708,7 +31740,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         MIR_item_t dproto;
         char dpname[64];
         size_t dops_start;
-        collect_args_and_func_types (c2m_ctx, dft);
+        collect_args_and_func_types (c2m_ctx, dft, NULL);
         sprintf (dpname, "__dtorproto%d", new_proto_count++);
         dproto = MIR_new_proto_arr (ctx, dpname,
                                     VARR_LENGTH (MIR_type_t, proto_info.ret_types),
@@ -32269,7 +32301,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       func_type = func_expr->type;
       assert (func_type->mode == TM_PTR && func_type->u.ptr_type->mode == TM_FUNC);
       func_type = func_type->u.ptr_type;
-      proto_item = func_type->u.func_type->proto_item; // ???
+      proto_item = ((struct expr *) r->attr)->call_proto_item;
+      if (proto_item == NULL) proto_item = func_type->u.func_type->proto_item;
       VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, proto_item));
       op1 = val_gen (c2m_ctx, func);
       if (!jcall_p && op1.mir_op.mode == MIR_OP_REF && func->code == N_ID
@@ -32495,6 +32528,11 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
               && e->type->mode == TM_CLASS && op2.mir_op.mode == MIR_OP_MEM)
             op2 = mem_to_address (c2m_ctx, op2, FALSE);
           op2 = promote (c2m_ctx, op2, t, FALSE);
+        } else if (NL_HEAD (param_list->u.ops) == NULL && !func_type->u.func_type->dots_p) {
+          arg_type = default_arg_promoted_type (c2m_ctx, arg_type);
+          t = get_mir_type (c2m_ctx, arg_type);
+          t = promote_mir_int_type (t);
+          op2 = promote (c2m_ctx, op2, t == MIR_T_F ? MIR_T_D : t, FALSE);
         } else {
           t = get_mir_type (c2m_ctx, e->type);
           t = promote_mir_int_type (t);
@@ -33051,7 +33089,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     stmtexpr_last_expr = NULL;
     curr_func_def = r;
     curr_call_arg_area_offset = 0;
-    collect_args_and_func_types (c2m_ctx, decl_type->u.func_type);
+    collect_args_and_func_types (c2m_ctx, decl_type->u.func_type, NULL);
 
     /* Mangled MIR name for this function/method; uses the same encoding as
        the pre-gen forward-declaration pass (see gen_forward_class_methods)
@@ -33185,7 +33223,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
          function's return signature before synthesizing the fall-through return,
          so e.g. a void function ending in a non-void method call still emits
          `ret` (0 operands) rather than a stray `ret <val>`. */
-      collect_args_and_func_types (c2m_ctx, decl_type->u.func_type);
+      collect_args_and_func_types (c2m_ctx, decl_type->u.func_type, NULL);
       if (VARR_LENGTH (MIR_type_t, proto_info.ret_types) == 0) {
         if (jump_ret_p)
           emit1 (c2m_ctx, MIR_JRET, MIR_new_int_op (ctx, 0));
@@ -34334,7 +34372,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       char pname[64];
       size_t ops_start;
 
-      collect_args_and_func_types (c2m_ctx, ft);
+      collect_args_and_func_types (c2m_ctx, ft, NULL);
       sprintf (pname, "__dtorproto%d", new_proto_count++);
       proto = MIR_new_proto_arr (ctx, pname,
                                  VARR_LENGTH (MIR_type_t, proto_info.ret_types),
@@ -34803,7 +34841,7 @@ static MIR_item_t get_mir_proto (c2m_ctx_t c2m_ctx, int vararg_p) {
 static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
   MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
-  node_t call, func, op1;
+  node_t call, func, op1, arg_list, first_arg;
   struct type *type;
   struct func_type *func_type;
 
@@ -34815,10 +34853,14 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
     /* Call nodes can be rewritten in place (e.g. capturing HOF → N_STMTEXPR). */
     if (call->code != N_CALL) continue;
     op1 = NL_HEAD (call->u.ops);
-    if (op1->code == N_ID && strcmp (op1->u.s.s, JCALL) == 0)
-      func = NL_HEAD (NL_NEXT (op1)->u.ops);
-    else
-      func = NL_HEAD (call->u.ops);
+    arg_list = NL_NEXT (op1);
+    if (op1->code == N_ID && strcmp (op1->u.s.s, JCALL) == 0) {
+      func = NL_HEAD (arg_list->u.ops);
+      first_arg = NL_EL (arg_list->u.ops, 1);
+    } else {
+      func = op1;
+      first_arg = (arg_list != NULL) ? NL_HEAD (arg_list->u.ops) : NULL;
+    }
     /* Built-in String method calls (s.length(), s.substr(), ...) are lowered to
        runtime helper calls in gen and have no user-level C prototype. */
     if (func->code == N_FIELD || func->code == N_DEREF_FIELD) {
@@ -34868,10 +34910,13 @@ static void gen_mir_protos (c2m_ctx_t c2m_ctx) {
     set_type_layout (c2m_ctx, type);
     func_type = type->u.ptr_type->u.func_type;
     assert (func_type->param_list->code == N_LIST);
-    collect_args_and_func_types (c2m_ctx, func_type);
-    func_type->proto_item
-      = get_mir_proto (c2m_ctx,
-                       func_type->dots_p || NL_HEAD (func_type->param_list->u.ops) == NULL);
+    collect_args_and_func_types (c2m_ctx, func_type, first_arg);
+    if (!func_type->dots_p && NL_HEAD (func_type->param_list->u.ops) == NULL) {
+      /* Unprototyped: per-call-site VARARG proto with fixed actual args. */
+      ((struct expr *) call->attr)->call_proto_item = get_mir_proto (c2m_ctx, TRUE);
+    } else {
+      func_type->proto_item = get_mir_proto (c2m_ctx, func_type->dots_p);
+    }
   }
   HTAB_DESTROY (MIR_item_t, proto_tab);
 }
