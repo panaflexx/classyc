@@ -12593,6 +12593,8 @@ static void aux_set_type_align (c2m_ctx_t c2m_ctx, struct type *type) {
               && expr->c.u_val == 0)
             continue;
           member_align = type_align (decl->decl_spec.type);
+          /* member-level _Alignas/aligned over-aligns the field (1fdf44d8). */
+          if (decl->decl_spec.align > member_align) member_align = decl->decl_spec.align;
           if (align < member_align) align = member_align;
         }
     }
@@ -12756,6 +12758,8 @@ static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
             continue;
           }
           member_align = type_align (decl->decl_spec.type);
+          /* _Alignas(N) / aligned(N) on the member over-aligns it (1fdf44d8). */
+          if (decl->decl_spec.align > member_align) member_align = decl->decl_spec.align;
           bits
             = width->code == N_IGNORE || !(expr = width->attr)->const_p ? -1 : (int) expr->c.u_val;
           update_field_layout (&bf_p, &overall_size, &offset, &bound_bit, prev_size, member_size,
@@ -14281,7 +14285,10 @@ static void check_labels (c2m_ctx_t c2m_ctx, node_t labels, node_t target) {
           } else if (signed_integer_type_p (cexpr->type) && cexpr->c.i_val < 0) {
             error (c2m_ctx, POS (size_node), "array size should be not negative");
           } else if (cexpr->c.i_val == 0) {
-            (c2m_options->pedantic_p ? error : warning) (c2m_ctx, POS (size_node), "zero array size");
+            /* GNU zero-length arrays: silent by default, warn under -pedantic
+               (8f3934ac; matches gcc/clang). */
+            if (c2m_options->pedantic_p)
+              warning (c2m_ctx, POS (size_node), "zero array size");
           }
         }
         check_type (c2m_ctx, el_type, level + 1, FALSE);
@@ -18115,8 +18122,12 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
       check_ctx_t check_ctx = c2m_ctx->check_ctx;
       node_t block = FUNC_DEF_BLOCK (curr_func_def);
       struct node_scope *ns = block->attr;
+      mir_size_t slot = round_size (type_size (c2m_ctx, type), MAX_ALIGNMENT);
 
-      curr_call_arg_area_offset += round_size (type_size (c2m_ctx, type), MAX_ALIGNMENT);
+      /* Empty (zero-size) struct memory-class results still need a real
+         fp-relative slot so the function gets a frame (3582b48e). */
+      if (slot == 0) slot = MAX_ALIGNMENT;
+      curr_call_arg_area_offset += slot;
       if (update_scope_p && ns->call_arg_area_size < curr_call_arg_area_offset)
         ns->call_arg_area_size = curr_call_arg_area_offset;
     }
@@ -20000,7 +20011,10 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
           *e->type = *((struct expr *) deref_op->attr)->type;
           break;
         } else if (e1->type->mode == TM_PTR && e1->type->arr_type != NULL) {
-          *e->type = *e1->type;
+          /* &array-lvalue is pointer-to-ARRAY, not the decayed element ptr
+             (C11 6.5.3.2 / 8a6a6c57). */
+          e->type->mode = TM_PTR;
+          e->type->u.ptr_type = e1->type->arr_type;
           break;
         } else if (e1->type->mode == TM_PTR && e1->type->u.ptr_type->mode == TM_FUNC
                    && e1->type->func_type_before_adjustment_p) {
@@ -25378,8 +25392,9 @@ static op_t force_val (c2m_ctx_t c2m_ctx, op_t op, int arr_p) {
       return op; /* MEM of a pointer value: keep as loadable rvalue */
     return mem_to_address (c2m_ctx, op, FALSE);
   }
-  /* MIR #459 / issue #458: narrow integer in a register (after addr-taken
-     materialization) must be sign/zero-extended when read as a value. */
+  /* Issue-458: a narrow integer reg value is born from an extending
+     operation, so reads need no extension except addr_p (2a157cc2).
+     Uninitialized narrow autos are repaired at declaration (9c7e7f3b). */
   if (op.decl != NULL && op.decl->addr_p && op.mir_op.mode == MIR_OP_REG
       && integer_type_p (op.decl->decl_spec.type)) {
     MIR_type_t nt = get_mir_type (c2m_ctx, op.decl->decl_spec.type);
@@ -32603,6 +32618,29 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
             }
             if (i >= VARR_LENGTH (node_t, sym.defs)) /* No item yet or no decl with intializer: */
               decl->u.item = MIR_new_bss (ctx, name, raw_type_size (c2m_ctx, decl->decl_spec.type));
+          } else if (decl->scope != top_scope && !decl->decl_spec.static_p
+                     && !decl->decl_spec.thread_local_p && decl->used_p
+                     && integer_type_p (decl->decl_spec.type)) {
+            /* Uninitialized narrow auto reg: extend once at birth (9c7e7f3b /
+               pr34099-2).  Memory-homed decls already extend via typed loads. */
+            MIR_type_t vt = get_mir_type (c2m_ctx, decl->decl_spec.type);
+            if (vt == MIR_T_I8 || vt == MIR_T_U8 || vt == MIR_T_I16 || vt == MIR_T_U16) {
+              if (id->attr == NULL) {
+                node_t saved_scope = curr_scope;
+
+                curr_scope = decl->scope;
+                check (c2m_ctx, id, NULL);
+                curr_scope = saved_scope;
+              }
+              op_t vr = gen (c2m_ctx, id, NULL, NULL, FALSE, NULL, NULL);
+              if (vr.mir_op.mode == MIR_OP_REG)
+                emit2 (c2m_ctx,
+                       vt == MIR_T_I8    ? MIR_EXT8
+                       : vt == MIR_T_U8  ? MIR_UEXT8
+                       : vt == MIR_T_I16 ? MIR_EXT16
+                                         : MIR_UEXT16,
+                       vr.mir_op, vr.mir_op);
+            }
           }
           /* Emit default member initializers for local class-typed variables.
              Also handles arrays of class objects (e.g. `Mixed m[15];`): each
