@@ -1699,15 +1699,21 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
 
   /* ----- Build load commands ----- */
 
-  /* DWARF section virtual addresses (contiguous after non-debug content). */
+  /* DWARF section virtual addresses (after all non-debug content).
+     Must not share an address with another section (even size-0 __bss) —
+     old ld64 (10.12) asserts on atom counts when sections overlap. */
   size_t dwarf_vm_base = 0;
   {
-    uint64_t vend = bss_addr + bss_size;
+    uint64_t vend = text_size + data_size;
+    uint64_t ba = bss_addr ? bss_addr : ((text_size + data_size + 7) & ~(uint64_t) 7);
+    uint64_t be = ba + bss_size;
+    if (be > vend) vend = be;
+    /* Empty bss still owns `ba`; start DWARF strictly after that point. */
+    if (bss_size == 0 && ba >= vend) vend = ba + 8;
     if (tbss_size > 0 && tbss_addr + tbss_size > vend) vend = tbss_addr + tbss_size;
     if (tvars_size > 0 && tvars_addr + tvars_size > vend) vend = tvars_addr + tvars_size;
     if (tdata_size > 0 && tdata_addr + tdata_size > vend) vend = tdata_addr + tdata_size;
-    if (vend < text_size + data_size) vend = text_size + data_size;
-    dwarf_vm_base = (size_t) vend;
+    dwarf_vm_base = (size_t) align_up ((size_t) vend, 8);
   }
 
   /* LC_SEGMENT_64: single segment for all sections (MH_OBJECT requirement). */
@@ -1747,7 +1753,8 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
   sec_text.size = text_size;
   sec_text.offset = (uint32_t)text_file_off;
   sec_text.align = 4; /* 2^4 = 16-byte alignment */
-  sec_text.reloff = (uint32_t)reloc_text_off;
+  /* ld64 requires reloff==0 when nreloc==0. */
+  sec_text.reloff = (uint32_t) (n_reloc_text ? reloc_text_off : 0);
   sec_text.nreloc = (uint32_t)n_reloc_text;
   sec_text.flags = S_REGULAR | S_ATTR_SOME_INSTRUCTIONS | S_ATTR_PURE_INSTRUCTIONS;
   sec_text.reserved1 = 0;
@@ -2023,8 +2030,13 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
     }
 #endif
 #if !MIR_NO_DBINFO
-    if (n_dwarf_sects > 0 && dwarf_file_off > cur)
+    /* Keep `cur` in sync with the file position — a stale cur caused a second
+       pad before __debug_frame (6 bytes when data ended unaligned), shifting
+       frame bytes and all following reloc/symtab data so ld64 saw garbage. */
+    if (n_dwarf_sects > 0 && dwarf_file_off > cur) {
       write_padding (fd, dwarf_file_off - cur);
+      cur = dwarf_file_off;
+    }
     if (has_dwarf_dies) {
       if (d_info_len) write (fd, dwarf.info.data, d_info_len);
       if (d_abbrev_len) write (fd, dwarf.abbrev.data, d_abbrev_len);
@@ -2033,7 +2045,10 @@ static void create_macho_object_file_from_module (MIR_context_t ctx,
       cur = dbg_str_off + d_str_len;
     }
     if (has_dwarf_frame) {
-      if (dbg_frame_off > cur) write_padding (fd, dbg_frame_off - cur);
+      if (dbg_frame_off > cur) {
+        write_padding (fd, dbg_frame_off - cur);
+        cur = dbg_frame_off;
+      }
       write (fd, dwarf.frame.data, d_frame_len);
       cur = dbg_frame_off + d_frame_len;
     }
