@@ -3226,14 +3226,17 @@ static void check_pragma (c2m_ctx_t c2m_ctx, token_t t, VARR (token_t) * tokens)
 
   i = 0;
   if (i < tokens_len && tokens_arr[i]->code == ' ') i++;
-#ifdef _WIN32
   if (i + 1 == tokens_len && tokens_arr[i]->code == T_ID
       && strcmp (tokens_arr[i]->repr, "once") == 0) {
     pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
     VARR_PUSH (char_ptr_t, once_include_files, cs->fname);
     return;
   }
-#endif
+  /* Darwin fcntl.h / netinet/in.h: `#pragma pack(4)` / `#pragma pack()`.
+     Layout is ignored; accept so SDK headers are not a warning storm. */
+  if (i < tokens_len && tokens_arr[i]->code == T_ID
+      && strcmp (tokens_arr[i]->repr, "pack") == 0)
+    return;
   if (i >= tokens_len || tokens_arr[i]->code != T_ID || strcmp (tokens_arr[i]->repr, "STDC") != 0) {
     warning (c2m_ctx, t->pos, "unknown pragma");
     return;
@@ -3960,6 +3963,41 @@ static void process_directive (c2m_ctx_t c2m_ctx) {
       else {
         VARR_LAST (ifstate_t, ifs)->skip_p = skip_if_part_p;
         VARR_LAST (ifstate_t, ifs)->true_p = true_p;
+      }
+    }
+  } else if (strcmp (t->repr, "elifdef") == 0 || strcmp (t->repr, "elifndef") == 0) {
+    /* C23: `#elifdef NAME` / `#elifndef NAME` — `#elif defined(NAME)` spelling. */
+    t1 = t;
+    if (cs != NULL && cs->ig_state == IG_IN_BODY
+        && (int) VARR_LENGTH (ifstate_t, ifs) == cs->ifs_length_at_stream_start + 1)
+      ig_fail (cs);
+    if (VARR_LENGTH (ifstate_t, ifs) == 0) {
+      error (c2m_ctx, t->pos, "#%s without #if", t->repr);
+    } else if (VARR_LAST (ifstate_t, ifs)->else_p) {
+      error (c2m_ctx, t->pos, "#%s after #else", t->repr);
+      skip_if_part_p = TRUE;
+    } else if (VARR_LAST (ifstate_t, ifs)->true_p) {
+      VARR_LAST (ifstate_t, ifs)->skip_p = skip_if_part_p = TRUE;
+      skip_nl (c2m_ctx, NULL, NULL);
+    } else {
+      t = get_next_pptoken (c2m_ctx);
+      if (t->code == ' ') t = get_next_pptoken (c2m_ctx);
+      if (t->code != T_ID) {
+        error (c2m_ctx, t1->pos, "wrong #%s", t1->repr);
+        skip_if_part_p = TRUE;
+        skip_nl (c2m_ctx, t, NULL);
+      } else {
+        macro.id = t;
+        true_p = HTAB_DO (macro_t, macro_tab, &macro, HTAB_FIND, tab_macro);
+        if (strcmp (t1->repr, "elifndef") == 0) true_p = !true_p;
+        skip_if_part_p = !true_p;
+        VARR_LAST (ifstate_t, ifs)->skip_p = skip_if_part_p;
+        VARR_LAST (ifstate_t, ifs)->true_p = true_p;
+        t = get_next_pptoken (c2m_ctx);
+        if (t->code != '\n') {
+          error (c2m_ctx, t1->pos, "garbage at the end of #%s", t1->repr);
+          skip_nl (c2m_ctx, NULL, NULL);
+        }
       }
     }
   } else if (skip_if_part_p) {
@@ -7463,6 +7501,46 @@ D (primary_expr) {
   node_t r, n, op, gn, list;
   pos_t pos;
 
+  /* GNU extended asm as an expression/statement:
+       __asm__ __volatile__ ("bswap %0" : "+r" (x));
+     Skip the operand lists; used by Darwin libkern and glibc barriers. */
+  if (C (T_ID) && curr_token->repr != NULL
+      && (strcmp (curr_token->repr, "__asm__") == 0 || strcmp (curr_token->repr, "__asm") == 0
+          || strcmp (curr_token->repr, "asm") == 0)) {
+    size_t asm_mark = record_start (c2m_ctx);
+    pos_t asm_pos = curr_token->pos;
+    read_token (c2m_ctx);
+    while (C (T_VOLATILE)
+           || (C (T_ID) && curr_token->repr != NULL
+               && (strcmp (curr_token->repr, "goto") == 0
+                   || strcmp (curr_token->repr, "__volatile__") == 0
+                   || strcmp (curr_token->repr, "__volatile") == 0)))
+      read_token (c2m_ctx);
+    if (C ('(')) {
+      int depth = 0;
+      int ok = 1;
+      do {
+        if (C ('(')) {
+          read_token (c2m_ctx);
+          depth++;
+        } else if (C (')')) {
+          read_token (c2m_ctx);
+          depth--;
+        } else if (C (T_EOFILE)) {
+          ok = 0;
+          break;
+        } else {
+          read_token (c2m_ctx);
+        }
+      } while (depth > 0);
+      if (ok) {
+        record_stop (c2m_ctx, asm_mark, FALSE);
+        return new_i_node (c2m_ctx, 0, asm_pos);
+      }
+    }
+    record_stop (c2m_ctx, asm_mark, TRUE);
+  }
+
   /* Lambda: ( typed-params ) => body  — try before other '(' handling */
   if (C ('(')) {
     node_t lr = TRY (lambda_expr);
@@ -8249,38 +8327,64 @@ D (asm_spec) {
   node_t r, id;
 
   PTN (T_ID);
-  if (strcmp (r->u.s.s, "__asm") != 0 && strcmp (r->u.s.s, "asm") != 0) PTFAIL (T_ID);
+  if (strcmp (r->u.s.s, "__asm") != 0 && strcmp (r->u.s.s, "__asm__") != 0
+      && strcmp (r->u.s.s, "asm") != 0)
+    PTFAIL (T_ID);
   id = r;
   PT ('(');
   PTN (T_STR);
+  /* Adjacent strings are already concatenated in pre_out; keep a loop so
+     `__asm("_" "open")` still works if that path is skipped. */
+  while (C (T_STR)) PTN (T_STR);
   PT (')');
   return new_pos_node1 (c2m_ctx, N_ASM, POS (id), r);
 }
 
+static void attr_list_append (c2m_ctx_t c2m_ctx, node_t *dst, node_t src) {
+  if (src == NULL || src == err_node) return;
+  if (*dst == NULL || *dst == err_node) {
+    *dst = src;
+    return;
+  }
+  if ((*dst)->code == N_LIST && src->code == N_LIST) {
+    for (node_t a = NL_HEAD (src->u.ops); a != NULL; ) {
+      node_t next = NL_NEXT (a);
+      NL_REMOVE (src->u.ops, a);
+      op_append (c2m_ctx, *dst, a);
+      a = next;
+    }
+  } else {
+    node_t merged = new_node (c2m_ctx, N_LIST);
+    op_append (c2m_ctx, merged, *dst);
+    op_append (c2m_ctx, merged, src);
+    *dst = merged;
+  }
+}
+
 static node_t try_attr_spec (c2m_ctx_t c2m_ctx, pos_t pos, node_t *asm_part) {
-  node_t r;
+  node_t r, list = NULL;
 
   if (c2m_options->pedantic_p) return NULL;
-  if (asm_part != NULL) {
-    *asm_part = NULL;
-    if ((r = TRY (asm_spec)) != err_node) {
-      if (c2m_options->pedantic_p)
-        error (c2m_ctx, pos, "asm is not implemented");
-      else {
-        /*warning (c2m_ctx, pos, "asm is not implemented -- ignoring it")*/
-      }
+  if (asm_part != NULL) *asm_part = NULL;
+  /* GNU/Darwin headers stack several `__attribute__((...))` and/or `__asm`
+     after a declarator.  Collect all of them; callers treat err_node as "none". */
+  for (;;) {
+    if (asm_part != NULL && *asm_part == NULL && (r = TRY (asm_spec)) != err_node) {
       *asm_part = r;
+      continue;
     }
-  }
-  if ((r = TRY (c23_attr_spec)) != err_node) return r; /* C23 [[...]] */
-  if ((r = TRY (attr_spec)) != err_node) {
-    if (c2m_options->pedantic_p)
-      error (c2m_ctx, pos, "GCC attributes are not implemented");
-    else {
-      /*warning (c2m_ctx, pos, "GCC attributes are not implemented -- ignoring them")*/
+    if ((r = TRY (c23_attr_spec)) != err_node) {
+      attr_list_append (c2m_ctx, &list, r);
+      continue;
     }
+    if ((r = TRY (attr_spec)) != err_node) {
+      attr_list_append (c2m_ctx, &list, r);
+      continue;
+    }
+    break;
   }
-  return r;
+  (void) pos;
+  return list != NULL ? list : err_node;
 }
 
 D (declaration) {
@@ -8539,12 +8643,57 @@ D (attr) {
   if (C ('(')) {
     PT ('(');
     while (!C (')')) {
-      if (C (T_NUMBER) || C (T_CH) || C (T_STR))
+      if (C (T_EOFILE)) PTFAIL (')');
+      if (C (T_NUMBER) || C (T_CH) || C (T_STR)) {
         PTN (curr_token->code);
-      else
-        PTN (T_ID);
-      op_append (c2m_ctx, list, r);
-      if (!C (')')) PT (',');
+        op_append (c2m_ctx, list, r);
+      } else if (C (T_ID)
+                 || (FIRST_KW <= (token_code_t) curr_token->code
+                     && (token_code_t) curr_token->code <= LAST_KW)) {
+        if (FIRST_KW <= (token_code_t) curr_token->code
+            && (token_code_t) curr_token->code <= LAST_KW) {
+          token_t kw = curr_token;
+          PT (curr_token->code);
+          r = new_str_node (c2m_ctx, N_ID, uniq_cstr (c2m_ctx, kw->repr), kw->pos);
+        } else {
+          PTN (T_ID);
+        }
+        op_append (c2m_ctx, list, r);
+        /* GNU keyword-arg: availability(..., introduced=10.10) */
+        if (C ('=')) {
+          int d = 0;
+          M ('=');
+          while (!C (T_EOFILE) && (d > 0 || (!C (',') && !C (')')))) {
+            if (C ('(')) {
+              M ('(');
+              d++;
+            } else if (C (')')) {
+              M (')');
+              d--;
+            } else {
+              read_token (c2m_ctx);
+            }
+          }
+        }
+      } else if (C ('(')) {
+        int d = 0;
+        do {
+          if (C ('(')) {
+            M ('(');
+            d++;
+          } else if (C (')')) {
+            M (')');
+            d--;
+          } else if (C (T_EOFILE)) {
+            PTFAIL (')');
+          } else {
+            read_token (c2m_ctx);
+          }
+        } while (d > 0);
+      } else {
+        read_token (c2m_ctx);
+      }
+      if (!C (')') && C (',')) PT (',');
     }
     PT (')');
   }
@@ -9371,7 +9520,7 @@ D (struct_declaration) {
 
 D (spec_qual_list) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
-  node_t list, op, r, arg = NULL;
+  node_t list, op, r, arg = NULL, at;
   int first_p;
 
   list = new_node (c2m_ctx, N_LIST);
@@ -9381,6 +9530,9 @@ D (spec_qual_list) {
       op = r;
     } else if ((op = TRY_A (type_spec, arg)) != err_node) {
       arg = op;
+    } else if ((at = try_attr_spec (c2m_ctx, curr_token->pos, NULL)) != err_node
+               && at != NULL) {
+      continue; /* GNU: `__attribute__((unused)) long pad;` in a struct */
     } else if (first_p) {
       return err_node;
     } else {
@@ -9580,12 +9732,17 @@ D (direct_declarator) {
 
 D (pointer) {
   parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
-  node_t op, r;
+  node_t op, r, at;
   pos_t pos;
 
   PTP ('*', pos);
+  /* GNU: `void *__attribute__((malloc)) f(void)` — attrs sit after `*`. */
+  while ((at = try_attr_spec (c2m_ctx, curr_token->pos, NULL)) != err_node && at != NULL) {
+  }
   if (C (T_CONST) || C (T_RESTRICT) || C (T_VOLATILE) || C (T_ATOMIC)) {
     P (type_qual_list);
+    while ((at = try_attr_spec (c2m_ctx, curr_token->pos, NULL)) != err_node && at != NULL) {
+    }
   } else {
     r = new_node (c2m_ctx, N_LIST);
   }
@@ -36037,9 +36194,23 @@ static void init_include_dirs (c2m_ctx_t c2m_ctx) {
   }
 #endif
 #if defined(__APPLE__)
-  if (!added_p)
-    VARR_PUSH (char_ptr_t, system_headers,
-               "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include");
+  if (!added_p) {
+    static const char *const apple_sdk_includes[] = {
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include",
+      NULL};
+    struct stat st;
+    int sdk_added = FALSE;
+
+    for (i = 0; apple_sdk_includes[i] != NULL; i++) {
+      if (stat (apple_sdk_includes[i], &st) == 0 && S_ISDIR (st.st_mode)) {
+        VARR_PUSH (char_ptr_t, system_headers, apple_sdk_includes[i]);
+        sdk_added = TRUE;
+      }
+    }
+    if (!sdk_added)
+      VARR_PUSH (char_ptr_t, system_headers, apple_sdk_includes[0]);
+  }
 #endif
 #if defined(__linux__) && defined(__x86_64__)
   VARR_PUSH (char_ptr_t, system_headers, "/usr/include/x86_64-linux-gnu");

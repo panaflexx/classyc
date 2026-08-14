@@ -130,9 +130,24 @@ static char aarch64_mirc[]
 #endif
 #elif defined(__APPLE__)
     "#define __APPLE__ 1\n"
-    "#define __arm64__\n"
+    "#define __arm64__ 1\n"
+    "#define __aarch64__ 1\n"
+    "#define __MACH__ 1\n"
     "#define __DARWIN_OS_INLINE static inline\n"
-    "typedef struct {void *a;} __darwin_va_list;\n"
+    "#define __llvm__ 1\n"
+    "static inline unsigned short __builtin_bswap16 (unsigned short __x) {\n"
+    "  return (unsigned short) ((__x << 8) | (__x >> 8));\n"
+    "}\n"
+    "static inline unsigned int __builtin_bswap32 (unsigned int __x) {\n"
+    "  return (__x << 24) | ((__x & 0xff00u) << 8) | ((__x >> 8) & 0xff00u) | (__x >> 24);\n"
+    "}\n"
+    "static inline unsigned long long __builtin_bswap64 (unsigned long long __x) {\n"
+    "  return ((unsigned long long) __builtin_bswap32 ((unsigned int) __x) << 32)\n"
+    "         | __builtin_bswap32 ((unsigned int) (__x >> 32));\n"
+    "}\n"
+    /* Darwin `_types.h` does `typedef __builtin_va_list __darwin_va_list`
+       once `__GNUC__ > 2`.  Provide the builtin, not a second darwin name. */
+    "typedef struct {void *__stack; void *__gr_top; void *__vr_top; int __gr_offs; int __vr_offs;} __builtin_va_list[1];\n"
     "#define __ARM64_ARCH_8__ 1\n"
     "#define __ARM_ALIGN_MAX_STACK_PWR 4\n"
     "#define __ARM_ARCH_8_3__ 1\n"

@@ -7,7 +7,7 @@ static char stdarg_str[]
     "#define __STDARG_H\n"
     "\n"
 #if defined(__APPLE__)
-    "typedef __darwin_va_list va_list;\n"
+    "typedef __builtin_va_list va_list;\n"
 #elif defined(__GNU_LIBRARY__)
     "typedef struct {\n"
     "  void *__stack;\n"

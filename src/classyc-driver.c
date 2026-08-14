@@ -1023,25 +1023,10 @@ int main (int argc, char *argv[], char *env[]) {
   options.prepro_output_file = NULL;
 	  init_options (argc, argv);
 
-	  /* (Removed: a previous version of this code predefined `__GNUC__`,
-	     `__APPLE__`, etc. on macOS so SDK headers wouldn't emit the
-	     "unsupported compiler" warning.  That block had two latent bugs:
-	     it never reached the preprocessor because `init_options()` had
-	     already snapshotted `options.macro_commands_num` /
-	     `options.macro_commands` before this code ran, AND — had the
-	     snapshot bug been fixed — declaring `__GNUC__` would have unmasked
-	     `__attribute__((__nothrow__))` etc. annotations on glibc / macOS
-	     SDK function declarations in positions classyc's parser doesn't
-	     yet accept, producing a cascade of syntax errors when including
-	     `<stdio.h>` and friends.
-
-	     The block has been removed entirely.  Step H attribute support
-	     (`((borrows))`, `((releases))`, `((cleanup(fn)))`) is parsed and
-	     wired into the ownership pass, but currently only takes effect in
-	     code that DOES NOT include problematic system headers in the same
-	     translation unit.  Restoring the predefines is contingent on first
-	     teaching the parser to accept trailing attribute-specs on function
-	     declarations.) */
+	  /* Darwin compiler identity lives in include/mirc.h (the environment
+	     stream `add_standard_includes` actually preprocesses).  A previous
+	     attempt to `-D__GNUC__` here never reached the preprocessor:
+	     `init_options()` had already snapshotted `macro_commands`. */
 
 	  main_ctx = MIR_init ();
 	  if (!C2MIR_PARALLEL || threads_num <= 0) c2mir_init (main_ctx);

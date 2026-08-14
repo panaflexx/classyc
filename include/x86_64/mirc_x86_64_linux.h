@@ -117,13 +117,28 @@ static char x86_64_mirc[]
 #endif
 #elif defined(__APPLE__)
     "#define __APPLE__ 1\n"
+    "#define __MACH__ 1\n"
     "#define __DARWIN_OS_INLINE static inline\n"
+    /* libkern/_OSByteOrder.h uses __builtin_bswap* when __llvm__ is set;
+       otherwise it emits GNU extended asm the parser does not lower. */
+    "#define __llvm__ 1\n"
+    "static inline unsigned short __builtin_bswap16 (unsigned short __x) {\n"
+    "  return (unsigned short) ((__x << 8) | (__x >> 8));\n"
+    "}\n"
+    "static inline unsigned int __builtin_bswap32 (unsigned int __x) {\n"
+    "  return (__x << 24) | ((__x & 0xff00u) << 8) | ((__x >> 8) & 0xff00u) | (__x >> 24);\n"
+    "}\n"
+    "static inline unsigned long long __builtin_bswap64 (unsigned long long __x) {\n"
+    "  return ((unsigned long long) __builtin_bswap32 ((unsigned int) __x) << 32)\n"
+    "         | __builtin_bswap32 ((unsigned int) (__x >> 32));\n"
+    "}\n"
+    /* i386/_types.h: `#if (__GNUC__ > 2) typedef __builtin_va_list __darwin_va_list`. */
     "typedef struct {\n"
     "  unsigned int gp_offset;\n"
     "  unsigned int fp_offset;\n"
     "  void *overflow_arg_area;\n"
     "  void *reg_save_area;\n"
-    "} __darwin_va_list[1];\n"
+    "} __builtin_va_list[1];\n"
 #else
 #error Uknown OS
 #endif

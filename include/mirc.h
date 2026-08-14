@@ -27,6 +27,32 @@ static const char mirc[]
     "#define __signed__ signed\n"
     "#define __volatile volatile\n"
     "#define __volatile__ volatile\n"
+    "/* GNU no-op: `__extension__ long long` / `__extension__ ({...})` prefix. */\n"
+    "#define __extension__\n"
+    "\n"
+    /* Darwin sys/cdefs.h: `#if !defined(__GNUC__) || __GNUC__ < 4` →
+       `#warning "Unsupported compiler detected"`.  Claim GCC 4.2 (Apple's
+       documented minimum) so the warning is silent and GCC-5+ / clang-only
+       paths stay closed.  `__has_*` stay 0 so Availability / nullability
+       annotations stay off.  Do not define `__clang__`: that unmasks
+       `_Nonnull` type-nullability tokens the parser does not accept. */
+    "#define __GNUC__ 4\n"
+    "#define __GNUC_MINOR__ 2\n"
+    "#define __GNUC_PATCHLEVEL__ 1\n"
+    /* Darwin (and glibc) remap memcpy/memset/snprintf to __builtin___*_chk
+       when _FORTIFY_SOURCE > 0 and __GNUC__ is set.  We do not implement
+       those builtins; disable fortify so list.h / map.h JIT-link. */
+    "#define _FORTIFY_SOURCE 0\n"
+    "#undef __USE_FORTIFY_LEVEL\n"
+    "#define __USE_FORTIFY_LEVEL 0\n"
+#if defined(__APPLE__)
+    "#define __MACH__ 1\n"
+#endif
+    "#define __has_attribute(x) 0\n"
+    "#define __has_feature(x) 0\n"
+    "#define __has_extension(x) 0\n"
+    "#define __has_c_attribute(x) 0\n"
+    "#define __has_declspec_attribute(x) 0\n"
     "\n"
     "/* Built-in null pointer literal (used for String/dict/pointer comparisons): */\n"
     "#define null ((void*)0)\n";
