@@ -265,8 +265,8 @@ static int midopt_collect_c11_p (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
     b = a != NULL ? NL_NEXT (a) : NULL;
     midopt_collect_uses (c2m_ctx, a, class_tag);
     lt = midopt_cond_known (a);
-    if (n->code == N_ANDAND && lt == 0) return 1;
-    if (n->code == N_OROR && lt == 1) return 1;
+    if (n->code == N_ANDAND && lt == 0 && c11_dead_skippable_p (b)) return 1;
+    if (n->code == N_OROR && lt == 1 && c11_dead_skippable_p (b)) return 1;
     midopt_collect_uses (c2m_ctx, b, class_tag);
     return 1;
   case N_COND:
@@ -275,11 +275,13 @@ static int midopt_collect_c11_p (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
     c = b != NULL ? NL_NEXT (b) : NULL;
     midopt_collect_uses (c2m_ctx, a, class_tag);
     k = midopt_cond_known (a);
-    if (k == 1)
+    if (k == 1) {
       midopt_collect_uses (c2m_ctx, b, class_tag);
-    else if (k == 0)
+      if (!c11_dead_skippable_p (c)) midopt_collect_uses (c2m_ctx, c, class_tag);
+    } else if (k == 0) {
+      if (!c11_dead_skippable_p (b)) midopt_collect_uses (c2m_ctx, b, class_tag);
       midopt_collect_uses (c2m_ctx, c, class_tag);
-    else {
+    } else {
       midopt_collect_uses (c2m_ctx, b, class_tag);
       midopt_collect_uses (c2m_ctx, c, class_tag);
     }
@@ -288,7 +290,8 @@ static int midopt_collect_c11_p (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
     a = NL_HEAD (n->u.ops);
     b = a != NULL ? NL_NEXT (a) : NULL;
     midopt_collect_uses (c2m_ctx, a, class_tag);
-    if (midopt_cond_known (a) != 1) midopt_collect_uses (c2m_ctx, b, class_tag);
+    if (midopt_cond_known (a) != 1 || !c11_dead_skippable_p (b))
+      midopt_collect_uses (c2m_ctx, b, class_tag);
     return 1;
   case N_IF:
     a = NL_EL (n->u.ops, 1);
@@ -296,11 +299,13 @@ static int midopt_collect_c11_p (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
     c = NL_EL (n->u.ops, 3);
     midopt_collect_uses (c2m_ctx, a, class_tag);
     k = midopt_cond_known (a);
-    if (k == 1)
+    if (k == 1) {
       midopt_collect_uses (c2m_ctx, b, class_tag);
-    else if (k == 0)
+      if (!c11_dead_skippable_p (c)) midopt_collect_uses (c2m_ctx, c, class_tag);
+    } else if (k == 0) {
+      if (!c11_dead_skippable_p (b)) midopt_collect_uses (c2m_ctx, b, class_tag);
       midopt_collect_uses (c2m_ctx, c, class_tag);
-    else {
+    } else {
       midopt_collect_uses (c2m_ctx, b, class_tag);
       midopt_collect_uses (c2m_ctx, c, class_tag);
     }
@@ -309,7 +314,8 @@ static int midopt_collect_c11_p (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
     a = NL_EL (n->u.ops, 1);
     b = NL_EL (n->u.ops, 2);
     midopt_collect_uses (c2m_ctx, a, class_tag);
-    if (midopt_cond_known (a) != 0) midopt_collect_uses (c2m_ctx, b, class_tag);
+    if (midopt_cond_known (a) != 0 || !c11_dead_skippable_p (b))
+      midopt_collect_uses (c2m_ctx, b, class_tag);
     return 1;
   case N_FOR:
     a = NL_EL (n->u.ops, 1); /* init */
@@ -318,7 +324,8 @@ static int midopt_collect_c11_p (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
     body = c != NULL ? NL_NEXT (c) : NULL;
     midopt_collect_uses (c2m_ctx, a, class_tag);
     midopt_collect_uses (c2m_ctx, b, class_tag);
-    if (b == NULL || b->code == N_IGNORE || midopt_cond_known (b) != 0) {
+    if (b == NULL || b->code == N_IGNORE || midopt_cond_known (b) != 0
+        || !c11_dead_skippable_p (body) || !c11_dead_skippable_p (c)) {
       midopt_collect_uses (c2m_ctx, c, class_tag);
       midopt_collect_uses (c2m_ctx, body, class_tag);
     }
@@ -1404,8 +1411,8 @@ static void midopt_safety_expr (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
 
     midopt_safety_expr (c2m_ctx, lhs, env);
     known = midopt_cond_known (lhs);
-    if (n->code == N_ANDAND && known == 0) return;
-    if (n->code == N_OROR && known == 1) return;
+    if (n->code == N_ANDAND && known == 0 && c11_dead_skippable_p (rhs)) return;
+    if (n->code == N_OROR && known == 1 && c11_dead_skippable_p (rhs)) return;
     decl = midopt_id_decl (lhs);
     f = decl != NULL ? midopt_env_find (env, decl) : NULL;
     if (f != NULL) {
@@ -1423,11 +1430,11 @@ static void midopt_safety_expr (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
 
     midopt_safety_expr (c2m_ctx, cond, env);
     k = midopt_cond_known (cond);
-    if (k == 1) {
+    if (k == 1 && c11_dead_skippable_p (fexpr)) {
       midopt_safety_expr (c2m_ctx, texpr, env);
       return;
     }
-    if (k == 0) {
+    if (k == 0 && c11_dead_skippable_p (texpr)) {
       midopt_safety_expr (c2m_ctx, fexpr, env);
       return;
     }
@@ -1440,7 +1447,8 @@ static void midopt_safety_expr (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
     node_t b = a != NULL ? NL_NEXT (a) : NULL;
 
     midopt_safety_expr (c2m_ctx, a, env);
-    if (midopt_cond_known (a) != 1) midopt_safety_expr (c2m_ctx, b, env);
+    if (midopt_cond_known (a) != 1 || !c11_dead_skippable_p (b))
+      midopt_safety_expr (c2m_ctx, b, env);
     return;
   }
   default:
@@ -1664,8 +1672,10 @@ static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *e
   if (init != NULL && init->code != N_IGNORE)
     midopt_safety_stmt (c2m_ctx, init, env);
 
-  /* for (...; 0; ...) — init runs, body/iter do not. */
-  if (cond != NULL && cond->code != N_IGNORE && midopt_cond_known (cond) == 0) {
+  /* for (...; 0; ...) — init runs, body/iter do not (unless a label is
+     reachable via goto). */
+  if (cond != NULL && cond->code != N_IGNORE && midopt_cond_known (cond) == 0
+      && c11_dead_skippable_p (stmt) && c11_dead_skippable_p (iter)) {
     midopt_safety_expr (c2m_ctx, cond, env);
     return;
   }
@@ -1873,8 +1883,8 @@ static void midopt_safety_while (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env 
   cond = NL_EL (n->u.ops, 1);
   stmt = NL_EL (n->u.ops, 2);
 
-  /* while (0) { ... } — body never runs; still analyze cond for effects. */
-  if (midopt_cond_known (cond) == 0) {
+  /* while (0) { ... } — body never runs unless a label is a goto target. */
+  if (midopt_cond_known (cond) == 0 && c11_dead_skippable_p (stmt)) {
     if (cond != NULL && cond->code != N_IGNORE) midopt_safety_expr (c2m_ctx, cond, env);
     return;
   }
@@ -2655,14 +2665,14 @@ static void midopt_safety_stmt (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
 
     midopt_safety_expr (c2m_ctx, cond, env);
     k = midopt_cond_known (cond);
-    if (k == 1) {
+    if (k == 1 && c11_dead_skippable_p (else_s)) {
       midopt_env_copy (&env_then, env);
       midopt_refine_cond (&env_then, cond, 1);
       midopt_safety_stmt (c2m_ctx, then_s, &env_then);
       midopt_env_copy (env, &env_then);
       return;
     }
-    if (k == 0) {
+    if (k == 0 && c11_dead_skippable_p (then_s)) {
       if (else_s != NULL && else_s->code != N_IGNORE) {
         midopt_env_copy (&env_else, env);
         midopt_refine_cond (&env_else, cond, 0);
