@@ -1469,6 +1469,16 @@ static void set_string_val (c2m_ctx_t c2m_ctx, token_t t, VARR (char) * temp, in
     if (!string_p && last_c >= 0 && !pre_skip_if_part_p (c2m_ctx))
       error (c2m_ctx, t->pos, "multibyte character");
     last_c = curr_c = (unsigned char) str[i];
+    /* Trigraphs in string/char literals (translation phase 1) even when
+       source-level `??` is the null-coalescing operator.  `??/` becomes `\`
+       and is then processed as an escape. */
+    if (curr_c == '?' && i + 2 < str_len - 1 && str[i + 1] == '?') {
+      int repl = trigraph_replacement ((unsigned char) str[i + 2]);
+      if (repl >= 0) {
+        curr_c = last_c = repl;
+        i += 2;
+      }
+    }
     if (curr_c != '\\') {
       push_str_char (temp, curr_c, type);
       continue;
@@ -23660,19 +23670,32 @@ if (base != NULL && base->code == N_ID) {
       error (c2m_ctx, POS (r), "statement expression is not a part of C11 standard");
       break;
     }
-    check (c2m_ctx, block, r);
+    {
+      /* The inner block is a statement and would zero curr_call_arg_area_offset.
+         Keep the enclosing expression's reservation so two aggregate
+         stmtexprs in one expr (`({s;}).x - ({s;}).x`) get distinct slots. */
+      mir_size_t saved_arg_off = curr_call_arg_area_offset;
+      check (c2m_ctx, block, r);
+      curr_call_arg_area_offset = saved_arg_off;
+    }
     node_t last_stmt = NL_TAIL (NL_EL (block->u.ops, 1)->u.ops);
-    if (!last_stmt || last_stmt->code != N_EXPR) {
-      error (c2m_ctx, POS (r), "last statement in statement expression is not an expression");
+    e = create_expr (c2m_ctx, r);
+    if (last_stmt != NULL && last_stmt->code == N_EXPR) {
+      node_t expr = NL_EL (last_stmt->u.ops, 1);
+      e1 = expr->attr;
+      if (e1 == NULL || e1->type == NULL) break;
+      t1 = e1->type;
+      e->type = create_type (c2m_ctx, t1);
+      set_type_layout (c2m_ctx, e->type);
+    } else {
+      /* GNU: `({ if (e) ...; })` is a void statement-expression.
+         glibc <assert.h> uses this form when __GNUC__ is defined. */
+      e->type = create_type (c2m_ctx, NULL);
+      e->type->mode = TM_BASIC;
+      e->type->u.basic_type = TP_VOID;
+      set_type_layout (c2m_ctx, e->type);
       break;
     }
-    node_t expr = NL_EL (last_stmt->u.ops, 1);
-    e1 = expr->attr;
-    if (e1 == NULL || e1->type == NULL) break;
-    t1 = e1->type;
-    e = create_expr (c2m_ctx, r);
-    e->type = create_type (c2m_ctx, t1);
-    set_type_layout (c2m_ctx, e->type);
     /* Aggregate stmtexpr results need a temporary that outlives the block's
        defers (which may destroy the last-expression local).  Reserve space in
        the call-arg area — NOT in func_block_scope->size / local offsets.
@@ -33767,7 +33790,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
 
     stmtexpr_last_expr
       = (last_stmt != NULL && last_stmt->code == N_EXPR) ? NL_EL (last_stmt->u.ops, 1) : NULL;
-    gen (c2m_ctx, block, NULL, NULL, FALSE, NULL, NULL);
+    {
+      /* Inner N_EXPR statements reset curr_call_arg_area_offset; restore so
+         this result's copy gets a unique slot (MIR #452). */
+      mir_size_t saved_arg_off = curr_call_arg_area_offset;
+      gen (c2m_ctx, block, NULL, NULL, FALSE, NULL, NULL);
+      curr_call_arg_area_offset = saved_arg_off;
+    }
     stmtexpr_last_expr = saved_last_expr;
     res = top_gen_last_op;
     /* Copy aggregate results into a call-arg-area temp.  Locals live at low
