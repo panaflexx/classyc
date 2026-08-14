@@ -12,10 +12,18 @@
  *   9. String as function parameter and return value
  *  10. String in struct / class member
  *  11. UTF-8 content in String
- *  12. String comparison via strcmp (undeclared / implicit)
+ *  12. String comparison via strcmp
  *  13. Mixing String arrays with dict for-in in one function
  *  14. String + basic-type auto-cast concatenation (int/bool/char/double/...)
+ *
+ * Include real prototypes for strlen/strcmp/printf.  Implicit declarations
+ * (int f()) are ABI-sensitive on Apple arm64: varargs go on the stack while
+ * ordinary callees read registers.  Phase 3 unprototyped-call handling is
+ * meant to cover that; this suite still wants correct C prototypes.
  */
+
+#include <stdio.h>
+#include <string.h>
 
 /* ---- globals ---- */
 

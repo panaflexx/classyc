@@ -12541,6 +12541,9 @@ static int basic_type_size (enum basic_type bt) {
   case TP_DOUBLE: return sizeof (mir_double);
   case TP_LDOUBLE: return sizeof (mir_ldouble);
   case TP_VOID: return 1;  // ???
+  case TP_STRING:
+    /* Built-in String is a pointer-width handle, not a C basic type. */
+    return (int) sizeof (mir_size_t);
   default: abort ();
   }
 }
