@@ -1,7 +1,8 @@
 /* src/midopt.c — Mid-level optimizer (check → gen) for ClassyC.
  *
- * STATUS: Phase B–E of GEN-OPT.md — method-level dead pruning (no whole-class
- * expand), gen protocol stamps, accessor inline marks, P1 guard elision.
+ * STATUS: Phase B–J + demand-driven keep + open-code skip-keep + Phase 3 IVs
+ * + Phase 4 MIR_INLINE of tiny methods (budget/hardness from -On)
+ * + C11 dead-arm / unevaluated walks (_Generic, const if/?:/&&/||, sizeof).
  *
  * Single-TU build model: this file is `#include`d from `src/classyc.c`
  * next to `ownership.c`, so it sees internal types (`c2m_ctx_t`, `node_t`,
@@ -86,6 +87,19 @@ static const char *midopt_func_name (node_t func_def) {
 static VARR (node_t) * midopt_keep;
 static VARR (node_t) * midopt_work;
 static int midopt_verbose_p;
+static int midopt_level; /* latched from -On at midopt_run; 2 if unspecified */
+
+/* Unspecified (-1) matches MIR's default (= 2). */
+static int midopt_opt_level (void) {
+  return midopt_level;
+}
+
+static int midopt_latch_opt_level (c2m_ctx_t c2m_ctx) {
+  int l = (c2m_options != NULL) ? c2m_options->optimize_level : -1;
+  if (l < 0) l = 2;
+  if (l > 3) l = 3;
+  return l;
+}
 
 static int midopt_keep_has (node_t f) {
   size_t i, n;
@@ -141,6 +155,26 @@ static int midopt_expr_node_p (node_code_t code) {
   }
 }
 
+/* True when gen will open-code every direct call of DEF (dense List/Set/Map
+   Count/Get/…).  Address-of still needs a MIR body. */
+static int midopt_open_code_accessor_p (node_t def) {
+  const char *nm;
+  int n_args;
+
+  if (def == NULL || def->code != N_FUNC_DEF) return 0;
+  nm = midopt_func_name (def);
+  if (nm == NULL) return 0;
+  if (strcmp (nm, "Count") == 0 || strcmp (nm, "IsEmpty") == 0 || strcmp (nm, "Capacity") == 0
+      || strcmp (nm, "First") == 0 || strcmp (nm, "Last") == 0
+      || strcmp (nm, "FirstMut") == 0 || strcmp (nm, "LastMut") == 0)
+    n_args = 0;
+  else if (strcmp (nm, "Get") == 0 || strcmp (nm, "GetMut") == 0)
+    n_args = 1;
+  else
+    return 0;
+  return dense_accessor_open_codeable_p (def, n_args);
+}
+
 static void midopt_mark_from_expr_node (node_t n) {
   struct expr *e;
   node_t def;
@@ -155,7 +189,21 @@ static void midopt_mark_from_expr_node (node_t n) {
   /* N_DETACH stashes runtime selectors as tiny integer sentinels, not nodes:
        (node_t)1 — string detach, (node_t)2 — object detach. */
   if (def == (node_t) (intptr_t) 1 || def == (node_t) (intptr_t) 2) return;
-  if (def->code == N_FUNC_DEF) midopt_mark_keep (def);
+  if (def->code != N_FUNC_DEF) return;
+  /* Open-coded dense accessors: a direct call does not need the MIR function.
+     N_ADDR of the method still keeps it (func-ptr / leftover ref). */
+  if (n->code != N_ADDR && midopt_open_code_accessor_p (def)) return;
+  if (n->code == N_ADDR) {
+    node_t inner = NL_HEAD (n->u.ops);
+    struct expr *ie;
+    if (inner != NULL && inner->attr != NULL && inner->attr != (void *) ((intptr_t) -1)) {
+      ie = (struct expr *) inner->attr;
+      if (ie->def_node != NULL && ie->def_node != (node_t) (intptr_t) 1
+          && ie->def_node != (node_t) (intptr_t) 2 && ie->def_node->code == N_FUNC_DEF)
+        midopt_mark_keep (ie->def_node);
+    }
+  }
+  midopt_mark_keep (def);
 }
 
 /* Keep every overload of NAME on CLASS_TAG (same-class call-graph fill-in). */
@@ -186,7 +234,153 @@ static void midopt_mark_named_on_class (c2m_ctx_t c2m_ctx, node_t class_tag, con
 /* ── AST walk: collect uses / apply elisions ─────────────────────────────── */
 
 static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag);
+
+/* c11_cond_known lives in classyc.c (also used by gen to skip dead arms). */
+#define midopt_cond_known c11_cond_known
+
+/* Unevaluated / short-circuit / const-dead children.  Recurses via
+   midopt_collect_uses on live subtrees only.  Returns 1 if the default
+   child walk should be skipped. */
+static int midopt_collect_c11_p (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) {
+  int k, lt;
+  node_t a, b, c, list, ga, body;
+
+  switch (n->code) {
+  case N_SIZEOF:
+  case N_EXPR_SIZEOF:
+  case N_ALIGNOF:
+    /* Operand is unevaluated (VLA size is a type operand, not a call). */
+    return 1;
+  case N_GENERIC:
+    /* Controlling expr is unevaluated (C11 6.5.1.1).  Check moved the
+       selected association to the list head; gen emits only that expr. */
+    list = NL_EL (n->u.ops, 1);
+    ga = (list != NULL && list->code == N_LIST) ? NL_HEAD (list->u.ops) : NULL;
+    if (ga != NULL && ga->code == N_GENERIC_ASSOC)
+      midopt_collect_uses (c2m_ctx, NL_EL (ga->u.ops, 1), class_tag);
+    return 1;
+  case N_ANDAND:
+  case N_OROR:
+    a = NL_HEAD (n->u.ops);
+    b = a != NULL ? NL_NEXT (a) : NULL;
+    midopt_collect_uses (c2m_ctx, a, class_tag);
+    lt = midopt_cond_known (a);
+    if (n->code == N_ANDAND && lt == 0) return 1;
+    if (n->code == N_OROR && lt == 1) return 1;
+    midopt_collect_uses (c2m_ctx, b, class_tag);
+    return 1;
+  case N_COND:
+    a = NL_HEAD (n->u.ops);
+    b = a != NULL ? NL_NEXT (a) : NULL;
+    c = b != NULL ? NL_NEXT (b) : NULL;
+    midopt_collect_uses (c2m_ctx, a, class_tag);
+    k = midopt_cond_known (a);
+    if (k == 1)
+      midopt_collect_uses (c2m_ctx, b, class_tag);
+    else if (k == 0)
+      midopt_collect_uses (c2m_ctx, c, class_tag);
+    else {
+      midopt_collect_uses (c2m_ctx, b, class_tag);
+      midopt_collect_uses (c2m_ctx, c, class_tag);
+    }
+    return 1;
+  case N_COALESCE:
+    a = NL_HEAD (n->u.ops);
+    b = a != NULL ? NL_NEXT (a) : NULL;
+    midopt_collect_uses (c2m_ctx, a, class_tag);
+    if (midopt_cond_known (a) != 1) midopt_collect_uses (c2m_ctx, b, class_tag);
+    return 1;
+  case N_IF:
+    a = NL_EL (n->u.ops, 1);
+    b = NL_EL (n->u.ops, 2);
+    c = NL_EL (n->u.ops, 3);
+    midopt_collect_uses (c2m_ctx, a, class_tag);
+    k = midopt_cond_known (a);
+    if (k == 1)
+      midopt_collect_uses (c2m_ctx, b, class_tag);
+    else if (k == 0)
+      midopt_collect_uses (c2m_ctx, c, class_tag);
+    else {
+      midopt_collect_uses (c2m_ctx, b, class_tag);
+      midopt_collect_uses (c2m_ctx, c, class_tag);
+    }
+    return 1;
+  case N_WHILE:
+    a = NL_EL (n->u.ops, 1);
+    b = NL_EL (n->u.ops, 2);
+    midopt_collect_uses (c2m_ctx, a, class_tag);
+    if (midopt_cond_known (a) != 0) midopt_collect_uses (c2m_ctx, b, class_tag);
+    return 1;
+  case N_FOR:
+    a = NL_EL (n->u.ops, 1); /* init */
+    b = a != NULL ? NL_NEXT (a) : NULL; /* cond */
+    c = b != NULL ? NL_NEXT (b) : NULL; /* iter */
+    body = c != NULL ? NL_NEXT (c) : NULL;
+    midopt_collect_uses (c2m_ctx, a, class_tag);
+    midopt_collect_uses (c2m_ctx, b, class_tag);
+    if (b == NULL || b->code == N_IGNORE || midopt_cond_known (b) != 0) {
+      midopt_collect_uses (c2m_ctx, c, class_tag);
+      midopt_collect_uses (c2m_ctx, body, class_tag);
+    }
+    return 1;
+  default:
+    return 0;
+  }
+}
 static void midopt_elide_walk (c2m_ctx_t c2m_ctx, node_t n);
+
+/* Gen-time dict-to-class bind fills collection pointer fields via default
+   ctor + Add (no N_CALL in the AST).  Keep that protocol on the bound type
+   and nested collection fields. */
+static void midopt_keep_default_ctor (node_t class_tag) {
+  node_t id, decl_list;
+  if (class_tag == NULL || class_tag->code != N_CLASS) return;
+  id = NL_HEAD (class_tag->u.ops);
+  decl_list = id != NULL ? NL_NEXT (id) : NULL;
+  if (decl_list == NULL || decl_list->code != N_LIST) return;
+  for (node_t m = NL_HEAD (decl_list->u.ops); m != NULL; m = NL_NEXT (m)) {
+    const char *nm;
+    decl_t d;
+    struct func_type *ft;
+    node_t cp;
+    if (m->code != N_FUNC_DEF || !midopt_class_method_p (m)) continue;
+    nm = midopt_func_name (m);
+    if (nm == NULL || strncmp (nm, "__ctor_", 7) != 0) continue;
+    d = (decl_t) m->attr;
+    if (d == NULL || d->decl_spec.type == NULL || d->decl_spec.type->mode != TM_FUNC) continue;
+    ft = d->decl_spec.type->u.func_type;
+    if (ft == NULL || ft->param_list == NULL) continue;
+    cp = NL_HEAD (ft->param_list->u.ops);
+    if (cp != NULL) cp = NL_NEXT (cp);
+    if (cp == NULL) midopt_mark_keep (m);
+  }
+}
+
+static void midopt_keep_bind_type (c2m_ctx_t c2m_ctx, struct type *t, pos_t pos, int depth) {
+  node_t tag, id, decl_list, add;
+  if (t == NULL || depth > 8) return;
+  if (t->mode == TM_PTR && t->u.ptr_type != NULL) {
+    midopt_keep_bind_type (c2m_ctx, t->u.ptr_type, pos, depth + 1);
+    return;
+  }
+  if ((t->mode != TM_CLASS && t->mode != TM_STRUCT) || t->u.tag_type == NULL) return;
+  tag = t->u.tag_type;
+  add = find_class_protocol_method (c2m_ctx, tag, "Add", 1, pos);
+  if (add != NULL) {
+    midopt_mark_keep (add);
+    midopt_keep_default_ctor (tag);
+  }
+  id = NL_HEAD (tag->u.ops);
+  decl_list = id != NULL ? NL_NEXT (id) : NULL;
+  if (decl_list == NULL || decl_list->code != N_LIST) return;
+  for (node_t mem = NL_HEAD (decl_list->u.ops); mem != NULL; mem = NL_NEXT (mem)) {
+    decl_t md;
+    if (mem->code != N_MEMBER || mem->attr == NULL) continue;
+    md = (decl_t) mem->attr;
+    if (md != NULL && md->decl_spec.type != NULL)
+      midopt_keep_bind_type (c2m_ctx, md->decl_spec.type, pos, depth + 1);
+  }
+}
 
 static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) {
   if (n == NULL) return;
@@ -270,9 +464,9 @@ static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
     struct expr *e = (struct expr *) n->attr;
     node_t def = e->def_node;
     if (def != NULL && def != (node_t) (intptr_t) 1 && def != (node_t) (intptr_t) 2
-        && def->code == N_FUNC_DEF)
-      midopt_mark_keep (def);
-    else if (e->type != NULL) {
+        && def->code == N_FUNC_DEF) {
+      if (!midopt_open_code_accessor_p (def)) midopt_mark_keep (def);
+    } else if (e->type != NULL) {
       node_t arr = NL_HEAD (n->u.ops);
       struct expr *ae = arr != NULL ? arr->attr : NULL;
       struct type *at = ae != NULL ? ae->type : NULL;
@@ -286,10 +480,10 @@ static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
         node_t m;
         const char *proto = e->mut_sub_p ? "GetMut" : "Get";
         m = find_class_protocol_method (c2m_ctx, cls->u.tag_type, proto, 1, POS (n));
-        if (m) midopt_mark_keep (m);
+        if (m && !midopt_open_code_accessor_p (m)) midopt_mark_keep (m);
         if (e->mut_sub_p) {
           m = find_class_protocol_method (c2m_ctx, cls->u.tag_type, "Get", 1, POS (n));
-          if (m) midopt_mark_keep (m);
+          if (m && !midopt_open_code_accessor_p (m)) midopt_mark_keep (m);
         }
       }
     }
@@ -313,6 +507,13 @@ static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
         if (m) midopt_mark_keep (m);
       }
     }
+  }
+
+  /* (T) dict bind: gen_dict_bind_collection_field calls default ctor + Add
+     on collection pointer fields with no N_CALL in the AST. */
+  if (n->code == N_CAST && n->attr != NULL && n->attr != (void *) ((intptr_t) -1)) {
+    struct expr *ce = (struct expr *) n->attr;
+    if (ce->type != NULL && ce->bind_p) midopt_keep_bind_type (c2m_ctx, ce->type, POS (n), 0);
   }
 
   /* new T{e1,e2,...} → gen emits ctor + Add(ei) per element (no N_CALL for Add). */
@@ -339,6 +540,8 @@ static void midopt_collect_uses (c2m_ctx_t c2m_ctx, node_t n, node_t class_tag) 
     if (dtor != NULL && dtor != (node_t) (intptr_t) -1 && dtor->code == N_FUNC_DEF)
       midopt_mark_keep (dtor);
   }
+
+  if (midopt_collect_c11_p (c2m_ctx, n, class_tag)) return;
 
   if (!midopt_node_has_ops (n->code)) return;
   for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
@@ -392,7 +595,9 @@ struct midopt_fact {
      Enables OOB elision on recv.Get(i) / recv[i] inside the loop body. */
   node_t sym_recv;
   mir_llong sym_lo;
+  int sym_minus; /* bound is Count()-sym_minus (0 for a raw Count()) */
   int addr_taken_p; /* &decl observed anywhere (monotone) — disables sym proofs */
+  int uniq_ptr_p; /* local pointer from `new`, never copied — alias-free */
 };
 
 struct midopt_env {
@@ -449,7 +654,9 @@ static struct midopt_fact *midopt_env_get (struct midopt_env *env, node_t decl) 
   p->lo = p->hi = 0;
   p->sym_recv = NULL;
   p->sym_lo = 0;
+  p->sym_minus = 0;
   p->addr_taken_p = 0;
+  p->uniq_ptr_p = 0;
   return p;
 }
 
@@ -481,6 +688,8 @@ static void midopt_env_join (struct midopt_env *dst, const struct midopt_env *a,
       fo->nullness = MN_TOP;
       fo->ival_p = 0;
       fo->sym_recv = NULL;
+      fo->uniq_ptr_p = 0;
+      fo->addr_taken_p = fa->addr_taken_p;
     } else {
       fo->nullness = midopt_null_join (fa->nullness, fb->nullness);
       if (fa->ival_p && fb->ival_p) {
@@ -491,10 +700,13 @@ static void midopt_env_join (struct midopt_env *dst, const struct midopt_env *a,
         fo->ival_p = 0;
       }
       /* Symbolic bound survives a join only when identical on both paths. */
-      if (fa->sym_recv != NULL && fa->sym_recv == fb->sym_recv && fa->sym_lo == fb->sym_lo)
+      if (fa->sym_recv != NULL && fa->sym_recv == fb->sym_recv && fa->sym_lo == fb->sym_lo
+          && fa->sym_minus == fb->sym_minus)
         fo->sym_recv = fa->sym_recv;
       else
         fo->sym_recv = NULL;
+      fo->addr_taken_p = fa->addr_taken_p || fb->addr_taken_p;
+      fo->uniq_ptr_p = fa->uniq_ptr_p && fb->uniq_ptr_p;
     }
   }
   for (i = 0; i < b->n; i++) {
@@ -504,6 +716,8 @@ static void midopt_env_join (struct midopt_env *dst, const struct midopt_env *a,
     fo->nullness = MN_TOP;
     fo->ival_p = 0;
     fo->sym_recv = NULL;
+    fo->uniq_ptr_p = 0;
+    fo->addr_taken_p = b->f[i].addr_taken_p;
   }
   *dst = out;
 }
@@ -591,9 +805,16 @@ static void midopt_kill_ival (struct midopt_env *env, node_t decl) {
   if (f != NULL) f->ival_p = 0;
 }
 
+static node_t midopt_peel_count (struct midopt_env *env, node_t n, mir_llong *minus);
+
 /* Refine env for then-branch of `if (cond)`.  then_p=1 → then arm; 0 → else. */
 static void midopt_refine_cond (struct midopt_env *env, node_t cond, int then_p) {
-  node_t decl, a, b;
+  node_t decl, a, b, iv, bound_expr, recv;
+  int strict;
+  mir_llong minus, blo, bhi, klo;
+  struct midopt_fact *f, *bf;
+  struct expr *ie;
+
   if (cond == NULL) return;
   /* if (p) / if (!p) */
   if (cond->code == N_ID) {
@@ -603,6 +824,11 @@ static void midopt_refine_cond (struct midopt_env *env, node_t cond, int then_p)
   }
   if (cond->code == N_NOT) {
     midopt_refine_cond (env, NL_HEAD (cond->u.ops), !then_p);
+    return;
+  }
+  if (cond->code == N_ANDAND && then_p) {
+    midopt_refine_cond (env, NL_HEAD (cond->u.ops), 1);
+    midopt_refine_cond (env, NL_NEXT (NL_HEAD (cond->u.ops)), 1);
     return;
   }
   /* p == 0 / 0 == p / p != 0 */
@@ -627,6 +853,100 @@ static void midopt_refine_cond (struct midopt_env *env, node_t cond, int then_p)
           midopt_set_null (env, decl, then_p ? MN_NONNULL : MN_NULL);
       }
     }
+    return;
+  }
+
+  /* Relational: then-arm only.  `i >= K` raises lo; `i < Count()` sets sym.
+     Gated at -O2+ (hardness). */
+  if (!then_p || midopt_opt_level () < 2) return;
+  if (cond->code != N_LT && cond->code != N_LE && cond->code != N_GT && cond->code != N_GE)
+    return;
+  a = NL_HEAD (cond->u.ops);
+  b = a != NULL ? NL_NEXT (a) : NULL;
+  if (a == NULL || b == NULL) return;
+
+  /* i >= K / K <= i  (const K) */
+  if ((cond->code == N_GE || cond->code == N_GT) && a->code == N_ID
+      && midopt_expr_ival (env, b, &blo, &bhi) && blo == bhi) {
+    decl = midopt_id_decl (a);
+    f = decl != NULL ? midopt_env_get (env, decl) : NULL;
+    if (f != NULL) {
+      klo = blo + (cond->code == N_GT ? 1 : 0);
+      if (!f->ival_p) {
+        f->ival_p = 1;
+        f->lo = klo;
+        f->hi = 0x7fffffffffffffffLL;
+      } else if (klo > f->lo)
+        f->lo = klo;
+    }
+    return;
+  }
+  if ((cond->code == N_LE || cond->code == N_LT) && b->code == N_ID
+      && midopt_expr_ival (env, a, &blo, &bhi) && blo == bhi) {
+    decl = midopt_id_decl (b);
+    f = decl != NULL ? midopt_env_get (env, decl) : NULL;
+    if (f != NULL) {
+      klo = blo + (cond->code == N_LT ? 1 : 0);
+      if (!f->ival_p) {
+        f->ival_p = 1;
+        f->lo = klo;
+        f->hi = 0x7fffffffffffffffLL;
+      } else if (klo > f->lo)
+        f->lo = klo;
+    }
+    return;
+  }
+
+  iv = NULL;
+  bound_expr = NULL;
+  strict = 1;
+  if ((cond->code == N_LT || cond->code == N_LE) && a->code == N_ID) {
+    iv = a;
+    bound_expr = b;
+    strict = cond->code == N_LT;
+  } else if ((cond->code == N_GT || cond->code == N_GE) && b->code == N_ID) {
+    iv = b;
+    bound_expr = a;
+    strict = cond->code == N_GT;
+  } else {
+    return;
+  }
+  decl = midopt_id_decl (iv);
+  if (decl == NULL) return;
+  f = midopt_env_get (env, decl);
+  if (f == NULL) return;
+  {
+    int nonneg = (f->ival_p && f->lo >= 0);
+    ie = iv->attr;
+    if (!nonneg && ie != NULL && ie->type != NULL && integer_type_p (ie->type)
+        && !signed_integer_type_p (ie->type))
+      nonneg = 1;
+    if (!nonneg) return;
+  }
+  minus = 0;
+  recv = midopt_peel_count (env, bound_expr, &minus);
+  if (recv == NULL) {
+    node_t bd = midopt_id_decl (bound_expr);
+    bf = bd != NULL ? midopt_env_find (env, bd) : NULL;
+    if (bf != NULL && bf->sym_recv != NULL) {
+      recv = bf->sym_recv;
+      minus = bf->sym_minus;
+    }
+  }
+  if (recv != NULL) {
+    if ((strict && minus >= 0) || (!strict && minus >= 1)) {
+      f->sym_recv = recv;
+      f->sym_lo = f->ival_p && f->lo >= 0 ? f->lo : 0;
+      f->sym_minus = (int) minus;
+    }
+  } else if (midopt_expr_ival (env, bound_expr, &blo, &bhi)) {
+    mir_llong hi = bhi - (strict ? 1 : 0);
+    if (!f->ival_p) {
+      f->ival_p = 1;
+      f->lo = 0;
+      f->hi = hi;
+    } else if (hi < f->hi)
+      f->hi = hi;
   }
 }
 
@@ -638,22 +958,35 @@ static void midopt_kill_sym_for (struct midopt_env *env, node_t decl);
 static node_t midopt_method_call_recv (node_t func, const char **name);
 static void midopt_check_class_iv (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *env);
 static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *env);
+static void midopt_safety_while (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *env);
 static int midopt_pure_coll_method_p (const char *nm);
 static int midopt_recv_mutated_p (node_t n, node_t recv);
 
-/* If N is a `recv.Count()` call on a value-class receiver (TM_CLASS local),
- * return the receiver's decl identity; else NULL.  Used to establish the
- * symbolic bound `i < recv.Count()` (R1).  Pointer receivers are excluded:
- * aliasing defeats the no-mutation proof.  Note: check prepends the receiver
- * as args[0] (N_ADDR for a value receiver), so a zero-user-arg method call
- * still has one args-list entry. */
-static node_t midopt_count_call_recv (node_t n) {
-  node_t func, recv, mid, args;
+/* True when N is `new T(...)` (casts peeled). */
+static int midopt_expr_is_new (node_t n) {
+  int g = 0;
+  while (n != NULL && g++ < 8) {
+    if (n->code == N_NEW) return 1;
+    if (n->code == N_CAST) {
+      n = NL_EL (n->u.ops, 1);
+      continue;
+    }
+    break;
+  }
+  return 0;
+}
+
+/* Receiver decl of `xs.Count()` / `p->Count()` when the proof may trust it.
+   Value-class locals are always ok.  Pointer locals only if uniq_ptr_p
+   (assigned from `new`, never copied) and not address-taken. */
+static node_t midopt_count_recv_from_call (struct midopt_env *env, node_t n) {
+  node_t func, recv, mid, args, d;
   struct expr *re;
+  struct midopt_fact *f;
 
   if (n == NULL || n->code != N_CALL) return NULL;
   func = NL_HEAD (n->u.ops);
-  if (func == NULL || func->code != N_FIELD) return NULL; /* value recv only */
+  if (func == NULL || (func->code != N_FIELD && func->code != N_DEREF_FIELD)) return NULL;
   recv = NL_HEAD (func->u.ops);
   mid = NL_NEXT (recv);
   if (recv == NULL || recv->code != N_ID || mid == NULL || mid->code != N_ID) return NULL;
@@ -661,12 +994,49 @@ static node_t midopt_count_call_recv (node_t n) {
   args = NL_EL (n->u.ops, 1);
   if (args != NULL && args->code == N_LIST) {
     node_t a0 = NL_HEAD (args->u.ops);
-    /* Only the injected receiver arg (N_ADDR) may be present. */
-    if (a0 != NULL && (a0->code != N_ADDR || NL_NEXT (a0) != NULL)) return NULL;
+    /* Injected receiver only (N_ADDR for value, the pointer for ->). */
+    if (a0 != NULL && NL_NEXT (a0) != NULL) return NULL;
   }
   re = recv->attr;
-  if (re == NULL || re->type == NULL || re->type->mode != TM_CLASS) return NULL;
-  return midopt_id_decl (recv);
+  if (re == NULL || re->type == NULL) return NULL;
+  d = midopt_id_decl (recv);
+  if (d == NULL) return NULL;
+  if (re->type->mode == TM_CLASS) return d;
+  if (midopt_opt_level () >= 2 && re->type->mode == TM_PTR && re->type->u.ptr_type != NULL
+      && re->type->u.ptr_type->mode == TM_CLASS) {
+    if (env == NULL) return NULL;
+    f = midopt_env_find (env, d);
+    if (f == NULL || !f->uniq_ptr_p || f->addr_taken_p) return NULL;
+    return d;
+  }
+  return NULL;
+}
+
+/* Peel `recv.Count()` or `recv.Count() - K` (K const >= 0).  *MINUS is K. */
+static node_t midopt_peel_count (struct midopt_env *env, node_t n, mir_llong *minus) {
+  node_t recv;
+  if (minus != NULL) *minus = 0;
+  if (n == NULL) return NULL;
+  recv = midopt_count_recv_from_call (env, n);
+  if (recv != NULL) return recv;
+  if (n->code == N_SUB) {
+    node_t a = NL_HEAD (n->u.ops);
+    node_t b = NL_NEXT (a);
+    mir_llong lo, hi;
+    recv = midopt_count_recv_from_call (env, a);
+    if (recv != NULL && midopt_expr_ival (env, b, &lo, &hi) && lo == hi && lo >= 0) {
+      if (minus != NULL) *minus = lo;
+      return recv;
+    }
+  }
+  return NULL;
+}
+
+/* Exact `recv.Count()` (minus == 0).  Used for R-LICM hoist of the call node. */
+static node_t midopt_count_call_recv (struct midopt_env *env, node_t n) {
+  mir_llong minus = 0;
+  node_t recv = midopt_peel_count (env, n, &minus);
+  return (recv != NULL && minus == 0) ? recv : NULL;
 }
 
 /* Apply assignment of `rhs` into `lhs` (N_ID or *p etc.). */
@@ -693,10 +1063,29 @@ static void midopt_on_assign (struct midopt_env *env, node_t lhs, node_t rhs) {
      assignment severs the tie. */
   {
     struct midopt_fact *f = midopt_env_get (env, decl);
-    node_t recv = midopt_count_call_recv (rhs);
+    mir_llong minus = 0;
+    node_t recv = midopt_peel_count (env, rhs, &minus);
     if (f != NULL) {
       f->sym_recv = recv;
       f->sym_lo = 0;
+      f->sym_minus = recv != NULL ? (int) minus : 0;
+    }
+  }
+  /* Unique heap pointer: `p = new T` is alias-free until copied or &p. */
+  {
+    struct expr *le = lhs->attr;
+    if (le != NULL && le->type != NULL && le->type->mode == TM_PTR) {
+      struct midopt_fact *pf = midopt_env_get (env, decl);
+      if (pf != NULL) {
+        if (midopt_expr_is_new (rhs)) {
+          pf->uniq_ptr_p = 1;
+        } else {
+          node_t rd = midopt_id_decl (rhs);
+          struct midopt_fact *rf = rd != NULL ? midopt_env_find (env, rd) : NULL;
+          pf->uniq_ptr_p = 0;
+          if (rf != NULL) rf->uniq_ptr_p = 0; /* copy aliases — neither unique */
+        }
+      }
     }
   }
 }
@@ -997,6 +1386,63 @@ static void midopt_safety_expr (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
        idioms like `x = calloc(1, sizeof(*x))` where x is provably null on this
        path.  (VLA size exprs are evaluated, but `sizeof(*p)` never derefs p.) */
     return;
+  case N_GENERIC: {
+    /* Controlling expr unevaluated; only the selected association (list head). */
+    node_t list = NL_EL (n->u.ops, 1);
+    node_t ga = (list != NULL && list->code == N_LIST) ? NL_HEAD (list->u.ops) : NULL;
+    if (ga != NULL && ga->code == N_GENERIC_ASSOC)
+      midopt_safety_expr (c2m_ctx, NL_EL (ga->u.ops, 1), env);
+    return;
+  }
+  case N_ANDAND:
+  case N_OROR: {
+    node_t lhs = NL_HEAD (n->u.ops);
+    node_t rhs = lhs != NULL ? NL_NEXT (lhs) : NULL;
+    node_t decl;
+    struct midopt_fact *f;
+    int known;
+
+    midopt_safety_expr (c2m_ctx, lhs, env);
+    known = midopt_cond_known (lhs);
+    if (n->code == N_ANDAND && known == 0) return;
+    if (n->code == N_OROR && known == 1) return;
+    decl = midopt_id_decl (lhs);
+    f = decl != NULL ? midopt_env_find (env, decl) : NULL;
+    if (f != NULL) {
+      if (n->code == N_ANDAND && f->nullness == MN_NULL) return;
+      if (n->code == N_OROR && f->nullness == MN_NONNULL) return;
+    }
+    midopt_safety_expr (c2m_ctx, rhs, env);
+    return;
+  }
+  case N_COND: {
+    node_t cond = NL_HEAD (n->u.ops);
+    node_t texpr = cond != NULL ? NL_NEXT (cond) : NULL;
+    node_t fexpr = texpr != NULL ? NL_NEXT (texpr) : NULL;
+    int k;
+
+    midopt_safety_expr (c2m_ctx, cond, env);
+    k = midopt_cond_known (cond);
+    if (k == 1) {
+      midopt_safety_expr (c2m_ctx, texpr, env);
+      return;
+    }
+    if (k == 0) {
+      midopt_safety_expr (c2m_ctx, fexpr, env);
+      return;
+    }
+    midopt_safety_expr (c2m_ctx, texpr, env);
+    midopt_safety_expr (c2m_ctx, fexpr, env);
+    return;
+  }
+  case N_COALESCE: {
+    node_t a = NL_HEAD (n->u.ops);
+    node_t b = a != NULL ? NL_NEXT (a) : NULL;
+
+    midopt_safety_expr (c2m_ctx, a, env);
+    if (midopt_cond_known (a) != 1) midopt_safety_expr (c2m_ctx, b, env);
+    return;
+  }
   default:
     if (!midopt_node_has_ops (n->code)) return;
     for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
@@ -1083,7 +1529,7 @@ static void midopt_kill_sym_for (struct midopt_env *env, node_t decl) {
    N_FIELD (value receiver) on an N_ID.  Fills *name with the method name. */
 static node_t midopt_method_call_recv (node_t func, const char **name) {
   node_t recv, mid;
-  if (func == NULL || func->code != N_FIELD) return NULL;
+  if (func == NULL || (func->code != N_FIELD && func->code != N_DEREF_FIELD)) return NULL;
   recv = NL_HEAD (func->u.ops);
   mid = NL_NEXT (recv);
   if (recv == NULL || recv->code != N_ID || mid == NULL || mid->code != N_ID) return NULL;
@@ -1165,8 +1611,9 @@ static int midopt_iv_hazard_p (node_t n, node_t iv_decl, node_t bound_decl, node
     if (fn != NULL && (fn->code == N_FIELD || fn->code == N_DEREF_FIELD)) {
       node_t args = NL_EL (n->u.ops, 1);
       node_t a0 = args != NULL && args->code == N_LIST ? NL_HEAD (args->u.ops) : NULL;
-      if (a0 != NULL && a0->code == N_ADDR) {
+      if (a0 != NULL) {
         node_t a;
+        /* Skip injected receiver (N_ADDR for value, the pointer for ->). */
         if (midopt_iv_hazard_p (fn, iv_decl, bound_decl, bound_recv)) return 1;
         for (a = NL_NEXT (a0); a != NULL; a = NL_NEXT (a))
           if (midopt_iv_hazard_p (a, iv_decl, bound_decl, bound_recv)) return 1;
@@ -1202,8 +1649,8 @@ static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *e
   node_t init, cond, iter, stmt;
   node_t iv_decl = NULL, iv_spec = NULL, bound_decl = NULL, bound_recv = NULL;
   node_t bound_call = NULL; /* the direct `recv.Count()` call node, if any (R-LICM) */
-  mir_llong init_lo = 0, init_hi = 0, bound_lo = 0, bound_hi = 0;
-  int init_p = 0, bound_ival_p = 0, strict = 1, step_ok = 0;
+  mir_llong init_lo = 0, init_hi = 0, bound_lo = 0, bound_hi = 0, bound_minus = 0;
+  int init_p = 0, bound_ival_p = 0, strict = 1, step_ok = 0, allow_sym = 0;
   struct midopt_env body_env;
   struct midopt_fact *f;
 
@@ -1216,6 +1663,12 @@ static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *e
      in env, keyed under both SPEC_DECL and N_DECL like other locals. */
   if (init != NULL && init->code != N_IGNORE)
     midopt_safety_stmt (c2m_ctx, init, env);
+
+  /* for (...; 0; ...) — init runs, body/iter do not. */
+  if (cond != NULL && cond->code != N_IGNORE && midopt_cond_known (cond) == 0) {
+    midopt_safety_expr (c2m_ctx, cond, env);
+    return;
+  }
 
   /* ── init: `int i = LO;` (N_LIST-wrapped N_SPEC_DECL) or `i = LO;`
      (bare N_ASSIGN — for-headers do not wrap in N_EXPR here) ── */
@@ -1261,13 +1714,20 @@ static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *e
     }
     if (bound_expr != NULL) {
       bound_ival_p = midopt_expr_ival (env, bound_expr, &bound_lo, &bound_hi);
-      bound_recv = midopt_count_call_recv (bound_expr);
-      if (bound_recv != NULL) bound_call = bound_expr; /* direct `recv.Count()` */
+      bound_recv = midopt_peel_count (env, bound_expr, &bound_minus);
+      if (bound_recv != NULL && bound_minus == 0
+          && midopt_count_call_recv (env, bound_expr) != NULL)
+        bound_call = bound_expr; /* exact Count() — eligible for R-LICM */
       bound_decl = midopt_id_decl (bound_expr);
       if (bound_recv == NULL && bound_decl != NULL) {
         struct midopt_fact *bf = midopt_env_find (env, bound_decl);
-        if (bf != NULL && bf->sym_recv != NULL) bound_recv = bf->sym_recv;
+        if (bf != NULL && bf->sym_recv != NULL) {
+          bound_recv = bf->sym_recv;
+          bound_minus = bf->sym_minus;
+        }
       }
+      /* i < Count()-k is always in range for k>=0; i <= Count()-k needs k>=1. */
+      allow_sym = bound_recv != NULL && ((strict && bound_minus >= 0) || (!strict && bound_minus >= 1));
     }
   }
 
@@ -1333,9 +1793,10 @@ static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *e
         f->lo = init_lo;
         f->hi = bound_hi - (strict ? 1 : 0);
       }
-      if (bound_recv != NULL && !recv_escaped && init_lo == init_hi) {
+      if (allow_sym && !recv_escaped && init_lo == init_hi) {
         f->sym_recv = bound_recv;
         f->sym_lo = init_lo;
+        f->sym_minus = (int) bound_minus;
       }
     }
     /* R-LICM: the loop bound is a direct `recv.Count()` whose receiver is
@@ -1364,6 +1825,181 @@ static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *e
   }
 }
 
+/* True when N is a non-decreasing step of IV (`i++`, `++i`, `i += k>=0`,
+   `i = i + k>=0`).  N_EXPR wrappers are peeled. */
+static int midopt_nondec_step_p (struct midopt_env *env, node_t n, node_t iv) {
+  node_t ex;
+  if (n == NULL || iv == NULL) return 0;
+  ex = n->code == N_EXPR ? NL_EL (n->u.ops, 1) : n;
+  if (ex == NULL) return 0;
+  if ((ex->code == N_POST_INC || ex->code == N_INC)
+      && midopt_same_decl (midopt_id_decl (NL_HEAD (ex->u.ops)), iv))
+    return 1;
+  if (ex->code == N_ADD_ASSIGN
+      && midopt_same_decl (midopt_id_decl (NL_HEAD (ex->u.ops)), iv)) {
+    mir_llong lo, hi;
+    if (midopt_expr_ival (env, NL_NEXT (NL_HEAD (ex->u.ops)), &lo, &hi) && lo >= 0)
+      return 1;
+  }
+  if (ex->code == N_ASSIGN
+      && midopt_same_decl (midopt_id_decl (NL_HEAD (ex->u.ops)), iv)) {
+    node_t rhs = NL_NEXT (NL_HEAD (ex->u.ops));
+    if (rhs != NULL && rhs->code == N_ADD) {
+      node_t x = NL_HEAD (rhs->u.ops);
+      node_t y = NL_NEXT (x);
+      mir_llong lo, hi;
+      if (midopt_same_decl (midopt_id_decl (x), iv) && midopt_expr_ival (env, y, &lo, &hi)
+          && lo >= 0)
+        return 1;
+      if (midopt_same_decl (midopt_id_decl (y), iv) && midopt_expr_ival (env, x, &lo, &hi)
+          && lo >= 0)
+        return 1;
+    }
+  }
+  return 0;
+}
+
+/* `while (i < B) { …; i++; }` — same IV fact as N_FOR when the increment is
+   the last statement (so the body sees i still below B).  N_DO is not handled:
+   the first iteration is unguarded. */
+static void midopt_safety_while (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *env) {
+  node_t cond, stmt, a, b, bound_expr, iv_decl, bound_decl, bound_recv, bound_call;
+  node_t list = NULL, last = NULL, s;
+  int strict = 1, step_ok = 0, allow_sym = 0, bound_ival_p = 0, init_p = 0, hazard = 0;
+  mir_llong init_lo = 0, init_hi = 0, bound_lo = 0, bound_hi = 0, bound_minus = 0;
+  struct midopt_env body_env;
+  struct midopt_fact *f, *bf;
+
+  cond = NL_EL (n->u.ops, 1);
+  stmt = NL_EL (n->u.ops, 2);
+
+  /* while (0) { ... } — body never runs; still analyze cond for effects. */
+  if (midopt_cond_known (cond) == 0) {
+    if (cond != NULL && cond->code != N_IGNORE) midopt_safety_expr (c2m_ctx, cond, env);
+    return;
+  }
+
+  iv_decl = NULL;
+  bound_expr = NULL;
+  bound_decl = NULL;
+  bound_recv = NULL;
+  bound_call = NULL;
+  if (cond != NULL
+      && (cond->code == N_LT || cond->code == N_LE || cond->code == N_GT
+          || cond->code == N_GE)) {
+    a = NL_HEAD (cond->u.ops);
+    b = a != NULL ? NL_NEXT (a) : NULL;
+    strict = (cond->code == N_LT || cond->code == N_GT);
+    if (a != NULL && b != NULL) {
+      if ((cond->code == N_LT || cond->code == N_LE) && a->code == N_ID) {
+        iv_decl = midopt_id_decl (a);
+        bound_expr = b;
+      } else if ((cond->code == N_GT || cond->code == N_GE) && b->code == N_ID) {
+        iv_decl = midopt_id_decl (b);
+        bound_expr = a;
+      }
+    }
+  }
+
+  if (iv_decl != NULL) {
+    f = midopt_env_find (env, iv_decl);
+    if (f != NULL && f->ival_p && f->lo >= 0) {
+      init_p = 1;
+      init_lo = f->lo;
+      init_hi = f->hi;
+    }
+  }
+  if (bound_expr != NULL) {
+    bound_ival_p = midopt_expr_ival (env, bound_expr, &bound_lo, &bound_hi);
+    bound_recv = midopt_peel_count (env, bound_expr, &bound_minus);
+    if (bound_recv != NULL && bound_minus == 0
+        && midopt_count_call_recv (env, bound_expr) != NULL)
+      bound_call = bound_expr;
+    bound_decl = midopt_id_decl (bound_expr);
+    if (bound_recv == NULL && bound_decl != NULL) {
+      bf = midopt_env_find (env, bound_decl);
+      if (bf != NULL && bf->sym_recv != NULL) {
+        bound_recv = bf->sym_recv;
+        bound_minus = bf->sym_minus;
+      }
+    }
+    allow_sym
+      = bound_recv != NULL && ((strict && bound_minus >= 0) || (!strict && bound_minus >= 1));
+  }
+
+  if (stmt != NULL && stmt->code == N_BLOCK) {
+    list = NL_EL (stmt->u.ops, 1);
+    if (list != NULL && list->code == N_LIST) {
+      for (s = NL_HEAD (list->u.ops); s != NULL; s = NL_NEXT (s)) last = s;
+      step_ok = midopt_nondec_step_p (env, last, iv_decl);
+    }
+  } else {
+    step_ok = midopt_nondec_step_p (env, stmt, iv_decl);
+  }
+
+  if (cond != NULL && cond->code != N_IGNORE) midopt_safety_expr (c2m_ctx, cond, env);
+  midopt_env_copy (&body_env, env);
+
+  if (iv_decl != NULL && step_ok && init_p && init_lo == init_hi
+      && (bound_ival_p || allow_sym)) {
+    if (list != NULL) {
+      for (s = NL_HEAD (list->u.ops); s != NULL; s = NL_NEXT (s)) {
+        if (s == last) continue;
+        if (midopt_iv_hazard_p (s, iv_decl, bound_decl, bound_recv)) {
+          hazard = 1;
+          break;
+        }
+      }
+    } else {
+      hazard = 0; /* body is only the step */
+    }
+    if (!hazard) {
+      int recv_escaped = 0;
+      if (bound_recv != NULL) {
+        struct midopt_fact *rf = midopt_env_find (env, bound_recv);
+        recv_escaped = rf != NULL && rf->addr_taken_p;
+      }
+      f = midopt_env_get (&body_env, iv_decl);
+      if (f != NULL) {
+        if (bound_ival_p) {
+          f->ival_p = 1;
+          f->lo = init_lo;
+          f->hi = bound_hi - (strict ? 1 : 0);
+        }
+        if (allow_sym && !recv_escaped) {
+          f->sym_recv = bound_recv;
+          f->sym_lo = init_lo;
+          f->sym_minus = (int) bound_minus;
+        }
+      }
+      if (bound_call != NULL && bound_recv != NULL && !recv_escaped
+          && bound_call->attr != NULL) {
+        int mut = 0;
+        if (list != NULL) {
+          for (s = NL_HEAD (list->u.ops); s != NULL; s = NL_NEXT (s)) {
+            if (s == last) continue;
+            if (midopt_recv_mutated_p (s, bound_recv)) {
+              mut = 1;
+              break;
+            }
+          }
+        }
+        if (!mut) {
+          ((struct expr *) bound_call->attr)->hoist_call_p = 1;
+          if (midopt_verbose_p)
+            fprintf (stderr, "  [midopt] R-LICM hoist while-invariant Count() bound\n");
+        }
+      }
+    }
+  }
+
+  if (stmt != NULL) midopt_safety_stmt (c2m_ctx, stmt, &body_env);
+  {
+    int i;
+    for (i = 0; i < env->n; i++) env->f[i].ival_p = 0;
+  }
+}
+
 /* Stamp elide_oob_p on collection accesses guarded by a proven IV bound:
  *   xs[i]           — class subscript (N_IND, TM_CLASS value receiver)
  *   xs.Get(i) / xs.GetMut(i) — N_CALL on a TM_CLASS value receiver
@@ -1383,7 +2019,11 @@ static void midopt_check_class_iv (c2m_ctx_t c2m_ctx, node_t n, struct midopt_en
     if (recv == NULL || recv->code != N_ID || idx == NULL || idx->code != N_ID) return;
     {
       struct expr *ae = recv->attr;
-      if (ae == NULL || ae->type == NULL || ae->type->mode != TM_CLASS) return;
+      struct type *at;
+      if (ae == NULL || ae->type == NULL) return;
+      at = ae->type;
+      if (at->mode == TM_PTR && at->u.ptr_type != NULL) at = at->u.ptr_type;
+      if (at->mode != TM_CLASS) return;
     }
     rdecl = midopt_id_decl (recv);
     idecl = midopt_id_decl (idx);
@@ -1400,25 +2040,28 @@ static void midopt_check_class_iv (c2m_ctx_t c2m_ctx, node_t n, struct midopt_en
 
   if (n->code == N_CALL) {
     const char *nm = NULL;
-    node_t args, a0;
-    rdecl = midopt_method_call_recv (NL_HEAD (n->u.ops), &nm);
+    node_t args, a0, fn;
+    fn = NL_HEAD (n->u.ops);
+    rdecl = midopt_method_call_recv (fn, &nm);
     if (rdecl == NULL || nm == NULL) return;
     if (strcmp (nm, "Get") != 0 && strcmp (nm, "GetMut") != 0
         && strcmp (nm, "KeyAt") != 0 && strcmp (nm, "ValAt") != 0
         && strcmp (nm, "ValMut") != 0)
       return;
-    /* Receiver must be a value-class local (N_FIELD excludes pointers). */
-    recv = NL_HEAD (NL_HEAD (n->u.ops)->u.ops);
+    recv = NL_HEAD (fn->u.ops);
     {
       struct expr *ae = recv->attr;
-      if (ae == NULL || ae->type == NULL || ae->type->mode != TM_CLASS) return;
+      struct type *at;
+      if (ae == NULL || ae->type == NULL) return;
+      at = ae->type;
+      if (at->mode == TM_PTR && at->u.ptr_type != NULL) at = at->u.ptr_type;
+      if (at->mode != TM_CLASS) return;
     }
     args = NL_EL (n->u.ops, 1);
     if (args == NULL || args->code != N_LIST) return;
     a0 = NL_HEAD (args->u.ops);
-    /* args[0] is the injected receiver (N_ADDR for value receivers); the
-       user index is args[1]. */
-    if (a0 == NULL || a0->code != N_ADDR) return;
+    /* args[0] is the injected receiver; the user index is args[1]. */
+    if (a0 == NULL) return;
     a0 = NL_NEXT (a0);
     if (a0 == NULL || a0->code != N_ID || NL_NEXT (a0) != NULL) return;
     idecl = midopt_id_decl (a0);
@@ -1519,7 +2162,7 @@ static int midopt_recv_mutated_p (node_t n, node_t recv) {
     if (fn != NULL && (fn->code == N_FIELD || fn->code == N_DEREF_FIELD)) {
       node_t args = NL_EL (n->u.ops, 1);
       node_t a0 = args != NULL && args->code == N_LIST ? NL_HEAD (args->u.ops) : NULL;
-      if (a0 != NULL && a0->code == N_ADDR) {
+      if (a0 != NULL) {
         node_t a;
         if (midopt_recv_mutated_p (fn, recv)) return 1;
         for (a = NL_NEXT (a0); a != NULL; a = NL_NEXT (a))
@@ -1861,14 +2504,18 @@ static void midopt_byref_forin (c2m_ctx_t c2m_ctx, node_t n) {
     return;
   }
 
-  /* Value-class collection with dense List/Set layout only (pointer receivers
-     alias; Map handled separately later). */
+  /* Dense List/Set/Map: value receiver, `*p`, or a pointer local (`p`).
+     Mutation is scanned on the named collection decl; aliased pointers that
+     mutate through another name stay conservative (no stamp). */
   coll_e = coll->attr;
-  if (coll_e == NULL || coll_e->type == NULL || coll_e->type->mode != TM_CLASS) {
-    return;
-  }
-  cls = coll_e->type;
-  if (cls->u.tag_type == NULL) return;
+  if (coll_e == NULL || coll_e->type == NULL) return;
+  cls = NULL;
+  if (coll_e->type->mode == TM_CLASS)
+    cls = coll_e->type;
+  else if (coll_e->type->mode == TM_PTR && coll_e->type->u.ptr_type != NULL
+           && coll_e->type->u.ptr_type->mode == TM_CLASS)
+    cls = coll_e->type->u.ptr_type;
+  if (cls == NULL || cls->u.tag_type == NULL) return;
   tag = cls->u.tag_type;
 
   /* Two dense layouts:
@@ -1900,13 +2547,16 @@ static void midopt_byref_forin (c2m_ctx_t c2m_ctx, node_t n) {
     return; /* scalars/pointers are already cheap single loads */
   }
 
-  /* The collection must be a plain local (N_ID) so aliasing is tractable. */
-  if (coll->code != N_ID) {
-    return;
-  }
-  coll_decl = midopt_id_decl (coll);
-  if (coll_decl == NULL) {
-    return;
+  /* Collection identity: `xs`, `p`, or `*p`. */
+  {
+    node_t coll_id = coll;
+    if (coll->code == N_DEREF) {
+      node_t inner = NL_HEAD (coll->u.ops);
+      if (inner != NULL && inner->code == N_ID) coll_id = inner;
+    }
+    if (coll_id->code != N_ID) return;
+    coll_decl = midopt_id_decl (coll_id);
+    if (coll_decl == NULL) return;
   }
 
   /* The loop var N_IDs are declaration sites (never checked as expression
@@ -1970,7 +2620,12 @@ static void midopt_safety_decl (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
       }
       /* `int n = recv.Count();` ties n to recv's length (R1 symbolic bound).
          The declarator's N_ID has no expr attr, so on_assign never sees it. */
-      f->sym_recv = midopt_count_call_recv (initializer);
+      {
+        mir_llong minus = 0;
+        f->sym_recv = midopt_peel_count (env, initializer, &minus);
+        f->sym_minus = f->sym_recv != NULL ? (int) minus : 0;
+        if (midopt_expr_is_new (initializer)) f->uniq_ptr_p = 1;
+      }
     }
     if (id != NULL && id->code == N_ID) midopt_on_assign (env, id, initializer);
   }
@@ -1996,8 +2651,26 @@ static void midopt_safety_stmt (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
     node_t then_s = NL_EL (n->u.ops, 2);
     node_t else_s = NL_EL (n->u.ops, 3);
     struct midopt_env env_then, env_else;
+    int k;
 
     midopt_safety_expr (c2m_ctx, cond, env);
+    k = midopt_cond_known (cond);
+    if (k == 1) {
+      midopt_env_copy (&env_then, env);
+      midopt_refine_cond (&env_then, cond, 1);
+      midopt_safety_stmt (c2m_ctx, then_s, &env_then);
+      midopt_env_copy (env, &env_then);
+      return;
+    }
+    if (k == 0) {
+      if (else_s != NULL && else_s->code != N_IGNORE) {
+        midopt_env_copy (&env_else, env);
+        midopt_refine_cond (&env_else, cond, 0);
+        midopt_safety_stmt (c2m_ctx, else_s, &env_else);
+        midopt_env_copy (env, &env_else);
+      }
+      return;
+    }
     midopt_env_copy (&env_then, env);
     midopt_env_copy (&env_else, env);
     midopt_refine_cond (&env_then, cond, 1);
@@ -2033,7 +2706,14 @@ static void midopt_safety_stmt (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
        interval facts for the body; falls back to conservative scans inside. */
     midopt_safety_for (c2m_ctx, n, env);
     return;
-  case N_WHILE: case N_DO: case N_FORIN: case N_SWITCH: {
+  case N_WHILE:
+    if (midopt_opt_level () >= 1) {
+      midopt_safety_while (c2m_ctx, n, env);
+      return;
+    }
+    /* -O0: fall through to conservative loop handling */
+    /* FALLTHROUGH */
+  case N_DO: case N_FORIN: case N_SWITCH: {
     /* Conservative: analyze body with TOP-killed increments unknown.
        Still check expressions inside for definite const issues. */
     if (midopt_node_has_ops (n->code)) {
@@ -2090,9 +2770,13 @@ static void midopt_safety_func (c2m_ctx_t c2m_ctx, node_t func_def) {
 static void midopt_safety_module (c2m_ctx_t c2m_ctx, node_t n) {
   if (n == NULL) return;
   if (n->code == N_FUNC_DEF) {
-    /* Analyze free functions and live methods (dead methods still checked if
-       present — cheap; helps catch bugs in monomorphs kept for other reasons). */
-    midopt_safety_func (c2m_ctx, n);
+    /* Skip methods midopt will not emit — their traps never reach gen. */
+    if (midopt_class_method_p (n) && midopt_decl_ready_p (n)
+        && ((decl_t) n->attr)->midopt_dead_p) {
+      /* fall through to children (none on FUNC_DEF that matter) */
+    } else {
+      midopt_safety_func (c2m_ctx, n);
+    }
   }
   if (!midopt_node_has_ops (n->code)) return;
   for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
@@ -2175,25 +2859,63 @@ static void midopt_elide_walk (c2m_ctx_t c2m_ctx, node_t n) {
     midopt_elide_walk (c2m_ctx, c);
 }
 
-/* Private/collection helpers often lack def_node on monomorph paths.  When a
-   monomorph already has ≥1 kept method, keep known helper names so Add/Set/…
-   do not call midopt-dead MIR items.  Does NOT keep the whole public API. */
-static const char *const midopt_helper_names[] = {
-  "EnsureCapacity", "init_storage", "grow_table", "ensure_table", "find_slot",
-  "find_index", "destroy_key_at", "destroy_val_at", "insert_new_at", "Copy", "Clear", "owns",
-  "ownsValues", "ownsKeys", NULL
-};
+/* Private helpers implied by a *kept* public method.  Public APIs (Copy,
+   Clear, owns*) are never implied — they must be reached from a real call.
+   Needed because monomorph bodies sometimes lack def_node on this.Foo(). */
+static const char *const midopt_hlp_grow[]
+  = {"EnsureCapacity", "init_storage", NULL};
+static const char *const midopt_hlp_map_write[]
+  = {"ensure_table", "find_slot", "insert_new_at", "grow_table", "init_storage",
+     "destroy_val_at", NULL};
+static const char *const midopt_hlp_map_read[] = {"find_slot", NULL};
+static const char *const midopt_hlp_map_remove[]
+  = {"find_slot", "find_index", "destroy_key_at", "destroy_val_at", NULL};
+static const char *const midopt_hlp_dtor[]
+  = {"destroy_key_at", "destroy_val_at", NULL};
 
-static void midopt_keep_helpers_on_class (c2m_ctx_t c2m_ctx, node_t class_tag, pos_t pos) {
+static int midopt_streq_any (const char *nm, const char *const *names) {
   size_t i;
-  if (class_tag == NULL || class_tag->code != N_CLASS) return;
-  for (i = 0; midopt_helper_names[i] != NULL; i++)
-    midopt_mark_named_on_class (c2m_ctx, class_tag, midopt_helper_names[i], pos);
+  if (nm == NULL) return 0;
+  for (i = 0; names[i] != NULL; i++)
+    if (strcmp (nm, names[i]) == 0) return 1;
+  return 0;
 }
 
-/* Keep every constructor and destructor of a live class (delete / RAII / new
-   overload paths often miss def_node on sibling ctors/dtors). */
-static void midopt_keep_ctors_dtors_on_class (node_t class_tag) {
+static const char *const *midopt_implied_helpers (const char *nm) {
+  static const char *const grow_callers[]
+    = {"Add", "Insert", "EnsureCapacity", "Concat", "AddRange", "InsertRange",
+       "Plus", "Slice", "Take", "Skip", "Repeat", "Range", "FromView", "FromJson",
+       "Copy", "Distinct", "Filter", "Where", "Map", "Select", "SelectString", NULL};
+  static const char *const map_write_callers[]
+    = {"Set", "TryAdd", "GetOrAdd", "AddOrUpdate", "Merge", "insert_new_at",
+       "GroupBy", "WhereKeys", "WhereValues", "SelectValues", "SelectKeys", NULL};
+  static const char *const map_read_callers[]
+    = {"Get", "GetOr", "TryGet", "Contains", "ContainsKey", "ContainsValue",
+       "GetMut", "ValMut", "KeyAt", "ValAt", NULL};
+  static const char *const map_remove_callers[] = {"Remove", "Clear", NULL};
+
+  if (nm == NULL) return NULL;
+  if (strncmp (nm, "__dtor_", 7) == 0) return midopt_hlp_dtor;
+  if (strncmp (nm, "__ctor_", 7) == 0) return midopt_hlp_grow; /* Map ctors → init_storage */
+  if (midopt_streq_any (nm, grow_callers)) return midopt_hlp_grow;
+  if (midopt_streq_any (nm, map_write_callers)) return midopt_hlp_map_write;
+  if (midopt_streq_any (nm, map_read_callers)) return midopt_hlp_map_read;
+  if (midopt_streq_any (nm, map_remove_callers)) return midopt_hlp_map_remove;
+  return NULL;
+}
+
+static void midopt_keep_implied_helpers (c2m_ctx_t c2m_ctx, node_t class_tag, const char *nm,
+                                        pos_t pos) {
+  const char *const *hs = midopt_implied_helpers (nm);
+  size_t i;
+  if (hs == NULL) return;
+  for (i = 0; hs[i] != NULL; i++)
+    midopt_mark_named_on_class (c2m_ctx, class_tag, hs[i], pos);
+}
+
+/* RAII / delete often miss def_node on the destructor.  Extra ctor overloads
+   are reached via ctor_call / N_NEW / the worklist — do not pin all of them. */
+static void midopt_keep_dtors_on_class (node_t class_tag) {
   node_t id, decl_list;
   if (class_tag == NULL || class_tag->code != N_CLASS) return;
   id = NL_HEAD (class_tag->u.ops);
@@ -2203,9 +2925,7 @@ static void midopt_keep_ctors_dtors_on_class (node_t class_tag) {
     const char *nm;
     if (m->code != N_FUNC_DEF || !midopt_class_method_p (m)) continue;
     nm = midopt_func_name (m);
-    if (nm == NULL) continue;
-    if (strncmp (nm, "__ctor_", 7) == 0 || strncmp (nm, "__dtor_", 7) == 0)
-      midopt_mark_keep (m);
+    if (nm != NULL && strncmp (nm, "__dtor_", 7) == 0) midopt_mark_keep (m);
   }
 }
 
@@ -2215,19 +2935,18 @@ static void midopt_keep_helpers_for_live (c2m_ctx_t c2m_ctx, node_t n) {
   if (n->code == N_CLASS && n->attr != (void *) ((intptr_t) -1)) {
     node_t id = NL_HEAD (n->u.ops);
     node_t decl_list = id != NULL ? NL_NEXT (id) : NULL;
+    pos_t pos = id != NULL ? POS (id) : no_pos;
     int any_keep = 0;
 
     if (decl_list != NULL && decl_list->code == N_LIST) {
       for (node_t m = NL_HEAD (decl_list->u.ops); m != NULL; m = NL_NEXT (m)) {
-        if (m->code == N_FUNC_DEF && midopt_keep_has (m)) {
-          any_keep = 1;
-          break;
-        }
+        const char *nm;
+        if (m->code != N_FUNC_DEF || !midopt_keep_has (m)) continue;
+        any_keep = 1;
+        nm = midopt_func_name (m);
+        midopt_keep_implied_helpers (c2m_ctx, n, nm, pos);
       }
-      if (any_keep) {
-        midopt_keep_helpers_on_class (c2m_ctx, n, id != NULL ? POS (id) : no_pos);
-        midopt_keep_ctors_dtors_on_class (n);
-      }
+      if (any_keep) midopt_keep_dtors_on_class (n);
     }
   }
 
@@ -2332,6 +3051,78 @@ static int midopt_expr_has_call_p (node_t n) {
    writes to `this`.  Requiring an arithmetic (incl. enum) return type excludes
    pointer / String / aggregate returns — i.e. the Get/GetMut pointer-into-`this`
    case that miscompiles chaining (see midopt_run step 4). */
+static int midopt_trivial_scalar_getter_p (c2m_ctx_t c2m_ctx, node_t func_def);
+
+static int midopt_ptr_into_this_ret_p (node_t func_def) {
+  const char *nm;
+  decl_t d;
+  struct func_type *ft;
+  struct type *ret;
+
+  nm = midopt_func_name (func_def);
+  if (nm != NULL
+      && (strcmp (nm, "Get") == 0 || strcmp (nm, "GetMut") == 0 || strcmp (nm, "FirstMut") == 0
+          || strcmp (nm, "LastMut") == 0 || strcmp (nm, "ValMut") == 0 || strcmp (nm, "KeyAt") == 0
+          || strcmp (nm, "ValAt") == 0))
+    return 1;
+  if (!midopt_decl_ready_p (func_def)) return 0;
+  d = (decl_t) func_def->attr;
+  if (d == NULL || d->decl_spec.type == NULL || d->decl_spec.type->mode != TM_FUNC) return 0;
+  ft = d->decl_spec.type->u.func_type;
+  if (ft == NULL || ft->ret_type == NULL) return 0;
+  ret = ft->ret_type;
+  return ret->mode == TM_PTR && ret->u.ptr_type != NULL
+         && (ret->u.ptr_type->mode == TM_CLASS || ret->u.ptr_type->mode == TM_STRUCT);
+}
+
+static void midopt_metrics_walk (node_t n, int *nst, int *ncall, int *hard) {
+  if (n == NULL) return;
+  switch (n->code) {
+  case N_WHILE: case N_DO: case N_FOR: case N_FORIN: case N_SWITCH: case N_TRY:
+    *hard = 1;
+    break;
+  case N_CALL: (*ncall)++; break;
+  case N_RETURN: case N_EXPR: case N_IF: (*nst)++; break;
+  default: break;
+  }
+  if (!midopt_node_has_ops (n->code)) return;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    midopt_metrics_walk (c, nst, ncall, hard);
+}
+
+static int midopt_should_inline_p (c2m_ctx_t c2m_ctx, node_t func_def) {
+  const char *nm;
+  decl_t d;
+  struct func_type *ft;
+  struct type *ret;
+  int lvl, nst = 0, ncall = 0, hard = 0, budget, call_ok;
+
+  nm = midopt_func_name (func_def);
+  if (nm == NULL) return 0;
+  if (strcmp (nm, "Count") == 0 || strcmp (nm, "IsEmpty") == 0 || strcmp (nm, "Capacity") == 0)
+    return 1;
+  if (midopt_ptr_into_this_ret_p (func_def)) return 0;
+  lvl = midopt_opt_level ();
+  if (lvl <= 0) return 0;
+  if (lvl == 1) return midopt_trivial_scalar_getter_p (c2m_ctx, func_def);
+
+  if (!midopt_decl_ready_p (func_def)) return 0;
+  d = (decl_t) func_def->attr;
+  if (d == NULL || d->decl_spec.type == NULL || d->decl_spec.type->mode != TM_FUNC) return 0;
+  ft = d->decl_spec.type->u.func_type;
+  if (ft == NULL || ft->ret_type == NULL) return 0;
+  ret = ft->ret_type;
+  if (!void_type_p (ret) && !arithmetic_type_p (ret)) return 0;
+
+  midopt_metrics_walk (FUNC_DEF_BLOCK (func_def), &nst, &ncall, &hard);
+  if (hard) return 0;
+  budget = (lvl >= 3) ? 8 : 3;
+  call_ok = (lvl >= 3) ? 2 : 0;
+  if (nst > budget || ncall > call_ok) return 0;
+  if (lvl < 3 && !midopt_method_readonly_p (c2m_ctx, func_def, 0)) return 0;
+  return 1;
+}
+
 static int midopt_trivial_scalar_getter_p (c2m_ctx_t c2m_ctx, node_t func_def) {
   decl_t d;
   struct func_type *ft;
@@ -2378,11 +3169,12 @@ static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
 
   alloc = c2m_alloc (c2m_ctx);
   midopt_verbose_p = c2m_options != NULL && c2m_options->verbose_p;
+  midopt_level = midopt_latch_opt_level (c2m_ctx);
   VARR_CREATE (node_t, midopt_keep, alloc, 64);
   VARR_CREATE (node_t, midopt_work, alloc, 64);
 
   if (midopt_verbose_p)
-    fprintf (stderr, "  [midopt] start (P0 dead methods + P1 guard elision)\n");
+    fprintf (stderr, "  [midopt] start (P0/P1 + IV/inline at -O%d)\n", midopt_level);
 
   /* 1) Seed ONLY from free functions (and nested decls/ctors in them). */
   midopt_seed_from_free_funcs (c2m_ctx, module);
@@ -2456,9 +3248,7 @@ static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
       const char *nm = midopt_func_name (f);
       decl_t d = f->attr;
       if (nm == NULL || d == NULL) continue;
-      if (strcmp (nm, "Count") == 0 || strcmp (nm, "IsEmpty") == 0
-          || strcmp (nm, "Capacity") == 0
-          || midopt_trivial_scalar_getter_p (c2m_ctx, f)) {
+      if (midopt_should_inline_p (c2m_ctx, f)) {
         d->decl_spec.inline_p = TRUE;
         if (midopt_verbose_p) fprintf (stderr, "  [midopt] inline mark %s\n", nm);
       }

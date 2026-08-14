@@ -219,10 +219,10 @@ for src in "${sources[@]}"; do
 	  compile_cmd+=(-c -o "$bmir" "$src")
 	  run "${compile_cmd[@]}"
 
-      run "$B2OBJ" "-O2" "$bmir" "$obj"
+      run "$B2OBJ" "-O3" "$bmir" "$obj"
       ;;
     *.bmir)
-      run "$B2OBJ" "-O2" "$src" "$obj"
+      run "$B2OBJ" "-O3" "$src" "$obj"
       ;;
   esac
   objects+=("$obj")

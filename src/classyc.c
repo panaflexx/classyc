@@ -18976,6 +18976,20 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
        to dereference the integer value as a pointer, producing a JIT SIGSEGV.
        fmt_idx is the 0-based position of the format string in arg_list->u.ops
        (0 for printf, 1 for fprintf/sprintf/snprintf).                           */
+    /* Peel `(const char *)"lit"` down to N_STR.  Wide strings are not folded. */
+    static node_t check_string_lit_node (node_t n) {
+      int g = 0;
+      while (n != NULL && g++ < 8) {
+        if (n->code == N_STR) return n;
+        if (n->code == N_CAST) {
+          n = NL_EL (n->u.ops, 1);
+          continue;
+        }
+        break;
+      }
+      return NULL;
+    }
+
     static void check_printf_format (c2m_ctx_t c2m_ctx, node_t arg_list, int fmt_idx) {
       node_t fmt_node = NL_EL (arg_list->u.ops, fmt_idx);
       if (fmt_node == NULL || fmt_node->code != N_STR) return;
@@ -22846,6 +22860,59 @@ if (base != NULL && base->code == N_ID) {
           if (fmt_pos >= 0)
             check_printf_format (c2m_ctx, arg_list, fmt_pos);
         }
+        /* C11: fold strlen/strcmp/memcmp of string literals so
+           `if (strlen("") == 0)` is a const if (midopt drops the dead arm;
+           gen's push_const_val skips the call).  Same for GNU
+           __builtin_strlen / __builtin_constant_p. */
+        if (op1->code == N_ID && op1->u.s.s != NULL && first_arg != NULL) {
+          const char *fn = op1->u.s.s;
+          node_t s0, s1, a1, a2;
+          struct expr *ne;
+          int slen_p = (strcmp (fn, "strlen") == 0 || strcmp (fn, "__builtin_strlen") == 0);
+          int scmp_p = (strcmp (fn, "strcmp") == 0 || strcmp (fn, "__builtin_strcmp") == 0);
+          int ncmp_p = (strcmp (fn, "strncmp") == 0 || strcmp (fn, "__builtin_strncmp") == 0);
+          int mcmp_p = (strcmp (fn, "memcmp") == 0 || strcmp (fn, "__builtin_memcmp") == 0);
+          int bcp_p = (strcmp (fn, "__builtin_constant_p") == 0);
+
+          if (slen_p) {
+            s0 = check_string_lit_node (first_arg);
+            if (s0 != NULL) {
+              e->const_p = TRUE;
+              e->c.u_val = (mir_ullong) strlen (s0->u.s.s);
+            }
+          } else if (scmp_p) {
+            a1 = NL_NEXT (first_arg);
+            s0 = check_string_lit_node (first_arg);
+            s1 = a1 != NULL ? check_string_lit_node (a1) : NULL;
+            if (s0 != NULL && s1 != NULL) {
+              e->const_p = TRUE;
+              e->c.i_val = strcmp (s0->u.s.s, s1->u.s.s);
+            }
+          } else if (ncmp_p || mcmp_p) {
+            a1 = NL_NEXT (first_arg);
+            a2 = a1 != NULL ? NL_NEXT (a1) : NULL;
+            s0 = check_string_lit_node (first_arg);
+            s1 = a1 != NULL ? check_string_lit_node (a1) : NULL;
+            ne = a2 != NULL ? a2->attr : NULL;
+            if (s0 != NULL && s1 != NULL && ne != NULL && ne->const_p && ne->type != NULL
+                && integer_type_p (ne->type)) {
+              mir_ullong n = signed_integer_type_p (ne->type)
+                               ? (mir_ullong) (ne->c.i_val < 0 ? 0 : ne->c.i_val)
+                               : ne->c.u_val;
+              if (ncmp_p) {
+                e->const_p = TRUE;
+                e->c.i_val = strncmp (s0->u.s.s, s1->u.s.s, (size_t) n);
+              } else if ((size_t) n <= s0->u.s.len && (size_t) n <= s1->u.s.len) {
+                e->const_p = TRUE;
+                e->c.i_val = memcmp (s0->u.s.s, s1->u.s.s, (size_t) n);
+              }
+            }
+          } else if (bcp_p) {
+            ne = first_arg->attr;
+            e->const_p = TRUE;
+            e->c.i_val = (ne != NULL && ne->const_p) ? 1 : 0;
+          }
+        }
         break;
       }
       case N_GENERIC: {
@@ -25408,6 +25475,97 @@ static void gen_nested_class_methods_in (c2m_ctx_t c2m_ctx, node_t node) {
 
 static op_t val_gen (c2m_ctx_t c2m_ctx, node_t r) {
   return gen (c2m_ctx, r, NULL, NULL, TRUE, NULL, NULL);
+}
+
+/* C11 compile-time truth of a scalar expr.  1 = known, *truth is 0/1.
+   Shared by gen (skip dead if/?:/&& arms) and midopt (keep/safety). */
+static int c11_const_truth (node_t n, int *truth) {
+  struct expr *e;
+  struct type *t;
+
+  if (n == NULL || n->attr == NULL || n->attr == (void *) ((intptr_t) -1)) return 0;
+  e = (struct expr *) n->attr;
+  t = e->type;
+  if (!e->const_p || t == NULL) return 0;
+  if (floating_type_p (t))
+    *truth = e->c.d_val != 0.0;
+  else if (signed_integer_type_p (t))
+    *truth = e->c.i_val != 0;
+  else
+    *truth = e->c.u_val != 0;
+  return 1;
+}
+
+/* 1 = always true, 0 = always false, -1 = unknown.
+   `x && 0` is always false after evaluating x (check must not mark that
+   ANDAND const_p — gen would skip x). */
+static int c11_cond_known_1 (node_t n, int depth) {
+  int t, l, r;
+  node_t a, b;
+
+  if (n == NULL || depth > 32) return -1;
+  if (c11_const_truth (n, &t)) return t ? 1 : 0;
+  switch (n->code) {
+  case N_ANDAND:
+    a = NL_HEAD (n->u.ops);
+    b = a != NULL ? NL_NEXT (a) : NULL;
+    l = c11_cond_known_1 (a, depth + 1);
+    if (l == 0) return 0;
+    r = c11_cond_known_1 (b, depth + 1);
+    if (r == 0) return 0;
+    if (l == 1 && r == 1) return 1;
+    return -1;
+  case N_OROR:
+    a = NL_HEAD (n->u.ops);
+    b = a != NULL ? NL_NEXT (a) : NULL;
+    l = c11_cond_known_1 (a, depth + 1);
+    if (l == 1) return 1;
+    r = c11_cond_known_1 (b, depth + 1);
+    if (r == 1) return 1;
+    if (l == 0 && r == 0) return 0;
+    return -1;
+  case N_NOT:
+    t = c11_cond_known_1 (NL_HEAD (n->u.ops), depth + 1);
+    if (t < 0) return -1;
+    return t ? 0 : 1;
+  case N_COMMA:
+    return c11_cond_known_1 (NL_EL (n->u.ops, 1), depth + 1);
+  case N_CAST:
+    return c11_cond_known_1 (NL_EL (n->u.ops, 1), depth + 1);
+  default:
+    return -1;
+  }
+}
+
+static int c11_cond_known (node_t n) { return c11_cond_known_1 (n, 0); }
+
+/* Leaf nodes store a payload in the ops union — do not walk them. */
+static int c11_node_has_ops (node_code_t code) {
+  switch (code) {
+  case N_I: case N_L: case N_LL: case N_U: case N_UL: case N_ULL:
+  case N_F: case N_D: case N_LD:
+  case N_CH: case N_CH16: case N_CH32:
+  case N_STR: case N_STR16: case N_STR32: case N_ID:
+  case N_IGNORE:
+    return 0;
+  default:
+    return 1;
+  }
+}
+
+/* C allows `goto` into a const-false if/for/while body (20040704-1, pr17078-1).
+   Only skip a dead region when nothing can jump into it. */
+static int c11_has_label_p (node_t n) {
+  if (n == NULL) return 0;
+  if (n->code == N_LABEL || n->code == N_CASE || n->code == N_DEFAULT) return 1;
+  if (!c11_node_has_ops (n->code)) return 0;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (c11_has_label_p (c)) return 1;
+  return 0;
+}
+
+static int c11_dead_skippable_p (node_t n) {
+  return n == NULL || n->code == N_IGNORE || !c11_has_label_p (n);
 }
 
 static int push_const_val (c2m_ctx_t c2m_ctx, node_t r, op_t *res) {
@@ -29689,7 +29847,8 @@ static void gen_forward_class_methods (c2m_ctx_t c2m_ctx, node_t module) {
    args must already be memory ops.  Returns the call result (a meaningless op
    for void functions). */
 static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_type *ft,
-                              MIR_op_t func_op, op_t *args, int n_args, op_t *agg_dest) {
+                              MIR_op_t func_op, op_t *args, int n_args, op_t *agg_dest,
+                              int mir_inline_p) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
   size_t ops_start = VARR_LENGTH (MIR_op_t, call_ops);
@@ -29763,7 +29922,7 @@ static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_t
     param = NL_NEXT (param);
   }
   {
-    MIR_insn_t ci = MIR_new_insn_arr (ctx, MIR_CALL,
+    MIR_insn_t ci = MIR_new_insn_arr (ctx, mir_inline_p ? MIR_INLINE : MIR_CALL,
                                       VARR_LENGTH (MIR_op_t, call_ops) - ops_start,
                                       VARR_ADDR (MIR_op_t, call_ops) + ops_start);
     emit_insn (c2m_ctx, ci);
@@ -30191,7 +30350,7 @@ static op_t gen_class_method_call_dest (c2m_ctx_t c2m_ctx, node_t func_def,
   all_args[0] = this_op; /* 'this' is the first parameter of the method */
   for (int j = 0; j < n_args; j++) all_args[j + 1] = args[j];
   return gen_funcptr_call (c2m_ctx, proto, ft, MIR_new_ref_op (ctx, mdecl->u.item), all_args,
-                           n_args + 1, agg_dest);
+                           n_args + 1, agg_dest, mdecl->decl_spec.inline_p);
 }
 
 static op_t gen_class_method_call_flags (c2m_ctx_t c2m_ctx, node_t func_def,
@@ -30418,7 +30577,7 @@ static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm
 
   switch (sm) {
   case SEQM_FILTER: {
-    op_t keep = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, &el_op, 1, NULL);
+    op_t keep = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, &el_op, 1, NULL, 0);
     MIR_label_t skip_label = MIR_new_label (ctx);
     op_t daddr = get_new_temp (c2m_ctx, MIR_T_I64);
 
@@ -30434,7 +30593,7 @@ static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm
     break;
   }
   case SEQM_MAP: {
-    op_t v = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, &el_op, 1, NULL);
+    op_t v = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, &el_op, 1, NULL, 0);
     op_t daddr = get_new_temp (c2m_ctx, MIR_T_I64);
 
     emit3 (c2m_ctx, MIR_MUL, daddr.mir_op, i_reg.mir_op, MIR_new_int_op (ctx, (long) out_size));
@@ -30448,7 +30607,7 @@ static op_t gen_seq_method_call (c2m_ctx_t c2m_ctx, node_t r, enum seq_method sm
 
     cb_args[0] = acc;
     cb_args[1] = el_op;
-    v = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, cb_args, 2, NULL);
+    v = gen_funcptr_call (c2m_ctx, cb_proto, cb_ft, cb_addr.mir_op, cb_args, 2, NULL, 0);
     emit2 (c2m_ctx, tp_mov (acc_mir_t), acc.mir_op,
            promote (c2m_ctx, v, acc_mir_t, FALSE).mir_op);
     break;
@@ -31722,9 +31881,17 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     MIR_label_t end_label = MIR_new_label (ctx);
     struct type *cond_res_type = ((struct expr *) r->attr)->type;
     op_t addr;
-    int void_p = void_type_p (cond_res_type), cond_expect_res;
+    int void_p = void_type_p (cond_res_type), cond_expect_res, cond_known;
     mir_size_t size = type_size (c2m_ctx, cond_res_type);
 
+    cond_known = c11_cond_known (cond);
+    if ((cond_known == 1 && c11_dead_skippable_p (false_expr))
+        || (cond_known == 0 && c11_dead_skippable_p (true_expr))) {
+      gen (c2m_ctx, cond, NULL, NULL, FALSE, NULL, NULL);
+      res = gen (c2m_ctx, cond_known == 1 ? true_expr : false_expr, true_label, false_label,
+                 val_p, desirable_dest, expect_res);
+      break;
+    }
     if (!void_p) t = get_mir_type (c2m_ctx, cond_res_type);
     gen (c2m_ctx, cond, cond_true_label, cond_false_label, FALSE, NULL, &cond_expect_res);
     emit_label_insn_opt (c2m_ctx, cond_true_label);
@@ -31766,7 +31933,17 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     node_t def_expr = NL_EL (r->u.ops, 1);
     struct type *res_type = ((struct expr *) r->attr)->type;
     MIR_label_t end_label = MIR_new_label (ctx);
+    int coal_known = c11_cond_known (val_expr);
 
+    if (coal_known == 1 && c11_dead_skippable_p (def_expr)) {
+      res = val_gen (c2m_ctx, val_expr);
+      break;
+    }
+    if (coal_known == 0) {
+      gen (c2m_ctx, val_expr, NULL, NULL, FALSE, NULL, NULL);
+      res = val_gen (c2m_ctx, def_expr);
+      break;
+    }
     t = get_mir_type (c2m_ctx, res_type);
     res = get_new_temp (c2m_ctx, t);
     op1 = val_gen (c2m_ctx, val_expr);
@@ -33066,11 +33243,20 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_GENERIC: {
     node_t list = NL_EL (r->u.ops, 1);
     node_t ga_case = NL_HEAD (list->u.ops);
+    node_t ga_expr = NL_EL (ga_case->u.ops, 1);
+    struct type *gt = ((struct expr *) r->attr)->type;
 
-    /* first element is now a compatible generic association case */
-    op1 = val_gen (c2m_ctx, NL_EL (ga_case->u.ops, 1));
-    t = get_mir_type (c2m_ctx, ((struct expr *) r->attr)->type);
-    res = promote (c2m_ctx, op1, t, TRUE);
+    /* first element is now a compatible generic association case.
+       A void association (statement-context `_Generic(..., T: f())`) has
+       no value — val_gen would force_val a void call result. */
+    if (void_type_p (gt)) {
+      gen (c2m_ctx, ga_expr, NULL, NULL, FALSE, NULL, NULL);
+      res = zero_op;
+    } else {
+      op1 = val_gen (c2m_ctx, ga_expr);
+      t = get_mir_type (c2m_ctx, gt);
+      res = promote (c2m_ctx, op1, t, TRUE);
+    }
     break;
   }
       case N_SPEC_DECL: {  // ??? export and defintion with external declaration
@@ -33846,11 +34032,25 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     node_t else_stmt = NL_NEXT (if_stmt);
     MIR_label_t if_label = MIR_new_label (ctx), else_label = MIR_new_label (ctx);
     MIR_label_t end_label = MIR_new_label (ctx);
-    int cond_expect_res;
+    int cond_expect_res, cond_known;
     MIR_insn_t insn, last = NULL;
 
     assert (false_label == NULL && true_label == NULL);
     emit_label (c2m_ctx, r);
+    /* C11: skip the dead arm so midopt can prune methods only named there
+       (is_pointer<T>(), strlen("…"), `x && 0`, `_Generic` lives in N_GENERIC). */
+    cond_known = c11_cond_known (expr);
+    if (cond_known == 1 && c11_dead_skippable_p (else_stmt)) {
+      gen (c2m_ctx, expr, NULL, NULL, FALSE, NULL, NULL);
+      gen (c2m_ctx, if_stmt, NULL, NULL, FALSE, NULL, NULL);
+      break;
+    }
+    if (cond_known == 0 && c11_dead_skippable_p (if_stmt)) {
+      gen (c2m_ctx, expr, NULL, NULL, FALSE, NULL, NULL);
+      if (else_stmt != NULL && else_stmt->code != N_IGNORE)
+        gen (c2m_ctx, else_stmt, NULL, NULL, FALSE, NULL, NULL);
+      break;
+    }
     top_gen (c2m_ctx, expr, if_label, else_label, &cond_expect_res);
     if (cond_expect_res == 0 || cond_expect_res == 1) { /* fall through on true */
       emit_label_insn_opt (c2m_ctx, if_label);
@@ -34038,7 +34238,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   case N_WHILE: {
     node_t expr = NL_EL (r->u.ops, 1);
     node_t stmt = NL_NEXT (expr);
-    MIR_label_t stmt_label = MIR_new_label (ctx);
+    MIR_label_t stmt_label;
+    if (c11_cond_known (expr) == 0 && c11_dead_skippable_p (stmt)) {
+      emit_label (c2m_ctx, r);
+      gen (c2m_ctx, expr, NULL, NULL, FALSE, NULL, NULL);
+      break;
+    }
+    stmt_label = MIR_new_label (ctx);
     MIR_label_t saved_continue_label = continue_label, saved_break_label = break_label;
     size_t saved_defer_break_mark = defer_break_mark;
     size_t saved_defer_continue_mark = defer_continue_mark;
@@ -34081,7 +34287,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     node_t cond = NL_NEXT (init);
     node_t iter = NL_NEXT (cond);
     node_t stmt = NL_NEXT (iter);
-    MIR_label_t stmt_label = MIR_new_label (ctx);
+    MIR_label_t stmt_label;
+    if (cond != NULL && cond->code != N_IGNORE && c11_cond_known (cond) == 0
+        && c11_dead_skippable_p (stmt) && c11_dead_skippable_p (iter)) {
+      emit_label (c2m_ctx, r);
+      top_gen (c2m_ctx, init, NULL, NULL, NULL);
+      gen (c2m_ctx, cond, NULL, NULL, FALSE, NULL, NULL);
+      break;
+    }
+    stmt_label = MIR_new_label (ctx);
     MIR_label_t saved_continue_label = continue_label, saved_break_label = break_label;
     size_t saved_defer_break_mark = defer_break_mark;
     size_t saved_defer_continue_mark = defer_continue_mark;

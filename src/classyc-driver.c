@@ -311,6 +311,7 @@ static void init_options (int argc, char *argv[]) {
   options.no_ownership_p = FALSE; /* -fno-ownership: skip the ownership analysis pass entirely */
   options.object_guards_p = FALSE; /* -fobject-guards: side-table UAF/double-free guards on `new` objects */
   options.no_midopt_p = FALSE; /* midopt on by default; -fno-midopt disables */
+  options.optimize_level = -1; /* -On: MIR + midopt; -1 means midopt default (=2) */
   options.safety_errors_p = FALSE; /* -fsafety-errors: definite null/OOB as errors */
   options.dump_mir_stats_p = FALSE; /* -fdump-mir-stats: MIR func/insn/call counts after gen */
   options.fibers_p = FALSE; /* -ffibers: opt-in go/await fiber syntax */
@@ -386,6 +387,7 @@ static void init_options (int argc, char *argv[]) {
       options.debug_info_p = TRUE;
     } else if (strncmp (argv[i], "-O", 2) == 0) {
       optimize_level = argv[i][2] != '\0' ? atoi (&argv[i][2]) : 2;
+      options.optimize_level = optimize_level;
     } else if (strcmp (argv[i], "-o") == 0) {
       if (i + 1 >= argc)
         fprintf (stderr, "-o without argument\n");
@@ -465,7 +467,9 @@ static void init_options (int argc, char *argv[]) {
       fprintf (stderr, "  -g -- emit source-level debug info (source locations, types, variables)\n");
       fprintf (stderr, "  -S, -c -- generate corresponding textual or binary MIR files\n");
       fprintf (stderr, "  -o file -- put output code into given file\n");
-      fprintf (stderr, "  -On -- use given optimization level in MIR-generator\n");
+      fprintf (stderr, "  -On -- optimization level for MIR-generator and midopt\n");
+      fprintf (stderr, "         (0=min, 1=while-IV+tiny getters, 2=default,\n");
+      fprintf (stderr, "          3=larger inline budget / more IV cases)\n");
       fprintf (stderr, "  -p[n] -- use given parallelism level in C2MIR and MIR-generator\n");
       fprintf (stderr, "  -ei -- execute code in the interpreter with given options\n");
       fprintf (stderr, "         (all trailing args are passed to the program)\n");
