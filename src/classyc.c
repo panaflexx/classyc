@@ -364,9 +364,15 @@ static void error_recovery (c2m_ctx_t c2m_ctx, int par_lev, const char *expected
 
 struct arr_type {
   unsigned int static_p : 1;
+  /* Last data member of a struct/class: C99 `T a[]`, GNU `T a[0]`, or the
+     C89 “struct hack” `T a[1]`.  Declared length is not the live bound. */
+  unsigned int flex_p : 1;
   struct type *el_type;
   struct type_qual ind_type_qual;
   node_t size;
+  /* Sibling integer member used as the live length/capacity (e.g. nAlloc),
+     or NULL when we could not name one.  N_MEMBER node. */
+  node_t flex_bound_member;
 };
 
 struct func_type {
@@ -1292,6 +1298,22 @@ static void remove_trigraphs (c2m_ctx_t c2m_ctx) {
     addr[to] = ch;
   }
   VARR_TRUNC (char, cs->ln, to);
+}
+
+/* Map `??X` to its C trigraph replacement, or -1 if X is not a trigraph. */
+static int trigraph_replacement (int c) {
+  switch (c) {
+  case '=': return '#';
+  case '(': return '[';
+  case '/': return '\\';
+  case ')': return ']';
+  case '\'': return '^';
+  case '<': return '{';
+  case '!': return '|';
+  case '>': return '}';
+  case '-': return '~';
+  default: return -1;
+  }
 }
 
 static int ln_get (c2m_ctx_t c2m_ctx) {
@@ -12855,6 +12877,192 @@ static void update_members_offset (struct type *type, mir_size_t offset) {
     }
 }
 
+/* ── Trailing flexible-array members (`T a[]` / `T a[0]` / C89 `T a[1]`) ── */
+
+static const char *member_decl_name (node_t mem) {
+  node_t md, id;
+
+  if (mem == NULL || mem->code != N_MEMBER) return NULL;
+  md = MEMBER_DECL (mem);
+  if (md == NULL || md->code != N_DECL) return NULL;
+  id = NL_HEAD (md->u.ops);
+  if (id == NULL || id->code != N_ID) return NULL;
+  return id->u.s.s;
+}
+
+static int fam_name_ieq (const char *a, const char *b) {
+  if (a == NULL || b == NULL) return 0;
+  while (*a != '\0' && *b != '\0') {
+    unsigned ca = (unsigned char) *a++, cb = (unsigned char) *b++;
+    if (ca >= 'A' && ca <= 'Z') ca += 32;
+    if (cb >= 'A' && cb <= 'Z') cb += 32;
+    if (ca != cb) return 0;
+  }
+  return *a == *b;
+}
+
+/* How likely `name` is a live length/capacity next to a trailing FAM.
+   >= 80: attach at layout time.  40–79: attach if it is the only integer
+   sibling, or if ownership later sees it used as a bound. */
+static int fam_bound_name_score (const char *name) {
+  if (name == NULL || name[0] == '\0') return 0;
+  if (fam_name_ieq (name, "nAlloc") || fam_name_ieq (name, "n_alloc")
+      || fam_name_ieq (name, "nalloc") || fam_name_ieq (name, "nCapacity")
+      || fam_name_ieq (name, "ncapacity"))
+    return 100;
+  if (fam_name_ieq (name, "capacity") || fam_name_ieq (name, "alloc")
+      || fam_name_ieq (name, "cap"))
+    return 90;
+  if (fam_name_ieq (name, "nExpr") || fam_name_ieq (name, "nItems")
+      || fam_name_ieq (name, "nUsed") || fam_name_ieq (name, "nCount")
+      || fam_name_ieq (name, "nLen") || fam_name_ieq (name, "nLength")
+      || fam_name_ieq (name, "nSize") || fam_name_ieq (name, "nslots")
+      || fam_name_ieq (name, "nelem") || fam_name_ieq (name, "nmemb"))
+    return 55;
+  if (fam_name_ieq (name, "count") || fam_name_ieq (name, "length")
+      || fam_name_ieq (name, "len") || fam_name_ieq (name, "size")
+      || fam_name_ieq (name, "used") || fam_name_ieq (name, "num"))
+    return 50;
+  if (fam_name_ieq (name, "n") || fam_name_ieq (name, "cnt")) return 40;
+  return 0;
+}
+
+static struct arr_type *type_arr_info (struct type *t) {
+  if (t == NULL) return NULL;
+  if (t->mode == TM_ARR && t->u.arr_type != NULL) return t->u.arr_type;
+  if (t->mode == TM_PTR && t->arr_type != NULL && t->arr_type->mode == TM_ARR)
+    return t->arr_type->u.arr_type;
+  return NULL;
+}
+
+static int type_flex_arr_p (struct type *t) {
+  struct arr_type *a = type_arr_info (t);
+  return a != NULL && a->flex_p;
+}
+
+/* Last named data N_MEMBER of a struct/class (methods are N_FUNC_DEF). */
+static node_t last_data_member (struct type *type) {
+  node_t dl, last = NULL, m;
+
+  if (type == NULL
+      || (type->mode != TM_STRUCT && type->mode != TM_CLASS && type->mode != TM_UNION)
+      || type->u.tag_type == NULL)
+    return NULL;
+  dl = TAG_MEMBER_LIST (type->u.tag_type);
+  if (dl == NULL || dl->code != N_LIST) return NULL;
+  for (m = NL_HEAD (dl->u.ops); m != NULL; m = NL_NEXT (m)) {
+    decl_t d;
+    if (m->code != N_MEMBER || m->attr == NULL) continue;
+    d = (decl_t) m->attr;
+    if (d->decl_spec.type == NULL) continue;
+    if (d->decl_spec.type->mode == TM_FUNC) continue;
+    if (d->decl_spec.type->func_type_before_adjustment_p) continue;
+    last = m;
+  }
+  return last;
+}
+
+static void fam_collect_int_members (struct type *type, node_t skip, node_t *best,
+                                     int *best_score, int *n_int) {
+  node_t dl, m;
+
+  if (type == NULL
+      || (type->mode != TM_STRUCT && type->mode != TM_CLASS && type->mode != TM_UNION)
+      || type->u.tag_type == NULL)
+    return;
+  dl = TAG_MEMBER_LIST (type->u.tag_type);
+  if (dl == NULL || dl->code != N_LIST) return;
+  for (m = NL_HEAD (dl->u.ops); m != NULL; m = NL_NEXT (m)) {
+    decl_t d;
+    struct type *mt;
+    if (m->code != N_MEMBER || m->attr == NULL || m == skip) continue;
+    d = (decl_t) m->attr;
+    mt = d->decl_spec.type;
+    if (mt == NULL) continue;
+    if (mt->unnamed_anon_struct_union_member_type_p
+        && (mt->mode == TM_STRUCT || mt->mode == TM_CLASS || mt->mode == TM_UNION)) {
+      fam_collect_int_members (mt, skip, best, best_score, n_int);
+      continue;
+    }
+    if (!integer_type_p (mt)) continue;
+    if (d->width >= 0) continue; /* skip bitfields */
+    (*n_int)++;
+    {
+      int sc = fam_bound_name_score (member_decl_name (m));
+      if (sc > *best_score) {
+        *best_score = sc;
+        *best = m;
+      }
+    }
+  }
+}
+
+static void attach_fam_bound_by_name (struct type *outer, struct arr_type *at) {
+  node_t best = NULL;
+  int best_score = 0, n_int = 0;
+
+  if (at == NULL || at->flex_bound_member != NULL) return;
+  fam_collect_int_members (outer, NULL, &best, &best_score, &n_int);
+  if (best == NULL) return;
+  if (best_score >= 80 || (best_score >= 40 && n_int == 1))
+    at->flex_bound_member = best;
+}
+
+static void mark_trailing_flex_array_1 (struct type *outer, struct type *type) {
+  node_t last;
+  decl_t ld;
+  struct type *ft;
+  struct arr_type *at;
+  node_t sz;
+  int is_flex = 0;
+
+  last = last_data_member (type);
+  if (last == NULL) return;
+  ld = (decl_t) last->attr;
+  if (ld == NULL) return;
+  ft = ld->decl_spec.type;
+  if (ft != NULL && (ft->mode == TM_STRUCT || ft->mode == TM_CLASS)
+      && ft->unnamed_anon_struct_union_member_type_p) {
+    mark_trailing_flex_array_1 (outer, ft);
+    return;
+  }
+  if (ft == NULL || ft->mode != TM_ARR || ft->u.arr_type == NULL) return;
+  at = ft->u.arr_type;
+  sz = at->size;
+  if (sz == NULL || sz->code == N_IGNORE)
+    is_flex = 1;
+  else if (sz->attr != NULL) {
+    struct expr *se = (struct expr *) sz->attr;
+    if (se->const_p && (se->c.i_val == 0 || se->c.i_val == 1)) is_flex = 1;
+  }
+  if (!is_flex) return;
+  at->flex_p = 1;
+  attach_fam_bound_by_name (outer, at);
+}
+
+static void mark_trailing_flex_array (struct type *type) {
+  if (type != NULL && (type->mode == TM_STRUCT || type->mode == TM_CLASS))
+    mark_trailing_flex_array_1 (type, type);
+}
+
+/* Trailing FAM member of a struct/class, or NULL. */
+static node_t type_trailing_flex_member (struct type *type) {
+  node_t last;
+  decl_t ld;
+  struct type *ft;
+
+  last = last_data_member (type);
+  if (last == NULL) return NULL;
+  ld = (decl_t) last->attr;
+  if (ld == NULL) return NULL;
+  ft = ld->decl_spec.type;
+  if (ft != NULL && (ft->mode == TM_STRUCT || ft->mode == TM_CLASS)
+      && ft->unnamed_anon_struct_union_member_type_p)
+    return type_trailing_flex_member (ft);
+  if (ft != NULL && type_flex_arr_p (ft)) return last;
+  return NULL;
+}
+
 static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
   mir_size_t overall_size = 0;
 
@@ -12944,6 +13152,8 @@ static void set_type_layout (c2m_ctx_t c2m_ctx, struct type *type) {
   /* we might need raw_size for alignment calculations */
   type->raw_size = overall_size;
   aux_set_type_align (c2m_ctx, type);
+  if ((type->mode == TM_STRUCT || type->mode == TM_CLASS) && overall_size != MIR_SIZE_MAX)
+    mark_trailing_flex_array (type);
   if (type->mode == TM_PTR) /* Visit the pointed but after setting size to avoid looping */
     set_type_layout (c2m_ctx, type->u.ptr_type);
   if (c2m_options->debug_p) {
@@ -14272,6 +14482,8 @@ static struct type *check_declarator (c2m_ctx_t c2m_ctx, node_t r, int func_def_
       check (c2m_ctx, size, n);
       arr_type->size = size;
       arr_type->static_p = static_node->code == N_STATIC;
+      arr_type->flex_p = 0;
+      arr_type->flex_bound_member = NULL;
       arr_type->el_type = NULL;
       break;
     }
@@ -18350,15 +18562,15 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
     }
 #undef REP_SEP
 
-    /* Create "static const char __func__[] = "<func name>" at the
-       beginning of func_block if it is necessary.  */
-    static void add__func__def (c2m_ctx_t c2m_ctx, node_t func_block, str_t func_name) {
-      static const char fdecl_name[] = "__func__";
+    /* Create `static const char ID[] = "<func name>"` at the beginning of
+       func_block when ID was referenced.  */
+    static void add_func_name_def (c2m_ctx_t c2m_ctx, node_t func_block, str_t func_name,
+                                   const char *id_name) {
       pos_t pos = POS (func_block);
       node_t list, declarator, decl, decl_specs;
       tab_str_t str;
 
-      if (!str_exists_p (c2m_ctx, fdecl_name, strlen (fdecl_name) + 1, &str)) return;
+      if (!str_exists_p (c2m_ctx, id_name, strlen (id_name) + 1, &str)) return;
       decl_specs = new_pos_node (c2m_ctx, N_LIST, pos);
       NL_APPEND (decl_specs->u.ops, new_pos_node (c2m_ctx, N_STATIC, pos));
       NL_APPEND (decl_specs->u.ops, new_pos_node (c2m_ctx, N_CONST, pos));
@@ -18373,6 +18585,14 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
                             new_node (c2m_ctx, N_IGNORE), new_node (c2m_ctx, N_IGNORE),
                             new_str_node (c2m_ctx, N_STR, func_name, pos));
       NL_PREPEND (NL_EL (func_block->u.ops, 1)->u.ops, decl);
+    }
+
+    /* C99 `__func__` plus the GNU aliases glibc <assert.h> uses once
+       `__GNUC__` is defined (`__PRETTY_FUNCTION__`, `__FUNCTION__`). */
+    static void add__func__def (c2m_ctx_t c2m_ctx, node_t func_block, str_t func_name) {
+      add_func_name_def (c2m_ctx, func_block, func_name, "__func__");
+      add_func_name_def (c2m_ctx, func_block, func_name, "__FUNCTION__");
+      add_func_name_def (c2m_ctx, func_block, func_name, "__PRETTY_FUNCTION__");
     }
 
     /* Sort by decl scope nesting then decl size.
@@ -18970,6 +19190,8 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         e->type->u.arr_type = arr_type = reg_malloc (c2m_ctx, sizeof (struct arr_type));
         clear_type_qual (&arr_type->ind_type_qual);
         arr_type->static_p = FALSE;
+        arr_type->flex_p = 0;
+        arr_type->flex_bound_member = NULL;
         arr_type->el_type = create_type (c2m_ctx, NULL);
         arr_type->el_type->pos_node = r;
         arr_type->el_type->mode = TM_BASIC;
@@ -22737,6 +22959,8 @@ if (base != NULL && base->code == N_ID) {
             at->u.arr_type = reg_malloc (c2m_ctx, sizeof (struct arr_type));
             at->u.arr_type->el_type = el;
             at->u.arr_type->static_p = FALSE;
+            at->u.arr_type->flex_p = 0;
+            at->u.arr_type->flex_bound_member = NULL;
             clear_type_qual (&at->u.arr_type->ind_type_qual);
             /* unspecified size: check_initializer counts the elements and
                completes the type (exactly like `int a[] = {...};`). */
@@ -26991,6 +27215,103 @@ static void gen_oob_check (c2m_ctx_t c2m_ctx, op_t idx_op, MIR_op_t len_op, long
   emit_label_insn_opt (c2m_ctx, ok_label);
 }
 
+/* Set by N_ADDR when its operand is N_IND: `&a[n]` is a valid one-past-end
+   pointer, so the OOB check uses length+1.  Nested subscripts (e.g. the
+   `a[i]` in `&a[i].f`) keep the strict bound. */
+static int gen_ind_one_past_p;
+
+/* Load an integer member at BASE_PTR+offset and widen it to i64. */
+static op_t gen_load_member_i64 (c2m_ctx_t c2m_ctx, op_t base_ptr, decl_t member) {
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_type_t mt = get_mir_type (c2m_ctx, member->decl_spec.type);
+  op_t tmp = get_new_temp (c2m_ctx, mt);
+  MIR_op_t mem
+    = MIR_new_mem_op (ctx, mt, (MIR_disp_t) member->offset, base_ptr.mir_op.u.reg, 0, 1);
+  emit2 (c2m_ctx, MIR_MOV, tmp.mir_op, mem);
+  if (mt == MIR_T_I64 || mt == MIR_T_U64) return tmp;
+  return cast (c2m_ctx, tmp, MIR_T_I64, FALSE);
+}
+
+/* C-array OOB under -fexceptions.  Fixed-size arrays use the declared
+   length.  Trailing FAM (`T a[1]`/`a[0]`/`a[]`):
+     · value object (s.a[i])  — declared size + brace-init extra
+     · pointer object (p->a[i]) — sibling capacity if we named one; else no
+       static check (the declared 1 is not the live bound). */
+static void gen_c_array_oob (c2m_ctx_t c2m_ctx, node_t r, node_t arr, struct type *arr_type,
+                             op_t idx_op) {
+  MIR_context_t ctx = c2m_ctx->ctx;
+  struct arr_type *ainfo;
+  op_t idx_check;
+  node_t abase, sz_node;
+  struct expr *sze;
+  int one_past = gen_ind_one_past_p;
+
+  if (!c2m_options->exceptions_p || arr_type == NULL) return;
+  if (r->attr != NULL && ((struct expr *) r->attr)->elide_oob_p) return;
+  ainfo = type_arr_info (arr_type);
+  if (ainfo == NULL) return;
+  idx_check = force_reg (c2m_ctx, idx_op, MIR_T_I64);
+  abase = arr;
+  while (abase != NULL && abase->code == N_CAST) abase = NL_EL (abase->u.ops, 1);
+
+  if (ainfo->flex_p) {
+    if (abase != NULL && abase->code == N_FIELD) {
+      mir_llong len = 0;
+      node_t obj;
+      if (ainfo->size != NULL && ainfo->size->code != N_IGNORE && ainfo->size->attr != NULL) {
+        sze = (struct expr *) ainfo->size->attr;
+        if (sze->const_p && sze->c.i_val > 0) len = sze->c.i_val;
+      }
+      obj = NL_HEAD (abase->u.ops);
+      if (obj != NULL && obj->attr != NULL) {
+        struct expr *oe = (struct expr *) obj->attr;
+        node_t def = oe->def_node != NULL ? oe->def_node : oe->u.lvalue_node;
+        if (def != NULL && def->attr != NULL
+            && (def->code == N_SPEC_DECL || def->code == N_MEMBER)) {
+          decl_t od = (decl_t) def->attr;
+          if (od->flex_extra_size > 0 && ainfo->el_type != NULL) {
+            mir_size_t elsz = type_size (c2m_ctx, ainfo->el_type);
+            if (elsz > 0) len += (mir_llong) (od->flex_extra_size / elsz);
+          }
+        }
+      }
+      if (len > 0)
+        gen_oob_check (c2m_ctx, idx_check,
+                       MIR_new_int_op (ctx, (long long) (one_past ? len + 1 : len)),
+                       (long) POS (r).lno);
+      return;
+    }
+    if (ainfo->flex_bound_member != NULL && ainfo->flex_bound_member->attr != NULL
+        && abase != NULL && abase->code == N_DEREF_FIELD) {
+      decl_t bd = (decl_t) ainfo->flex_bound_member->attr;
+      node_t obj = NL_HEAD (abase->u.ops);
+      if (obj != NULL && bd->decl_spec.type != NULL && integer_type_p (bd->decl_spec.type)) {
+        op_t base = val_gen (c2m_ctx, obj);
+        base = force_reg (c2m_ctx, base, MIR_T_I64);
+        {
+          op_t blen = gen_load_member_i64 (c2m_ctx, base, bd);
+          if (one_past) {
+            op_t lim = get_new_temp (c2m_ctx, MIR_T_I64);
+            emit3 (c2m_ctx, MIR_ADD, lim.mir_op, blen.mir_op, MIR_new_int_op (ctx, 1));
+            gen_oob_check (c2m_ctx, idx_check, lim.mir_op, (long) POS (r).lno);
+          } else {
+            gen_oob_check (c2m_ctx, idx_check, blen.mir_op, (long) POS (r).lno);
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  sz_node = ainfo->size;
+  if (sz_node == NULL || sz_node->code == N_IGNORE || sz_node->attr == NULL) return;
+  sze = (struct expr *) sz_node->attr;
+  if (sze->const_p && sze->c.i_val > 0)
+    gen_oob_check (c2m_ctx, idx_check,
+                   MIR_new_int_op (ctx, (long long) (one_past ? sze->c.i_val + 1 : sze->c.i_val)),
+                   (long) POS (r).lno);
+}
+
 /* Guard: shift count must be in [0, width_bits).  C11 §6.5.7/3 — negative or
    >= width is UB.  Emits _safety_trap(5, …) (shift out of range).
    count_op must be an I64 register.  width_bits is 8/16/32/64. */
@@ -31081,24 +31402,10 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       op2 = cast (c2m_ctx, op2, ind_t == MIR_T_I32 ? MIR_T_I64 : MIR_T_U64, FALSE);
     }
 #endif
-    /* Static C array bounds guard (exceptions mode only).  We know the length
-       when the pointer was obtained by array-to-pointer decay (arr_type->arr_type
-       is the original TM_ARR type with a constant size).  Negative or oversized
-       indices are caught by unsigned comparison. */
-    if (c2m_options->exceptions_p && arr_type->arr_type != NULL
-        && arr_type->arr_type->mode == TM_ARR
-        && (r->attr == NULL || !((struct expr *) r->attr)->elide_oob_p)) {
-      node_t sz_node = arr_type->arr_type->u.arr_type->size;
-      if (sz_node != NULL && sz_node->code != N_IGNORE && sz_node->attr != NULL) {
-        struct expr *sze = sz_node->attr;
-        if (sze->const_p && sze->c.i_val > 0) {
-          op_t idx_check = force_reg (c2m_ctx, op2, MIR_T_I64);
-          gen_oob_check (c2m_ctx, idx_check,
-                         MIR_new_int_op (ctx, (long long) sze->c.i_val),
-                         (long) POS (r).lno);
-        }
-      }
-    }
+    /* Static C array bounds guard (exceptions mode only).  Fixed-size arrays
+       use the declared length; trailing FAM (`T a[1]`/`a[0]`/`a[]`) uses a
+       sibling capacity if we named one, never the placeholder 1. */
+    gen_c_array_oob (c2m_ctx, r, arr, arr_type, op2);
     if (el_type->mode == TM_PTR && el_type->arr_type != NULL) { /* elem is an array */
       size = type_size (c2m_ctx, el_type->arr_type);
     }
@@ -31177,8 +31484,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
   }
   case N_ADDR: {
     int add_p = FALSE;
+    int saved_one_past = gen_ind_one_past_p;
+    node_t addr_op = NL_HEAD (r->u.ops);
 
-    op1 = gen (c2m_ctx, NL_HEAD (r->u.ops), NULL, NULL, FALSE, NULL, NULL);
+    /* `&a[n]` is a valid one-past-end pointer; allow idx == length. */
+    gen_ind_one_past_p = (addr_op != NULL && addr_op->code == N_IND);
+    op1 = gen (c2m_ctx, addr_op, NULL, NULL, FALSE, NULL, NULL);
+    gen_ind_one_past_p = saved_one_past;
     type = ((struct expr *) r->attr)->type;
     t = get_mir_type (c2m_ctx, type);
     if (op1.mir_op.mode == MIR_OP_REG && type->mode == TM_PTR && scalar_type_p (type->u.ptr_type)) {
@@ -35727,7 +36039,8 @@ static void print_type (c2m_ctx_t c2m_ctx, FILE *f, struct type *type) {
   case TM_ARR:
     fprintf (f, "array [%s", type->u.arr_type->static_p ? "static " : "");
     print_qual (f, type->u.arr_type->ind_type_qual);
-    fprintf (f, "size node %u] (", type->u.arr_type->size->uid);
+    fprintf (f, "size node %u%s] (", type->u.arr_type->size->uid,
+             type->u.arr_type->flex_p ? ", FAM" : "");
     print_type (c2m_ctx, f, type->u.arr_type->el_type);
     fprintf (f, ")");
     break;

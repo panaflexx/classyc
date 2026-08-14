@@ -39,6 +39,16 @@
  *                          ^^^^^^^^^^^
  *                          this file
  *
+ * Trailing flexible arrays (`T a[1]` / `T a[0]` / `T a[]`):
+ *   check marks the last data member of a struct/class when the declared
+ *   length is 0, 1, or omitted (`arr_type->flex_p`).  This pass then tries
+ *   to recover the *live* bound:
+ *     · sibling integer named nAlloc/capacity/… (or the unique `n`/`count`)
+ *     · usage `i < p->field` in the same TU, when no name match landed
+ *     · constant malloc/calloc/realloc size → element count via offsetof
+ *   Proven in-range indexes are stamped elide_oob_p.  gen never uses the
+ *   placeholder length 1 on a pointer FAM; it checks the sibling if named.
+ *
  * After check: all names resolved, types known, generics specialised,
  * keywords (`defer`, `detach`, `attach`, `unowned`, `new`, `delete`) have
  * become concrete N_* nodes with valid attrs.  Before gen: nothing has been
@@ -3596,6 +3606,275 @@ static void ow_analyze_function (c2m_ctx_t c2m_ctx, node_t func_def) {
   if (ow_inference_p && ow_last_install_changed_p) ow_enqueue_dependents (idx);
 }
 
+/* ────────────────────────────────────────────────────────────────────────
+ * Trailing FAM (`T a[1]`) — live-bound recovery.
+ *
+ * Type-level flex_p / name-based sibling attach happens in check
+ * (set_type_layout).  Here we refine from usage and from malloc size, and
+ * stamp elide_oob_p when a constant index is proven in range.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+  node_t decl;
+  mir_llong nelem;
+} ow_fam_alloc_t;
+DEF_VARR (ow_fam_alloc_t);
+
+static void ow_fam_set_nelem (VARR (ow_fam_alloc_t) * allocs, node_t decl, mir_llong n) {
+  size_t i, len;
+  ow_fam_alloc_t rec;
+  if (decl == NULL || allocs == NULL) return;
+  len = VARR_LENGTH (ow_fam_alloc_t, allocs);
+  for (i = 0; i < len; i++) {
+    if (VARR_ADDR (ow_fam_alloc_t, allocs)[i].decl == decl) {
+      VARR_ADDR (ow_fam_alloc_t, allocs)[i].nelem = n;
+      return;
+    }
+  }
+  rec.decl = decl;
+  rec.nelem = n;
+  VARR_PUSH (ow_fam_alloc_t, allocs, rec);
+}
+
+static mir_llong ow_fam_get_nelem (VARR (ow_fam_alloc_t) * allocs, node_t decl) {
+  size_t i, len;
+  if (decl == NULL || allocs == NULL) return -1;
+  len = VARR_LENGTH (ow_fam_alloc_t, allocs);
+  for (i = 0; i < len; i++)
+    if (VARR_ADDR (ow_fam_alloc_t, allocs)[i].decl == decl)
+      return VARR_ADDR (ow_fam_alloc_t, allocs)[i].nelem;
+  return -1;
+}
+
+static int ow_const_ull (node_t n, mir_ullong *out) {
+  struct expr *e;
+  if (n == NULL || n->attr == NULL) return 0;
+  e = (struct expr *) n->attr;
+  if (!e->const_p || e->type == NULL) return 0;
+  if (signed_integer_type_p (e->type)) {
+    if (e->c.i_val < 0) return 0;
+    *out = (mir_ullong) e->c.i_val;
+    return 1;
+  }
+  if (integer_type_p (e->type) || e->type->mode == TM_PTR) {
+    *out = e->c.u_val;
+    return 1;
+  }
+  return 0;
+}
+
+/* Constant byte count of malloc / calloc / realloc, or 0 if unknown. */
+static int ow_call_const_alloc_size (node_t call, mir_ullong *sz_out) {
+  node_t callee, args, a0, a1;
+  const char *nm;
+  mir_ullong x, y;
+
+  if (call == NULL || call->code != N_CALL) return 0;
+  callee = NL_HEAD (call->u.ops);
+  args = callee != NULL ? NL_NEXT (callee) : NULL;
+  if (callee == NULL || callee->code != N_ID || args == NULL || args->code != N_LIST)
+    return 0;
+  nm = callee->u.s.s;
+  if (nm == NULL) return 0;
+  a0 = NL_HEAD (args->u.ops);
+  a1 = a0 != NULL ? NL_NEXT (a0) : NULL;
+  if (strcmp (nm, "calloc") == 0) {
+    if (!ow_const_ull (a0, &x) || !ow_const_ull (a1, &y)) return 0;
+    *sz_out = x * y;
+    return 1;
+  }
+  if (strcmp (nm, "malloc") == 0) return ow_const_ull (a0, sz_out);
+  if (strcmp (nm, "realloc") == 0) return ow_const_ull (a1, sz_out);
+  return 0;
+}
+
+static int ow_fam_nelem_from_bytes (c2m_ctx_t c2m_ctx, node_t fam_mem, mir_ullong bytes,
+                                    mir_llong *n_out) {
+  decl_t fd;
+  struct arr_type *at;
+  mir_size_t elsz;
+
+  if (fam_mem == NULL || fam_mem->attr == NULL) return 0;
+  fd = (decl_t) fam_mem->attr;
+  if (fd->decl_spec.type == NULL) return 0;
+  at = type_arr_info (fd->decl_spec.type);
+  if (at == NULL || at->el_type == NULL) return 0;
+  elsz = type_size (c2m_ctx, at->el_type);
+  if (elsz == 0 || bytes < fd->offset) return 0;
+  *n_out = (mir_llong) ((bytes - (mir_ullong) fd->offset) / elsz);
+  return 1;
+}
+
+static struct type *ow_ptr_struct_type (struct type *t) {
+  if (t == NULL) return NULL;
+  if (t->mode == TM_PTR) t = t->u.ptr_type;
+  if (t != NULL && (t->mode == TM_STRUCT || t->mode == TM_CLASS)) return t;
+  return NULL;
+}
+
+static void ow_fam_try_attach_usage (node_t field_expr) {
+  struct expr *e;
+  node_t mem, fam;
+  struct type *st, *mt;
+  struct arr_type *at;
+  int sc;
+
+  if (field_expr == NULL
+      || (field_expr->code != N_FIELD && field_expr->code != N_DEREF_FIELD))
+    return;
+  e = (struct expr *) field_expr->attr;
+  if (e == NULL || e->u.lvalue_node == NULL || e->u.lvalue_node->code != N_MEMBER)
+    return;
+  mem = e->u.lvalue_node;
+  if (mem->attr == NULL) return;
+  mt = ((decl_t) mem->attr)->decl_spec.type;
+  if (mt == NULL || !integer_type_p (mt)) return;
+  {
+    node_t obj = NL_HEAD (field_expr->u.ops);
+    struct expr *oe;
+    if (obj == NULL || obj->attr == NULL) return;
+    oe = (struct expr *) obj->attr;
+    st = ow_ptr_struct_type (oe->type);
+  }
+  if (st == NULL) return;
+  fam = type_trailing_flex_member (st);
+  if (fam == NULL || fam->attr == NULL) return;
+  at = type_arr_info (((decl_t) fam->attr)->decl_spec.type);
+  if (at == NULL || at->flex_bound_member != NULL) return;
+  sc = fam_bound_name_score (member_decl_name (mem));
+  if (sc >= 40) at->flex_bound_member = mem;
+}
+
+static void ow_fam_note_relop (node_t n) {
+  node_t a, b;
+  if (n == NULL) return;
+  if (n->code != N_LT && n->code != N_LE && n->code != N_GT && n->code != N_GE)
+    return;
+  a = NL_HEAD (n->u.ops);
+  b = a != NULL ? NL_NEXT (a) : NULL;
+  ow_fam_try_attach_usage (a);
+  ow_fam_try_attach_usage (b);
+}
+
+static void ow_fam_note_assign (c2m_ctx_t c2m_ctx, node_t n,
+                               VARR (ow_fam_alloc_t) * allocs) {
+  node_t lhs, rhs, decl, fam;
+  struct expr *le;
+  struct type *st;
+  mir_ullong bytes;
+  mir_llong nels;
+
+  if (n == NULL || n->code != N_ASSIGN) return;
+  lhs = NL_HEAD (n->u.ops);
+  rhs = lhs != NULL ? NL_NEXT (lhs) : NULL;
+  decl = id_resolves_to_decl (lhs);
+  if (decl == NULL || rhs == NULL) return;
+  while (rhs != NULL && rhs->code == N_CAST) rhs = NL_EL (rhs->u.ops, 1);
+  if (rhs == NULL || rhs->code != N_CALL) return;
+  if (!ow_call_const_alloc_size (rhs, &bytes)) return;
+  le = (struct expr *) lhs->attr;
+  if (le == NULL || le->type == NULL) return;
+  /* Prefer the LHS type: `p = (T *)malloc(n)` peels the cast on the RHS. */
+  st = ow_ptr_struct_type (le->type);
+  if (st == NULL) return;
+  fam = type_trailing_flex_member (st);
+  if (fam == NULL) return;
+  if (!ow_fam_nelem_from_bytes (c2m_ctx, fam, bytes, &nels)) return;
+  ow_fam_set_nelem (allocs, decl, nels);
+}
+
+static void ow_fam_note_spec_decl (c2m_ctx_t c2m_ctx, node_t n,
+                                  VARR (ow_fam_alloc_t) * allocs) {
+  node_t init, fam;
+  decl_t d;
+  struct type *st;
+  mir_ullong bytes;
+  mir_llong nels;
+
+  if (n == NULL || n->code != N_SPEC_DECL || n->attr == NULL) return;
+  d = (decl_t) n->attr;
+  init = SPEC_DECL_INIT (n);
+  if (init == NULL || init->code == N_IGNORE) return;
+  while (init != NULL && init->code == N_CAST) init = NL_EL (init->u.ops, 1);
+  if (init == NULL || init->code != N_CALL) return;
+  if (!ow_call_const_alloc_size (init, &bytes)) return;
+  if (d->decl_spec.type == NULL) return;
+  st = ow_ptr_struct_type (d->decl_spec.type);
+  if (st == NULL) return;
+  fam = type_trailing_flex_member (st);
+  if (fam == NULL) return;
+  if (!ow_fam_nelem_from_bytes (c2m_ctx, fam, bytes, &nels)) return;
+  ow_fam_set_nelem (allocs, n, nels);
+}
+
+static void ow_fam_note_ind (c2m_ctx_t c2m_ctx, node_t n, VARR (ow_fam_alloc_t) * allocs) {
+  node_t arr, idx, abase, recv, d;
+  struct expr *e, *ie, *ae;
+  struct arr_type *ai;
+  mir_llong nels, ival;
+
+  if (n == NULL || n->code != N_IND || n->attr == NULL) return;
+  e = (struct expr *) n->attr;
+  if (e->type == NULL) return;
+  arr = NL_HEAD (n->u.ops);
+  idx = arr != NULL ? NL_NEXT (arr) : NULL;
+  if (arr == NULL || idx == NULL || arr->attr == NULL || idx->attr == NULL) return;
+  ae = (struct expr *) arr->attr;
+  if (!type_flex_arr_p (ae->type)) return;
+  ie = (struct expr *) idx->attr;
+  ai = type_arr_info (ae->type);
+  abase = arr;
+  while (abase != NULL && abase->code == N_CAST) abase = NL_EL (abase->u.ops, 1);
+
+  /* `a[0]` on a C89 `T a[1]` FAM is always inside the declared object. */
+  if (ie->const_p && ie->c.i_val == 0 && ai != NULL && ai->size != NULL
+      && ai->size->code != N_IGNORE && ai->size->attr != NULL) {
+    struct expr *se = (struct expr *) ai->size->attr;
+    if (se->const_p && se->c.i_val >= 1) {
+      e->elide_oob_p = 1;
+      return;
+    }
+  }
+
+  if (abase == NULL || abase->code != N_DEREF_FIELD) return;
+  recv = NL_HEAD (abase->u.ops);
+  d = id_resolves_to_decl (recv);
+  nels = ow_fam_get_nelem (allocs, d);
+  if (nels < 0) return;
+  if (!ie->const_p) return;
+  ival = ie->c.i_val;
+  if (ival >= 0 && ival < nels) {
+    e->elide_oob_p = 1;
+  } else if (!ownership_silent_pass_p && (ival < 0 || ival >= nels)) {
+    warning (c2m_ctx, POS (n),
+             "index %lld is outside the allocated flexible array "
+             "(%lld element%s)",
+             (long long) ival, (long long) nels, nels == 1 ? "" : "s");
+  }
+}
+
+static void ow_fam_walk (c2m_ctx_t c2m_ctx, node_t n, VARR (ow_fam_alloc_t) * allocs) {
+  if (n == NULL) return;
+  if (n->code == N_SPEC_DECL) ow_fam_note_spec_decl (c2m_ctx, n, allocs);
+  if (n->code == N_ASSIGN) ow_fam_note_assign (c2m_ctx, n, allocs);
+  if (n->code == N_LT || n->code == N_LE || n->code == N_GT || n->code == N_GE)
+    ow_fam_note_relop (n);
+  if (n->code == N_IND) ow_fam_note_ind (c2m_ctx, n, allocs);
+  if (!ownership_node_has_ops (n->code)) return;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    ow_fam_walk (c2m_ctx, c, allocs);
+}
+
+static void ow_fam_analyze_func (c2m_ctx_t c2m_ctx, node_t func_def) {
+  VARR (ow_fam_alloc_t) *allocs;
+  MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+  if (func_def == NULL || func_def->code != N_FUNC_DEF) return;
+  VARR_CREATE (ow_fam_alloc_t, allocs, alloc, 8);
+  ow_fam_walk (c2m_ctx, FUNC_DEF_DECLS (func_def), allocs);
+  ow_fam_walk (c2m_ctx, FUNC_DEF_BLOCK (func_def), allocs);
+  VARR_DESTROY (ow_fam_alloc_t, allocs);
+}
+
 /* Recursively walk an AST subtree, accounting for any SPEC_DECLs the check
  * pass marked as auto-defer candidates, and kicking off the per-function
  * leak check at each N_FUNC_DEF.  When `verbose_p` is set, prints one line
@@ -3608,8 +3887,10 @@ static void ownership_walk (c2m_ctx_t c2m_ctx, node_t n, int *count, int verbose
      still continue recursion below so nested defs (class methods are
      hoisted to module top, but other future nesting patterns may appear)
      are visited and the auto-defer candidate count stays correct. */
-  if (n->code == N_FUNC_DEF)
+  if (n->code == N_FUNC_DEF) {
     ow_analyze_function (c2m_ctx, n);
+    ow_fam_analyze_func (c2m_ctx, n);
+  }
 
   if (n->code == N_SPEC_DECL) {
     decl_t d = (decl_t) n->attr;

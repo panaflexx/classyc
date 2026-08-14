@@ -763,6 +763,13 @@ static void midopt_check_ind_oob (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env
   if (!(arr_type->mode == TM_PTR && arr_type->arr_type != NULL
         && arr_type->arr_type->mode == TM_ARR))
     return;
+  /* Pointer-to-struct FAM (`p->a[i]` on trailing `T a[1]`): the declared
+     length is not the live bound.  Value-object `s.a[i]` still uses it. */
+  if (type_flex_arr_p (arr_type)) {
+    node_t abase = arr;
+    while (abase != NULL && abase->code == N_CAST) abase = NL_EL (abase->u.ops, 1);
+    if (abase == NULL || abase->code != N_FIELD) return;
+  }
   sz_node = arr_type->arr_type->u.arr_type->size;
   if (sz_node == NULL || sz_node->code == N_IGNORE || sz_node->attr == NULL) return;
   sze = (struct expr *) sz_node->attr;
@@ -2115,6 +2122,11 @@ static void midopt_try_elide_oob (node_t n) {
     struct expr *sze;
     mir_llong len, i;
 
+    if (type_flex_arr_p (arr_type)) {
+      node_t abase = arr;
+      while (abase != NULL && abase->code == N_CAST) abase = NL_EL (abase->u.ops, 1);
+      if (abase == NULL || abase->code != N_FIELD) return;
+    }
     if (sz_node == NULL || sz_node->code == N_IGNORE || sz_node->attr == NULL) return;
     sze = (struct expr *) sz_node->attr;
     if (!sze->const_p || sze->c.i_val <= 0) return;
