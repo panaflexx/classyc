@@ -1007,6 +1007,57 @@ static int build_whole_program_buffer (VARR (uint8_t) *out, const char **virt_na
   return 1;
 }
 
+/* JIT-generated code is not a well-behaved C callee: GNU
+   `register ... asm("r13")` (and other hard-assigned globals) are
+   omitted from the MIR prologue save set, so -eg `main` can clobber
+   SysV callee-saved GPRs.  Isolate that from the driver's frame. */
+#if defined(__GNUC__) || defined(__clang__)
+#define CLASSYC_NOINLINE __attribute__ ((noinline))
+#else
+#define CLASSYC_NOINLINE
+#endif
+
+static CLASSYC_NOINLINE int
+call_jit_main (uint64_t (*fn) (int, void *, char **), int argc, void *argv, char **env) {
+#if defined(__x86_64__) && !defined(_WIN32)
+  long result, argc_l = (long) argc;
+
+  /* Copy inputs into call-clobbered regs first so later pushes can
+     reuse rbx/rbp/r12-r15.  SysV: rsp ≡ 0 immediately before call. */
+  __asm__ volatile (
+      "movq %1, %%rdi\n\t"
+      "movq %2, %%rsi\n\t"
+      "movq %3, %%rdx\n\t"
+      "movq %4, %%r11\n\t"
+      "pushq %%rbx\n\t"
+      "pushq %%rbp\n\t"
+      "pushq %%r12\n\t"
+      "pushq %%r13\n\t"
+      "pushq %%r14\n\t"
+      "pushq %%r15\n\t"
+      "movq %%rsp, %%rbp\n\t"
+      "andq $-16, %%rsp\n\t"
+      "callq *%%r11\n\t"
+      "movq %%rbp, %%rsp\n\t"
+      "popq %%r15\n\t"
+      "popq %%r14\n\t"
+      "popq %%r13\n\t"
+      "popq %%r12\n\t"
+      "popq %%rbp\n\t"
+      "popq %%rbx\n\t"
+      : "=a"(result)
+      : "r"(argc_l), "r"(argv), "r"(env), "r"(fn)
+      : "rcx", "rdi", "rsi", "rdx", "r8", "r9", "r10", "r11", "cc", "memory");
+  return (int) result;
+#else
+  int result = (int) fn (argc, argv, env);
+#if defined(__GNUC__) || defined(__clang__)
+  __asm__ volatile ("" : "+r"(result) : : "memory");
+#endif
+  return result;
+#endif
+}
+
 int main (int argc, char *argv[], char *env[]) {
   int i, bin_p;
   size_t len;
@@ -1304,7 +1355,7 @@ int main (int argc, char *argv[], char *env[]) {
         }
         fun_addr = main_func->addr;
         start_time = real_usec_time ();
-        result_code = (int) fun_addr (fun_argc, fun_argv, env);
+        result_code = call_jit_main (fun_addr, fun_argc, (void *) fun_argv, env);
         /* void main() has no return register — treat as exit 0 */
         if (main_func->u.func->nres == 0) result_code = 0;
         if (options.verbose_p) {
