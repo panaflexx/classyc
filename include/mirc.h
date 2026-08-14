@@ -54,6 +54,36 @@ static const char mirc[]
     "#define __has_c_attribute(x) 0\n"
     "#define __has_declspec_attribute(x) 0\n"
     "\n"
+    /* glibc <math.h> defines INFINITY as `__builtin_inff()` when it sees
+       __GNUC__.  Provide IEEE bit-pattern helpers so JIT does not look
+       them up as libc symbols. */
+    "static float __builtin_inff (void) {\n"
+    "  union { unsigned u; float f; } __x;\n"
+    "  __x.u = 0x7f800000u;\n"
+    "  return __x.f;\n"
+    "}\n"
+    "static double __builtin_inf (void) {\n"
+    "  union { unsigned long long u; double f; } __x;\n"
+    "  __x.u = 0x7ff0000000000000ull;\n"
+    "  return __x.f;\n"
+    "}\n"
+    "static float __builtin_huge_valf (void) { return __builtin_inff (); }\n"
+    "static double __builtin_huge_val (void) { return __builtin_inf (); }\n"
+    "static float __builtin_nanf (const char *__tag) {\n"
+    "  union { unsigned u; float f; } __x;\n"
+    "  (void) __tag;\n"
+    "  __x.u = 0x7fc00000u;\n"
+    "  return __x.f;\n"
+    "}\n"
+    "static double __builtin_nan (const char *__tag) {\n"
+    "  union { unsigned long long u; double f; } __x;\n"
+    "  (void) __tag;\n"
+    "  __x.u = 0x7ff8000000000000ull;\n"
+    "  return __x.f;\n"
+    "}\n"
+    /* GCC 4.1+ builtin used by SQLite sqlite3MemoryBarrier(). */
+    "#define __sync_synchronize() __atomic_thread_fence (5)\n"
+    "\n"
     "/* Built-in null pointer literal (used for String/dict/pointer comparisons): */\n"
     "#define null ((void*)0)\n";
 
