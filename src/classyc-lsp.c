@@ -30,6 +30,7 @@
 #include "logger.h" /* log_set_diag_sink, log_diag_t — defined in classyc.c TU */
 
 #define C2M_DICT_API static
+#define DICT_CLASSYC_INTERNAL
 #include "dict.h" /* single-header JSON (build + parse) */
 
 /* ───────────────────────────── small utilities ──────────────────────────── */

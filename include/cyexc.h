@@ -67,6 +67,8 @@ typedef struct {
    stack and current-exception cell, so throws on one thread never disturb
    handlers on another (no heap state, so no thread-exit sweep is needed). */
 static _Thread_local jmp_buf        cy__exc_frames[CY_EXC_MAX_DEPTH];
+static _Thread_local size_t         cy__exc_str_marks[CY_EXC_MAX_DEPTH];
+static _Thread_local size_t         cy__exc_obj_marks[CY_EXC_MAX_DEPTH];
 static _Thread_local int            cy__exc_depth = 0;
 static _Thread_local cy_exception_t cy__exc_current = {0, 0, 0, 0};
 
@@ -82,6 +84,31 @@ C2M_EXC_API void *cy_exc_push (void) {
 /* Unwind one frame (on normal try completion, or after entering a handler). */
 C2M_EXC_API void cy_exc_pop (void) {
   if (cy__exc_depth > 0) cy__exc_depth--;
+}
+
+/* Bank the String/object arena high-water marks captured at try-entry for the
+   frame just pushed by cy_exc_push(), so an exception handler can release
+   back to them without relying on any JIT-generated value surviving a
+   longjmp (see the comment at the classyc.c call sites: values merely held
+   in a register/temp across a setjmp/longjmp span are not reliably preserved
+   by MIR-generated code, since MIR-gen has no model of longjmp as an
+   implicit second entry point). This is plain C-compiled runtime state,
+   addressed by depth, so it is immune to that hazard. */
+C2M_EXC_API void cy_exc_set_marks (size_t str_mark, size_t obj_mark) {
+  if (cy__exc_depth > 0) {
+    cy__exc_str_marks[cy__exc_depth - 1] = str_mark;
+    cy__exc_obj_marks[cy__exc_depth - 1] = obj_mark;
+  }
+}
+
+/* Read back the marks banked for the currently-topmost frame. Call on the
+   exception-dispatch path BEFORE cy_exc_pop() (these read index
+   cy__exc_depth - 1, i.e. the frame that's about to be popped). */
+C2M_EXC_API size_t cy_exc_current_str_mark (void) {
+  return cy__exc_depth > 0 ? cy__exc_str_marks[cy__exc_depth - 1] : 0;
+}
+C2M_EXC_API size_t cy_exc_current_obj_mark (void) {
+  return cy__exc_depth > 0 ? cy__exc_obj_marks[cy__exc_depth - 1] : 0;
 }
 
 /* Pointer to the current / last-thrown exception record. */

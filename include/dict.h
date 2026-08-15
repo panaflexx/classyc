@@ -4,6 +4,19 @@
 #ifndef DICT_H
 #define DICT_H
 
+/* This is ClassyC's internal dict/JSON/BSON runtime implementation, not a
+   user-facing API: its function bodies don't survive the ownership checker
+   (real double-free/leak findings against its own allocation patterns), and
+   casting a `dict` value to `DictValue*` in .cy code reads the wrong bytes
+   (every dict->pointer cast unwraps the union payload, not this struct).
+   .cy code that needs a dict value's runtime type should
+   #include "dict_types.h" and use the d.type() builtin instead. Compiler-
+   internal C sources define DICT_CLASSYC_INTERNAL before this include — the
+   whole body below is gated on it so an unauthorized include stops at the
+   #error at the bottom of this file instead of parsing (and ownership-
+   checking) the internals anyway. */
+#ifdef DICT_CLASSYC_INTERNAL
+
 #ifndef C2M_DICT_API
 #define C2M_DICT_API static
 #endif
@@ -1332,5 +1345,9 @@ fail:
 #ifdef __cplusplus
 }
 #endif
+
+#else /* !DICT_CLASSYC_INTERNAL */
+#error "dict.h is ClassyC's internal runtime header, not for .cy user code; #include \"dict_types.h\" and use d.type() instead (see cy-validate/SHORTCOMINGS.md)"
+#endif /* DICT_CLASSYC_INTERNAL */
 
 #endif /* DICT_H */

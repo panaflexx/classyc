@@ -413,6 +413,247 @@ static int subtree_mentions_decl (node_t n, node_t target) {
 }
 
 /* ────────────────────────────────────────────────────────────────────────
+ * Unowned pointer-collection reminder (SHORTCOMINGS.md: "Any<I>* handles
+ * retained in a collection", and the parallel String case).
+ *
+ * `list->Add(new C(...))` / `list->Add(any<I>(...))` on a List<T*>/Set<T*>/
+ * Map<K,T*> silently never frees those elements unless `.owns()` (or
+ * `.ownsValues()`/`.ownsKeys()` for Map) is called somewhere on the same
+ * collection -- exactly the shape that crashed examples/test-any-arena.cy
+ * and examples/test-any-implicit.cy at process exit (the object arena no
+ * longer auto-frees a handle retained in a collection; see
+ * subtree_retains_object_in_collection_p in classyc.c). This is a compile-
+ * time reminder for that pattern, not a proof of a leak: we can't tell an
+ * intentionally-owning collection from an intentionally-*non-owning* view
+ * (README's `library.Where(...)` idiom) purely from an argument's type.
+ *
+ * Deliberately narrow / syntactic, matching subtree_retains_*_in_collection_p:
+ *   - only fires for declarations whose type resolves to a generic
+ *     (`__generic_`-mangled) collection class that actually defines
+ *     owns()/ownsValues()/ownsKeys() (so the suggested fix always applies --
+ *     a user's own hand-rolled `class List<T>` without that protocol, like
+ *     the pre-fix version of test-any-arena.cy, is correctly left alone);
+ *   - only fires when an Add()/Set() call on that declaration passes a
+ *     pointer-to-class argument (scalars/String/by-value elements don't
+ *     need `.owns()`);
+ *   - only fires when no owns()/ownsValues()/ownsKeys() call on that same
+ *     declaration is seen anywhere in the function.
+ * False negatives are possible (e.g. `.owns()` called by a different
+ * function that received the collection, or elements deleted one at a time
+ * without ever calling `.owns()`) -- this trades recall for zero required
+ * new runtime/dataflow machinery, matching the existing helpers' philosophy. */
+
+static const char *const ow_collection_owns_method_names[] = {"owns", "ownsValues", "ownsKeys"};
+
+/* TRUE iff `n` calls one of owns()/ownsValues()/ownsKeys() on a receiver
+ * that resolves to `target`. */
+static int subtree_calls_owns_on_decl (node_t n, node_t target) {
+  if (n == NULL || target == NULL) return 0;
+  if (n->code == N_CALL) {
+    node_t callee = NL_HEAD (n->u.ops);
+    if (callee != NULL && (callee->code == N_FIELD || callee->code == N_DEREF_FIELD)) {
+      node_t recv = NL_HEAD (callee->u.ops);
+      const char *mname = callee_name_of (callee);
+      if (recv != NULL && id_resolves_to_decl (recv) == target && mname != NULL) {
+        for (size_t i = 0; i < sizeof (ow_collection_owns_method_names)
+                                / sizeof (ow_collection_owns_method_names[0]); i++)
+          if (strcmp (mname, ow_collection_owns_method_names[i]) == 0) return 1;
+      }
+    }
+  }
+  if (!ownership_node_has_ops (n->code)) return 0;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (subtree_calls_owns_on_decl (c, target)) return 1;
+  return 0;
+}
+
+/* TRUE iff `n` contains a call to owns()/ownsValues()/ownsKeys() ANYWHERE,
+ * regardless of receiver.  Used only on a declaration's own initializer
+ * subtree, for the common chained-call idiom `new List<Item*>().owns()`:
+ * `.owns()` there is called on the anonymous `new` prvalue before the
+ * variable it's being assigned to even exists, so subtree_calls_owns_on_decl
+ * (which requires the receiver to resolve to a *named* declaration) can
+ * never see it. Chained calls return `this`, so any owns()-family call
+ * inside the initializer necessarily applies to the object this declaration
+ * ends up bound to -- safe to check name-only, without receiver resolution. */
+static int subtree_calls_owns_chained (node_t n) {
+  if (n == NULL) return 0;
+  if (n->code == N_CALL) {
+    node_t callee = NL_HEAD (n->u.ops);
+    const char *mname = callee_name_of (callee);
+    if (mname != NULL)
+      for (size_t i = 0; i < sizeof (ow_collection_owns_method_names)
+                              / sizeof (ow_collection_owns_method_names[0]); i++)
+        if (strcmp (mname, ow_collection_owns_method_names[i]) == 0) return 1;
+  }
+  if (!ownership_node_has_ops (n->code)) return 0;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (subtree_calls_owns_chained (c)) return 1;
+  return 0;
+}
+
+/* TRUE iff `a` (after peeling casts) is a fresh-acquisition expression --
+ * `new C(...)` or `any<I>(...)`.  Deliberately does NOT accept "any pointer-
+ * typed expression": a plain variable/parameter/loop-element being copied
+ * into a *different* collection (exactly what List<T>'s own Filter/Map/Copy/
+ * Take/etc. do internally -- see include/list.h) is a borrowed reference,
+ * not a fresh owned pointer, and must NOT trigger this warning. Restricting
+ * to the two literal acquire node shapes is what keeps this check from
+ * firing on every one of those library-internal `result->Add(item)` calls. */
+static int node_is_fresh_acquire_p (node_t a) {
+  while (a != NULL && a->code == N_CAST) a = NL_EL (a->u.ops, 1);
+  return a != NULL && (a->code == N_NEW || a->code == N_ANY);
+}
+
+/* TRUE iff `n` deletes an element read back out of `target` (`delete
+ * target->Get(i);` / `delete target[i];`) -- the manual-cleanup idiom used
+ * instead of `.owns()` (e.g. by a hand-rolled collection class, or by
+ * choice). Suppresses the warning: the elements ARE being freed, just not
+ * via the owns() protocol. */
+static int subtree_manually_deletes_from_decl (node_t n, node_t target) {
+  if (n == NULL || target == NULL) return 0;
+  if (n->code == N_DELETE) {
+    node_t expr = NL_EL (n->u.ops, 1);
+    while (expr != NULL && expr->code == N_CAST) expr = NL_EL (expr->u.ops, 1);
+    if (expr != NULL && expr->code == N_CALL) {
+      node_t callee = NL_HEAD (expr->u.ops);
+      if (callee != NULL && (callee->code == N_FIELD || callee->code == N_DEREF_FIELD)) {
+        node_t recv = NL_HEAD (callee->u.ops);
+        if (recv != NULL && id_resolves_to_decl (recv) == target) return 1;
+      }
+    } else if (expr != NULL && expr->code == N_IND) {
+      node_t recv = NL_HEAD (expr->u.ops);
+      if (recv != NULL && id_resolves_to_decl (recv) == target) return 1;
+    }
+  }
+  if (!ownership_node_has_ops (n->code)) return 0;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (subtree_manually_deletes_from_decl (c, target)) return 1;
+  return 0;
+}
+
+/* TRUE iff `n` deletes a plain identifier named `name` (`delete v;`).
+ * Matches by name rather than resolved declaration: the for-in loop
+ * variable checked by the caller is bound fresh per-iteration, and
+ * comparing by name is sufficient for a warning-suppression heuristic (a
+ * false negative here just means the warning still fires, which is the
+ * safe direction). */
+static int subtree_deletes_named_id (node_t n, const char *name) {
+  if (n == NULL || name == NULL) return 0;
+  if (n->code == N_DELETE) {
+    node_t expr = NL_EL (n->u.ops, 1);
+    while (expr != NULL && expr->code == N_CAST) expr = NL_EL (expr->u.ops, 1);
+    if (expr != NULL && expr->code == N_ID && expr->u.s.s != NULL
+        && strcmp (expr->u.s.s, name) == 0)
+      return 1;
+  }
+  if (!ownership_node_has_ops (n->code)) return 0;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (subtree_deletes_named_id (c, name)) return 1;
+  return 0;
+}
+
+/* TRUE iff `n` is (or contains) a for-in loop over `target` whose body
+ * deletes the loop variable -- `for (auto v in target) delete v;` -- another
+ * manual-cleanup idiom (see val-012-interfaces-any.cy) that must suppress
+ * the warning same as subtree_manually_deletes_from_decl. AST shape:
+ * N_FORIN(labels, var_id, val_id, collection, body). */
+static int subtree_forin_deletes_element_of_decl (node_t n, node_t target) {
+  if (n == NULL || target == NULL) return 0;
+  if (n->code == N_FORIN) {
+    node_t var_id = NL_EL (n->u.ops, 1);
+    node_t val_id = NL_EL (n->u.ops, 2);
+    node_t coll = NL_EL (n->u.ops, 3);
+    node_t body = NL_EL (n->u.ops, 4);
+    while (coll != NULL && coll->code == N_CAST) coll = NL_EL (coll->u.ops, 1);
+    if (coll != NULL && id_resolves_to_decl (coll) == target) {
+      if (var_id != NULL && var_id->code == N_ID && var_id->u.s.s != NULL
+          && subtree_deletes_named_id (body, var_id->u.s.s))
+        return 1;
+      if (val_id != NULL && val_id->code == N_ID && val_id->u.s.s != NULL
+          && subtree_deletes_named_id (body, val_id->u.s.s))
+        return 1;
+    }
+  }
+  if (!ownership_node_has_ops (n->code)) return 0;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (subtree_forin_deletes_element_of_decl (c, target)) return 1;
+  return 0;
+}
+
+/* TRUE iff `n` calls Add()/Set() on a receiver resolving to `target` with a
+ * fresh-acquisition argument (see node_is_fresh_acquire_p). */
+static int subtree_adds_owned_ptr_to_decl (node_t n, node_t target) {
+  if (n == NULL || target == NULL) return 0;
+  if (n->code == N_CALL) {
+    node_t callee = NL_HEAD (n->u.ops);
+    if (callee != NULL && (callee->code == N_FIELD || callee->code == N_DEREF_FIELD)) {
+      node_t recv = NL_HEAD (callee->u.ops);
+      const char *mname = callee_name_of (callee);
+      if (recv != NULL && id_resolves_to_decl (recv) == target && mname != NULL
+          && (strcmp (mname, "Add") == 0 || strcmp (mname, "Set") == 0)) {
+        node_t args = NL_NEXT (callee);
+        if (args != NULL && args->code == N_LIST)
+          for (node_t a = NL_HEAD (args->u.ops); a != NULL; a = NL_NEXT (a))
+            if (node_is_fresh_acquire_p (a)) return 1;
+      }
+    }
+  }
+  if (!ownership_node_has_ops (n->code)) return 0;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (subtree_adds_owned_ptr_to_decl (c, target)) return 1;
+  return 0;
+}
+
+/* Per-function driver: find local/param declarations of an owns()-capable
+ * generic collection, and warn if the function adds owned pointers to one
+ * without ever calling owns()/ownsValues()/ownsKeys() on it. */
+static void check_unowned_pointer_collection_decl (c2m_ctx_t c2m_ctx, node_t spec_decl,
+                                                    node_t body) {
+  decl_t d = (decl_t) spec_decl->attr;
+  struct type *t;
+  node_t class_tag;
+  const char *cname, *name;
+
+  if (d == NULL || d->decl_spec.type == NULL) return;
+  t = d->decl_spec.type;
+  if (t->mode == TM_PTR && t->u.ptr_type != NULL) t = t->u.ptr_type;
+  if (t->mode != TM_CLASS) return;
+  cname = class_type_name (t);
+  if (cname == NULL || strncmp (cname, "__generic_", 10) != 0) return;
+  class_tag = t->u.tag_type;
+  if (find_class_protocol_method (c2m_ctx, class_tag, "owns", 0, POS (spec_decl)) == NULL
+      && find_class_protocol_method (c2m_ctx, class_tag, "ownsValues", 0, POS (spec_decl)) == NULL
+      && find_class_protocol_method (c2m_ctx, class_tag, "ownsKeys", 0, POS (spec_decl)) == NULL)
+    return; /* not an owns()-capable collection (e.g. a hand-rolled class List<T>) */
+  if (!subtree_adds_owned_ptr_to_decl (body, spec_decl)) return;
+  if (subtree_calls_owns_on_decl (body, spec_decl)) return;
+  if (subtree_calls_owns_chained (SPEC_DECL_INIT (spec_decl))) return;
+  if (subtree_manually_deletes_from_decl (body, spec_decl)) return;
+  if (subtree_forin_deletes_element_of_decl (body, spec_decl)) return;
+  name = ownership_spec_decl_name (spec_decl);
+  warning (c2m_ctx, POS (spec_decl),
+           "collection `%s` never calls .owns()/.ownsValues()/.ownsKeys(): its "
+           "pointer elements will never be freed\n"
+           "  hint: add `.owns()`, or ignore if `%s` is a non-owning view",
+           name != NULL ? name : "?", name != NULL ? name : "it");
+}
+
+static void check_unowned_pointer_collections_walk (c2m_ctx_t c2m_ctx, node_t n, node_t body) {
+  if (n == NULL) return;
+  if (n->code == N_SPEC_DECL) check_unowned_pointer_collection_decl (c2m_ctx, n, body);
+  if (!ownership_node_has_ops (n->code)) return;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    check_unowned_pointer_collections_walk (c2m_ctx, c, body);
+}
+
+static void check_unowned_pointer_collections (c2m_ctx_t c2m_ctx, node_t func_def) {
+  node_t block = FUNC_DEF_BLOCK (func_def);
+  if (block == NULL) return;
+  check_unowned_pointer_collections_walk (c2m_ctx, block, block);
+}
+
+/* ────────────────────────────────────────────────────────────────────────
  * State lattice + per-function analysis context (Step F).
  *
  * Per-binding state: one of the five values from the design doc.  Stored
@@ -3890,6 +4131,9 @@ static void ownership_walk (c2m_ctx_t c2m_ctx, node_t n, int *count, int verbose
   if (n->code == N_FUNC_DEF) {
     ow_analyze_function (c2m_ctx, n);
     ow_fam_analyze_func (c2m_ctx, n);
+    /* Diagnostics-only, single-function syntactic check -- run once, on the
+       final pass, same as every other diagnostic emitted from this walk. */
+    if (!ownership_silent_pass_p) check_unowned_pointer_collections (c2m_ctx, n);
   }
 
   if (n->code == N_SPEC_DECL) {

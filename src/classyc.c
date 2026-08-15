@@ -24862,6 +24862,18 @@ struct gen_ctx {
   MIR_item_t cy_exc_current_proto, cy_exc_current_item; /* void *cy_exc_current(void)     */
   MIR_item_t cy_exc_throw_proto, cy_exc_throw_item;     /* void  cy_exc_throw(id,msg,f,l) */
   MIR_item_t cy_setjmp_proto, cy_setjmp_item;           /* int   setjmp(void *buf)        */
+  /* String/object arena marks banked into the exception-frame runtime state at
+     try-entry (SHORTCOMINGS.md gotcha #10 fix). MIR-generated values live
+     across setjmp/longjmp are NOT reliably preserved -- MIR-gen has no model
+     of longjmp as an implicit second entry point into the function, so a
+     value merely held in a local temp/register between the checkpoint and the
+     exception-dispatch label can be clobbered by the try body's own codegen.
+     Banking the marks into cy_exc's own frame-stack (plain C runtime state,
+     unrelated to any JIT-generated register) and re-reading them fresh after
+     the jump sidesteps the hazard entirely. */
+  MIR_item_t cy_exc_set_marks_proto, cy_exc_set_marks_item;             /* void cy_exc_set_marks(str_mark,obj_mark) */
+  MIR_item_t cy_exc_current_str_mark_proto, cy_exc_current_str_mark_item; /* size_t cy_exc_current_str_mark(void) */
+  MIR_item_t cy_exc_current_obj_mark_proto, cy_exc_current_obj_mark_item; /* size_t cy_exc_current_obj_mark(void) */
   MIR_item_t safety_trap_proto, safety_trap_item;       /* void  _safety_trap(reason,fid,line) */
   MIR_item_t cy_safe_alloc_proto, cy_safe_alloc_item;  /* void *cy_safe_alloc(size)           */
   MIR_item_t cy_safe_free_proto,  cy_safe_free_item;   /* void  cy_safe_free(ptr,line)        */
@@ -25041,6 +25053,12 @@ struct gen_ctx {
 #define cy_exc_current_item gen_ctx->cy_exc_current_item
 #define cy_exc_throw_proto gen_ctx->cy_exc_throw_proto
 #define cy_exc_throw_item gen_ctx->cy_exc_throw_item
+#define cy_exc_set_marks_proto gen_ctx->cy_exc_set_marks_proto
+#define cy_exc_set_marks_item gen_ctx->cy_exc_set_marks_item
+#define cy_exc_current_str_mark_proto gen_ctx->cy_exc_current_str_mark_proto
+#define cy_exc_current_str_mark_item gen_ctx->cy_exc_current_str_mark_item
+#define cy_exc_current_obj_mark_proto gen_ctx->cy_exc_current_obj_mark_proto
+#define cy_exc_current_obj_mark_item gen_ctx->cy_exc_current_obj_mark_item
 #define cy_setjmp_proto gen_ctx->cy_setjmp_proto
 #define cy_setjmp_item gen_ctx->cy_setjmp_item
 #define safety_trap_proto gen_ctx->safety_trap_proto
@@ -27255,6 +27273,17 @@ static void exception_ensure_imports (c2m_ctx_t c2m_ctx) {
      so it captures that frame.  Declared to return a 64-bit value (the int
      result is zero/sign-extended in the return register on supported ABIs). */
   rt_import (c2m_ctx, "setjmp", "cy_setjmp", &cy_setjmp_proto, &cy_setjmp_item, 1, "buf");
+  /* void cy_exc_set_marks(size_t str_mark, size_t obj_mark) - bank the
+     String/object arena marks for the frame just pushed. */
+  rt_import (c2m_ctx, "cy_exc_set_marks", NULL, &cy_exc_set_marks_proto, &cy_exc_set_marks_item,
+             0, "str_mark obj_mark");
+  /* size_t cy_exc_current_str_mark(void) / cy_exc_current_obj_mark(void) -
+     read back the marks banked for the currently-topmost frame.  Call before
+     cy_exc_pop() on the dispatch path (it reads cy__exc_depth - 1). */
+  rt_import (c2m_ctx, "cy_exc_current_str_mark", NULL, &cy_exc_current_str_mark_proto,
+             &cy_exc_current_str_mark_item, 1, "");
+  rt_import (c2m_ctx, "cy_exc_current_obj_mark", NULL, &cy_exc_current_obj_mark_proto,
+             &cy_exc_current_obj_mark_item, 1, "");
 }
 
 /* -ffibers go/await runtime (cyfiber.h, bound by the driver's import_resolver
@@ -27861,7 +27890,9 @@ static void gen_dict_bind_throw_key_exception (c2m_ctx_t c2m_ctx,
    works for any Add-protocol collection, not just List<T>.  Nested class
    elements recurse through gen_dict_bind_into; String elements take a private
    copy (c2m_str_own) so the bound object owns them, mirroring the String-field
-   path.  Pointer-to-class elements (T = C*) are Phase 3. */
+   path.  Pointer-to-class elements (T = C*) allocate + zero the pointee and
+   recurse gen_dict_bind_into into it, same as the by-value nested-class case
+   but heap-allocated and passed by pointer. */
 /* Forward declarations: gen_dict_bind_into (defined just below) recurses into
    nested class/struct elements; gen_class_method_call is defined later in the
    gen section. */
@@ -27877,7 +27908,7 @@ static op_t gen_class_method_call_flags (c2m_ctx_t c2m_ctx, node_t func_def,
                                          struct type *this_type, op_t this_op, op_t *args,
                                          int n_args, int safe_flags);
 static op_t gen_dict_bind_collection_field (c2m_ctx_t c2m_ctx, struct type *cls_ptr_type,
-                                            op_t val_dv, pos_t pos) {
+                                            op_t val_dv, int lenient, pos_t pos) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
   MIR_context_t ctx = c2m_ctx->ctx;
   struct type *cls_type = cls_ptr_type->u.ptr_type;
@@ -27984,6 +28015,32 @@ static op_t gen_dict_bind_collection_field (c2m_ctx_t c2m_ctx, struct type *cls_
       MIR_op_t own_arg = force_reg (c2m_ctx, unwrapped, MIR_T_I64).mir_op;
       el_arg = gen_rt_call (c2m_ctx, str_own_proto, str_own_item, 1, &own_arg);
       el_arg = force_reg (c2m_ctx, el_arg, MIR_T_I64);
+    } else if (el_type->mode == TM_PTR && el_type->u.ptr_type != NULL
+               && el_type->u.ptr_type->mode == TM_CLASS) {
+      /* Pointer-to-class element (T = C*), e.g. List<User*>: allocate + zero
+         the pointee, recurse gen_dict_bind_into to fill its fields from the
+         nested dict object, and pass the real pointer to Add(T).  This must
+         be checked before the generic scalar_type_p branch below, since
+         scalar_type_p() is true for every TM_PTR — falling through there
+         would "unwrap" a nested-object DictValue* as if it held a raw scalar
+         payload, handing Add() a bogus pointer (the historical bug: Count()
+         came back right because Add() was still called N times, but each
+         element was garbage and crashed on first use). The collection owns
+         the allocation; deleting it must delete each element (matches
+         List<T*> semantics for owned pointer elements).
+
+         SIBLING: gen_dict_bind_into's own TM_PTR/TM_CLASS branch (pointer-to-
+         collection *field*, not element) has the same ordering requirement
+         relative to its own scalar_type_p branch, for the same reason. If you
+         add a new pointer-to-class special case to one of these two
+         functions' dispatch chains, add the matching case to the other and
+         keep it ahead of scalar_type_p there too. */
+      struct type *el_cls_type = el_type->u.ptr_type;
+      mir_size_t el_csize = type_size (c2m_ctx, el_cls_type);
+      op_t el_obj = gen_heap_alloc (c2m_ctx, el_csize == 0 ? 1 : el_csize);
+      if (el_csize > 0) gen_memset (c2m_ctx, 0, el_obj.mir_op.u.reg, el_csize);
+      gen_dict_bind_into (c2m_ctx, el_cls_type, el_dv, el_obj, lenient, pos);
+      el_arg = el_obj;
     } else if (floating_type_p (el_type)) {
       /* Floating-point element (e.g. List<double>): the union payload at offset
          8 holds the value's raw bits (dict_create_number stores a `double`), so
@@ -28010,13 +28067,16 @@ static op_t gen_dict_bind_collection_field (c2m_ctx_t c2m_ctx, struct type *cls_
         el_arg = force_reg (c2m_ctx, unwrapped, MIR_T_I64);
       }
     } else {
-      /* Pointer-to-class element (T = C*): Phase 3.  Skip with a warning so the
-         collection still builds; the slot is left at the raw unwrapped value. */
-      warning (c2m_ctx, pos,
-               "dict->collection bind: element type of '%s' is a pointer-to-class (Phase 3); element left unwrapped",
-               cname != NULL ? cname : "<class>");
-      el_arg = gen_dict_unwrap (c2m_ctx, el_dv);
-      el_arg = force_reg (c2m_ctx, el_arg, MIR_T_I64);
+      /* Nothing above matched (e.g. a pointer-to-non-class element type, or
+         some other exotic T): fail loudly at compile time instead of handing
+         Add() a bogus unwrapped value that corrupts the collection at
+         runtime. */
+      error (c2m_ctx, pos,
+             "dict->collection bind: unsupported element type for '%s' "
+             "(Phase 3 supports scalars, String, nested class/struct by "
+             "value, and pointer-to-class elements)",
+             cname != NULL ? cname : "<class>");
+      el_arg = new_op (NULL, MIR_new_int_op (ctx, 0));
     }
     gen_class_method_call (c2m_ctx, add_def, cls_ptr_type, obj, &el_arg, 1);
   }
@@ -28153,8 +28213,19 @@ static void gen_dict_bind_into (c2m_ctx_t c2m_ctx, struct type *cls_type,
       /* Phase 2: pointer-to-collection field (List<T>* / Set<T>* / any class
          with a default ctor + Add(T)).  Build a heap collection from the dict
          array and store its pointer into the field.  The bound object owns the
-         new collection (its destructor must `delete` it, as List<T>::~List does). */
-      op_t coll = gen_dict_bind_collection_field (c2m_ctx, mtype, val_dv, pos);
+         new collection (its destructor must `delete` it, as List<T>::~List does).
+
+         Like the pointer-to-class branch below, this must stay ordered before
+         the generic scalar_type_p branch (true for every TM_PTR) or a
+         collection field would get "unwrapped" as a raw scalar instead of
+         recursively bound.
+
+         SIBLING: gen_dict_bind_collection_field has the matching pointer-to-
+         class *element* case (as opposed to this function's pointer-to-
+         collection *field* case), with the identical ordering requirement —
+         see the comment there for the bug this ordering prevents. Keep new
+         pointer-to-class dispatch cases in both functions in sync. */
+      op_t coll = gen_dict_bind_collection_field (c2m_ctx, mtype, val_dv, lenient, pos);
       coll = force_reg (c2m_ctx, coll, MIR_T_I64);
       MIR_type_t mir_t = get_mir_type (c2m_ctx, mtype);
       MIR_alias_t alias = get_type_alias (c2m_ctx, mtype);
@@ -29036,6 +29107,60 @@ static int subtree_retains_string_in_collection_p (node_t n) {
   return FALSE;
 }
 
+/* TRUE if the subtree stores a tracked `Any<I>` handle into a
+   handle-holding collection via a method call, e.g. `shapes->Add(any<Shape>(new
+   Circle(r)))` / `byName->Set(key, h)` where the receiver is a `List<Any<I>*>`
+   / `Set<Any<I>*>` / `Map<K, Any<I>*>`.  Mirrors
+   subtree_retains_string_in_collection_p exactly, but for the object arena:
+   the collection can outlive both a single loop iteration (per-iter release
+   would free an element still referenced by the collection) and the
+   enclosing function itself (a returned collection's contents would be freed
+   out from under the caller by the function-level release).  Used to gate
+   BOTH the per-iteration loop arena and the function-level arena for the
+   object side -- see gen_loop_body_scope_enter and the function-entry
+   checkpoint in the N_BLOCK gen case.
+
+   Detection is deliberately narrow, same rationale as the String version:
+   only fires when the receiver is a generic collection specialized on an
+   Any<I> handle type (mangled class name `__generic_*__Any_*`) AND an
+   argument's type is a pointer to a synthesized `__Any_<Interface>` erasure
+   class. That keeps ordinary handle usage (method calls on the handle,
+   passing it to a plain helper function to read) out of scope, so those
+   patterns stay eligible for automatic reclamation. */
+static int subtree_retains_object_in_collection_p (node_t n) {
+  if (n == NULL || node_is_leaf_p (n->code)) return FALSE;
+  if (n->code == N_CALL) {
+    node_t callee = NL_HEAD (n->u.ops);
+    if (callee != NULL && (callee->code == N_FIELD || callee->code == N_DEREF_FIELD)) {
+      node_t recv = NL_HEAD (callee->u.ops);
+      struct expr *re = recv == NULL ? NULL : (struct expr *) recv->attr;
+      const char *cname = NULL;
+      if (re != NULL && re->type != NULL) {
+        const struct type *t = re->type;
+        if (t->mode == TM_PTR) t = t->u.ptr_type;
+        cname = class_type_name (t);
+      }
+      if (cname != NULL && strncmp (cname, "__generic_", 10) == 0
+          && strstr (cname, "__Any_") != NULL) {
+        node_t args = NL_NEXT (callee);
+        if (args != NULL && args->code == N_LIST)
+          for (node_t a = NL_HEAD (args->u.ops); a != NULL; a = NL_NEXT (a)) {
+            struct expr *ae = (struct expr *) a->attr;
+            const char *acn = NULL;
+            if (ae != NULL && ae->type != NULL && ae->type->mode == TM_PTR)
+              acn = class_type_name (ae->type->u.ptr_type);
+            if (acn != NULL && strncmp (acn, "__Any_", 6) == 0) return TRUE;
+          }
+      }
+    }
+  }
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c)) {
+    if (c->code == N_FUNC_DEF) continue; /* separate scope */
+    if (subtree_retains_object_in_collection_p (c)) return TRUE;
+  }
+  return FALSE;
+}
+
 /* Per-loop-body arena scope helpers --------------------------------------
    Layered inside the function-level str_scope_X / obj_scope_X state: each
    loop iteration emits a fresh checkpoint at the top of the body and a
@@ -29075,11 +29200,13 @@ static void gen_loop_body_scope_enter (c2m_ctx_t c2m_ctx, node_t body,
      is lost). */
   int safe_for_per_iter = !subtree_assigns_tracked_id_p (body)
                           && !subtree_retains_string_in_collection_p (body);
+  int safe_for_per_iter_obj = safe_for_per_iter
+                              && !subtree_retains_object_in_collection_p (body);
   if (safe_for_per_iter && subtree_allocates_string_p (body)) {
     loop_str_scope_mark = gen_str_checkpoint (c2m_ctx);
     loop_str_scope_active = TRUE;
   }
-  if (safe_for_per_iter && subtree_allocates_object_p (body)) {
+  if (safe_for_per_iter_obj && subtree_allocates_object_p (body)) {
     loop_obj_scope_mark = gen_obj_checkpoint (c2m_ctx);
     loop_obj_scope_active = TRUE;
   }
@@ -33870,14 +33997,33 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       loop_str_scope_active = FALSE;
       loop_obj_scope_active = FALSE;
       loop_break_label_for_scope = NULL;
-      if (subtree_allocates_string_p (stmt)) {
+      /* Skip when the body retains a String into a collection anywhere
+         (list->Add(s) / map[k] = s on a String-typed collection): such a
+         collection may escape this function (e.g. via return) with the
+         String still referenced, so releasing at this function's exit would
+         free it out from under whoever ends up holding the collection --
+         same reasoning as the object-arena gate below, and the same bug
+         shape as the Any<I> collection-escape fix (SHORTCOMINGS.md).
+         subtree_retains_string_in_collection_p already existed (used only
+         for the per-loop gate below) but was never applied here. */
+      if (subtree_allocates_string_p (stmt)
+          && !subtree_retains_string_in_collection_p (stmt)) {
         str_scope_mark = gen_str_checkpoint (c2m_ctx);
         str_scope_active = TRUE;
       }
       /* Automatic object-arena (Any<I> handle) reclamation: checkpoint here and
-         release at every exit so handles placed into collections are destroyed
-         (running ~__Any_I, freeing the wrapped concrete) when the scope ends. */
-      if (subtree_allocates_object_p (stmt)) {
+         release at every exit so handles that don't escape are destroyed
+         (running ~__Any_I, freeing the wrapped concrete) when the scope ends.
+         Skip entirely when the body retains a handle into a collection
+         (subtree_retains_object_in_collection_p): such a collection may be
+         returned (or otherwise escape) with the handle still referenced, and
+         releasing at this function's exit would free it out from under
+         whoever ends up holding the collection. Handles built by a function
+         like that fall back to ordinary heap-pointer semantics -- the
+         collection (or its final owner) is responsible for them, same as any
+         other List<T*> of owned pointers. */
+      if (subtree_allocates_object_p (stmt)
+          && !subtree_retains_object_in_collection_p (stmt)) {
         obj_scope_mark = gen_obj_checkpoint (c2m_ctx);
         obj_scope_active = TRUE;
       }
@@ -35370,6 +35516,35 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       size_t try_defer_mark = VARR_LENGTH (node_t, defer_stmts);
       VARR_PUSH (node_t, defer_stmts, CY_EXC_POP_MARKER);
 
+      /* SHORTCOMINGS.md gotcha #10 fix (String/object arena half): the
+         String and object (Any<I>) arenas are global thread-local
+         high-water-mark stacks (checkpoint() reads the count, release_to(m)
+         truncates back to it) -- unlike defer_stmts, they don't care which
+         function pushed an entry, so releasing back to a mark taken here
+         correctly reclaims everything allocated since this try started, no
+         matter how many call frames deep the throw happened in.
+
+         The marks are banked into cy_exc's own frame-stack via
+         cy_exc_set_marks() (called here, before the try body can throw)
+         rather than kept in a local temp across the try body: a value merely
+         held in a MIR-generated register/temp between here and the
+         exception-dispatch label is NOT reliably preserved across a
+         setjmp/longjmp span -- MIR-gen has no model of longjmp as an
+         implicit second entry point into this code, so it can (and does)
+         place such a value in a register that the try body's own codegen
+         then clobbers. Banking into cy_exc's plain-C-runtime frame array and
+         re-reading fresh after the jump (cy_exc_current_str_mark /
+         cy_exc_current_obj_mark, called on the dispatch path below, before
+         cy_exc_pop) sidesteps that hazard entirely. */
+      {
+        op_t str_mark = gen_str_checkpoint (c2m_ctx);
+        op_t obj_mark = gen_obj_checkpoint (c2m_ctx);
+        MIR_op_t mark_args[2];
+        mark_args[0] = str_mark.mir_op;
+        mark_args[1] = obj_mark.mir_op;
+        gen_rt_call_void (c2m_ctx, cy_exc_set_marks_proto, cy_exc_set_marks_item, 2, mark_args);
+      }
+
       /* --- normal path: run protected body, unwind frame, done --- */
       gen (c2m_ctx, body, NULL, NULL, FALSE, NULL, NULL);
       {
@@ -35387,9 +35562,19 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
          (dispatch) path below pops the frame explicitly at runtime. */
       VARR_TRUNC (node_t, defer_stmts, try_defer_mark);
 
-      /* --- exception path: pop our frame, then dispatch on the thrown id --- */
+      /* --- exception path: read back the banked marks (must happen BEFORE
+         cy_exc_pop(), which decrements the depth these are indexed by), pop
+         our frame, reclaim Strings/Any<I> handles allocated since try-entry
+         (anywhere on the call chain -- see the comment above), then dispatch
+         on the thrown id --- */
       emit_label_insn_opt (c2m_ctx, dispatch_label);
+      op_t dispatch_str_mark
+        = gen_rt_call (c2m_ctx, cy_exc_current_str_mark_proto, cy_exc_current_str_mark_item, 0, NULL);
+      op_t dispatch_obj_mark
+        = gen_rt_call (c2m_ctx, cy_exc_current_obj_mark_proto, cy_exc_current_obj_mark_item, 0, NULL);
       gen_rt_call_void (c2m_ctx, cy_exc_pop_proto, cy_exc_pop_item, 0, NULL);
+      gen_str_release_to (c2m_ctx, dispatch_str_mark.mir_op);
+      gen_obj_release_to (c2m_ctx, dispatch_obj_mark.mir_op);
       op_t excp = gen_rt_call (c2m_ctx, cy_exc_current_proto, cy_exc_current_item, 0, NULL);
       excp = force_reg (c2m_ctx, excp, MIR_T_I64);
       op_t tid = get_new_temp (c2m_ctx, MIR_T_I64);

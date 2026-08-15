@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 /* Include dict.h to make dict runtime functions available to the import resolver */
+#define DICT_CLASSYC_INTERNAL
 #include "dict.h"
 /* Include cstring.h to make the UTF-8 String runtime available to the resolver */
 #include "cstring.h"
@@ -672,6 +673,9 @@ static void *import_resolver (const char *name) {
     if (strcmp (name, "cy_exc_current") == 0) return (void *) cy_exc_current;
     if (strcmp (name, "cy_exc_throw") == 0) return (void *) cy_exc_throw;
     if (strcmp (name, "cy_exc_active") == 0) return (void *) cy_exc_active;
+    if (strcmp (name, "cy_exc_set_marks") == 0) return (void *) cy_exc_set_marks;
+    if (strcmp (name, "cy_exc_current_str_mark") == 0) return (void *) cy_exc_current_str_mark;
+    if (strcmp (name, "cy_exc_current_obj_mark") == 0) return (void *) cy_exc_current_obj_mark;
     if (strcmp (name, "_safety_trap") == 0) return (void *) _safety_trap;
     if (strcmp (name, "cy_safe_alloc") == 0) return (void *) cy_safe_alloc;
     if (strcmp (name, "cy_safe_free") == 0) return (void *) cy_safe_free;
@@ -1326,6 +1330,15 @@ int main (int argc, char *argv[], char *env[]) {
           fprintf (stderr, "  execution       -- %.0f usec\n", real_usec_time () - start_time);
           fprintf (stderr, "exit code: %lu\n", (long unsigned) result_code);
         }
+        /* Real exit here, not a fall-through return from this main(): any
+           atexit() the .cy program registered (e.g. cobjarena.h's leak
+           sweep) holds a function pointer into MIR-interpreted code that
+           MIR_finish() below tears down. libc only runs atexit callbacks
+           when the process actually terminates, so if we let control fall
+           through to MIR_finish() first, the callback fires against freed
+           state. Exiting now runs them while everything is still live. */
+        fflush (NULL);
+        exit (result_code);
       } else {
         int fun_argc = (int) VARR_LENGTH (char_ptr_t, exec_argv);
         const char **fun_argv = VARR_ADDR (char_ptr_t, exec_argv);
@@ -1367,7 +1380,15 @@ int main (int argc, char *argv[], char *env[]) {
                    (real_usec_time () - start_time) / 1000.0);
           fprintf (stderr, "exit code: %d\n", result_code);
         }
-        MIR_gen_finish (main_ctx);
+        /* Real exit here, not a fall-through return from this main(): any
+           atexit() the .cy program registered (e.g. cobjarena.h's leak
+           sweep) holds a JIT-compiled function pointer. MIR_gen_finish()
+           below unmaps that generated code, and libc only runs atexit
+           callbacks when the process actually terminates -- so falling
+           through first means the callback fires into unmapped memory.
+           Exiting now runs it while the code is still live. */
+        fflush (NULL);
+        exit (result_code);
       }
     }
   }

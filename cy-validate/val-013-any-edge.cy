@@ -65,7 +65,7 @@ class Frame {
     String      title;
     Frame(String title, Any<Shape>* inner) { this.title = title; this.inner = inner; }
     double inner_area() { return this.inner->area(); }   /* delegate via handle */
-    ~Frame() {}
+    ~Frame() { delete inner; }   /* Frame owns the handle it composes */
 };
 
 /* Free functions over the erased type. */
@@ -75,8 +75,14 @@ Any<Shape>* bigger_circle(double r) { return any<Shape>(new Circle(r)); }
 int main() {
     printf("=== val-013 Any<I> edge cases ===\n\n");
 
-    /* non-void returns + String return through the erased handle */
+    /* non-void returns + String return through the erased handle.
+       NOTE (see SHORTCOMINGS.md): since this function also retains a handle
+       into a collection below (shapes->Add / byName[k] =), the automatic
+       object-arena checkpoint is disabled for this whole function -- every
+       Any<I>* handle built directly in main() now needs an explicit
+       `defer delete`, same as any other owned pointer. */
     Any<Shape>* c = any<Shape>(new Circle(2.0));
+    defer delete c;
     check(approx(c->area(), 12.56636), "erased non-void (double) return");
     check(strcmp((char*)c->name(), "circle") == 0, "erased String return");
 
@@ -86,16 +92,19 @@ int main() {
 
     /* structural conformance dispatches correctly */
     Any<Shape>* sq = any<Shape>(new Square(3.0));
+    defer delete sq;
     check(approx(sq->area(), 9.0) && strcmp((char*)sq->name(), "square") == 0,
           "structural (no-impl) class dispatches via Any");
 
     /* pass handle to a function / return handle from a function */
     check(approx(area_of(sq), 9.0), "pass Any<Shape>* into a function");
     Any<Shape>* mc = bigger_circle(5.0);
+    defer delete mc;
     check(approx(mc->area(), 78.53975), "return Any<Shape>* from a function");
 
-    /* heterogeneous List<Any<Shape>*> */
+    /* heterogeneous List<Any<Shape>*> -- .owns() so ~List deletes each handle */
     List<Any<Shape>*>* shapes = new List<Any<Shape>*>();
+    shapes->owns();
     defer delete shapes;
     shapes->Add(any<Shape>(new Circle(1.0)));
     shapes->Add(any<Shape>(new Square(2.0)));
@@ -103,8 +112,9 @@ int main() {
     double lt = 0; for (auto s in shapes) lt += s->area();
     check(approx(lt, 3.14159 + 4.0 + 28.27431), "List<Any<Shape>*> for-in sums areas");
 
-    /* heterogeneous Map<String, Any<Shape>*> */
+    /* heterogeneous Map<String, Any<Shape>*> -- ownsValues() so ~Map deletes each handle */
     Map<String, Any<Shape>*>* byName = new Map<String, Any<Shape>*>();
+    byName->ownsValues();
     defer delete byName;
     byName["unit-circle"] = any<Shape>(new Circle(1.0));
     byName["2x2-square"]  = any<Shape>(new Square(2.0));
@@ -119,7 +129,9 @@ int main() {
 
     /* same concrete class behind two handles (distinct objects) */
     Any<Shape>* s1 = any<Shape>(new Square(2.0));
+    defer delete s1;
     Any<Shape>* s2 = any<Shape>(new Square(5.0));
+    defer delete s2;
     check(approx(s1->area(), 4.0) && approx(s2->area(), 25.0),
           "two independent handles of the same class don't alias");
 
@@ -130,7 +142,9 @@ int main() {
        Note `Named` shares the name() method with `Shape`, exercising the
        shared-thunk path too. */
     Any<Shape>* dual_shape = any<Shape>(new Square(2.0));   /* Square -> Shape  */
+    defer delete dual_shape;
     Any<Named>* dual_named = any<Named>(new Square(7.0));   /* Square -> Named  */
+    defer delete dual_named;
     check(approx(dual_shape->area(), 4.0), "same class erased to interface #1 (Shape)");
     check(strcmp((char*)dual_named->name(), "square") == 0,
           "same class erased to interface #2 (Named) — E1 fixed");

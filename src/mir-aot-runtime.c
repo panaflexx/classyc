@@ -5,6 +5,7 @@
 #define C2M_OBJ_API
 #include "cobjarena.h"
 #define C2M_DICT_API
+#define DICT_CLASSYC_INTERNAL
 #include "dict.h"
 #define C2M_EXC_API
 #include "cyexc.h"

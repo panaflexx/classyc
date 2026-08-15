@@ -15,6 +15,7 @@
 #define MAP_ANONYMOUS MAP_ANON
 #endif
 #endif
+#define DICT_CLASSYC_INTERNAL
 #include "dict.h"
 #include "cstring.h"
 #include "cobjarena.h"
@@ -117,6 +118,9 @@ static void *import_resolver(const char *name){
     if(strcmp(name,"cy_exc_current")==0) return (void*)cy_exc_current;
     if(strcmp(name,"cy_exc_throw")==0) return (void*)cy_exc_throw;
     if(strcmp(name,"cy_exc_active")==0) return (void*)cy_exc_active;
+    if(strcmp(name,"cy_exc_set_marks")==0) return (void*)cy_exc_set_marks;
+    if(strcmp(name,"cy_exc_current_str_mark")==0) return (void*)cy_exc_current_str_mark;
+    if(strcmp(name,"cy_exc_current_obj_mark")==0) return (void*)cy_exc_current_obj_mark;
     if(strcmp(name,"_safety_trap")==0) return (void*)_safety_trap;
     if(strcmp(name,"cy_safe_alloc")==0) return (void*)cy_safe_alloc;
     if(strcmp(name,"cy_safe_free")==0) return (void*)cy_safe_free;
