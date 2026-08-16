@@ -23,18 +23,25 @@ B2OBJ   := $(ROOT)/build/bin/b2obj
 AOT_SH  := $(ROOT)/classyc-aot.sh
 # -ffibers: go / Chan / cy_sched (workers mode).  Always on so one binary
 # covers blocking + fibers + workers without a rebuild.
-CYFLAGS := -I $(ROOT)/include -I $(ROOT)/ext/ccchan -ffibers -l sqlite3
+#
+# http-serve-fibers.c is NOT used (see main.cy's "fibers" mode comment): it
+# #includes ext/ccchan/minicoro.h directly, which classyc's parser can't
+# accept (a hand-written top-level __asm__ block for the coroutine context
+# switch) -- and even a parser fix wouldn't help, since MIR has no mechanism
+# to emit raw inline assembly at all. http-serve-cchan.c (plain pthreads,
+# no coroutines) replaces it.
+CYFLAGS := -I $(ROOT)/include -I $(ROOT)/ext/ccchan -ffibers -w -l sqlite3
 
 # Server cores + app.  JIT resolves all externs at load time, so include
 # every mode even when only one is selected at runtime.
 SRC := $(ROOT)/examples/http-serve.c \
-       $(ROOT)/examples/http-serve-fibers.c \
+       $(ROOT)/examples/http-serve-cchan.c \
        $(ROOT)/examples/http-serve-workers.cy \
        main.cy items.cy
 
 # Paths relative to ROOT for classyc-aot.sh (it resolves tools from repo root).
 AOT_SRC := examples/http-serve.c \
-           examples/http-serve-fibers.c \
+           examples/http-serve-cchan.c \
            examples/http-serve-workers.cy \
            examples/http_crud/main.cy \
            examples/http_crud/items.cy
@@ -75,15 +82,18 @@ test-workers:
 # ── AOT (native binary via classyc-aot.sh) ─────────────────────────────
 # Drive from $(ROOT) so tools/runtime resolve correctly.  Override C2M/B2OBJ
 # to the *build* tree (repo bin/ can lag behind).  -ffibers → CHANFIBERS in
-# mir-aot-runtime; http-serve-fibers.c skips MINICORO_IMPL when CHANFIBERS is
-# set so mco_* is only defined once.  GNU ld provides
-# __start_cyreg_routes / __stop_cyreg_routes for the cyreg_routes section.
+# mir-aot-runtime, which links a full cchan_t implementation of its own;
+# -D CY_FIBERS_PROVIDE_CCHAN tells http-serve-cchan.c to skip its own copy
+# so the two don't collide as duplicate symbols in the final native link
+# (harmless under JIT above, a hard error under AOT -- see that file's
+# comment).  GNU ld provides __start_cyreg_routes / __stop_cyreg_routes for
+# the cyreg_routes section.
 
 aot: $(BIN)
 
 $(BIN): $(SRC) $(AOT_SH) $(CLASSYC) $(B2OBJ)
 	cd $(ROOT) && C2M=$(CLASSYC) B2OBJ=$(B2OBJ) $(AOT_SH) \
-	    -I include -I ext/ccchan -ffibers -l sqlite3 \
+	    -I include -I ext/ccchan -ffibers -l sqlite3 -D CY_FIBERS_PROVIDE_CCHAN \
 	    $(AOT_SRC) -o examples/http_crud/$(BIN)
 
 aot-test: $(BIN)

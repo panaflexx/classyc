@@ -5,14 +5,26 @@
  *
  * Modes:
  *   test       in-process CRUD (no sockets)
- *   blocking   serve(port)          — single-thread accept → handle
- *   fibers     serve_fibers(port)   — one fiber per connection, 1 OS thread
- *   workers    serve_workers(port,N)— multi-OS-thread pool + Chan fan-out
+ *   blocking   serve(port)                — single-thread accept → handle
+ *   fibers     serve_workers_cchan(port,1)— 1 dedicated pthread worker
+ *   workers    serve_workers(port,N)      — multi-OS-thread pool + Chan fan-out
+ *
+ * "fibers" used to mean serve_fibers(port) from http-serve-fibers.c: one
+ * minicoro coroutine per connection, cooperatively multiplexed on a single
+ * OS thread via non-blocking sockets. That file #includes ext/ccchan/
+ * minicoro.h directly, which classyc's parser can't accept (a hand-written
+ * top-level __asm__ block for the coroutine context switch) -- and MIR has
+ * no mechanism to emit raw inline assembly at all, so this isn't just a
+ * parser gap. serve_workers_cchan(port, 1) (examples/http-serve-cchan.c) is
+ * the nearest available substitute: it still keeps request handling off the
+ * accept thread, just serially on one dedicated worker rather than
+ * N-way-interleaved on the accept thread itself. Real N-way concurrency
+ * still lives in "workers" mode.
  *
  * Self-test (no sockets):
  *
  *   ./bin/classyc -I include -I ext/ccchan -ffibers -l sqlite3 \
- *       examples/http-serve.c examples/http-serve-fibers.c \
+ *       examples/http-serve.c examples/http-serve-cchan.c \
  *       examples/http-serve-workers.cy \
  *       examples/http_crud/main.cy examples/http_crud/items.cy -eg -- test
  *
@@ -121,6 +133,6 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     if (workers) return serve_workers(port, nworkers);
-    if (fibers)  return serve_fibers(port);
+    if (fibers)  return serve_workers_cchan(port, 1);
     return serve(port);
 }

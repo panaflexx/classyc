@@ -15900,23 +15900,49 @@ static const char *ensure_defer_thunk (c2m_ctx_t c2m_ctx,
 
      Insertion point: before curr_module_item during the check pass (so gen
      emits the thunk before the function that references it). The ownership
-     pass's `owned` hook calls us AFTER check, when module_item_list has been
-     restored to NULL; then append at the end of module_items_root (the same
-     list, stashed at N_MODULE check entry) -- gen handles the forward
-     reference via MIR_new_forward (see gen_defer_shadow_push). */
+     pass's `owned` hook calls us AFTER check (module_item_list has been
+     restored to NULL) but BEFORE gen_mir/top_gen ever walks module_items_root
+     (the same list, stashed at N_MODULE check entry) -- ownership_run always
+     completes before gen_mir starts, per c2mir_compile's pipeline. So prepend
+     rather than append: gen still walks the list front-to-back, and putting
+     every ownership-synthesized thunk at the front makes it generate (a real
+     MIR_func_item, not just a MIR_new_forward stand-in) before ANY function
+     that might reference it, however early. This matters beyond tidiness --
+     MIR's binary (.bmir) writer serializes items in this same order, and its
+     reader resolves a name reference against whatever's already in the
+     module's item table *at that point in the stream*; a forward item
+     created only when the first reference is gen'd (mid-body, well after
+     that referencing function's own item already exists earlier in the
+     list) serializes AFTER its own first use, which round-trips fine for
+     JIT (MIR_link works off the live in-memory graph, order-independent)
+     but made b2obj's AOT read fail with "not found item __thunk_dtor_X".
+     Prepending removes the ordering hazard instead of relying on
+     MIR_finish_module's in-memory-only forward/real unification to paper
+     over stream order that a subsequent write+read doesn't preserve. */
   {
     node_t root = module_item_list != NULL ? module_item_list : module_items_root;
     if (items != NULL && root != NULL) {
       node_t arr[8];
       int n = 0;
       for (node_t it = NL_HEAD (items->u.ops); it != NULL && n < 8; it = NL_NEXT (it)) arr[n++] = it;
-      for (int k = 0; k < n; k++) {
-        NL_REMOVE (items->u.ops, arr[k]);
-        if (curr_module_item != NULL)
+      if (curr_module_item != NULL) {
+        for (int k = 0; k < n; k++) {
+          NL_REMOVE (items->u.ops, arr[k]);
           DLIST_INSERT_BEFORE (node_t, root->u.ops, curr_module_item, arr[k]);
-        else
-          DLIST_APPEND (node_t, root->u.ops, arr[k]);
-        check_lambda_func_def (c2m_ctx, arr[k]);
+          check_lambda_func_def (c2m_ctx, arr[k]);
+        }
+      } else {
+        /* Prepend in order: inserting each at the head one at a time would
+           reverse them, so insert-before-current-head as we go instead. */
+        for (int k = n; k-- > 0;) {
+          NL_REMOVE (items->u.ops, arr[k]);
+          node_t head = DLIST_HEAD (node_t, root->u.ops);
+          if (head != NULL)
+            DLIST_INSERT_BEFORE (node_t, root->u.ops, head, arr[k]);
+          else
+            DLIST_APPEND (node_t, root->u.ops, arr[k]);
+          check_lambda_func_def (c2m_ctx, arr[k]);
+        }
       }
     }
   }

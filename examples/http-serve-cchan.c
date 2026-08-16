@@ -40,8 +40,19 @@
  *
  * (-w quiets false-positive ownership warnings the analyzer raises walking
  * cchan.h's own free paths, same as classy-cchan.cy.)
- */
+ *
+ * If also linking -ffibers' go/Chan<T> runtime in the same build (e.g. an
+ * app that picks a server core at runtime), pass -D CY_FIBERS_PROVIDE_CCHAN
+ * on the classyc command line: cyfiber.h's CYFIBER_IMPLEMENTATION already
+ * compiles a full cchan_t implementation into mir-aot-runtime.c (AOT, under
+ * -DCHANFIBERS) / the driver (JIT), so this file's own CCHAN_IMPLEMENTATION
+ * would otherwise fight it for the same C symbol names -- harmless under
+ * JIT (MIR_link doesn't need global uniqueness), but a "multiple
+ * definition" link error under AOT, where both land in real, separately
+ * gcc-compiled .o files. */
+#ifndef CY_FIBERS_PROVIDE_CCHAN
 #define CCHAN_IMPLEMENTATION
+#endif
 #include "cchan.h"
 #include "httpserve.h"
 #include <pthread.h>

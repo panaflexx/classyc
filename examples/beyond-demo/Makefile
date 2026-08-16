@@ -16,6 +16,11 @@ AOT_SH  ?= ./classyc-aot.sh
 # an unlinked serve_* would fail to load even on a path never taken.
 SERVER_SRCS = ../../examples/http-serve.c ../../examples/http-serve-workers.cy \
               ../../examples/http-serve-cchan.c
+# NOTE: no -D CY_FIBERS_PROVIDE_CCHAN here on purpose. Under JIT, -ffibers'
+# cchan_t usage is entirely internal to the precompiled driver binary (never
+# exposed as an importable symbol), so http-serve-cchan.c must still bring
+# its own CCHAN_IMPLEMENTATION for raw cchan_* calls to resolve at all --
+# unlike the AOT link below, there's no real-symbol collision to avoid here.
 SERVER_FLAGS = -I ../../include -I ../../ext/ccchan -ffibers -w
 
 .PHONY: all core server test server-test server-cchan server-test-cchan \
@@ -54,7 +59,7 @@ stress-customers:
 # flags as SERVER_FLAGS above, just repo-root-relative instead of
 # this-dir-relative since `cd ../..` changes where "." is.)
 aot:
-	cd ../.. && $(AOT_SH) -I include -I ext/ccchan -ffibers -w \
+	cd ../.. && $(AOT_SH) -I include -I ext/ccchan -ffibers -w -D CY_FIBERS_PROVIDE_CCHAN \
 	    examples/http-serve.c examples/http-serve-workers.cy \
 	    examples/http-serve-cchan.c \
 	    examples/beyond-demo/classyc-db-server.cy \

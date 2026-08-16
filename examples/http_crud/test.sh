@@ -28,8 +28,8 @@ esac
 echo "== http_crud integration test: $MODE server on :$PORT (log: $LOG)"
 
 # shellcheck disable=SC2086
-"$CLASSYC" -I "$ROOT/include" -I "$ROOT/ext/ccchan" -ffibers -l sqlite3 \
-    "$ROOT/examples/http-serve.c" "$ROOT/examples/http-serve-fibers.c" \
+"$CLASSYC" -I "$ROOT/include" -I "$ROOT/ext/ccchan" -ffibers -w -l sqlite3 \
+    "$ROOT/examples/http-serve.c" "$ROOT/examples/http-serve-cchan.c" \
     "$ROOT/examples/http-serve-workers.cy" \
     "$HERE/main.cy" "$HERE/items.cy" \
     -eg -- $MODEARGS --port="$PORT" >"$LOG" 2>&1 &
