@@ -69,8 +69,71 @@ typedef struct {
 static _Thread_local jmp_buf        cy__exc_frames[CY_EXC_MAX_DEPTH];
 static _Thread_local size_t         cy__exc_str_marks[CY_EXC_MAX_DEPTH];
 static _Thread_local size_t         cy__exc_obj_marks[CY_EXC_MAX_DEPTH];
+static _Thread_local size_t         cy__exc_defer_marks[CY_EXC_MAX_DEPTH];
 static _Thread_local int            cy__exc_depth = 0;
 static _Thread_local cy_exception_t cy__exc_current = {0, 0, 0, 0};
+
+/* ── defer/owned cleanup stack ────────────────────────────────────────────
+ * A third arena alongside the String/object ones above, but its entries are
+ * *thunks* (a function pointer + one captured pointer argument) rather than
+ * passive buffers, because unwinding `defer`/`owned` cleanup means
+ * actually *calling* something, not just rewinding a high-water mark.
+ *
+ * The compiler pushes one entry here, at runtime, at the exact point each
+ * trackable cleanup is registered (`owned`'s auto-release or an explicit
+ * `defer delete <class-ptr>;` — never a stack-object RAII destructor: the
+ * arg is captured by value, and a stack address from an unwound frame is a
+ * dead-frame pointer) -- in addition to,
+ * not instead of, the existing compile-time defer_stmts replay that already
+ * runs these correctly on a normal return/break/continue/fall-through. That
+ * existing mechanism has no way to fire across a `throw`'s longjmp (it's
+ * tied to syntactic exit points the jump skips entirely); this shadow stack
+ * gives the exception-dispatch path something it can walk and invoke
+ * instead, since -- like the String/object marks -- it's plain global
+ * runtime state, reachable from any call depth, immune to the "value held
+ * in a register across setjmp/longjmp isn't reliably preserved" hazard.
+ *
+ * Kept in sync with the compile-time list: gen_run_defers() (the normal-exit
+ * path) discards (pops without calling) exactly the entries it replays via
+ * AST, so a later unrelated throw never re-invokes an already-run cleanup. */
+typedef void (*cy_defer_fn_t) (void *);
+typedef struct { void *arg; cy_defer_fn_t fn; } cy__defer_entry;
+#ifndef CY_DEFER_MAX_DEPTH
+#define CY_DEFER_MAX_DEPTH 1024
+#endif
+static _Thread_local cy__defer_entry cy__defer_stack[CY_DEFER_MAX_DEPTH];
+static _Thread_local size_t          cy__defer_len = 0;
+
+/* Register a pending cleanup thunk.  Silently drops on overflow (matches the
+   fixed-depth try-frame stack above) rather than aborting a running program
+   over bookkeeping for a safety net. */
+C2M_EXC_API void cy_defer_push (cy_defer_fn_t fn, void *arg) {
+  if (cy__defer_len >= CY_DEFER_MAX_DEPTH) return;
+  cy__defer_stack[cy__defer_len].fn = fn;
+  cy__defer_stack[cy__defer_len].arg = arg;
+  cy__defer_len++;
+}
+
+/* Opaque checkpoint of the current entry count. */
+C2M_EXC_API size_t cy_defer_checkpoint (void) { return cy__defer_len; }
+
+/* Drop the single most-recent entry WITHOUT invoking it: used by the normal
+   (non-exceptional) unwind path, which already ran the same cleanup via the
+   compile-time defer_stmts replay and just needs to keep this shadow stack
+   in sync. */
+C2M_EXC_API void cy_defer_discard_one (void) {
+  if (cy__defer_len > 0) cy__defer_len--;
+}
+
+/* Invoke and drop every entry above `mark`, LIFO: used on the exception-
+   dispatch path, which the normal AST-replay path never reaches. */
+C2M_EXC_API void cy_defer_release_to (size_t mark) {
+  if (mark > cy__defer_len) return;
+  while (cy__defer_len > mark) {
+    cy__defer_len--;
+    cy__defer_stack[cy__defer_len].fn (cy__defer_stack[cy__defer_len].arg);
+  }
+}
 
 /* Push a new frame; return a pointer to its jmp_buf for the inline setjmp(). */
 C2M_EXC_API void *cy_exc_push (void) {
@@ -93,11 +156,14 @@ C2M_EXC_API void cy_exc_pop (void) {
    in a register/temp across a setjmp/longjmp span are not reliably preserved
    by MIR-generated code, since MIR-gen has no model of longjmp as an
    implicit second entry point). This is plain C-compiled runtime state,
-   addressed by depth, so it is immune to that hazard. */
-C2M_EXC_API void cy_exc_set_marks (size_t str_mark, size_t obj_mark) {
+   addressed by depth, so it is immune to that hazard. Also banks the
+   defer-thunk-stack checkpoint (see the cy__defer_stack block above) for
+   the same reason and the same way. */
+C2M_EXC_API void cy_exc_set_marks (size_t str_mark, size_t obj_mark, size_t defer_mark) {
   if (cy__exc_depth > 0) {
     cy__exc_str_marks[cy__exc_depth - 1] = str_mark;
     cy__exc_obj_marks[cy__exc_depth - 1] = obj_mark;
+    cy__exc_defer_marks[cy__exc_depth - 1] = defer_mark;
   }
 }
 
@@ -109,6 +175,9 @@ C2M_EXC_API size_t cy_exc_current_str_mark (void) {
 }
 C2M_EXC_API size_t cy_exc_current_obj_mark (void) {
   return cy__exc_depth > 0 ? cy__exc_obj_marks[cy__exc_depth - 1] : 0;
+}
+C2M_EXC_API size_t cy_exc_current_defer_mark (void) {
+  return cy__exc_depth > 0 ? cy__exc_defer_marks[cy__exc_depth - 1] : 0;
 }
 
 /* Pointer to the current / last-thrown exception record. */
