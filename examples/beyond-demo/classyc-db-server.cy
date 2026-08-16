@@ -1,13 +1,22 @@
 /* classyc-db-server.cy — ClassyDB HTTP server.
  *
  * Build + run (JIT):
- *   ./bin/classyc -I include \
- *       examples/http-serve.c examples/beyond-demo/classyc-db-server.cy -eg
+ *   ./bin/classyc -I include -ffibers \
+ *       examples/http-serve.c examples/http-serve-workers.cy \
+ *       examples/beyond-demo/classyc-db-server.cy -eg
  *
  * Build + run (AOT):
- *   ./classyc-aot.sh -I include \
- *       examples/http-serve.c examples/beyond-demo/classyc-db-server.cy -o classyc-db
+ *   ./classyc-aot.sh -I include -ffibers \
+ *       examples/http-serve.c examples/http-serve-workers.cy \
+ *       examples/beyond-demo/classyc-db-server.cy -o classyc-db
  *   ./classyc-db
+ *
+ * Default (no argv) runs the `go`/`Chan<T>` fiber worker pool (serve_workers,
+ * see examples/http-serve-workers.cy, needs -ffibers). `serial` runs one
+ * connection at a time (http-serve.c, no -ffibers needed). `cchan` runs a
+ * plain pthread worker pool over ext/ccchan's cchan_t directly
+ * (serve_workers_cchan, examples/http-serve-cchan.c) — build with
+ * `-I ext/ccchan -w` instead of `-ffibers` for that one; see its own header.
  *
  * Test with curl:
  *   curl -s http://127.0.0.1:7099/api/users
@@ -26,8 +35,19 @@
 
 #include "httpserve.h"
 #include "classyc-db-engine.h"
+#include <pthread.h>
 
 Database* g_db;
+
+/* Database/Collection (classyc-db-engine.h) have no internal locking -- see
+   README.md "Concurrency model: why fibers, not pthreads/RW-locks". Once a
+   server core runs app_handle() from more than one real OS thread (any
+   serve_workers or serve_workers_cchan configuration with nworkers > 1), two
+   requests could mutate g_db at once without this. Coarse-grained on
+   purpose: it only serializes the DB-touching + stats-touching work inside
+   app_handle, not the socket I/O around it (parsing, connect, send/recv),
+   so concurrent connections still overlap on the part that's actually slow. */
+static pthread_mutex_t g_db_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Keep the cyreg_routes linker set non-empty for AOT links: with zero
    ROUTE() entries across all TUs, GNU ld provides no __start_/__stop_
@@ -185,6 +205,7 @@ Response* app_route(Request* req) {
 /* Entry point called by the server cores: routes the request and records
  * per-method HTTP op stats (app compute time — queue waits excluded). */
 Response* app_handle(Request* req) {
+    pthread_mutex_lock(&g_db_lock);
     double t0 = NowMs();
     Response* r = app_route(req);
     double ms = NowMs() - t0;
@@ -192,6 +213,7 @@ Response* app_handle(Request* req) {
     else if (req->IsPost())   g_http_post.add(ms);
     else if (req->IsPut())    g_http_put.add(ms);
     else if (req->IsDelete()) g_http_delete.add(ms);
+    pthread_mutex_unlock(&g_db_lock);
     return r;
 }
 
@@ -391,7 +413,15 @@ int main(int argc, char **argv) {
     g_db = new Database();
     g_start_ms = NowMs();
     printf("ClassyDB server starting...\n");
+    /* Every path below can run app_handle() from more than one real OS
+       thread (serve_workers/serve_workers_cchan both pin fibers/workers to
+       real pthreads once nworkers > 1) -- g_db_lock (above) is what makes
+       that safe, since Database/Collection have no locking of their own.
+       See README.md "Concurrency model: why fibers, not pthreads/RW-locks"
+       for why that used to force a single-OS-thread design instead. */
     if (argc > 1 && strcmp(argv[1], "serial") == 0)
-        return serve(7099);        /* one connection at a time (http-serve.c) */
-    return serve_fibers(7099);     /* default: one fiber per connection */
+        return serve(7099);                    /* one connection at a time (http-serve.c) */
+    if (argc > 1 && strcmp(argv[1], "cchan") == 0)
+        return serve_workers_cchan(7099, 8);   /* pthread worker pool (http-serve-cchan.c) */
+    return serve_workers(7099, 8);             /* default: go/Chan<T> fiber worker pool (-ffibers) */
 }

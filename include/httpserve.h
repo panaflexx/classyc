@@ -131,6 +131,7 @@ extern Response* app_handle(Request* req);
 extern int serve(int port);                      /* http-serve.c — blocking */
 extern int serve_fibers(int port);               /* http-serve-fibers.c */
 extern int serve_workers(int port, int nworkers); /* http-serve-workers.cy (-ffibers) */
+extern int serve_workers_cchan(int port, int nworkers); /* http-serve-cchan.c (pthreads, no fibers) */
 
 /* Shared listen / one-shot client helpers (http-serve.c).
    http_listen binds+listens and returns the listen fd, or -1 on error.

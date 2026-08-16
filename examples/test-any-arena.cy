@@ -1,14 +1,22 @@
 /* test-any-arena.c — Phase 2b: arena-managed Any<I> handles.
  *
- * "Collections are arena managed" (like String / dict): every `any<I>(...)`
- * handle is registered in a scope-bound object arena.  When the scope that
- * constructed it exits, the compiler automatically destroys each handle —
- * running ~__Any_I, which frees the wrapped concrete object via its dtor slot.
+ * Every `any<I>(...)` handle is registered in a scope-bound object arena.
+ * When the scope that constructed it exits *and the handle was never
+ * retained anywhere else*, the compiler automatically destroys it — running
+ * ~__Any_I, which frees the wrapped concrete object via its dtor slot.
  *
- * So the developer does NOT delete the handles or the concrete objects placed
- * into the list; the compiler reclaims them when they go out of scope.  Explicit
- * heap management (new/delete) remains available for things the dev owns
- * directly (here, the List container itself).
+ * That automatic reclamation stops the moment a handle is stored into a
+ * collection (`list->Add(any<I>(...))`): the collection may outlive this
+ * function (or even just this loop iteration), so auto-freeing at scope exit
+ * would risk freeing something the collection still points at. From that
+ * point the handle is an ordinary owned pointer, exactly like
+ * `List<Track*>`: the collection needs `.owns()` so its destructor deletes
+ * every element (see below), or each handle needs an explicit `delete`. See
+ * cy-validate/SHORTCOMINGS.md ("Any<I>* handles retained in a collection")
+ * and val-059-any-collection-escape.cy.
+ *
+ * Explicit heap management (new/delete) remains available for things the
+ * dev owns directly (here, the List container itself).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,12 +55,13 @@ class Text {
 };
 
 void build_and_render() {
-    /* The List is the only thing we manage by hand. */
+    /* The List frees only its own backing buffer (see ~List above), and a
+       handle stored into it is no longer auto-reclaimed at scope exit (see
+       the header comment) -- so we own deleting each handle by hand, same as
+       any other `List<Track*>`-shaped pointer collection without `.owns()`. */
     List<Any<View>*>* widgets = new List<Any<View>*>();
     defer delete widgets;
 
-    /* No `new`/`delete` bookkeeping for the elements: each handle (and the
-       Button/Text it wraps) is reclaimed automatically at function scope exit. */
     widgets->Add(any<View>(new Button("OK")));
     widgets->Add(any<View>(new Text("hello")));
     widgets->Add(any<View>(new Button("Cancel")));
@@ -60,8 +69,10 @@ void build_and_render() {
     printf("-- render (count = %d) --\n", widgets->Count());
     for (auto v in widgets) v->render();
 
-    printf("-- leaving scope: arena reclaims handles (LIFO) --\n");
-    /* on return: ~Cancel, ~hello, ~OK run automatically, then `defer delete widgets` */
+    printf("-- leaving scope: deleting handles by hand (LIFO) --\n");
+    for (int i = widgets->Count() - 1; i >= 0; i--) delete widgets->Get(i);
+    /* on return: ~Cancel, ~hello, ~OK already ran above, then `defer delete
+       widgets` frees just the List's own backing buffer. */
 }
 
 int main() {

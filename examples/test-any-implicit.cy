@@ -11,7 +11,10 @@
  *
  *     new List<Any<View>*>{ new Button("Save"), new Text("world") };
  *
- * Handles remain arena-managed: no manual delete of the elements is needed.
+ * Handles are arena-managed only until stored into a collection: once a
+ * handle is retained via `Add`/brace-init, it's an ordinary owned pointer
+ * (like `List<Track*>`) and needs an explicit `delete` -- see
+ * cy-validate/SHORTCOMINGS.md ("Any<I>* handles retained in a collection").
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +66,7 @@ int main() {
     a->Add(new Text("hello"));
     a->Add(new Button("Cancel"));
     render_all(a);
+    for (int i = a->Count() - 1; i >= 0; i--) delete a->Get(i);
 
     /* (2) declarative brace-initializer — each element auto-wrapped */
     printf("\n-- b: new List<Any<View>*>{ ... } --\n");
@@ -73,7 +77,8 @@ int main() {
     };
     defer delete b;
     render_all(b);
+    for (int i = b->Count() - 1; i >= 0; i--) delete b->Get(i);
 
-    printf("\n-- leaving main: arena reclaims all handles --\n");
+    printf("\n-- leaving main: handles deleted by hand above --\n");
     return 0;
 }
