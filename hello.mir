@@ -1,0 +1,8 @@
+M0:	module
+hello:	func	i32
+
+# 0 args, 0 locals, 0 globals
+	ret	42
+	endfunc
+	export	hello
+	endmodule

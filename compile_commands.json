@@ -1,0 +1,242 @@
+[
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc",
+  "command": "/usr/bin/cc  -I/home/rdavenpo/src/MIR/classyc/ext/mir -I/home/rdavenpo/src/MIR/classyc/include -I/home/rdavenpo/src/MIR/classyc/ext/ccchan -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -o CMakeFiles/classyc.dir/src/classyc.c.o -c /home/rdavenpo/src/MIR/classyc/src/classyc.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/src/classyc.c",
+  "output": "CMakeFiles/classyc.dir/src/classyc.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc",
+  "command": "/usr/bin/cc  -I/home/rdavenpo/src/MIR/classyc/ext/mir -I/home/rdavenpo/src/MIR/classyc/include -I/home/rdavenpo/src/MIR/classyc/ext/ccchan -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -o CMakeFiles/classyc.dir/src/classyc-driver.c.o -c /home/rdavenpo/src/MIR/classyc/src/classyc-driver.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/src/classyc-driver.c",
+  "output": "CMakeFiles/classyc.dir/src/classyc-driver.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc",
+  "command": "/usr/bin/cc  -I/home/rdavenpo/src/MIR/classyc/ext/mir -I/home/rdavenpo/src/MIR/classyc/include -I/home/rdavenpo/src/MIR/classyc/ext/ccchan -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -o CMakeFiles/classyc.dir/src/cyfiber.c.o -c /home/rdavenpo/src/MIR/classyc/src/cyfiber.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/src/cyfiber.c",
+  "output": "CMakeFiles/classyc.dir/src/cyfiber.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc",
+  "command": "/usr/bin/cc  -I/home/rdavenpo/src/MIR/classyc/ext/mir -I/home/rdavenpo/src/MIR/classyc/include -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -o CMakeFiles/classyc-lsp.dir/src/classyc.c.o -c /home/rdavenpo/src/MIR/classyc/src/classyc.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/src/classyc.c",
+  "output": "CMakeFiles/classyc-lsp.dir/src/classyc.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc",
+  "command": "/usr/bin/cc  -I/home/rdavenpo/src/MIR/classyc/ext/mir -I/home/rdavenpo/src/MIR/classyc/include -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -o CMakeFiles/classyc-lsp.dir/src/classyc-lsp.c.o -c /home/rdavenpo/src/MIR/classyc/src/classyc-lsp.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/src/classyc-lsp.c",
+  "output": "CMakeFiles/classyc-lsp.dir/src/classyc-lsp.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc",
+  "command": "/usr/bin/cc  -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -o CMakeFiles/b2obj.dir/src/b2obj.c.o -c /home/rdavenpo/src/MIR/classyc/src/b2obj.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/src/b2obj.c",
+  "output": "CMakeFiles/b2obj.dir/src/b2obj.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/mir.dir/mir.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir.c",
+  "output": "ext/mir/CMakeFiles/mir.dir/mir.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/mir.dir/mir-gen.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-gen.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-gen.c",
+  "output": "ext/mir/CMakeFiles/mir.dir/mir-gen.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/mir.dir/mir-tls.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tls.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tls.c",
+  "output": "ext/mir/CMakeFiles/mir.dir/mir-tls.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -Wunused-function -o CMakeFiles/mir.dir/c2mir/c2mir.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/c2mir/c2mir.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/c2mir/c2mir.c",
+  "output": "ext/mir/CMakeFiles/mir.dir/c2mir/c2mir.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/mir.dir/mir-debug-gdb.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-debug-gdb.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-debug-gdb.c",
+  "output": "ext/mir/CMakeFiles/mir.dir/mir-debug-gdb.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/c2m.dir/c2mir/c2mir-driver.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/c2mir/c2mir-driver.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/c2mir/c2mir-driver.c",
+  "output": "ext/mir/CMakeFiles/c2m.dir/c2mir/c2mir-driver.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/m2b.dir/mir-utils/m2b.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-utils/m2b.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-utils/m2b.c",
+  "output": "ext/mir/CMakeFiles/m2b.dir/mir-utils/m2b.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/b2m.dir/mir-utils/b2m.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-utils/b2m.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-utils/b2m.c",
+  "output": "ext/mir/CMakeFiles/b2m.dir/mir-utils/b2m.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/b2ctab.dir/mir-utils/b2ctab.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-utils/b2ctab.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-utils/b2ctab.c",
+  "output": "ext/mir/CMakeFiles/b2ctab.dir/mir-utils/b2ctab.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -I/usr/lib/llvm-18/include -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/l2m.dir/llvm2mir/llvm2mir.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/llvm2mir/llvm2mir.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/llvm2mir/llvm2mir.c",
+  "output": "ext/mir/CMakeFiles/l2m.dir/llvm2mir/llvm2mir.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -I/usr/lib/llvm-18/include -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/l2m.dir/llvm2mir/llvm2mir-driver.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/llvm2mir/llvm2mir-driver.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/llvm2mir/llvm2mir-driver.c",
+  "output": "ext/mir/CMakeFiles/l2m.dir/llvm2mir/llvm2mir-driver.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc  -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/varr_test.dir/adt-tests/mir-varr-test.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/adt-tests/mir-varr-test.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/adt-tests/mir-varr-test.c",
+  "output": "ext/mir/CMakeFiles/varr_test.dir/adt-tests/mir-varr-test.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc  -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/dlist_test.dir/adt-tests/mir-dlist-test.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/adt-tests/mir-dlist-test.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/adt-tests/mir-dlist-test.c",
+  "output": "ext/mir/CMakeFiles/dlist_test.dir/adt-tests/mir-dlist-test.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc  -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/bitmap_test.dir/adt-tests/mir-bitmap-test.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/adt-tests/mir-bitmap-test.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/adt-tests/mir-bitmap-test.c",
+  "output": "ext/mir/CMakeFiles/bitmap_test.dir/adt-tests/mir-bitmap-test.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc  -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/htab_test.dir/adt-tests/mir-htab-test.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/adt-tests/mir-htab-test.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/adt-tests/mir-htab-test.c",
+  "output": "ext/mir/CMakeFiles/htab_test.dir/adt-tests/mir-htab-test.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc  -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/reduce_test.dir/adt-tests/mir-reduce-test.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/adt-tests/mir-reduce-test.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/adt-tests/mir-reduce-test.c",
+  "output": "ext/mir/CMakeFiles/reduce_test.dir/adt-tests/mir-reduce-test.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN  -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/simplify_test.dir/mir-tests/simplify.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/simplify.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/simplify.c",
+  "output": "ext/mir/CMakeFiles/simplify_test.dir/mir-tests/simplify.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN  -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/scan_test.dir/mir-tests/scan-test.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/scan-test.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/scan-test.c",
+  "output": "ext/mir/CMakeFiles/scan_test.dir/mir-tests/scan-test.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN  -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/io_test.dir/mir-tests/io.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/io.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/io.c",
+  "output": "ext/mir/CMakeFiles/io_test.dir/mir-tests/io.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN  -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/dump_code_security_test.dir/mir-tests/dump-code-security.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/dump-code-security.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/dump-code-security.c",
+  "output": "ext/mir/CMakeFiles/dump_code_security_test.dir/mir-tests/dump-code-security.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/tls_test.dir/mir-tests/tls.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/tls.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/tls.c",
+  "output": "ext/mir/CMakeFiles/tls_test.dir/mir-tests/tls.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/run_test.dir/mir-tests/run-test.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/run-test.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/run-test.c",
+  "output": "ext/mir/CMakeFiles/run_test.dir/mir-tests/run-test.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_INTERP_DEBUG=1 -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/interp_loop.dir/mir-tests/loop-interp.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/loop-interp.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/loop-interp.c",
+  "output": "ext/mir/CMakeFiles/interp_loop.dir/mir-tests/loop-interp.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_C_INTERFACE=1 -DMIR_INTERP_DEBUG=1 -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/interp_loop_c.dir/mir-tests/loop-interp.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/loop-interp.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/loop-interp.c",
+  "output": "ext/mir/CMakeFiles/interp_loop_c.dir/mir-tests/loop-interp.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_INTERP_DEBUG=1 -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/interp_sieve.dir/mir-tests/sieve-interp.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/sieve-interp.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/sieve-interp.c",
+  "output": "ext/mir/CMakeFiles/interp_sieve.dir/mir-tests/sieve-interp.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_C_INTERFACE=1 -DMIR_INTERP_DEBUG=1 -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/interp_sieve_c.dir/mir-tests/sieve-interp.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/sieve-interp.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/sieve-interp.c",
+  "output": "ext/mir/CMakeFiles/interp_sieve_c.dir/mir-tests/sieve-interp.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_INTERP_DEBUG=1 -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/interp_hi.dir/mir-tests/hi-interp.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/hi-interp.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/hi-interp.c",
+  "output": "ext/mir/CMakeFiles/interp_hi.dir/mir-tests/hi-interp.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/interp_args.dir/mir-tests/args-interp.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/args-interp.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/args-interp.c",
+  "output": "ext/mir/CMakeFiles/interp_args.dir/mir-tests/args-interp.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_C_INTERFACE=1 -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/interp_args_c.dir/mir-tests/args-interp.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/args-interp.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/args-interp.c",
+  "output": "ext/mir/CMakeFiles/interp_args_c.dir/mir-tests/args-interp.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -DTEST_GEN_DEBUG=1 -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/run_test_d.dir/mir-tests/run-test.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/run-test.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/run-test.c",
+  "output": "ext/mir/CMakeFiles/run_test_d.dir/mir-tests/run-test.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -DTEST_GEN_DEBUG=1 -DTEST_GEN_LOOP -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/gen_loop.dir/mir-tests/loop-sieve-gen.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/loop-sieve-gen.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/loop-sieve-gen.c",
+  "output": "ext/mir/CMakeFiles/gen_loop.dir/mir-tests/loop-sieve-gen.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -DTEST_GEN_DEBUG=1 -DTEST_GEN_SIEVE -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/gen_sieve.dir/mir-tests/loop-sieve-gen.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/loop-sieve-gen.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/loop-sieve-gen.c",
+  "output": "ext/mir/CMakeFiles/gen_sieve.dir/mir-tests/loop-sieve-gen.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/readme_example.dir/mir-tests/readme-example.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/readme-example.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir-tests/readme-example.c",
+  "output": "ext/mir/CMakeFiles/readme_example.dir/mir-tests/readme-example.c.o"
+},
+{
+  "directory": "/home/rdavenpo/src/MIR/classyc/ext/mir",
+  "command": "/usr/bin/cc -DMIR_PARALLEL_GEN -DTEST_MIR2C -I/home/rdavenpo/src/MIR/classyc/ext/mir -g -std=gnu11 -Wno-abi -fsigned-char -fPIC -fno-tree-sra -fno-ipa-cp-clone -o CMakeFiles/mir2c_test.dir/mir2c/mir2c.c.o -c /home/rdavenpo/src/MIR/classyc/ext/mir/mir2c/mir2c.c",
+  "file": "/home/rdavenpo/src/MIR/classyc/ext/mir/mir2c/mir2c.c",
+  "output": "ext/mir/CMakeFiles/mir2c_test.dir/mir2c/mir2c.c.o"
+}
+]

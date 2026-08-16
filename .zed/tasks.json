@@ -1,0 +1,28 @@
+[
+  {
+    "label": "CMake Configure (In-Source)",
+    "command": "cmake",
+    "args": [
+      ".",
+      "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+      "-DCMAKE_BUILD_TYPE=Debug",
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+  },
+  {
+    "label": "Build (Make)",
+    "command": "make",
+    "args": ["-j8"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "save": "all",
+  },
+  {
+    "label": "Clean + Reconfigure + Build",
+    "command": "make",
+    "args": ["clean"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+  },
+]

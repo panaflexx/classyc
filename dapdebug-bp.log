@@ -1,0 +1,128 @@
+
+=== DAP stdio start ===
+
+===== IN  1783918825 =====
+{"type":"request","seq":1,"command":"initialize","arguments":{"clientID":"python-dap-debug-test","adapterID":"jitrunner","linesStartAt1":true,"columnsStartAt1":true,"pathFormat":"path"}}
+dispatch_message: type=request command=initialize seq=1
+
+===== OUT t=1783918825 len=162 =====
+{"seq":1,"type":"response","request_seq":1,"command":"initialize","success":true,"body":{"supportsConfigurationDoneRequest":true,"supportTerminateDebuggee":true}}
+
+===== OUT t=1783918825 len=46 =====
+{"seq":2,"type":"event","event":"initialized"}
+
+===== IN  1783918825 =====
+{"type":"request","seq":2,"command":"launch","arguments":{"program":"examples/debug-sample.bmir","noDebug":false}}
+dispatch_message: type=request command=launch seq=2
+
+===== OUT t=1783918825 len=77 =====
+{"seq":3,"type":"response","request_seq":2,"command":"launch","success":true}
+launch received (program=examples/debug-sample.bmir) waiting for configurationDone=0
+
+===== IN  1783918825 =====
+{"type":"request","seq":3,"command":"setBreakpoints","arguments":{"source":{"path":"examples/debug-sample.cy","name":"debug-sample.cy"},"breakpoints":[{"line":7}],"sourceModified":false}}
+dispatch_message: type=request command=setBreakpoints seq=3
+setBreakpoints src=examples/debug-sample.cy count=1 first=7 raw={"type":"request","seq":3,"command":"setBreakpoints","arguments":{"source":{"path":"examples/debug-sample.cy","name":"debug-sample.cy"},"breakpoints":[{"line":7}],"sourceModified":false}}
+
+===== OUT t=1783918825 len=144 =====
+{"seq":4,"type":"response","request_seq":3,"command":"setBreakpoints","success":true,"body":{"breakpoints":[{"id":1,"verified":true,"line":7}]}}
+
+===== IN  1783918825 =====
+{"type":"request","seq":4,"command":"configurationDone"}
+dispatch_message: type=request command=configurationDone seq=4
+
+===== OUT t=1783918825 len=88 =====
+{"seq":5,"type":"response","request_seq":4,"command":"configurationDone","success":true}
+configurationDone received (launch_received=1)
+stdio handshake done: ready=1 launch=1 configDone=1 state=1
+DAP has_bps=1 mode=2
+DAP setenv BPS=0 CTRL=0 fd_str=5 read=5 write=6
+
+===== OUT t=1783918825 len=131 =====
+{"seq":6,"type":"event","event":"output","body":{"category":"console","output":"[jitrunner] running examples/debug-sample.bmir\n"}}
+CHILD ENV BPS=/tmp/classyc-dap-bps.txt CTRL=5 mode=2
+CHILD loading bps file /tmp/classyc-dap-bps.txt fd=6
+CHILD add bp examples/debug-sample.cy:7 (resolving)
+call_depth delta=1 now=1 step_mode=0 next_depth=0
+CHILD BREAK examples/debug-sample.cy:7 ctrl=5
+CHILD waiting ctrl_fd=5
+
+===== OUT t=1783918825 len=86 =====
+{"seq":7,"type":"event","event":"stopped","body":{"reason":"breakpoint","threadId":1}}
+DAP stopped (breakpoint) at examples/debug-sample.cy:7 waiting for resume
+
+===== IN  1783918825 =====
+{"type":"request","seq":5,"command":"threads"}
+dispatch_message: type=request command=threads seq=5
+
+===== OUT t=1783918825 len=122 =====
+{"seq":8,"type":"response","request_seq":5,"command":"threads","success":true,"body":{"threads":[{"id":1,"name":"main"}]}}
+
+===== IN  1783918825 =====
+{"type":"request","seq":6,"command":"stackTrace","arguments":{"threadId":1,"startFrame":0,"levels":20}}
+dispatch_message: type=request command=stackTrace seq=6
+
+===== OUT t=1783918825 len=245 =====
+{"seq":9,"type":"response","request_seq":6,"command":"stackTrace","success":true,"body":{"stackFrames":[{"id":1,"name":"main","line":7,"column":17,"source":{"name":"examples/debug-sample.cy","path":"examples/debug-sample.cy"}}],"totalFrames":1}}
+
+===== IN  1783918825 =====
+{"type":"request","seq":7,"command":"scopes","arguments":{"frameId":1}}
+dispatch_message: type=request command=scopes seq=7
+
+===== OUT t=1783918825 len=157 =====
+{"seq":10,"type":"response","request_seq":7,"command":"scopes","success":true,"body":{"scopes":[{"name":"Locals","variablesReference":1,"expensive":false}]}}
+
+===== IN  1783918825 =====
+{"type":"request","seq":8,"command":"variables","arguments":{"variablesReference":1}}
+dispatch_message: type=request command=variables seq=8
+
+===== OUT t=1783918825 len=105 =====
+{"seq":11,"type":"response","request_seq":8,"command":"variables","success":true,"body":{"variables":[]}}
+
+===== IN  1783918825 =====
+{"type":"request","seq":9,"command":"stepIn","arguments":{"threadId":1}}
+dispatch_message: type=request command=stepIn seq=9
+
+===== OUT t=1783918825 len=78 =====
+{"seq":12,"type":"response","request_seq":9,"command":"stepIn","success":true}
+dap_signal_child_resume cmd=s fd=6 rc=0
+CHILD read ret=1 cmd=s
+CHILD resuming cmd=s step_mode=1 next_depth=0 call_depth=1
+CHILD STEP examples/debug-sample.cy:8 ctrl=5
+CHILD waiting ctrl_fd=5
+
+===== OUT t=1783918825 len=81 =====
+{"seq":13,"type":"event","event":"stopped","body":{"reason":"step","threadId":1}}
+DAP stopped (step) at examples/debug-sample.cy:8 waiting for resume
+
+===== IN  1783918825 =====
+{"type":"request","seq":10,"command":"continue","arguments":{"threadId":1}}
+dispatch_message: type=request command=continue seq=10
+
+===== OUT t=1783918825 len=117 =====
+{"seq":14,"type":"response","request_seq":10,"command":"continue","success":true,"body":{"allThreadsContinued":true}}
+dap_signal_child_resume cmd=c fd=6 rc=0
+CHILD read ret=1 cmd=c
+CHILD resuming cmd=c step_mode=0 next_depth=0 call_depth=1
+call_depth delta=-1 now=0 step_mode=0 next_depth=0
+call_depth delta=1 now=1 step_mode=0 next_depth=0
+call_depth delta=-1 now=0 step_mode=0 next_depth=0
+
+===== OUT t=1783918825 len=91 =====
+{"seq":15,"type":"event","event":"output","body":{"category":"stdout","output":"sum=30\n"}}
+
+===== OUT t=1783918825 len=64 =====
+{"seq":16,"type":"event","event":"exited","body":{"exitCode":0}}
+
+===== OUT t=1783918825 len=112 =====
+{"seq":17,"type":"event","event":"output","body":{"category":"console","output":"program exited with code 0\n"}}
+
+===== OUT t=1783918825 len=46 =====
+{"seq":18,"type":"event","event":"terminated"}
+
+===== IN  1783918825 =====
+{"type":"request","seq":11,"command":"disconnect","arguments":{"restart":false,"terminateDebuggee":true}}
+dispatch_message: type=request command=disconnect seq=11
+
+===== OUT t=1783918825 len=83 =====
+{"seq":19,"type":"response","request_seq":11,"command":"disconnect","success":true}

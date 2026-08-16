@@ -1,0 +1,884 @@
+M0:	module
+	import	memcpy
+memcpy_p:	proto	i64, i64:dest, i64:src, i64:n
+	import	memset
+memset_p:	proto	i64, i64:s, i32:c, i64:n
+	import	cy_safe_deref
+__cy_safe_deref_p:	proto	i64:ptr, i64:line
+	import	cy_safe_free
+__cy_safe_free_p:	proto	i64:ptr, i64:line
+	import	cy_safe_alloc
+__cy_safe_alloc_p:	proto	i64, i64:size
+	import	_safety_trap
+__safety_trap_p:	proto	i64:reason, i64:file_id, i64:line
+	import	setjmp
+__cy_setjmp_p:	proto	i64, i64:buf
+	import	cy_exc_throw
+__cy_exc_throw_p:	proto	i64:id, i64:msg, i64:file, i64:line
+	import	cy_exc_current
+__cy_exc_current_p:	proto	i64
+	import	cy_exc_pop
+__cy_exc_pop_p:	proto	
+	import	cy_exc_push
+__cy_exc_push_p:	proto	i64
+proto0:	proto	f
+proto1:	proto	d
+proto2:	proto	ld
+proto3:	proto	d, u64:U0___tag
+proto4:	proto	i32, u64:U0___s1, u64:U0___s2, u64:U0___n
+proto5:	proto	i32, u64:U0___s1, u64:U0___s2
+proto6:	proto	u64:U0_this
+proto7:	proto	u64:U0_this, i32:i0_item
+proto8:	proto	i32, u64:U0___format, ...
+proto9:	proto	i32, u64:U0_this
+proto10:	proto	u64, u64:U0___size
+proto11:	proto	u64, u64:U0___s, i32:i0___c, u64:U0___n
+proto12:	proto	u64:U0___ptr
+proto13:	proto	u64, u64:U0___dest, u64:U0___src, u64:U0___n
+proto14:	proto	i32, u64:U0_a, u64:U0_b, u64:U0_n
+proto15:	proto	i32, u64:U0_this, u64:U0_item
+proto16:	proto	i32, u64:p
+proto17:	proto	u64:U0_this, i32:i0_min
+proto18:	proto	u64:U0_this, i32:i0_index
+proto19:	proto	i32, u64:p, u64:p
+proto20:	proto	u64:U0_this, u64:U0_item
+proto21:	proto	u64, u64:U0_this, i32:i0_index
+proto22:	proto	u64:U0_this, i32:i0_initialCapacity
+proto23:	proto	rblk:24(Ret_Addr), u64:U0_this
+proto24:	proto	u64:U0_this, u64:U0_other
+proto25:	proto	u64:p
+proto26:	proto	u64, u64:p
+proto27:	proto	i64
+proto28:	proto	i64, u64:U0_s
+proto29:	proto	i64, d:d0_n
+proto30:	proto	i64, i64:I0_n
+proto31:	proto	i32, i64:I0_array_val, i64:I0_new_val
+proto32:	proto	i64, u64:p
+proto33:	proto	i32, i64:I0_obj_val, u64:U0_key, i64:I0_new_val
+proto34:	proto	i64, u64:U0_this
+proto35:	proto	i64:I0_v
+proto36:	proto	u64, u64:U0_this
+proto37:	proto	i32, i32:p
+proto38:	proto	i32, u64:U0_this, i32:i0_index
+proto39:	proto	i32:p
+proto40:	proto	i32, u64:U0_this, i32:i0_item
+proto41:	proto	i32, i32:p, i32:p
+proto42:	proto	u64, i32:p
+proto43:	proto	i64, i32:p
+	forward	__ctor___generic_List_int__v_57189
+	forward	__ctor___generic_List_int__i_57286
+	forward	__ctor___generic_List_int__i_57397
+	forward	__ctor___generic_List_int__Pii_57521
+	forward	__dtor___generic_List_int__v_57689
+	forward	__generic_List_int_Count__v
+	forward	__generic_List_int_owns__v
+	forward	__generic_List_int_Get__i
+	forward	__generic_List_int_owns__i
+	forward	__generic_List_int_EnsureCapacity__i
+	forward	__generic_List_int_Add__i
+	forward	__generic_List_int_Clear__v
+	forward	__generic_List_int_Copy__v
+__bm_str_length:	bss	4
+__bm_str_empty:	bss	4
+__bm_str_substr:	bss	4
+__bm_str_find:	bss	4
+__bm_str_replace:	bss	4
+__bm_str_replace_all:	bss	4
+__bm_str_upper:	bss	4
+__bm_str_lower:	bss	4
+__bm_str_detach:	bss	4
+__bm_str_starts_with:	bss	4
+__bm_str_ends_with:	bss	4
+__bm_str_contains:	bss	4
+__bm_str_trim:	bss	4
+__bm_str_split:	bss	4
+__bm_str_equals:	bss	4
+__bm_str_copy:	bss	4
+__bm_str_attach:	bss	4
+__bm_str_join:	bss	4
+__builtin_inff:	func	f
+	local	i64:fp
+
+# 0 args, 1 local, 0 globals
+	alloca	fp, 16
+	mov	u32:(fp):Uife, 2139095040
+	ret	f:(fp):Uife
+	endfunc
+__builtin_inf:	func	d
+	local	i64:fp
+
+# 0 args, 1 local, 0 globals
+	alloca	fp, 16
+	mov	u64:(fp):ULde, 9218868437227405312
+	ret	d:(fp):ULde
+	endfunc
+__builtin_huge_valf:	func	f
+	local	f:f_0
+
+# 0 args, 1 local, 0 globals
+	call	proto0, __builtin_inff, f_0
+	ret	f_0
+	endfunc
+__builtin_huge_val:	func	d
+	local	d:d_0
+
+# 0 args, 1 local, 0 globals
+	call	proto1, __builtin_inf, d_0
+	ret	d_0
+	endfunc
+__builtin_nanf:	func	f, u64:U0___tag
+	local	i64:fp
+
+# 1 arg, 1 local, 0 globals
+	alloca	fp, 16
+	mov	u32:(fp):Uife, 2143289344
+	ret	f:(fp):Uife
+	endfunc
+__builtin_nan:	func	d, u64:U0___tag
+	local	i64:fp
+
+# 1 arg, 1 local, 0 globals
+	alloca	fp, 16
+	mov	u64:(fp):ULde, 9221120237041090560
+	ret	d:(fp):ULde
+	endfunc
+__builtin_infl:	func	ld
+	local	d:d_0, ld:D_1
+
+# 0 args, 2 locals, 0 globals
+	call	proto1, __builtin_inf, d_0
+	d2ld	D_1, d_0
+	ret	D_1
+	endfunc
+__builtin_huge_vall:	func	ld
+	local	ld:D_0
+
+# 0 args, 1 local, 0 globals
+	call	proto2, __builtin_infl, D_0
+	ret	D_0
+	endfunc
+__builtin_nanl:	func	ld, u64:U0___tag
+	local	d:d_0, ld:D_1
+
+# 1 arg, 2 locals, 0 globals
+	call	proto3, __builtin_nan, d_0, "\000"
+	d2ld	D_1, d_0
+	ret	D_1
+	endfunc
+__builtin_fabsf:	func	f, f:f0___x
+	local	i64:fp, i64:u_0, i64:u_1
+
+# 1 arg, 3 locals, 0 globals
+	alloca	fp, 16
+	fmov	f:(fp):Uife, f0___x
+	mov	u_0, u32:(fp):Uife
+	ands	u_0, u_0, 2147483647
+	mov	u32:(fp):Uife, u_0
+	ret	f:(fp):Uife
+	endfunc
+__builtin_fabs:	func	d, d:d0___x
+	local	i64:fp, i64:U_0, i64:U_1
+
+# 1 arg, 3 locals, 0 globals
+	alloca	fp, 16
+	dmov	d:(fp):ULde, d0___x
+	mov	U_0, u64:(fp):ULde
+	and	U_0, U_0, 9223372036854775807
+	mov	u64:(fp):ULde, U_0
+	ret	d:(fp):ULde
+	endfunc
+__builtin_fabsl:	func	ld, ld:D0___x
+	local	ld:D_0, i64:i_1, ld:D_2, ld:D_3
+
+# 1 arg, 4 locals, 0 globals
+	i2ld	D_0, 0
+	ldblt	L1, D0___x, D_0
+	jmp	L2
+L1:
+	ldneg	D_2, D0___x
+	ldmov	D_3, D_2
+	jmp	L3
+L2:
+	ldmov	D_3, D0___x
+L3:
+	ret	D_3
+	endfunc
+	import	printf
+__bswap_16:	func	u16, u16:u0___bsx
+	local	i64:i_0, i64:I_1, i64:i_2, i64:i_3, i64:i_4, i64:I_5, i64:i_6, i64:I_7
+
+# 1 arg, 8 locals, 0 globals
+	mov	I_1, 8
+	blt	L5, I_1, 0
+	blt	L4, I_1, 32
+L5:
+	call	__safety_trap_p, _safety_trap, 5, 0, 39
+L4:
+	rshs	i_0, u0___bsx, 8
+	ands	i_2, i_0, 255
+	ands	i_3, u0___bsx, 255
+	mov	I_5, 8
+	blt	L7, I_5, 0
+	blt	L6, I_5, 32
+L7:
+	call	__safety_trap_p, _safety_trap, 5, 0, 39
+L6:
+	lshs	i_4, i_3, 8
+	ors	i_6, i_2, i_4
+	uext16	I_7, i_6
+	ret	I_7
+	endfunc
+__bswap_32:	func	u32, u32:u0___bsx
+	local	i64:u_0, i64:u_1, i64:I_2, i64:u_3, i64:u_4, i64:I_5, i64:u_6, i64:u_7
+	local	i64:u_8, i64:I_9, i64:u_10, i64:u_11, i64:u_12, i64:I_13, i64:u_14
+
+# 1 arg, 15 locals, 0 globals
+	ands	u_0, u0___bsx, 4278190080
+	mov	I_2, 24
+	blt	L9, I_2, 0
+	blt	L8, I_2, 32
+L9:
+	call	__safety_trap_p, _safety_trap, 5, 0, 54
+L8:
+	urshs	u_1, u_0, 24
+	ands	u_3, u0___bsx, 16711680
+	mov	I_5, 8
+	blt	L11, I_5, 0
+	blt	L10, I_5, 32
+L11:
+	call	__safety_trap_p, _safety_trap, 5, 0, 54
+L10:
+	urshs	u_4, u_3, 8
+	ors	u_6, u_1, u_4
+	ands	u_7, u0___bsx, 65280
+	mov	I_9, 8
+	blt	L13, I_9, 0
+	blt	L12, I_9, 32
+L13:
+	call	__safety_trap_p, _safety_trap, 5, 0, 54
+L12:
+	lshs	u_8, u_7, 8
+	ors	u_10, u_6, u_8
+	ands	u_11, u0___bsx, 255
+	mov	I_13, 24
+	blt	L15, I_13, 0
+	blt	L14, I_13, 32
+L15:
+	call	__safety_trap_p, _safety_trap, 5, 0, 54
+L14:
+	lshs	u_12, u_11, 24
+	ors	u_14, u_10, u_12
+	ret	u_14
+	endfunc
+__bswap_64:	func	u64, u64:U0___bsx
+	local	i64:U_0, i64:U_1, i64:I_2, i64:U_3, i64:U_4, i64:I_5, i64:U_6, i64:U_7
+	local	i64:U_8, i64:I_9, i64:U_10, i64:U_11, i64:U_12, i64:I_13, i64:U_14, i64:U_15
+	local	i64:U_16, i64:I_17, i64:U_18, i64:U_19, i64:U_20, i64:I_21, i64:U_22, i64:U_23
+	local	i64:U_24, i64:I_25, i64:U_26, i64:U_27, i64:U_28, i64:I_29, i64:U_30
+
+# 1 arg, 31 locals, 0 globals
+	and	U_0, U0___bsx, 18374686479671623680
+	mov	I_2, 56
+	blt	L17, I_2, 0
+	blt	L16, I_2, 64
+L17:
+	call	__safety_trap_p, _safety_trap, 5, 0, 75
+L16:
+	ursh	U_1, U_0, 56
+	and	U_3, U0___bsx, 71776119061217280
+	mov	I_5, 40
+	blt	L19, I_5, 0
+	blt	L18, I_5, 64
+L19:
+	call	__safety_trap_p, _safety_trap, 5, 0, 75
+L18:
+	ursh	U_4, U_3, 40
+	or	U_6, U_1, U_4
+	and	U_7, U0___bsx, 280375465082880
+	mov	I_9, 24
+	blt	L21, I_9, 0
+	blt	L20, I_9, 64
+L21:
+	call	__safety_trap_p, _safety_trap, 5, 0, 75
+L20:
+	ursh	U_8, U_7, 24
+	or	U_10, U_6, U_8
+	and	U_11, U0___bsx, 1095216660480
+	mov	I_13, 8
+	blt	L23, I_13, 0
+	blt	L22, I_13, 64
+L23:
+	call	__safety_trap_p, _safety_trap, 5, 0, 75
+L22:
+	ursh	U_12, U_11, 8
+	or	U_14, U_10, U_12
+	and	U_15, U0___bsx, 4278190080
+	mov	I_17, 8
+	blt	L25, I_17, 0
+	blt	L24, I_17, 64
+L25:
+	call	__safety_trap_p, _safety_trap, 5, 0, 75
+L24:
+	lsh	U_16, U_15, 8
+	or	U_18, U_14, U_16
+	and	U_19, U0___bsx, 16711680
+	mov	I_21, 24
+	blt	L27, I_21, 0
+	blt	L26, I_21, 64
+L27:
+	call	__safety_trap_p, _safety_trap, 5, 0, 75
+L26:
+	lsh	U_20, U_19, 24
+	or	U_22, U_18, U_20
+	and	U_23, U0___bsx, 65280
+	mov	I_25, 40
+	blt	L29, I_25, 0
+	blt	L28, I_25, 64
+L29:
+	call	__safety_trap_p, _safety_trap, 5, 0, 75
+L28:
+	lsh	U_24, U_23, 40
+	or	U_26, U_22, U_24
+	and	U_27, U0___bsx, 255
+	mov	I_29, 56
+	blt	L31, I_29, 0
+	blt	L30, I_29, 64
+L31:
+	call	__safety_trap_p, _safety_trap, 5, 0, 75
+L30:
+	lsh	U_28, U_27, 56
+	or	U_30, U_26, U_28
+	ret	U_30
+	endfunc
+__uint16_identity:	func	u16, u16:u0___x
+
+# 1 arg, 0 locals, 0 globals
+	ret	u0___x
+	endfunc
+__uint32_identity:	func	u32, u32:u0___x
+
+# 1 arg, 0 locals, 0 globals
+	ret	u0___x
+	endfunc
+__uint64_identity:	func	u64, u64:U0___x
+
+# 1 arg, 0 locals, 0 globals
+	ret	U0___x
+	endfunc
+	import	malloc
+	import	free
+	import	memmove
+	import	memcmp
+	import	strcmp
+list_eq_bytes:	func	i32, u64:U0_a, u64:U0_b, u64:U0_n
+	local	i64:i_0, i64:i_1
+
+# 3 args, 2 locals, 0 globals
+	call	proto4, memcmp, i_0, U0_a, U0_b, U0_n
+	eqs	i_1, i_0, 0
+	ret	i_1
+	endfunc
+list_eq_str:	func	i32, u64:U0_a, u64:U0_b, u64:U0_n
+	local	i64:U0_x, i64:U_0, i64:U0_y, i64:U_1, i64:i_2, i64:i_3, i64:i_4, i64:i_5
+	local	i64:i_6
+
+# 3 args, 9 locals, 0 globals
+	mov	U_0, U0_a
+	bne	L32, U_0, 0
+	call	__safety_trap_p, _safety_trap, 2, 0, 79
+L32:
+	mov	U0_x, u64:(U_0):pc
+	mov	U_1, U0_b
+	bne	L33, U_1, 0
+	call	__safety_trap_p, _safety_trap, 2, 0, 80
+L33:
+	mov	U0_y, u64:(U_1):pc
+	bne	L35, U0_x, U0_y
+L34:
+	ret	1
+	jmp	L36
+L35:
+L36:
+	beq	L37, U0_x, 0
+L40:
+	bne	L38, U0_y, 0
+L37:
+	ret	0
+	jmp	L39
+L38:
+L39:
+	call	proto5, strcmp, i_5, U0_x, U0_y
+	eqs	i_6, i_5, 0
+	ret	i_6
+	endfunc
+	import	dict_create_array
+	import	dict_create_object
+	import	dict_create_null
+	import	dict_create_int64
+	import	dict_create_number
+	import	dict_create_string
+	import	dict_array_append
+	import	dict_object_set
+	import	dict_destroy
+__ctor___generic_List_int__v_57189:	func	u64:U0_this
+	local	i64:U_0, i64:U_1, i64:U_2, i64:U_3, i64:U_4, i64:U_5
+
+# 1 arg, 6 locals, 0 globals
+	mov	i32:8(U0_this):i, 0
+	mov	i32:12(U0_this):i, 4
+	mul	U_1, 4, i32:12(U0_this):i
+	call	proto10, malloc, U_0, U_1
+	mov	U_2, U_0
+	mov	u64:(U0_this):pi, U_2
+	bf	L42, u64:(U0_this):pi
+L41:
+	mov	U_4, u64:(U0_this):pi
+	mul	U_5, 4, i32:12(U0_this):i
+	call	proto11, memset, U_3, U_4, 0, U_5
+	jmp	L43
+L42:
+L43:
+	mov	i32:16(U0_this):i, 0
+	ret
+	endfunc
+	export	__ctor___generic_List_int__v_57189
+__ctor___generic_List_int__i_57286:	func	u64:U0_this, i32:i0_initialCapacity
+	local	i64:i_0, i64:i_1, i64:U_2, i64:U_3, i64:U_4, i64:U_5, i64:U_6, i64:U_7
+
+# 2 args, 8 locals, 0 globals
+	mov	i32:8(U0_this):i, 0
+	bles	L45, i0_initialCapacity, 0
+L44:
+	mov	i_1, i0_initialCapacity
+	jmp	L46
+L45:
+	mov	i_1, 4
+L46:
+	mov	i32:12(U0_this):i, i_1
+	mul	U_3, 4, i32:12(U0_this):i
+	call	proto10, malloc, U_2, U_3
+	mov	U_4, U_2
+	mov	u64:(U0_this):pi, U_4
+	bf	L48, u64:(U0_this):pi
+L47:
+	mov	U_6, u64:(U0_this):pi
+	mul	U_7, 4, i32:12(U0_this):i
+	call	proto11, memset, U_5, U_6, 0, U_7
+	jmp	L49
+L48:
+L49:
+	mov	i32:16(U0_this):i, 0
+	ret
+	endfunc
+	export	__ctor___generic_List_int__i_57286
+__ctor___generic_List_int__i_57397:	func	u64:U0_this, i32:i0_firstItem
+	local	i64:U_0, i64:U_1, i64:U_2, i64:U_3, i64:U_4, i64:U_5, i64:U_6
+
+# 2 args, 7 locals, 0 globals
+	mov	i32:8(U0_this):i, 0
+	mov	i32:12(U0_this):i, 4
+	mul	U_1, 4, i32:12(U0_this):i
+	call	proto10, malloc, U_0, U_1
+	mov	U_2, U_0
+	mov	u64:(U0_this):pi, U_2
+	bf	L51, u64:(U0_this):pi
+L50:
+	mov	U_4, u64:(U0_this):pi
+	mul	U_5, 4, i32:12(U0_this):i
+	call	proto11, memset, U_3, U_4, 0, U_5
+	jmp	L52
+L51:
+L52:
+	mov	i32:16(U0_this):i, 0
+	add	U_6, u64:(U0_this):pi, 0
+	bne	L53, U_6, 0
+	call	__safety_trap_p, _safety_trap, 2, 0, 150
+L53:
+	mov	i32:(U_6):i, i0_firstItem
+	mov	i32:8(U0_this):i, 1
+	ret
+	endfunc
+	export	__ctor___generic_List_int__i_57397
+__ctor___generic_List_int__Pii_57521:	func	u64:U0_this, u64:U0_items, i32:i0___seqlen_items
+	local	i64:i0_n, i64:i_0, i64:i_1, i64:U_2, i64:U_3, i64:U_4, i64:U_5, i64:U_6
+	local	i64:U_7, i64:i139_i, i64:i_8, i64:U_9, i64:U_10, i64:U_11, i64:U_12, i64:U_13
+	local	i64:U_14, i64:i_15, i64:i_16, i64:i_17
+
+# 3 args, 20 locals, 0 globals
+	mov	i0_n, i0___seqlen_items
+	mov	i32:8(U0_this):i, 0
+	bles	L55, i0_n, 0
+L54:
+	mov	i_1, i0_n
+	jmp	L56
+L55:
+	mov	i_1, 4
+L56:
+	mov	i32:12(U0_this):i, i_1
+	mul	U_3, 4, i32:12(U0_this):i
+	call	proto10, malloc, U_2, U_3
+	mov	U_4, U_2
+	mov	u64:(U0_this):pi, U_4
+	bf	L58, u64:(U0_this):pi
+L57:
+	mov	U_6, u64:(U0_this):pi
+	mul	U_7, 4, i32:12(U0_this):i
+	call	proto11, memset, U_5, U_6, 0, U_7
+	jmp	L59
+L58:
+L59:
+	mov	i32:16(U0_this):i, 0
+	mov	i139_i, 0
+	bges	L62, i139_i, i0_n
+L60:
+	ext32	U_9, i139_i
+	mul	U_11, U_9, 4
+	add	U_10, u64:(U0_this):pi, U_11
+	bne	L63, U_10, 0
+	call	__safety_trap_p, _safety_trap, 2, 0, 168
+L63:
+	ext32	U_12, i139_i
+	mul	U_14, U_12, 4
+	add	U_13, U0_items, U_14
+	bne	L64, U_13, 0
+	call	__safety_trap_p, _safety_trap, 2, 0, 168
+L64:
+	mov	i32:(U_10):i, i32:(U_13):i
+	mov	i_15, i32:8(U0_this):i
+	adds	i_15, i_15, 1
+	mov	i32:8(U0_this):i, i_15
+L61:
+	mov	i_16, i139_i
+	adds	i_16, i_16, 1
+	mov	i139_i, i_16
+	blts	L60, i139_i, i0_n
+L62:
+	ret
+	endfunc
+	export	__ctor___generic_List_int__Pii_57521
+__dtor___generic_List_int__v_57689:	func	u64:U0_this
+	local	i64:i141_i, i64:i_0, i64:i_1, i64:i_2, i64:U_3
+
+# 1 arg, 5 locals, 0 globals
+	mov	i141_i, 0
+	bges	L67, i141_i, i32:8(U0_this):i
+L65:
+	bf	L69, i32:16(U0_this):i
+L71:
+	bf	L69, 0
+L68:
+	jmp	L70
+L69:
+L70:
+L66:
+	mov	i_1, i141_i
+	adds	i_1, i_1, 1
+	mov	i141_i, i_1
+	blts	L65, i141_i, i32:8(U0_this):i
+L67:
+	bf	L73, u64:(U0_this):pi
+L72:
+	mov	U_3, u64:(U0_this):pi
+	call	proto12, free, U_3
+	jmp	L74
+L73:
+L74:
+	ret
+	endfunc
+	export	__dtor___generic_List_int__v_57689
+__generic_List_int_Count__v:	func	i32, u64:U0_this
+
+# 1 arg, 0 locals, 0 globals
+	ret	i32:8(U0_this):i
+	endfunc
+	export	__generic_List_int_Count__v
+__generic_List_int_owns__v:	func	u64, u64:U0_this
+
+# 1 arg, 0 locals, 0 globals
+	mov	i32:16(U0_this):i, 1
+	ret	U0_this
+	endfunc
+	export	__generic_List_int_owns__v
+__generic_List_int_Get__i:	func	i32, u64:U0_this, i32:i0_index
+	local	i64:i_0, i64:i_1, i64:I_2, i64:I_3, i64:U_4, i64:U_5, i64:U_6
+
+# 2 args, 7 locals, 0 globals
+	blts	L75, i0_index, 0
+L78:
+	blts	L76, i0_index, i32:8(U0_this):i
+L75:
+	mov	I_2, 2
+	mov	I_3, "List.Get oob\000"
+	call	__cy_exc_throw_p, cy_exc_throw, I_2, I_3, 0, 0
+L79:
+	jmp	L77
+L76:
+L77:
+	ext32	U_4, i0_index
+	mul	U_6, U_4, 4
+	add	U_5, u64:(U0_this):pi, U_6
+	bne	L80, U_5, 0
+	call	__safety_trap_p, _safety_trap, 2, 0, 221
+L80:
+	ret	i32:(U_5):i
+	endfunc
+	export	__generic_List_int_Get__i
+__generic_List_int_owns__i:	func	u64, u64:U0_this, i32:i0_v
+	local	i64:I_0, i64:i_1
+
+# 2 args, 2 locals, 0 globals
+	ext32	I_0, i0_v
+	bf	L82, I_0
+L81:
+	mov	i_1, 1
+	jmp	L83
+L82:
+	mov	i_1, 0
+L83:
+	mov	i32:16(U0_this):i, i_1
+	ret	U0_this
+	endfunc
+	export	__generic_List_int_owns__i
+__generic_List_int_EnsureCapacity__i:	func	u64:U0_this, i32:i0_min
+	local	i64:i_0, i64:i0_newCap, i64:i_1, i64:i_2, i64:i_3, i64:i_4, i64:i_5, i64:U0_newData
+	local	i64:U_6, i64:U_7, i64:U_8, i64:U_9, i64:U_10, i64:U_11, i64:U_12, i64:U_13
+	local	i64:i_14, i64:U_15, i64:U_16, i64:U_17, i64:U_18, i64:U_19
+
+# 2 args, 22 locals, 0 globals
+	bgts	L85, i0_min, i32:12(U0_this):i
+L84:
+	ret
+	jmp	L86
+L85:
+L86:
+	bles	L88, i32:12(U0_this):i, 0
+L87:
+	mov	i_2, i32:12(U0_this):i
+	jmp	L89
+L88:
+	mov	i_2, 1
+L89:
+	mov	i0_newCap, i_2
+L91:
+	bges	L92, i0_newCap, i0_min
+L90:
+	muls	i_4, i0_newCap, 2
+	mov	i0_newCap, i_4
+	blts	L90, i0_newCap, i0_min
+L92:
+	ext32	U_7, i0_newCap
+	mul	U_8, 4, U_7
+	call	proto10, malloc, U_6, U_8
+	mov	U_9, U_6
+	mov	U0_newData, U_9
+	bt	L94, U0_newData
+L93:
+	ret
+	jmp	L95
+L94:
+L95:
+	mov	U_11, U0_newData
+	ext32	U_12, i0_newCap
+	mul	U_13, 4, U_12
+	call	proto11, memset, U_10, U_11, 0, U_13
+	bles	L97, i32:8(U0_this):i, 0
+L99:
+	bf	L97, u64:(U0_this):pi
+L96:
+	mov	U_16, U0_newData
+	mov	U_17, u64:(U0_this):pi
+	mul	U_18, 4, i32:8(U0_this):i
+	call	proto13, memcpy, U_15, U_16, U_17, U_18
+	jmp	L98
+L97:
+L98:
+	mov	U_19, u64:(U0_this):pi
+	call	proto12, free, U_19
+	mov	u64:(U0_this):pi, U0_newData
+	mov	i32:12(U0_this):i, i0_newCap
+	ret
+	endfunc
+	export	__generic_List_int_EnsureCapacity__i
+__generic_List_int_Add__i:	func	u64:U0_this, i32:i0_item
+	local	i64:i_0, i64:i_1, i64:U_2, i64:U_3, i64:i_4
+
+# 2 args, 5 locals, 0 globals
+	blts	L101, i32:8(U0_this):i, i32:12(U0_this):i
+L100:
+	bne	L103, U0_this, 0
+	call	__safety_trap_p, _safety_trap, 2, 0, 348
+L103:
+	adds	i_1, i32:8(U0_this):i, 1
+	call	proto17, __generic_List_int_EnsureCapacity__i, U0_this, i_1
+	jmp	L102
+L101:
+L102:
+	mul	U_3, i32:8(U0_this):i, 4
+	add	U_2, u64:(U0_this):pi, U_3
+	bne	L104, U_2, 0
+	call	__safety_trap_p, _safety_trap, 2, 0, 349
+L104:
+	mov	i32:(U_2):i, i0_item
+	mov	i_4, i32:8(U0_this):i
+	adds	i_4, i_4, 1
+	mov	i32:8(U0_this):i, i_4
+	ret
+	endfunc
+	export	__generic_List_int_Add__i
+__generic_List_int_Clear__v:	func	u64:U0_this
+	local	i64:i150_i, i64:i_0, i64:i_1, i64:i_2, i64:i_3, i64:U_4, i64:U_5, i64:U_6
+
+# 1 arg, 8 locals, 0 globals
+	mov	i150_i, 0
+	bges	L107, i150_i, i32:8(U0_this):i
+L105:
+	bf	L109, i32:16(U0_this):i
+L111:
+	bf	L109, 0
+L108:
+	jmp	L110
+L109:
+L110:
+L106:
+	mov	i_1, i150_i
+	adds	i_1, i_1, 1
+	mov	i150_i, i_1
+	blts	L105, i150_i, i32:8(U0_this):i
+L107:
+	bf	L113, u64:(U0_this):pi
+L115:
+	bles	L113, i32:8(U0_this):i, 0
+L112:
+	mov	U_5, u64:(U0_this):pi
+	mul	U_6, 4, i32:8(U0_this):i
+	call	proto11, memset, U_4, U_5, 0, U_6
+	jmp	L114
+L113:
+L114:
+	mov	i32:8(U0_this):i, 0
+	ret
+	endfunc
+	export	__generic_List_int_Clear__v
+__generic_List_int_Copy__v:	func	rblk:24(Ret_Addr), u64:U0_this
+	local	i64:fp, i64:I_0, i64:U_1, i64:i_2, i64:i_3, i64:i167_i, i64:i_4, i64:U_5
+	local	i64:i_6, i64:I_7, i64:I_8, i64:I_9, i64:i_10, i64:U_11, i64:U_12, i64:U_13
+	local	i64:U_14, i64:i_15, i64:i_16, i64:I_17, i64:I_18, i64:I_19, i64:U_20, i64:I_21
+
+# 2 args, 24 locals, 0 globals
+	alloca	fp, 64
+	call	memset_p, memset, I_0, fp, 0, 24
+	mov	U_1, fp
+	bles	L117, i32:8(U0_this):i, 0
+L116:
+	mov	i_3, i32:8(U0_this):i
+	jmp	L118
+L117:
+	mov	i_3, 1
+L118:
+	call	proto22, __ctor___generic_List_int__i_57286, U_1, i_3
+	mov	i167_i, 0
+	bges	L121, i167_i, i32:8(U0_this):i
+L119:
+	bf	L123, 0
+L122:
+	mov	U_5, fp
+	bne	L125, U0_this, 0
+	call	__safety_trap_p, _safety_trap, 2, 0, 218
+L125:
+	mov	i_6, i32:8(U0_this):i
+	ublt	L126, i167_i, i_6
+	call	__safety_trap_p, _safety_trap, 1, 0, 218
+L126:
+	mov	I_7, i64:(U0_this):pi
+	mul	I_8, i167_i, 4
+	add	I_9, I_7, I_8
+	mov	i_10, i32:(I_9)
+	call	proto7, __generic_List_int_Add__i, U_5, i_10
+	jmp	L124
+L123:
+	mov	U_11, fp
+	ext32	U_12, i167_i
+	mul	U_14, U_12, 4
+	add	U_13, u64:(U0_this):pi, U_14
+	bne	L127, U_13, 0
+	call	__safety_trap_p, _safety_trap, 2, 0, 516
+L127:
+	call	proto7, __generic_List_int_Add__i, U_11, i32:(U_13):i
+L124:
+L120:
+	mov	i_15, i167_i
+	adds	i_15, i_15, 1
+	mov	i167_i, i_15
+	blts	L119, i167_i, i32:8(U0_this):i
+L121:
+	add	I_17, fp, 32
+	call	memcpy_p, memcpy, I_18, I_17, fp, 24
+	call	memset_p, memset, I_19, fp, 0, 24
+	mov	U_20, fp
+	call	proto6, __dtor___generic_List_int__v_57689, U_20
+	call	memcpy_p, memcpy, I_21, Ret_Addr, I_17, 24
+	ret
+	endfunc
+	export	__generic_List_int_Copy__v
+main:	func	i32
+	local	i64:fp, i64:I_0, i64:U_1, i64:i0_s, i64:i0_i, i64:i_2, i64:U_3, i64:i_4
+	local	i64:i_5, i64:I_6, i64:I_7, i64:i_8, i64:I_9, i64:I_10, i64:I_11, i64:I_12
+	local	i64:i_13, i64:i2_v, i64:i_14, i64:i_15, i64:i_16, i64:i_17, i64:i_18, i64:i_19
+	local	i64:i_20, i64:i_21, i64:U_22, i64:i_23, i64:U_24
+
+# 0 args, 29 locals, 0 globals
+	alloca	fp, 32
+	call	memset_p, memset, I_0, fp, 0, 24
+	mov	U_1, fp
+	call	proto6, __ctor___generic_List_int__v_57189, U_1
+	mov	i0_s, 0
+	mov	i0_i, 0
+	bges	L130, i0_i, 100
+L128:
+	mov	U_3, fp
+	call	proto7, __generic_List_int_Add__i, U_3, i0_i
+L129:
+	mov	i_4, i0_i
+	adds	i_4, i_4, 1
+	mov	i0_i, i_4
+	blts	L128, i0_i, 100
+L130:
+	mov	I_6, fp
+	mov	i_8, i32:8(I_6):i
+	mov	I_7, i_8
+	mov	I_9, i64:(I_6):pi
+	mov	I_10, 0
+L131:
+	bge	L134, I_10, I_7
+L132:
+	mul	I_11, I_10, 4
+	add	I_12, I_9, I_11
+	mov	i2_v, i32:(I_12)
+	mov	i_14, i0_s
+	adds	i_14, i_14, i2_v
+	mov	i0_s, i_14
+L133:
+	add	I_10, I_10, 1
+	jmp	L131
+L134:
+	mov	i_17, i32:8(fp):i
+	call	proto8, printf, i_16, "sum=%d count=%d\n\000", i0_s, i_17
+	bnes	L135, i0_s, 4950
+L138:
+	mov	i_19, i32:8(fp):i
+	beqs	L136, i_19, 100
+L135:
+	call	proto8, printf, i_21, "FAIL\n\000"
+	mov	U_22, fp
+	call	proto6, __dtor___generic_List_int__v_57689, U_22
+	ret	1
+	jmp	L137
+L136:
+L137:
+	call	proto8, printf, i_23, "PASS\n\000"
+	mov	U_24, fp
+	call	proto6, __dtor___generic_List_int__v_57689, U_24
+	ret	0
+	endfunc
+	export	main
+	endmodule

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sh cy-validate/run-validate.sh *)",
+      "Bash(sh bugs/run-bugs.sh *)",
+      "Bash(sh ./ext/mir/c-tests/runtests.sh *)"
+    ]
+  }
+}
