@@ -606,7 +606,7 @@ The rest of `examples/` is fair game. From the repo root:
 ```
 
 Behavior claimed here is supposed to stay true in
-**[`cy-validate/`](cy-validate/)** (60 programs):
+**[`cy-validate/`](cy-validate/)** (64 programs):
 
 ```bash
 sh cy-validate/run-validate.sh

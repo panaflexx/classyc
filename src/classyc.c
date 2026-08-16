@@ -11235,6 +11235,108 @@ static node_t synthesize_any_thunks (c2m_ctx_t c2m_ctx, const char *iface_name,
 #undef SB_PUTS
 }
 
+/* Parse (but do not yet inject/check) the top-level source for a per-class
+   defer-cleanup thunk -- the synthesis half of ensure_defer_thunk (defined
+   later, once module_item_list/check_lambda_func_def are available; split
+   across the file for that reason -- see its comment):
+
+     static void __thunk_dtor_<C>(void* p) { delete (C*)p; }
+
+   Full delete (dtor + string-member drop + object-guard-or-free).  Uses
+   the exact name any<I>(C*) erasure already synthesizes, so the two
+   features share one definition for a class used both ways (deduped
+   via any_thunk_register_p's registry, whichever registers first).
+
+   Sets *NAME_OUT to the interned thunk name unconditionally.  Returns NULL
+   (nothing to inject) when the name was already registered -- by an earlier
+   call or an any<I>(C*) erasure of the same class -- or when CONCRETE_NAME
+   does not resolve to a class visible at top_scope (the thunk body's cast
+   could never check; see below).  Otherwise returns the parsed N_LIST of
+   items (one top-level function def) for the caller to inject and check. */
+static node_t synthesize_defer_thunk_items (c2m_ctx_t c2m_ctx,
+                                            const char *concrete_name, pos_t pos,
+                                            const char **name_out) {
+  parse_ctx_t parse_ctx = c2m_ctx->parse_ctx;
+  MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+  char thunk_name[512];
+  VARR (char) * sb;
+  node_t items, cid;
+  size_t tstart, saved_idx;
+  token_t saved_tok;
+  node_t saved_scope, saved_class;
+
+  snprintf (thunk_name, sizeof (thunk_name), "__thunk_dtor_%s", concrete_name);
+  *name_out = uniq_cstr (c2m_ctx, thunk_name).s;
+  if (!any_thunk_register_p (c2m_ctx, thunk_name)) return NULL; /* already exists */
+
+  /* The thunk body names the class in a cast: `delete (C*)__p;`.  That makes
+     two preconditions for the reparse below, both visible only when C is a
+     mangled name no user source ever spells (__generic_Map_String_int,
+     __Any_Shape, ...):
+
+     1. CHECK: the name must resolve to a class definition from top_scope
+        (check_lambda_func_def checks the thunk with curr_scope = top_scope).
+        Specializations get their S_TAG/S_REGULARS symbols when materialized,
+        so this holds for any class the caller could hold a checked pointer
+        to -- but verify, because a thunk that fails to check would leave the
+        name registered with no definition.
+
+     2. PARSE: the name must be a *parser* typename reachable from the
+        reparse's NULL scope.  typedef_name()'s scope walk from
+        curr_scope == NULL sees only NULL-scope entries, and the mangled
+        name's original tpname_add used whatever scope was live when the
+        specialization was created (often a since-popped function scope).
+        Seed the NULL-scope entry explicitly. */
+  cid = build_id (c2m_ctx, concrete_name, pos);
+  if (top_scope == NULL
+      || find_def (c2m_ctx, S_TAG, cid, top_scope, NULL) == NULL)
+    return NULL;
+  if (!tpname_find (c2m_ctx, cid, NULL, NULL)) tpname_add (c2m_ctx, cid, NULL, TRUE);
+
+#define SB_PUTS(s) varr_str_push (sb, (s))
+  VARR_CREATE (char, sb, alloc, 256);
+  SB_PUTS ("static void ");
+  SB_PUTS (thunk_name);
+  SB_PUTS ("(void* __p) { delete (");
+  SB_PUTS (concrete_name);
+  /* The trailing run of ';' tokens is more than spare lookahead for the
+     reparse loop: they are error-recovery sync points.  If the synthesized
+     text ever fails to parse, the parser's skip-to-';' recovery must find a
+     sentinel INSIDE this token run -- the synthesized tokens are the tail of
+     recorded_tokens, so a skip that overruns them reads past the varr and
+     aborts (mir-varr assert), corrupting the whole compile. */
+  SB_PUTS ("*)__p; }\n;\n;\n;\n;\n");
+  VARR_PUSH (char, sb, '\0');
+
+  if (c2m_options->debug_p)
+    fprintf (stderr, "=== synthesized defer thunk %s ===\n%s\n", thunk_name, VARR_ADDR (char, sb));
+
+  tstart = lex_source_into_tokens (c2m_ctx, VARR_ADDR (char, sb), pos);
+  VARR_DESTROY (char, sb);
+#undef SB_PUTS
+
+  saved_idx = next_token_index;
+  saved_tok = curr_token;
+  saved_scope = curr_scope;
+  saved_class = parse_ctx->curr_class;
+  curr_scope = NULL;
+  parse_ctx->curr_class = NULL;
+  next_token_index = tstart;
+  read_token (c2m_ctx);
+  items = new_node (c2m_ctx, N_LIST);
+  while (!C (';') && !C (T_EOFILE)) {
+    node_t item = TRY (declaration);
+    if (item == err_node) item = parse_synth_func_def (c2m_ctx);
+    if (item == NULL || item == err_node) break;
+    op_flat_append (c2m_ctx, items, item);
+  }
+  curr_scope = saved_scope;
+  parse_ctx->curr_class = saved_class;
+  next_token_index = saved_idx;
+  curr_token = saved_tok;
+  return items;
+}
+
 /* interface Name { ret meth(params); ... }
    Parsed like a struct body (each prototype becomes an N_MEMBER carrying a
    function declarator).  Builds N_INTERFACE { id(0), member_list(1) } and
@@ -11804,6 +11906,11 @@ struct check_ctx {
   node_t module_item_list; /* the module's top-level N_LIST */
   node_t curr_module_item; /* module item currently being checked */
   node_t curr_lambda_def;  /* innermost synthetic lambda FUNC_DEF being checked */
+  /* Same as module_item_list but NEVER cleared after the module walk: the
+     ownership pass runs after check (when module_item_list is already
+     restored to NULL) and still needs to append synthesized top-level
+     functions (defer-cleanup thunks, ensure_defer_thunk). */
+  node_t module_items_root;
   /* When non-zero (set across the module's first check pass), method bodies
      of class members are queued in `pending_method_bodies` instead of being
      checked immediately.  Restoring 0 around the drain prevents recursive
@@ -11833,6 +11940,7 @@ struct check_ctx {
 #define context_stack check_ctx->context_stack
 #define module_item_list check_ctx->module_item_list
 #define curr_module_item check_ctx->curr_module_item
+#define module_items_root check_ctx->module_items_root
 #define curr_lambda_def check_ctx->curr_lambda_def
 #define in_unowned_p check_ctx->in_unowned_p
 #define in_owned_p check_ctx->in_owned_p
@@ -15769,6 +15877,52 @@ static void check_lambda_func_def (c2m_ctx_t c2m_ctx, node_t func_def) {
   curr_call_arg_area_offset = saved_arg_area;
 }
 
+/* Ensure the per-class defer-cleanup thunk exists as a checked,
+   module-injected top-level function (see synthesize_defer_thunk_items,
+   defined near synthesize_any_thunks, for the actual source-text
+   synthesis). Split across the file because synthesis needs the parser's
+   C()/TRY() macros, which are #undef'd before this point, while injection
+   needs module_item_list/curr_module_item/check_lambda_func_def, none of
+   which are declared yet back where synthesis has to live. Returns the
+   interned thunk name. */
+static const char *ensure_defer_thunk (c2m_ctx_t c2m_ctx,
+                                       const char *concrete_name, pos_t pos) {
+  check_ctx_t check_ctx = c2m_ctx->check_ctx;
+  const char *name;
+  node_t items = synthesize_defer_thunk_items (c2m_ctx, concrete_name, pos, &name);
+
+  /* Inject + check right now, just like synthesize_any_thunks's caller does
+     for the Any<I> factory, so `name` resolves for any find_def lookup
+     that follows. NULL items means the thunk was already registered (by an
+     earlier call or an any<I>(C*) erasure of the same class) or the class
+     name wasn't synthesizable -- nothing to inject, `name` is still valid
+     (gen tolerates the decl being absent: no shadow push is emitted).
+
+     Insertion point: before curr_module_item during the check pass (so gen
+     emits the thunk before the function that references it). The ownership
+     pass's `owned` hook calls us AFTER check, when module_item_list has been
+     restored to NULL; then append at the end of module_items_root (the same
+     list, stashed at N_MODULE check entry) -- gen handles the forward
+     reference via MIR_new_forward (see gen_defer_shadow_push). */
+  {
+    node_t root = module_item_list != NULL ? module_item_list : module_items_root;
+    if (items != NULL && root != NULL) {
+      node_t arr[8];
+      int n = 0;
+      for (node_t it = NL_HEAD (items->u.ops); it != NULL && n < 8; it = NL_NEXT (it)) arr[n++] = it;
+      for (int k = 0; k < n; k++) {
+        NL_REMOVE (items->u.ops, arr[k]);
+        if (curr_module_item != NULL)
+          DLIST_INSERT_BEFORE (node_t, root->u.ops, curr_module_item, arr[k]);
+        else
+          DLIST_APPEND (node_t, root->u.ops, arr[k]);
+        check_lambda_func_def (c2m_ctx, arr[k]);
+      }
+    }
+  }
+  return name;
+}
+
 /* Instantiate an untyped lambda  (params) => body  with concrete parameter
    types inferred at the call site.  Builds a synthetic static FUNC_DEF,
    inserts it into the module item list before the item being checked (so its
@@ -18006,7 +18160,15 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
                                   new_node (c2m_ctx, N_LIST));
             saved_errs = n_errors;
             check (c2m_ctx, call, decl_node);
-            if (n_errors == saved_errs) decl->dtor_call = call;
+            if (n_errors == saved_errs) {
+              decl->dtor_call = call;
+              /* NOTE: stack-object (RAII) destructors are deliberately NOT
+                 registered on the exception-path defer shadow stack
+                 (cy__defer_stack, cyexc.h): the thunk arg is captured by
+                 value at registration, and a stack address is a dead-frame
+                 pointer once a cross-function longjmp has unwound past it.
+                 See cy-validate/SHORTCOMINGS.md (defer/throw gotcha). */
+            }
           }
         }
       }
@@ -19090,6 +19252,7 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
         node_t saved_module_item = curr_module_item, saved_item_list = module_item_list;
 
         if (top_list_p) module_item_list = r;
+        if (top_list_p) module_items_root = r;
         for (node_t n = NL_HEAD (r->u.ops); n != NULL; n = NL_NEXT (n)) {
           if (top_list_p) curr_module_item = n;
           check (c2m_ctx, n, r);
@@ -24269,6 +24432,22 @@ if (base != NULL && base->code == N_ID) {
 
     check_labels (c2m_ctx, labels, r);
     check (c2m_ctx, stmt, r);
+    /* -fexceptions, `defer delete <class-ptr-expr>;`: also make this cleanup
+       reachable via a runtime-callable thunk, so a `throw` that skips this
+       scope's normal exit can still run it (see cyexc.h's cy__defer_stack
+       and gen_defer_shadow_push). Mirrors the auto_release_call hook in
+       ownership.c for the same N_DELETE shape. */
+    if (c2m_options != NULL && c2m_options->exceptions_p && stmt->code == N_DELETE) {
+      node_t del_expr = NL_EL (stmt->u.ops, 1);
+      struct expr *de = del_expr != NULL ? del_expr->attr : NULL;
+      if (de != NULL && de->type != NULL && de->type->mode == TM_PTR
+          && de->type->u.ptr_type != NULL && de->type->u.ptr_type->mode == TM_CLASS
+          && de->type->u.ptr_type->u.tag_type != NULL) {
+        node_t tag_id = TAG_ID (de->type->u.ptr_type->u.tag_type);
+        if (tag_id != NULL && tag_id->code == N_ID && tag_id->u.s.s != NULL)
+          ensure_defer_thunk (c2m_ctx, tag_id->u.s.s, POS (stmt));
+      }
+    }
     break;
   }
   case N_GO: {
@@ -24871,9 +25050,16 @@ struct gen_ctx {
      Banking the marks into cy_exc's own frame-stack (plain C runtime state,
      unrelated to any JIT-generated register) and re-reading them fresh after
      the jump sidesteps the hazard entirely. */
-  MIR_item_t cy_exc_set_marks_proto, cy_exc_set_marks_item;             /* void cy_exc_set_marks(str_mark,obj_mark) */
+  MIR_item_t cy_exc_set_marks_proto, cy_exc_set_marks_item;             /* void cy_exc_set_marks(str_mark,obj_mark,defer_mark) */
   MIR_item_t cy_exc_current_str_mark_proto, cy_exc_current_str_mark_item; /* size_t cy_exc_current_str_mark(void) */
   MIR_item_t cy_exc_current_obj_mark_proto, cy_exc_current_obj_mark_item; /* size_t cy_exc_current_obj_mark(void) */
+  MIR_item_t cy_exc_current_defer_mark_proto, cy_exc_current_defer_mark_item; /* size_t cy_exc_current_defer_mark(void) */
+  /* defer/owned cleanup thunk stack (cyexc.h) -- see the comment at
+     exception_ensure_imports's rt_import calls for these. */
+  MIR_item_t cy_defer_push_proto, cy_defer_push_item;   /* void cy_defer_push(fn,arg)     */
+  MIR_item_t cy_defer_checkpoint_proto, cy_defer_checkpoint_item; /* size_t cy_defer_checkpoint(void) */
+  MIR_item_t cy_defer_discard_one_proto, cy_defer_discard_one_item; /* void cy_defer_discard_one(void) */
+  MIR_item_t cy_defer_release_to_proto, cy_defer_release_to_item; /* void cy_defer_release_to(mark) */
   MIR_item_t safety_trap_proto, safety_trap_item;       /* void  _safety_trap(reason,fid,line) */
   MIR_item_t cy_safe_alloc_proto, cy_safe_alloc_item;  /* void *cy_safe_alloc(size)           */
   MIR_item_t cy_safe_free_proto,  cy_safe_free_item;   /* void  cy_safe_free(ptr,line)        */
@@ -25059,6 +25245,16 @@ struct gen_ctx {
 #define cy_exc_current_str_mark_item gen_ctx->cy_exc_current_str_mark_item
 #define cy_exc_current_obj_mark_proto gen_ctx->cy_exc_current_obj_mark_proto
 #define cy_exc_current_obj_mark_item gen_ctx->cy_exc_current_obj_mark_item
+#define cy_exc_current_defer_mark_proto gen_ctx->cy_exc_current_defer_mark_proto
+#define cy_exc_current_defer_mark_item gen_ctx->cy_exc_current_defer_mark_item
+#define cy_defer_push_proto gen_ctx->cy_defer_push_proto
+#define cy_defer_push_item gen_ctx->cy_defer_push_item
+#define cy_defer_checkpoint_proto gen_ctx->cy_defer_checkpoint_proto
+#define cy_defer_checkpoint_item gen_ctx->cy_defer_checkpoint_item
+#define cy_defer_discard_one_proto gen_ctx->cy_defer_discard_one_proto
+#define cy_defer_discard_one_item gen_ctx->cy_defer_discard_one_item
+#define cy_defer_release_to_proto gen_ctx->cy_defer_release_to_proto
+#define cy_defer_release_to_item gen_ctx->cy_defer_release_to_item
 #define cy_setjmp_proto gen_ctx->cy_setjmp_proto
 #define cy_setjmp_item gen_ctx->cy_setjmp_item
 #define safety_trap_proto gen_ctx->safety_trap_proto
@@ -27114,6 +27310,10 @@ static void gen_heap_free (c2m_ctx_t c2m_ctx, MIR_op_t ptr, long line) {
    already returned.  A low integer never collides with a real heap node_t. */
 #define CY_EXC_POP_MARKER ((node_t) (intptr_t) 2)
 
+static void exception_ensure_imports (c2m_ctx_t c2m_ctx);
+static MIR_item_t defer_shadow_thunk_item (c2m_ctx_t c2m_ctx, node_t delete_node);
+static void gen_defer_shadow_push (c2m_ctx_t c2m_ctx, node_t delete_node);
+
 /* Emit the deferred statements registered above stack depth `from`, in LIFO
    order, without popping them (the caller decides when to truncate the stack). */
 static void gen_run_defers (c2m_ctx_t c2m_ctx, size_t from) {
@@ -27124,10 +27324,23 @@ static void gen_run_defers (c2m_ctx_t c2m_ctx, size_t from) {
     node_t d;
     i--;
     d = VARR_GET (node_t, defer_stmts, i);
-    if (d == CY_EXC_POP_MARKER)
+    if (d == CY_EXC_POP_MARKER) {
       gen_rt_call_void (c2m_ctx, cy_exc_pop_proto, cy_exc_pop_item, 0, NULL);
-    else
+    } else {
+      /* Keep the exception-path shadow stack (cy__defer_stack, cyexc.h) in
+         sync: a cleanup replayed here on a normal exit must not be re-invoked
+         by a later throw's dispatch path.  Discard BEFORE running: if the
+         cleanup itself throws, its own entry is already gone (no double-run)
+         and the entries below it still unwind via cy_defer_release_to.  The
+         item lookup is the exact condition under which the push was emitted
+         (see gen_defer_shadow_push), so the two sets match by construction. */
+      if (defer_shadow_thunk_item (c2m_ctx, d) != NULL) {
+        exception_ensure_imports (c2m_ctx);
+        gen_rt_call_void (c2m_ctx, cy_defer_discard_one_proto, cy_defer_discard_one_item, 0,
+                          NULL);
+      }
       gen (c2m_ctx, d, NULL, NULL, FALSE, NULL, NULL);
+    }
   }
 }
 
@@ -27273,10 +27486,11 @@ static void exception_ensure_imports (c2m_ctx_t c2m_ctx) {
      so it captures that frame.  Declared to return a 64-bit value (the int
      result is zero/sign-extended in the return register on supported ABIs). */
   rt_import (c2m_ctx, "setjmp", "cy_setjmp", &cy_setjmp_proto, &cy_setjmp_item, 1, "buf");
-  /* void cy_exc_set_marks(size_t str_mark, size_t obj_mark) - bank the
-     String/object arena marks for the frame just pushed. */
+  /* void cy_exc_set_marks(size_t str_mark, size_t obj_mark, size_t defer_mark)
+     - bank the String/object/defer-thunk-stack marks for the frame just
+     pushed. */
   rt_import (c2m_ctx, "cy_exc_set_marks", NULL, &cy_exc_set_marks_proto, &cy_exc_set_marks_item,
-             0, "str_mark obj_mark");
+             0, "str_mark obj_mark defer_mark");
   /* size_t cy_exc_current_str_mark(void) / cy_exc_current_obj_mark(void) -
      read back the marks banked for the currently-topmost frame.  Call before
      cy_exc_pop() on the dispatch path (it reads cy__exc_depth - 1). */
@@ -27284,6 +27498,91 @@ static void exception_ensure_imports (c2m_ctx_t c2m_ctx) {
              &cy_exc_current_str_mark_item, 1, "");
   rt_import (c2m_ctx, "cy_exc_current_obj_mark", NULL, &cy_exc_current_obj_mark_proto,
              &cy_exc_current_obj_mark_item, 1, "");
+  rt_import (c2m_ctx, "cy_exc_current_defer_mark", NULL, &cy_exc_current_defer_mark_proto,
+             &cy_exc_current_defer_mark_item, 1, "");
+  /* defer/owned cleanup thunk stack (cyexc.h): see the big comment there.
+     cy_defer_push registers a (fn, arg) pair at the point a trackable
+     cleanup (owned auto-release, `defer delete <class-ptr>`) is registered;
+     checkpoint/discard_one keep it in sync with the normal AST-replay path;
+     release_to is what the exception-dispatch path calls to actually run
+     pending cleanups a `throw`'s longjmp would otherwise skip. */
+  rt_import (c2m_ctx, "cy_defer_push", NULL, &cy_defer_push_proto, &cy_defer_push_item, 0,
+             "fn arg");
+  rt_import (c2m_ctx, "cy_defer_checkpoint", NULL, &cy_defer_checkpoint_proto,
+             &cy_defer_checkpoint_item, 1, "");
+  rt_import (c2m_ctx, "cy_defer_discard_one", NULL, &cy_defer_discard_one_proto,
+             &cy_defer_discard_one_item, 0, "");
+  rt_import (c2m_ctx, "cy_defer_release_to", NULL, &cy_defer_release_to_proto,
+             &cy_defer_release_to_item, 0, "mark");
+}
+
+/* If NODE is a `delete <class-ptr-expr>;` statement whose class has a
+   runtime-callable cleanup thunk (`__thunk_dtor_<C>`, synthesized at
+   check/ownership time by ensure_defer_thunk), return the thunk's MIR item,
+   creating a forward declaration for it when the thunk's definition sits
+   later in the module than the function currently being generated (the
+   ownership pass appends its thunks at the module end; a forward and the
+   later real definition unify by name at MIR_finish_module time -- the same
+   pattern gen_forward_class_methods uses for class methods).  Otherwise
+   NULL.
+
+   This lookup is the SINGLE source of truth for "does this defer_stmts
+   entry have a shadow-stack entry": gen_defer_shadow_push emits
+   cy_defer_push exactly when this returns non-NULL, and gen_run_defers
+   emits cy_defer_discard_one under the same condition, so the pushed set
+   and the discarded set are identical by construction. */
+static MIR_item_t defer_shadow_thunk_item (c2m_ctx_t c2m_ctx, node_t delete_node) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  node_t expr, thunk_id, thunk_def;
+  struct expr *de;
+  decl_t thunk_decl;
+  const char *cname;
+  char thunk_name[512];
+
+  if (c2m_options == NULL || !c2m_options->exceptions_p) return NULL;
+  if (delete_node == NULL || delete_node->code != N_DELETE) return NULL;
+  if (delete_node->attr == (void *) (intptr_t) -1) return NULL; /* dead-code delete sentinel */
+  expr = NL_EL (delete_node->u.ops, 1);
+  de = expr != NULL ? (struct expr *) expr->attr : NULL;
+  if (de == NULL || de->type == NULL || de->type->mode != TM_PTR) return NULL;
+  cname = class_type_name (de->type->u.ptr_type);
+  if (cname == NULL) return NULL;
+  snprintf (thunk_name, sizeof (thunk_name), "__thunk_dtor_%s", cname);
+  thunk_id = build_id (c2m_ctx, thunk_name, POS (delete_node));
+  if (top_scope == NULL) return NULL;
+  thunk_def = find_def (c2m_ctx, S_REGULARS, thunk_id, top_scope, NULL);
+  if (thunk_def == NULL || thunk_def->code != N_FUNC_DEF || thunk_def->attr == NULL) return NULL;
+  thunk_decl = (decl_t) thunk_def->attr;
+  if (thunk_decl->u.item == NULL) thunk_decl->u.item = MIR_new_forward (ctx, thunk_name);
+  return thunk_decl->u.item;
+}
+
+/* Registration-time half of the exception-path defer shadow stack: when NODE
+   is a trackable `delete <class-ptr-expr>;`, evaluate the pointer expression
+   NOW (Go-style: the deferred value is captured at registration, not at
+   scope exit) and push (thunk, ptr) onto cy__defer_stack.  Normal syntactic
+   exits still replay NODE via gen_run_defers (which discards the shadow
+   entry); only a throw's longjmp -- which skips every syntactic exit --
+   leaves the entry for the dispatch path's cy_defer_release_to.  No-op
+   unless -fexceptions and the class has a synthesized thunk. */
+static void gen_defer_shadow_push (c2m_ctx_t c2m_ctx, node_t delete_node) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+  MIR_item_t thunk = defer_shadow_thunk_item (c2m_ctx, delete_node);
+  node_t expr;
+  op_t pv;
+  MIR_op_t push_args[2];
+
+  if (thunk == NULL) return;
+  exception_ensure_imports (c2m_ctx);
+  expr = NL_EL (delete_node->u.ops, 1);
+  pv = gen (c2m_ctx, expr, NULL, NULL, FALSE, NULL, NULL);
+  pv = force_val (c2m_ctx, pv, FALSE);
+  pv = force_reg (c2m_ctx, pv, MIR_T_I64);
+  push_args[0] = MIR_new_ref_op (ctx, thunk);
+  push_args[1] = pv.mir_op;
+  gen_rt_call_void (c2m_ctx, cy_defer_push_proto, cy_defer_push_item, 2, push_args);
 }
 
 /* -ffibers go/await runtime (cyfiber.h, bound by the driver's import_resolver
@@ -33768,8 +34067,14 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
            ownership pass set decl->auto_release_call to a checked `delete p;`
            / `release(p);` node; routing it through defer_stmts makes it unwind
            at scope exit and on every return/break/continue. */
-        if (decl->auto_release_call != NULL)
+        if (decl->auto_release_call != NULL) {
+          /* -fexceptions: shadow-stack registration too (pointer captured by
+             value here), so a throw's longjmp can still run the release --
+             see gen_defer_shadow_push.  No-op for non-class `release(p);`
+             shapes. */
+          gen_defer_shadow_push (c2m_ctx, decl->auto_release_call);
           VARR_PUSH (node_t, defer_stmts, decl->auto_release_call);
+        }
         if (decl->u.item != NULL && decl->scope == top_scope && !decl->decl_spec.static_p) {
           MIR_new_export (ctx, name);
         } else if (decl->u.item != NULL && decl->scope != top_scope && decl->decl_spec.static_p) {
@@ -35140,12 +35445,20 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       top_gen (c2m_ctx, e, NULL, NULL, NULL);
     break;
   }
-  case N_DEFER:
+  case N_DEFER: {
     /* Register the deferred statement; its code is emitted (LIFO) at scope exit
        by gen_run_defers from N_BLOCK / N_RETURN / N_BREAK / N_CONTINUE. */
+    node_t defer_body = NL_EL (r->u.ops, 1);
+
     assert (false_label == NULL && true_label == NULL);
-    VARR_PUSH (node_t, defer_stmts, NL_EL (r->u.ops, 1));
+    /* -fexceptions: a trackable `defer delete <class-ptr>;` also goes onto the
+       runtime shadow stack now (value captured here), so a throw's longjmp --
+       which skips every syntactic exit gen_run_defers is emitted at -- can
+       still run it.  No-op for any other defer body shape. */
+    gen_defer_shadow_push (c2m_ctx, defer_body);
+    VARR_PUSH (node_t, defer_stmts, defer_body);
     break;
+  }
   case N_GO: {
     /* go f(args); → cy_spawn8((void *) f, nargs, a0, …, a7).  check() validated
        the shape (direct plain-function call, ≤8 GP-class args); the args are
@@ -35539,10 +35852,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       {
         op_t str_mark = gen_str_checkpoint (c2m_ctx);
         op_t obj_mark = gen_obj_checkpoint (c2m_ctx);
-        MIR_op_t mark_args[2];
+        op_t defer_mark
+          = gen_rt_call (c2m_ctx, cy_defer_checkpoint_proto, cy_defer_checkpoint_item, 0, NULL);
+        MIR_op_t mark_args[3];
         mark_args[0] = str_mark.mir_op;
         mark_args[1] = obj_mark.mir_op;
-        gen_rt_call_void (c2m_ctx, cy_exc_set_marks_proto, cy_exc_set_marks_item, 2, mark_args);
+        mark_args[2] = defer_mark.mir_op;
+        gen_rt_call_void (c2m_ctx, cy_exc_set_marks_proto, cy_exc_set_marks_item, 3, mark_args);
       }
 
       /* --- normal path: run protected body, unwind frame, done --- */
@@ -35572,7 +35888,16 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
         = gen_rt_call (c2m_ctx, cy_exc_current_str_mark_proto, cy_exc_current_str_mark_item, 0, NULL);
       op_t dispatch_obj_mark
         = gen_rt_call (c2m_ctx, cy_exc_current_obj_mark_proto, cy_exc_current_obj_mark_item, 0, NULL);
+      op_t dispatch_defer_mark
+        = gen_rt_call (c2m_ctx, cy_exc_current_defer_mark_proto, cy_exc_current_defer_mark_item, 0,
+                        NULL);
       gen_rt_call_void (c2m_ctx, cy_exc_pop_proto, cy_exc_pop_item, 0, NULL);
+      /* Run pending defer/owned/RAII cleanup thunks registered since try-entry
+         (anywhere on the call chain) BEFORE releasing the String/object
+         arenas: a deferred cleanup may itself touch a String or Any<I>
+         handle that's about to be reclaimed below. */
+      gen_rt_call_void (c2m_ctx, cy_defer_release_to_proto, cy_defer_release_to_item, 1,
+                        &dispatch_defer_mark.mir_op);
       gen_str_release_to (c2m_ctx, dispatch_str_mark.mir_op);
       gen_obj_release_to (c2m_ctx, dispatch_obj_mark.mir_op);
       op_t excp = gen_rt_call (c2m_ctx, cy_exc_current_proto, cy_exc_current_item, 0, NULL);

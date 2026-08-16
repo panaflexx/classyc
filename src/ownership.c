@@ -3241,6 +3241,22 @@ static int try_synthesize_auto_release (flowctx_t *ctx, candidate_t *c) {
       return 0;
     }
     d->auto_release_call = del;
+    /* -fexceptions: also make this cleanup reachable via a runtime-callable
+       thunk, so a `throw` that skips this scope's normal exit can still run
+       it (see cyexc.h's cy__defer_stack and gen_defer_shadow_push). Only for
+       class-typed pointers -- ensure_defer_thunk needs a concrete class name
+       to synthesize `delete (C*)p;`; a bare `owned` pointer with no class
+       (release_fn would be "free", not "delete", so it never reaches this
+       branch) isn't affected. */
+    if (c2m_options != NULL && c2m_options->exceptions_p) {
+      struct type *pt = d->decl_spec.type;
+      if (pt != NULL && pt->mode == TM_PTR && pt->u.ptr_type != NULL
+          && pt->u.ptr_type->mode == TM_CLASS && pt->u.ptr_type->u.tag_type != NULL) {
+        node_t tag_id = TAG_ID (pt->u.ptr_type->u.tag_type);
+        if (tag_id != NULL && tag_id->code == N_ID && tag_id->u.s.s != NULL)
+          ensure_defer_thunk (c2m_ctx, tag_id->u.s.s, POS (id));
+      }
+    }
     c->release_kind = c->managed_p ? "auto-deleted at scope exit (owned)"
                                    : "auto-released (-fauto-release)";
     c->release_pos  = POS (id);

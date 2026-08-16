@@ -121,6 +121,11 @@ static void *import_resolver(const char *name){
     if(strcmp(name,"cy_exc_set_marks")==0) return (void*)cy_exc_set_marks;
     if(strcmp(name,"cy_exc_current_str_mark")==0) return (void*)cy_exc_current_str_mark;
     if(strcmp(name,"cy_exc_current_obj_mark")==0) return (void*)cy_exc_current_obj_mark;
+    if(strcmp(name,"cy_exc_current_defer_mark")==0) return (void*)cy_exc_current_defer_mark;
+    if(strcmp(name,"cy_defer_push")==0) return (void*)cy_defer_push;
+    if(strcmp(name,"cy_defer_checkpoint")==0) return (void*)cy_defer_checkpoint;
+    if(strcmp(name,"cy_defer_discard_one")==0) return (void*)cy_defer_discard_one;
+    if(strcmp(name,"cy_defer_release_to")==0) return (void*)cy_defer_release_to;
     if(strcmp(name,"_safety_trap")==0) return (void*)_safety_trap;
     if(strcmp(name,"cy_safe_alloc")==0) return (void*)cy_safe_alloc;
     if(strcmp(name,"cy_safe_free")==0) return (void*)cy_safe_free;
