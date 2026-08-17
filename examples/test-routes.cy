@@ -14,8 +14,8 @@ static void show(Request* req) {
 
 int main() {
     printf("registered routes:\n");
-    for (RouteReg** p = __start_cyreg_routes; p < __stop_cyreg_routes; p++)
-        printf("  %-4s %s\n", (*p)->method, (*p)->path);
+    for (auto r in route_list())
+        printf("  %-4s %s\n", r.method, r.path);
 
     printf("\ndispatch tests:\n");
     { owned Request* q = new Request("GET", "/api/symptoms", "id=T001", ""); show(q); }

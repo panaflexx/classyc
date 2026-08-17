@@ -38,10 +38,8 @@ int main() {
     printf("════════════════════════════════════════════\n");
     printf("  classyc web app  (attribute-routed)\n");
     printf("  registered routes:\n");
-    for (RouteReg** p = __start_cyreg_routes; p < __stop_cyreg_routes; p++) {
-        RouteReg* r = *p;
-        printf("    %-4s %s\n", r->method, r->path);
-    }
+    for (auto r in route_list())
+        printf("    %-4s %s\n", r.method, r.path);
     printf("════════════════════════════════════════════\n");
     return serve(8080);
 }

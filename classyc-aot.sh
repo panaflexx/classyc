@@ -20,6 +20,8 @@
 #     -o FILE        name of the output executable (default: a.out)
 #     -I DIR / -IDIR, -D..., -U..., -include F, -std=..., -O..., -w, -pedantic
 #                    passed through to classyc (the C front end)
+#     -F DIR / -FDIR, -framework NAME
+#                    clang-style frameworks: classyc (headers + JIT) and the linker
 #     -L..., -l...   passed through to gcc (the linker)
 #     --with-mir     also link the MIR core library (mir.o + mir-gen.o) - needed
 #                    when the compiled program calls the MIR API, e.g. when
@@ -106,9 +108,18 @@ while [ $# -gt 0 ]; do
     # -g: emit debug info through the whole pipeline (classyc -> b2obj -> gcc)
     -g) debug=1; c2m_flags+=("$arg") ;;
     # c2m front-end flags that take a separate argument
-    -I|-D|-U|-include)
+    -I|-D|-U|-include|-F)
       shift; [ $# -gt 0 ] || { echo "$prog: $arg needs an argument" >&2; exit 1; }
-      c2m_flags+=("$arg" "$1") ;;
+      c2m_flags+=("$arg" "$1")
+      # -F is also a linker framework-search path (clang).
+      [ "$arg" = "-F" ] && ld_flags_v+=("$arg" "$1") ;;
+    -framework)
+      shift; [ $# -gt 0 ] || { echo "$prog: $arg needs an argument" >&2; exit 1; }
+      c2m_flags+=("-framework" "$1")
+      ld_flags_v+=("-framework" "$1") ;;
+    -F*)
+      c2m_flags+=("$arg")
+      ld_flags_v+=("$arg") ;;
     -I*|-D*|-U*|-std=*|-O*|-w|-pedantic|-fsigned-char|-fno-*)
       c2m_flags+=("$arg") ;;
     # -ffibers: opt-in go/await syntax for classyc, and pull the fiber/channel

@@ -40,6 +40,11 @@ struct c2mir_options {
   size_t macro_commands_num, include_dirs_num;
   struct c2mir_macro_command *macro_commands;
   const char **include_dirs;
+  /* Clang-style framework search: #include <Foo/bar.h> looks in
+     {dir}/Foo.framework/Headers/bar.h.  Default Darwin SDK/system roots
+     are added by the front end even when this is empty. */
+  size_t framework_dirs_num;
+  const char **framework_dirs;
 };
 
 void c2mir_init (MIR_context_t ctx);

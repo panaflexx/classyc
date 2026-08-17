@@ -184,7 +184,8 @@ struct c2m_ctx {
   jmp_buf env; /* put it first as it might need 16-byte malloc allignment */
   VARR (char_ptr_t) * headers;
   VARR (char_ptr_t) * system_headers;
-  const char **header_dirs, **system_header_dirs;
+  VARR (char_ptr_t) * fw_dirs;
+  const char **header_dirs, **system_header_dirs, **fw_dir_list;
   void (*error_func) (c2m_ctx_t, C_error_code_t code, const char *message);
   VARR (void_ptr_t) * reg_memory;
   VARR (stream_t) * streams; /* stack of streams */
@@ -219,8 +220,10 @@ typedef struct c2m_ctx *c2m_ctx_t;
 #define c2m_options c2m_ctx->options
 #define headers c2m_ctx->headers
 #define system_headers c2m_ctx->system_headers
+#define fw_dirs c2m_ctx->fw_dirs
 #define header_dirs c2m_ctx->header_dirs
 #define system_header_dirs c2m_ctx->system_header_dirs
+#define fw_dir_list c2m_ctx->fw_dir_list
 #define error_func c2m_ctx->error_func
 #define reg_memory c2m_ctx->reg_memory
 #define str_tab c2m_ctx->str_tab
@@ -3133,6 +3136,40 @@ static const char *include_dir_key (c2m_ctx_t c2m_ctx, const char *fname) {
   return uniq_cstr (c2m_ctx, VARR_ADDR (char, temp_string)).s;
 }
 
+/* Clang-style framework include: <Foo/bar.h> → {Fdir}/Foo.framework/Headers/bar.h */
+static const char *framework_resolve (c2m_ctx_t c2m_ctx, const char *name) {
+  const char *slash, *rest;
+  size_t fw_len, i;
+
+  if (name == NULL || name[0] == '\0' || name[0] == '/' || fw_dir_list == NULL) return NULL;
+  slash = strchr (name, '/');
+  if (slash == NULL || slash == name || slash[1] == '\0') return NULL;
+  fw_len = (size_t) (slash - name);
+  rest = slash + 1;
+  for (i = 0; fw_dir_list[i] != NULL; i++) {
+    const char *dir = fw_dir_list[i];
+    size_t dlen;
+    if (dir == NULL || dir[0] == '\0') continue;
+    dlen = strlen (dir);
+    VARR_TRUNC (char, temp_string, 0);
+    add_to_temp_string (c2m_ctx, dir);
+    if (dir[dlen - 1] != '/') add_to_temp_string (c2m_ctx, "/");
+    {
+      size_t k;
+      if (VARR_LENGTH (char, temp_string) != 0
+          && VARR_LAST (char, temp_string) == '\0')
+        VARR_POP (char, temp_string);
+      for (k = 0; k < fw_len; k++) VARR_PUSH (char, temp_string, name[k]);
+      VARR_PUSH (char, temp_string, '\0');
+    }
+    add_to_temp_string (c2m_ctx, ".framework/Headers/");
+    add_to_temp_string (c2m_ctx, rest);
+    if (file_found_cached (c2m_ctx, VARR_ADDR (char, temp_string)))
+      return uniq_cstr (c2m_ctx, VARR_ADDR (char, temp_string)).s;
+  }
+  return NULL;
+}
+
 static void include_resolve_store (c2m_ctx_t c2m_ctx, const char *name, const char *from_dir,
                                    int quote_p, const char *resolved, const char *content) {
   pre_ctx_t pre_ctx = c2m_ctx->pre_ctx;
@@ -3207,6 +3244,13 @@ static const char *get_include_fname (c2m_ctx_t c2m_ctx, token_t t, const char *
         const char *res = uniq_cstr (c2m_ctx, fullname).s;
         include_resolve_store (c2m_ctx, iname, from_dir, quote_p, res, NULL);
         return res;
+      }
+    }
+    {
+      const char *fw = framework_resolve (c2m_ctx, name);
+      if (fw != NULL) {
+        include_resolve_store (c2m_ctx, iname, from_dir, quote_p, fw, NULL);
+        return fw;
       }
     }
   }
@@ -37312,9 +37356,16 @@ static void init_include_dirs (c2m_ctx_t c2m_ctx) {
 
   VARR_CREATE (char_ptr_t, headers, alloc, 0);
   VARR_CREATE (char_ptr_t, system_headers, alloc, 0);
+  VARR_CREATE (char_ptr_t, fw_dirs, alloc, 0);
   for (size_t j = 0; j < c2m_options->include_dirs_num; j++) {
     VARR_PUSH (char_ptr_t, headers, c2m_options->include_dirs[j]);
     VARR_PUSH (char_ptr_t, system_headers, c2m_options->include_dirs[j]);
+  }
+  if (c2m_options->framework_dirs != NULL) {
+    for (size_t j = 0; j < c2m_options->framework_dirs_num; j++) {
+      const char *fd = c2m_options->framework_dirs[j];
+      if (fd != NULL && fd[0] != '\0') VARR_PUSH (char_ptr_t, fw_dirs, fd);
+    }
   }
 
   /* Auto-discover ClassyC's own include/ (so -I include is usually unnecessary).
@@ -37383,9 +37434,35 @@ static void init_include_dirs (c2m_ctx_t c2m_ctx) {
 #if defined(__APPLE__) || defined(__unix__)
   VARR_PUSH (char_ptr_t, system_headers, "/usr/include");
 #endif
+#if defined(__APPLE__)
+  /* Default -F roots.  Headers live in the SDK; the runtime image is under
+     /System/Library/Frameworks (see the JIT -framework loader). */
+  {
+    static const char *const apple_fw_dirs[] = {
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+      "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks",
+      "/System/Library/Frameworks",
+      "/Library/Frameworks",
+      NULL};
+    struct stat st;
+    int fi;
+    for (fi = 0; apple_fw_dirs[fi] != NULL; fi++) {
+      size_t k, n;
+      if (stat (apple_fw_dirs[fi], &st) != 0 || !S_ISDIR (st.st_mode)) continue;
+      n = VARR_LENGTH (char_ptr_t, fw_dirs);
+      for (k = 0; k < n; k++) {
+        const char *p = VARR_GET (char_ptr_t, fw_dirs, k);
+        if (p != NULL && strcmp (p, apple_fw_dirs[fi]) == 0) break;
+      }
+      if (k == n) VARR_PUSH (char_ptr_t, fw_dirs, apple_fw_dirs[fi]);
+    }
+  }
+#endif
   VARR_PUSH (char_ptr_t, system_headers, NULL);
+  VARR_PUSH (char_ptr_t, fw_dirs, NULL);
   header_dirs = (const char **) VARR_ADDR (char_ptr_t, headers);
   system_header_dirs = (const char **) VARR_ADDR (char_ptr_t, system_headers);
+  fw_dir_list = (const char **) VARR_ADDR (char_ptr_t, fw_dirs);
 }
 
 static int check_id_p (c2m_ctx_t c2m_ctx, const char *str) {
@@ -37489,6 +37566,7 @@ static void compile_finish (c2m_ctx_t c2m_ctx) {
   context_finish (c2m_ctx);
   if (headers != NULL) VARR_DESTROY (char_ptr_t, headers);
   if (system_headers != NULL) VARR_DESTROY (char_ptr_t, system_headers);
+  if (fw_dirs != NULL) VARR_DESTROY (char_ptr_t, fw_dirs);
   if (call_nodes != NULL) VARR_DESTROY (node_t, call_nodes);
   if (containing_anon_members != NULL) VARR_DESTROY (node_t, containing_anon_members);
   if (init_object_path != NULL) VARR_DESTROY (init_object_t, init_object_path);

@@ -56,8 +56,8 @@ static void show(const char* label, Request* req) {
 
 static int selftest(void) {
     printf("routes:\n");
-    for (RouteReg** p = __start_cyreg_routes; p < __stop_cyreg_routes; p++)
-        printf(f"  {(*p)->method} {(*p)->path}\n");
+    for (auto r in route_list())
+        printf(f"  {r.method} {r.path}\n");
 
     printf("\nCRUD:\n");
     {
@@ -127,8 +127,8 @@ int main(int argc, char** argv) {
         printf(f"  {mode} · :{port} · {nworkers} OS threads\n");
     else
         printf(f"  {mode} · :{port}\n");
-    for (RouteReg** p = __start_cyreg_routes; p < __stop_cyreg_routes; p++)
-        printf(f"    {(*p)->method} {(*p)->path}\n");
+    for (auto r in route_list())
+        printf(f"    {r.method} {r.path}\n");
     printf("════════════════════════════════════════\n");
     fflush(stdout);
 

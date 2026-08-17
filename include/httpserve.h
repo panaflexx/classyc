@@ -7,9 +7,9 @@
  *         examples/http-serve.c \
  *         examples/http_crud/main.cy examples/http_crud/items.cy -eg
  *
- * Controllers register routes with ROUTE() → [[registry("routes")]]; the app
- * entry point only calls route_dispatch().  Path templates may include
- * `{param}` segments (Flask-style).
+ * Controllers register routes with [[HttpGet]] / ROUTE() → registry("routes").
+ * Apps enumerate them with route_list() (a List<RouteReg>) and dispatch with
+ * route_dispatch().  Path templates may include `{param}` segments.
  */
 #ifndef CLASSYC_HTTPSERVE_H
 #define CLASSYC_HTTPSERVE_H
@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "list.h"
 
 /* ── tiny string helpers (static → each TU gets its own copy for AOT) ── */
 
@@ -133,10 +134,10 @@ extern int serve_fibers(int port);               /* http-serve-fibers.c */
 extern int serve_workers(int port, int nworkers); /* http-serve-workers.cy (-ffibers) */
 extern int serve_workers_cchan(int port, int nworkers); /* http-serve-cchan.c (pthreads, no fibers) */
 
-/* Shared listen / one-shot client helpers (http-serve.c).
+/* Shared listen / client helpers (http-serve.c).
    http_listen binds+listens and returns the listen fd, or -1 on error.
-   http_handle_client reads one request, calls app_handle, writes the response
-   (does not close cfd — the caller owns the fd). */
+   http_handle_client serves the connection (HTTP/1.1 keep-alive) then returns;
+   the caller owns and closes cfd.  Apps just return a Response. */
 extern int  http_listen(int port);
 extern void http_handle_client(int cfd);
 
@@ -163,6 +164,9 @@ extern void http_handle_client(int cfd);
  *     ROUTE("GET", "/api/items/{id}", items_get);
  *
  *     Response* app_handle(Request* req) { return route_dispatch(req); }
+ *
+ *     for (auto r in route_list())
+ *         printf("%s %s\n", r.method, r.path);
  */
 
 typedef struct {
@@ -171,8 +175,18 @@ typedef struct {
     Response* (*handler)(Request*);
 } RouteReg;
 
+/* Linker set filled by [[registry("routes")]].  Prefer route_list(). */
 extern RouteReg* __start_cyreg_routes[];
 extern RouteReg* __stop_cyreg_routes[];
+
+/* Snapshot of every registered route (by-value copies of the POD records).
+   Strings and handlers stay owned by the registry; the List is a RAII shell. */
+static List<RouteReg> route_list(void) {
+    auto rs = List<RouteReg>();
+    for (RouteReg** p = __start_cyreg_routes; p < __stop_cyreg_routes; p++)
+        if (*p) rs.Add(**p);
+    return move rs;
+}
 
 /* Legacy: explicit ROUTE table entry (prefer [[HttpGet]] / etc. on the fn). */
 #define ROUTE(method, path, fn) \

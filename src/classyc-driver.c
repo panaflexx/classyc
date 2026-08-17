@@ -34,6 +34,14 @@
 #define C2MIR_PARALLEL 0
 #endif
 
+#ifndef PATH_MAX
+#ifdef _WIN32
+#define PATH_MAX 260
+#else
+#define PATH_MAX 4096
+#endif
+#endif
+
 #if C2MIR_PARALLEL && defined(_WIN32) /* TODO: Win thread primitives ??? */
 #undef C2MIR_PARALLEL
 #define C2MIR_PARALLEL 0
@@ -230,6 +238,85 @@ static void open_std_libs (void) {
 DEF_VARR (lib_t);
 static VARR (lib_t) * cmdline_libs;
 static VARR (char_ptr_t) * lib_dirs;
+static VARR (char_ptr_t) * framework_dirs;
+
+#if defined(__APPLE__)
+static const char *darwin_framework_dirs[] = {
+  "/System/Library/Frameworks",
+  "/Library/Frameworks",
+  "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks",
+  "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks",
+  NULL};
+#endif
+
+/* dlopen name.framework/{name,Versions/Current/name} under DIR. */
+static void *try_dlopen_framework (const char *dir, const char *name) {
+  static const char *const tails[] = {"/%s.framework/%s", "/%s.framework/Versions/Current/%s", NULL};
+  size_t i;
+  void *h;
+
+  if (dir == NULL || dir[0] == '\0' || name == NULL || name[0] == '\0') return NULL;
+  for (i = 0; tails[i] != NULL; i++) {
+    char path[PATH_MAX];
+    if (snprintf (path, sizeof path, "%s", dir) >= (int) sizeof path) continue;
+    {
+      size_t n = strlen (path);
+      if (n > 0 && path[n - 1] == '/') path[n - 1] = '\0';
+      if (snprintf (path + strlen (path), sizeof path - strlen (path), tails[i], name, name)
+          >= (int) (sizeof path - strlen (path)))
+        continue;
+    }
+    h = dlopen (path, RTLD_LAZY);
+    if (h != NULL) return h;
+  }
+  return NULL;
+}
+
+static void *open_framework (const char *name) {
+  void *h = NULL;
+  size_t i;
+
+  if (name == NULL || name[0] == '\0') return NULL;
+  /* Allow "OpenGL.framework" on the command line. */
+  {
+    size_t n = strlen (name);
+    const char *suf = ".framework";
+    size_t sl = strlen (suf);
+    if (n > sl && strcmp (name + n - sl, suf) == 0) {
+      char *tmp = reg_malloc (n - sl + 1);
+      memcpy (tmp, name, n - sl);
+      tmp[n - sl] = '\0';
+      name = tmp;
+    }
+  }
+  if (framework_dirs != NULL) {
+    for (i = 0; i < VARR_LENGTH (char_ptr_t, framework_dirs); i++) {
+      h = try_dlopen_framework (VARR_GET (char_ptr_t, framework_dirs, i), name);
+      if (h != NULL) return h;
+    }
+  }
+#if defined(__APPLE__)
+  for (i = 0; darwin_framework_dirs[i] != NULL; i++) {
+    h = try_dlopen_framework (darwin_framework_dirs[i], name);
+    if (h != NULL) return h;
+  }
+#else
+  (void) i;
+#endif
+  return NULL;
+}
+
+static void process_cmdline_framework (char *fw_name) {
+  lib_t lib;
+
+  lib.name = fw_name;
+  lib.handler = open_framework (fw_name);
+  if (lib.handler == NULL) {
+    fprintf (stderr, "cannot find framework %s -- good bye\n", fw_name);
+    exit (1);
+  }
+  VARR_PUSH (lib_t, cmdline_libs, lib);
+}
 
 static void *open_lib (const char *dir, const char *name) {
   const char *last_slash = strrchr (dir, slash);
@@ -260,8 +347,16 @@ static void process_cmdline_lib (char *lib_name) {
   lib_t lib;
 
   lib.name = lib_name;
+  lib.handler = NULL;
   for (size_t i = 0; i < VARR_LENGTH (char_ptr_t, lib_dirs); i++)
     if ((lib.handler = open_lib (VARR_GET (char_ptr_t, lib_dirs, i), lib_name)) != NULL) break;
+#if defined(__APPLE__)
+  /* Linux command lines keep working: -lGL is OpenGL.framework on Darwin. */
+  if (lib.handler == NULL
+      && (strcmp (lib_name, "GL") == 0 || strcmp (lib_name, "OpenGL") == 0
+          || strcmp (lib_name, "GLU") == 0))
+    lib.handler = open_framework ("OpenGL");
+#endif
   if (lib.handler == NULL) {
     fprintf (stderr, "cannot find library lib%s -- good bye\n", lib_name);
     exit (1);
@@ -319,6 +414,7 @@ static void init_options (int argc, char *argv[]) {
   gen_debug_level = -1;
   VARR_CREATE (char, temp_string, &default_alloc, 0);
   VARR_CREATE (char_ptr_t, headers, &default_alloc, 0);
+  VARR_CREATE (char_ptr_t, framework_dirs, &default_alloc, 0);
   VARR_CREATE (macro_command_t, macro_commands, &default_alloc, 0);
   optimize_level = -1;
   threads_num = 1;
@@ -394,6 +490,23 @@ static void init_options (int argc, char *argv[]) {
         fprintf (stderr, "-o without argument\n");
       else
         options.output_file_name = argv[++i];
+    } else if (strcmp (argv[i], "-framework") == 0) {
+      char *arg;
+      const char *name = (i + 1 < argc) ? argv[++i] : "";
+      if (*name == '\0') {
+        fprintf (stderr, "-framework without a name\n");
+        exit (1);
+      }
+      arg = reg_malloc (strlen (name) + 1);
+      strcpy (arg, name);
+      process_cmdline_framework (arg);
+    } else if (strncmp (argv[i], "-F", 2) == 0) {
+      char *arg;
+      const char *dir = strlen (argv[i]) == 2 && i + 1 < argc ? argv[++i] : argv[i] + 2;
+      if (*dir == '\0') continue;
+      arg = reg_malloc (strlen (dir) + 1);
+      strcpy (arg, dir);
+      VARR_PUSH (char_ptr_t, framework_dirs, arg);
     } else if ((incl_p = strncmp (argv[i], "-I", 2) == 0)
                || (ldir_p = strncmp (argv[i], "-L", 2) == 0) || strncmp (argv[i], "-l", 2) == 0) {
       char *arg;
@@ -457,7 +570,10 @@ static void init_options (int argc, char *argv[]) {
       fprintf (stderr, "  -dg[level] -- output given (or max) level MIR-generator debug info\n");
       fprintf (stderr, "  -E -- output C preprocessed code into stdout\n");
       fprintf (stderr, "  -Dname[=value], -Uname -- predefine or unpredefine macros\n");
-      fprintf (stderr, "  -Idir, -Ldir -- add directories to search include headers or lbraries\n");
+      fprintf (stderr, "  -Idir, -Ldir -- add directories to search include headers or libraries\n");
+      fprintf (stderr, "  -Fdir, -framework name -- clang-style framework include/search and JIT-load\n");
+      fprintf (stderr, "                (<Foo/bar.h> → dir/Foo.framework/Headers/bar.h;\n");
+      fprintf (stderr, "                 -lGL on Darwin aliases to OpenGL.framework)\n");
       fprintf (stderr, "  -fpreprocessed -- assume preprocessed input C\n");
       fprintf (stderr, "  -fsyntax-only -- check C code correctness only\n");
       fprintf (stderr, "  -fpedantic -- assume strict standard input C code\n");
@@ -486,6 +602,8 @@ static void init_options (int argc, char *argv[]) {
   }
   options.include_dirs_num = VARR_LENGTH (char_ptr_t, headers);
   options.include_dirs = VARR_ADDR (char_ptr_t, headers);
+  options.framework_dirs_num = VARR_LENGTH (char_ptr_t, framework_dirs);
+  options.framework_dirs = VARR_ADDR (char_ptr_t, framework_dirs);
   options.macro_commands_num = VARR_LENGTH (macro_command_t, macro_commands);
   options.macro_commands = VARR_ADDR (macro_command_t, macro_commands);
   if (!C2MIR_PARALLEL || threads_num <= 1) threads_num = 0;

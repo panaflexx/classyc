@@ -96,6 +96,7 @@ the repo root.
 | `-ffibers` | enable `go` / `await` |
 | `-fno-exceptions` | no exceptions, no safety traps |
 | `-l name` / `-L dir` | same idea as `cc` (`-l sqlite3`, not a path) |
+| `-F dir` / `-framework name` | clang-style frameworks (`<OpenGL/gl.h>`, JIT-load `OpenGL.framework`; `-lGL` aliases that on Darwin) |
 
 `classyc` is also a C compiler. The MIR c-test suite is
 `sh ext/mir/c-tests/runtests.sh ext/mir/c-tests/use-c2m-gen-O3 bin/classyc`.
