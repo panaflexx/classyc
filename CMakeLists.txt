@@ -153,12 +153,20 @@ elseif( UNIX )
   target_link_libraries(b2obj PRIVATE mir_static ${CMAKE_DL_LIBS})
 endif()
 
+# nmb: nm-like inspector for .bmir / .mir (symbols, traps, debug types).
+add_executable(nmb src/nmb.c)
+target_include_directories(nmb PRIVATE ${CMAKE_SOURCE_DIR}/${MIRDIR})
+target_link_libraries(nmb PRIVATE mir_static)
+if(NOT APPLE)
+  target_link_libraries(nmb PRIVATE m)
+endif()
+
 # ------------------ Optional: Examples and classyc-aot support -----------------------
 # You can extend this to build examples if desired, but since they use classyc-aot script,
 # the main targets above should suffice for manual use.
 
 # Install rules (optional)
-install(TARGETS classyc RUNTIME DESTINATION bin)
+install(TARGETS classyc nmb RUNTIME DESTINATION bin)
 if(APPLE)
   install(TARGETS b2objmac RUNTIME DESTINATION bin)
   install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/b2obj DESTINATION bin)

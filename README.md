@@ -556,6 +556,12 @@ gdb /tmp/taste
 Or `./classyc-aot.sh -I include -g examples/readme-taste.cy -o /tmp/taste`.
 Line information is DWARF v4.
 
+`bin/nmb` is `nm` for `.bmir` / `.mir`: symbols, trap sites, debug types.
+
+```bash
+./bin/nmb -slt examples/http_crud/http_crud.bmir
+```
+
 ### jitrunner
 
 Hot-reload and DAP (Zed / VS Code) sit in `bin/jitrunner`:

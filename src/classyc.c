@@ -25835,12 +25835,20 @@ static MIR_insn_code_t tp_mov (MIR_type_t t) {
   return t == MIR_T_F ? MIR_FMOV : t == MIR_T_D ? MIR_DMOV : t == MIR_T_LD ? MIR_LDMOV : MIR_MOV;
 }
 
+/* Stamp the current AST source location onto INSN when -g is on.
+   emit_insn_opt used to skip this, so most generated instructions (and
+   therefore DWARF line records / GDB stepping) had no location. */
+static void emit_stamp (c2m_ctx_t c2m_ctx, MIR_insn_t insn) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+
+  if (c2m_options->debug_info_p && curr_src_line != 0 && curr_src_file_id != 0)
+    MIR_insn_set_source_loc (insn, curr_src_file_id, curr_src_line, curr_src_col);
+}
+
 static void emit_insn (c2m_ctx_t c2m_ctx, MIR_insn_t insn) {
   gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
 
-  /* Stamp source location on every emitted instruction (only with -g) */
-  if (c2m_options->debug_info_p && curr_src_line != 0 && curr_src_file_id != 0)
-    MIR_insn_set_source_loc (insn, curr_src_file_id, curr_src_line, curr_src_col);
+  emit_stamp (c2m_ctx, insn);
   MIR_append_insn (c2m_ctx->ctx, curr_func, insn);
 }
 
@@ -25884,11 +25892,13 @@ static void emit_insn_opt (c2m_ctx_t c2m_ctx, MIR_insn_t insn) {
     MIR_insn_op_mode (ctx, tail, 0, &out_p);
     if (out_p) {
       tail->ops[0] = insn->ops[0];
+      emit_stamp (c2m_ctx, insn);
       MIR_append_insn (ctx, curr_func, insn);
       MIR_remove_insn (ctx, curr_func, insn);
       return;
     }
   }
+  emit_stamp (c2m_ctx, insn);
   MIR_append_insn (ctx, curr_func, insn);
 }
 
@@ -31350,8 +31360,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     if (c2m_options->exceptions_p && (r->code == N_DIV || r->code == N_MOD)
         && integer_type_p (((struct expr *) r->attr)->type)) {
       struct type *rt = ((struct expr *) r->attr)->type;
+      node_t den_n = NL_EL (r->u.ops, 1);
+      struct expr *den_e = den_n != NULL ? den_n->attr : NULL;
+      /* Constant non-zero divisor: the trap is dead. */
+      int den_known_nz = den_e != NULL && den_e->const_p && den_e->c.i_val != 0;
       op_t div_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
-      gen_div_zero_check (c2m_ctx, div_reg, (long) POS (r).lno);
+      if (!den_known_nz)
+        gen_div_zero_check (c2m_ctx, div_reg, (long) POS (r).lno);
       /* Signed MIN / -1 overflow (SIGFPE) guard. */
       if (signed_integer_type_p (rt)) {
         mir_size_t sz = type_size (c2m_ctx, rt);
@@ -31368,8 +31383,15 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       int width = (int) (sz * MIR_CHAR_BIT);
       if (width < 8) width = 8;
       if (width > 64) width = 64;
-      op_t cnt_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
-      gen_shift_range_check (c2m_ctx, cnt_reg, width, (long) POS (r).lno);
+      node_t cnt_n = NL_EL (r->u.ops, 1);
+      struct expr *cnt_e = cnt_n != NULL ? cnt_n->attr : NULL;
+      /* Constant count already in range: the trap is dead.  This is the
+         common case for libc inline helpers (bswap, etc.). */
+      if (!(cnt_e != NULL && cnt_e->const_p && cnt_e->c.i_val >= 0
+            && cnt_e->c.i_val < width)) {
+        op_t cnt_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
+        gen_shift_range_check (c2m_ctx, cnt_reg, width, (long) POS (r).lno);
+      }
     }
     emit_bin_op (c2m_ctx, r, ((struct expr *) r->attr)->type, res, op1, op2);
     break;
@@ -31538,8 +31560,12 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     if (c2m_options->exceptions_p && (r->code == N_DIV_ASSIGN || r->code == N_MOD_ASSIGN)
         && integer_type_p (((struct expr *) r->attr)->type2)) {
       struct type *rt = ((struct expr *) r->attr)->type2;
+      node_t den_n = NL_EL (r->u.ops, 1);
+      struct expr *den_e = den_n != NULL ? den_n->attr : NULL;
+      int den_known_nz = den_e != NULL && den_e->const_p && den_e->c.i_val != 0;
       op_t div_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
-      gen_div_zero_check (c2m_ctx, div_reg, (long) POS (r).lno);
+      if (!den_known_nz)
+        gen_div_zero_check (c2m_ctx, div_reg, (long) POS (r).lno);
       /* Signed MIN / -1 overflow (SIGFPE) guard. */
       if (signed_integer_type_p (rt)) {
         mir_size_t sz = type_size (c2m_ctx, rt);
@@ -31556,8 +31582,13 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       int width = (int) (sz * MIR_CHAR_BIT);
       if (width < 8) width = 8;
       if (width > 64) width = 64;
-      op_t cnt_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
-      gen_shift_range_check (c2m_ctx, cnt_reg, width, (long) POS (r).lno);
+      node_t cnt_n = NL_EL (r->u.ops, 1);
+      struct expr *cnt_e = cnt_n != NULL ? cnt_n->attr : NULL;
+      if (!(cnt_e != NULL && cnt_e->const_p && cnt_e->c.i_val >= 0
+            && cnt_e->c.i_val < width)) {
+        op_t cnt_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
+        gen_shift_range_check (c2m_ctx, cnt_reg, width, (long) POS (r).lno);
+      }
     }
     emit_bin_op (c2m_ctx, r, ((struct expr *) r->attr)->type2, val, val, op2);
     t = get_op_type (c2m_ctx, var);
@@ -36353,12 +36384,31 @@ static MIR_dbtype_id_t dbinfo_lower_type_impl (c2m_ctx_t c2m_ctx, MIR_module_t m
   switch (type->mode) {
   case TM_BASIC: {
     enum basic_type bt = type->u.basic_type;
+    const char *nm;
+    uint32_t sz, al;
+    MIR_dbencoding_t enc;
     if (bt == TP_VOID) return 0;
+    nm = basic_type_dbname (bt);
+    sz = (bt == TP_STRING) ? (uint32_t) sizeof (void *) : (uint32_t) basic_type_size (bt);
+    al = (bt == TP_STRING) ? (uint32_t) sizeof (void *) : (uint32_t) basic_type_align (bt);
+    enc = basic_type_encoding (bt);
+    /* Pointer-identity cache misses for the many fresh `struct type`s
+       create_type() allocates for `int` / `String`.  Reuse an existing
+       DIE with the same name/size/encoding so gdb is not flooded. */
+    if (mod->dbtypes != NULL) {
+      uint32_t i;
+      for (i = 1; i < mod->dbtypes->num_types; i++) {
+        MIR_dbtype_t *t = &mod->dbtypes->types[i];
+        if (t->kind == MIR_DBT_BASE && t->u.base.encoding == enc && t->byte_size == sz
+            && t->name != NULL && strcmp (t->name, nm) == 0)
+          return t->id;
+      }
+    }
     dt.kind = MIR_DBT_BASE;
-    dt.name = basic_type_dbname (bt);
-    dt.byte_size = (bt == TP_STRING) ? (uint32_t) sizeof (void *) : (uint32_t) basic_type_size (bt);
-    dt.align = (bt == TP_STRING) ? (uint32_t) sizeof (void *) : (uint32_t) basic_type_align (bt);
-    dt.u.base.encoding = basic_type_encoding (bt);
+    dt.name = nm;
+    dt.byte_size = sz;
+    dt.align = al;
+    dt.u.base.encoding = enc;
     return MIR_dbinfo_add_type (ctx, mod, &dt);
   }
   case TM_PTR: {
@@ -36397,6 +36447,17 @@ static MIR_dbtype_id_t dbinfo_lower_type_impl (c2m_ctx_t c2m_ctx, MIR_module_t m
     dt.name = tname;
     dt.byte_size = type->raw_size != MIR_SIZE_MAX ? (uint32_t) type->raw_size : 0;
     dt.align = type->align >= 0 ? (uint32_t) type->align : 0;
+    /* Named complete aggregates: reuse the first DIE with the same
+       name/kind/size so Request/Response do not appear N times. */
+    if (tname != NULL && dt.byte_size != 0 && mod->dbtypes != NULL) {
+      uint32_t i;
+      for (i = 1; i < mod->dbtypes->num_types; i++) {
+        MIR_dbtype_t *t = &mod->dbtypes->types[i];
+        if (t->kind == dt.kind && t->byte_size == dt.byte_size && t->name != NULL
+            && strcmp (t->name, tname) == 0)
+          return t->id;
+      }
+    }
     dt.u.aggregate.num_members = 0;
     dt.u.aggregate.members = NULL;
     /* Count members */
