@@ -37373,7 +37373,8 @@ static void init_include_dirs (c2m_ctx_t c2m_ctx) {
      install: .../bin → ../include or share), then cwd.  Extra paths: CFLAGS -I… */
   if (classyc_exe_dir (exe_dir, sizeof (exe_dir)) == 0) {
     static const char *const rels[]
-      = {"../include", "include", "../../include", "../share/classyc/include", NULL};
+      = {"../include", "../include/classyc", "include", "../../include",
+         "../share/classyc/include", NULL};
     for (i = 0; rels[i] != NULL; i++) try_push_include_rel (c2m_ctx, alloc, exe_dir, rels[i]);
   }
   if (getcwd (cwd, sizeof (cwd)) != NULL) try_push_include_rel (c2m_ctx, alloc, cwd, "include");

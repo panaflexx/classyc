@@ -47,16 +47,36 @@ usage () { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; }
 # The C2M and B2OBJ environment variables override the tools, which makes it
 # possible to bootstrap successive generations of the compiler, e.g.
 #     C2M=./classyc-aot ./classyc-aot --with-mir ... -o classyc-gen2.aot
+#
+# classyc-aot.sh supports two layouts, resolved relative to the script's own
+# location (not the caller's cwd, so it works from anywhere):
+#   repo tree  - ./classyc-aot.sh at the repo root; tools in ./bin, AOT
+#                support files in ./src, ./ext/mir, ./lib, ./ext/ccchan.
+#   installed  - <prefix>/bin/classyc-aot next to classyc/b2obj/nmb; AOT
+#                support files under <prefix>/share/classyc/... and
+#                <prefix>/lib (see CMakeLists.txt's install() rules).
 script_dir=$(cd "$(dirname "$0")" && pwd)
-csrc_dir="./src"
-mir_dir="ext/mir"
-mir_lib_dir="./lib"
+if [ -x "$script_dir/bin/classyc" ]; then
+  tool_dir="$script_dir/bin"
+  include_dir="$script_dir/include"
+  csrc_dir="$script_dir/src"
+  mir_dir="$script_dir/ext/mir"
+  mir_lib_dir="$script_dir/lib"
+  ccchan_dir="$script_dir/ext/ccchan"
+else
+  tool_dir="$script_dir"
+  include_dir="$script_dir/../include/classyc"
+  csrc_dir="$script_dir/../share/classyc/runtime"
+  mir_dir="$script_dir/../share/classyc/mir"
+  mir_lib_dir="$script_dir/../lib"
+  ccchan_dir="$script_dir/../share/classyc/ccchan"
+fi
 
 find_tool () {
   local name=$1
-  if [ -x "$script_dir/$name" ]; then echo "$script_dir/$name"
+  if [ -x "$tool_dir/$name" ]; then echo "$tool_dir/$name"
   elif command -v "$name" >/dev/null 2>&1; then command -v "$name"
-  else echo "$prog: cannot find '$name' (looked in $script_dir and \$PATH)" >&2; exit 1
+  else echo "$prog: cannot find '$name' (looked in $tool_dir and \$PATH)" >&2; exit 1
   fi
 }
 
@@ -69,8 +89,8 @@ else
     B2OBJ_DEFAULT="b2obj"
 fi
 
-C2M=${C2M:-$(find_tool "bin/classyc")}
-B2OBJ=${B2OBJ:-$(find_tool "bin/$B2OBJ_DEFAULT")}
+C2M=${C2M:-$(find_tool "classyc")}
+B2OBJ=${B2OBJ:-$(find_tool "$B2OBJ_DEFAULT")}
 CC=${CC:-gcc}
 
 output="a.out"
@@ -101,7 +121,7 @@ while [ $# -gt 0 ]; do
     -v|--verbose) verbose=1 ;;
     --with-mir)
 	  c2m_flags+=("-I" "$mir_dir")
-	  c2m_flags+=("-I" "include")
+	  c2m_flags+=("-I" "$include_dir")
 	  with_mir=1 ;;
     -o) shift; [ $# -gt 0 ] || { echo "$prog: -o needs an argument" >&2; exit 1; }; output=$1 ;;
     -o*) output=${arg#-o} ;;
@@ -168,8 +188,8 @@ if [ -f "$csrc_dir/mir-aot-runtime.c" ]; then
   rt_obj="$workdir/mir-aot-runtime.o"
   rt_cmd=("$CC" -O2)
   [ "$debug" -eq 1 ] && rt_cmd+=(-g)
-  [ "$chanfibers" -eq 1 ] && rt_cmd+=(-DCHANFIBERS -I ext/ccchan)
-  rt_cmd+=(-c -I include -I "${mir_dir}" "$csrc_dir/mir-aot-runtime.c" -o "$rt_obj")
+  [ "$chanfibers" -eq 1 ] && rt_cmd+=(-DCHANFIBERS -I "${ccchan_dir}")
+  rt_cmd+=(-c -I "${include_dir}" -I "${mir_dir}" "$csrc_dir/mir-aot-runtime.c" -o "$rt_obj")
   echo "${rt_cmd[@]}"
   run "${rt_cmd[@]}"
   link_objects+=("$rt_obj")
@@ -191,7 +211,7 @@ if [ "$with_mir" -eq 1 ]; then
   if [ -f "${mir_lib_dir}/libmir_static.a" ]; then
     link_objects+=("${mir_lib_dir}/libmir_static.a")
   else
-    echo "$prog: --with-mir: need $script_dir/{mir.o,mir-gen.o} or $script_dir/libmir.a" >&2
+    echo "$prog: --with-mir: need ${mir_lib_dir}/libmir_static.a" >&2
     exit 1
   fi
 fi

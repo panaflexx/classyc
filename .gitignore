@@ -1,6 +1,15 @@
 # Prerequisites
 *.d
 
+# In-tree CMake build (README's `cmake . && make` workflow generates these
+# at the repo root; the normal `cmake -B build -S .` workflow doesn't).
+/CMakeCache.txt
+/Makefile
+/cmake_install.cmake
+/CTestTestfile.cmake
+/compile_commands.json
+/install_manifest.txt
+
 # Object files
 *.o
 *.ko
@@ -56,4 +65,5 @@ dkms.conf
 CMakeFiles/
 bin/
 build/
+build-user/
 .cache/

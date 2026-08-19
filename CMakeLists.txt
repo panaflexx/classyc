@@ -165,15 +165,101 @@ endif()
 # You can extend this to build examples if desired, but since they use classyc-aot script,
 # the main targets above should suffice for manual use.
 
-# Install rules (optional)
-install(TARGETS classyc nmb RUNTIME DESTINATION bin)
+# ------------------ Install ------------------------------------------------
+# Works identically for a system install (default prefix /usr/local, needs
+# sudo/root) and a per-user install (-DCMAKE_INSTALL_PREFIX=$HOME/.classyc,
+# no elevated privileges) — same rules, different prefix.
+include(GNUInstallDirs)
+
+install(TARGETS classyc classyc-lsp nmb
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+install(TARGETS mir_static
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
 if(APPLE)
-  install(TARGETS b2objmac RUNTIME DESTINATION bin)
-  install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/b2obj DESTINATION bin)
+  install(TARGETS b2objmac RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  # b2obj is a convenience alias for b2objmac on macOS.  Create the symlink
+  # fresh inside the install tree (relative target) at install time, rather
+  # than installing the build-tree symlink verbatim — that one points back
+  # into the build directory and breaks once it's removed.
+  install(CODE "
+    execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink
+        b2objmac
+        \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/b2obj\")
+  ")
 elseif(UNIX)
-  install(TARGETS b2obj RUNTIME DESTINATION bin)
+  install(TARGETS b2obj RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
+
+# classyc-aot: the AOT driver script (classyc -> b2obj -> cc), installed
+# alongside the binaries it drives.
+install(PROGRAMS ${CMAKE_SOURCE_DIR}/classyc-aot.sh
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+    RENAME classyc-aot
+)
+
+# Headers: the whole include/ tree (list.h, sqlite.h, dict.h, ..., the
+# per-arch aarch64/ ppc64/ riscv64/ s390x/ x86_64/ subdirs, and the embedded
+# buffer.bmir template), namespaced under <prefix>/include/classyc so it
+# can't collide with anything else on the system. src/classyc.c's own header
+# auto-discovery already probes "../include/classyc" relative to the binary.
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/classyc
+)
+
+# AOT support files classyc-aot (the installed script) needs at build time
+# for every AOT program:
+#   - mir-aot-runtime.c: GCC-compiled runtime glue (atomics, va_arg builtins,
+#     etc). Ships as source and stays GCC-compiled per AOT build — classyc
+#     cannot compile this file itself (it uses GCC/Clang atomic builtins,
+#     thread_local registries, and __builtin_frame_address/return_address,
+#     none of which the classyc frontend implements).
+#   - mir-tls.c + the ext/mir headers: needed for mir-tls.c's own compile
+#     step, and for `classyc-aot --with-mir` (e.g. bootstrapping classyc
+#     itself against the real MIR API).
+install(FILES ${CMAKE_SOURCE_DIR}/src/mir-aot-runtime.c
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/classyc/runtime
+)
+install(FILES ${CMAKE_SOURCE_DIR}/${MIRDIR}/mir-tls.c
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/classyc/mir
+)
+# Top-level ext/mir/*.h only (mir.h, mir-gen.h, and the handful of headers
+# they transitively pull in) — NOT a recursive copy. ext/mir is the full
+# vendored MIR checkout (its own c2mir/ front end, test suites, build
+# artifacts); classyc's own build never references anything below its
+# top level either (see the classyc target's include dirs above), so a
+# non-recursive glob is both correct and avoids dragging that in.
+file(GLOB CLASSYC_MIR_HEADERS "${CMAKE_SOURCE_DIR}/${MIRDIR}/*.h")
+install(FILES ${CLASSYC_MIR_HEADERS}
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/classyc/mir
+)
+install(FILES
+    ${CMAKE_SOURCE_DIR}/ext/ccchan/cchan.h
+    ${CMAKE_SOURCE_DIR}/ext/ccchan/minicoro.h
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/classyc/ccchan
+)
+
+# ---- uninstall --------------------------------------------------------------
+# CMake has no built-in uninstall; this is the standard recipe (walk
+# install_manifest.txt, which `install()` writes automatically on
+# `cmake --install`, and remove every path it lists). Prefix-agnostic: works
+# the same for the system and per-user builds since each has its own
+# manifest in its own build directory.
+if(NOT TARGET uninstall)
+  configure_file(
+      "${CMAKE_SOURCE_DIR}/cmake/cmake_uninstall.cmake.in"
+      "${CMAKE_BINARY_DIR}/cmake_uninstall.cmake"
+      IMMEDIATE @ONLY
+  )
+  add_custom_target(uninstall
+      COMMAND ${CMAKE_COMMAND} -P ${CMAKE_BINARY_DIR}/cmake_uninstall.cmake
+      COMMENT "Removing installed classyc files (see install_manifest.txt)"
+  )
 endif()
 
 message(STATUS "classyc build configured. MIR integrated as subdirectory.")
 message(STATUS "Build with: cmake -B build -S . && cmake --build build")
 message(STATUS "Output: bin/classyc and b2obj/b2objmac")
+message(STATUS "Install with: cmake --install build   (uninstall: cmake --build build --target uninstall)")

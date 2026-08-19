@@ -63,6 +63,36 @@ and aliases it as `b2obj`.
 
 ---
 
+## Install
+
+```bash
+./install.sh          # system install: /usr/local/{bin,include/classyc,lib,share/classyc}
+                       # (sudo needed for the final `cmake --install` step)
+./install.sh --user    # per-user install: ~/.classyc/{bin,include/classyc,lib,share/classyc}
+                       # no sudo needed; add ~/.classyc/bin to PATH as prompted
+```
+
+Both give you `classyc`, `classyc-lsp`, `nmb`, `b2obj`/`b2objmac`, and
+`classyc-aot` (the AOT driver script, installed under that name) on `PATH`,
+plus a namespaced header tree so `#include "list.h"` etc. just works with no
+`-I` flags — `classyc` auto-discovers `<prefix>/include/classyc` relative to
+its own binary. AOT builds (`classyc-aot`, `--with-mir`, `-ffibers`) work the
+same way, installed or run straight from the repo.
+
+Under the hood these are thin wrappers around plain CMake:
+
+```bash
+cmake -B build -S . -DCMAKE_INSTALL_PREFIX=/wherever
+cmake --build build -j
+cmake --install build
+```
+
+Uninstall with `./uninstall.sh` (or `./uninstall.sh --user`), which just runs
+the `uninstall` CMake target — removes exactly what `install()` put down, by
+reading `install_manifest.txt`.
+
+---
+
 ## Run
 
 ```bash
