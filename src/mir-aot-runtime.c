@@ -147,6 +147,91 @@ FILE *__mir_stdin_ptr(void) { return stdin; }
 
 #if !defined(_WIN32)
 
+#if defined(__aarch64__)
+
+/* aarch64 va_list layout differs entirely from x86_64's — Apple's is a bare
+   stack-pointer cursor (all varargs are passed on the stack), while Linux
+   aarch64 (AAPCS64) uses the 5-field {__stack,__gr_top,__vr_top,__gr_offs,
+   __vr_offs} struct.  Mirrors ext/mir/mir-aarch64.c's va_arg_builtin, which
+   is only linked in via --with-mir; AOT binaries built without --with-mir
+   need this weak fallback to match the real layout MIR's aarch64 codegen
+   sets up in VA_START, or va_arg reads garbage stack offsets. */
+#if defined(__APPLE__)
+struct aarch64_va_list {
+    uint64_t *arg_area;
+};
+#else
+struct aarch64_va_list {
+    void *__stack, *__gr_top, *__vr_top;
+    int __gr_offs, __vr_offs;
+};
+#endif
+
+__attribute__((weak))
+void *va_arg_builtin (void *p, uint64_t t) {
+    struct aarch64_va_list *va = p;
+    int type = (int)t;                 /* MIR_type_t is a small enum */
+    void *a;
+#if defined(__APPLE__)
+    a = va->arg_area;
+    va->arg_area += (type == 10 /* MIR_T_LD */ && __SIZEOF_LONG_DOUBLE__ == 16) ? 2 : 1;
+#else
+    int fp_p = (type == 8 /* MIR_T_F */ || type == 9 /* MIR_T_D */ || type == 10 /* MIR_T_LD */);
+
+    if (fp_p && va->__vr_offs < 0) {
+        a = (char *) va->__vr_top + va->__vr_offs;
+        va->__vr_offs += 16;
+    } else if (!fp_p && va->__gr_offs < 0) {
+        a = (char *) va->__gr_top + va->__gr_offs;
+        va->__gr_offs += 8;
+    } else {
+        if (type == 10 /* MIR_T_LD */ && __SIZEOF_LONG_DOUBLE__ == 16)
+            va->__stack = (void *) (((uint64_t) va->__stack + 15) / 16 * 16);
+        a = va->__stack;
+        va->__stack = (char *) va->__stack + (type == 10 && __SIZEOF_LONG_DOUBLE__ == 16 ? 16 : 8);
+    }
+#endif
+    return a;
+}
+
+__attribute__((weak))
+void va_block_arg_builtin (void *res, void *p, size_t s, uint64_t ncase MIR_UNUSED) {
+    struct aarch64_va_list *va = p;
+#if defined(__APPLE__)
+    void *a = (void *) va->arg_area;
+    if (s <= 2 * 8) {
+        va->arg_area += (s + sizeof (uint64_t) - 1) / sizeof (uint64_t);
+    } else {
+        a = *(void **) a;
+        va->arg_area++;
+    }
+    if (res != NULL) memcpy (res, a, s);
+#else
+    void *a;
+    long size = (long) ((s + 7) / 8 * 8);
+
+    if (size <= 2 * 8 && va->__gr_offs + size > 0) { /* not enough regs to pass: */
+        a = va->__stack;
+        va->__stack = (char *) va->__stack + size;
+        va->__gr_offs += (int) size;
+        if (res != NULL) memcpy (res, a, s);
+        return;
+    }
+    if (size > 2 * 8) size = 8;
+    if (va->__gr_offs < 0) {
+        a = (char *) va->__gr_top + va->__gr_offs;
+        va->__gr_offs += (int) size;
+    } else {
+        a = va->__stack;
+        va->__stack = (char *) va->__stack + size;
+    }
+    if (s > 2 * 8) a = *(void **) a; /* address */
+    if (res != NULL) memcpy (res, a, s);
+#endif
+}
+
+#else /* !__aarch64__: x86_64 System V */
+
 struct x86_64_va_list {
     uint32_t gp_offset, fp_offset;
     uint64_t *overflow_arg_area, *reg_save_area;
@@ -183,6 +268,8 @@ void va_block_arg_builtin (void *res, void *p, size_t s, uint64_t ncase) {
     if (res != NULL) memcpy (res, a, s);
     va->overflow_arg_area += size / 8;
 }
+
+#endif /* __aarch64__ */
 
 #else
 /* Win32 / MinGW – provide the _WIN32 versions if you ever need AOT on Windows */
