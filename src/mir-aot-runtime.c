@@ -195,8 +195,9 @@ void *va_arg_builtin (void *p, uint64_t t) {
 }
 
 __attribute__((weak))
-void va_block_arg_builtin (void *res, void *p, size_t s, uint64_t ncase MIR_UNUSED) {
+void va_block_arg_builtin (void *res, void *p, size_t s, uint64_t ncase) {
     struct aarch64_va_list *va = p;
+    (void) ncase;
 #if defined(__APPLE__)
     void *a = (void *) va->arg_area;
     if (s <= 2 * 8) {
