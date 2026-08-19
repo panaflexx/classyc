@@ -1,0 +1,20 @@
+# Standard CMake "uninstall" recipe: walk install_manifest.txt (written by
+# `install()` during `cmake --install`) and remove every path it lists.
+# Prefix-agnostic — works the same for a system (/usr/local) or a per-user
+# (~/.classyc) build, since each build directory has its own manifest.
+
+set(MANIFEST "@CMAKE_BINARY_DIR@/install_manifest.txt")
+
+if(NOT EXISTS "${MANIFEST}")
+  message(FATAL_ERROR "Cannot find install manifest: ${MANIFEST} (run `cmake --install` first)")
+endif()
+
+file(STRINGS "${MANIFEST}" files)
+foreach(file ${files})
+  if(EXISTS "${file}" OR IS_SYMLINK "${file}")
+    message(STATUS "Removing: ${file}")
+    file(REMOVE "${file}")
+  else()
+    message(STATUS "Already removed: ${file}")
+  endif()
+endforeach()
