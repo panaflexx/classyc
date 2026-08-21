@@ -20,6 +20,8 @@
 #include "cstring.h"
 #include "cobjarena.h"
 #include "cyexc.h"
+#define CYFIBER_IMPLEMENTATION /* jitrunner is a "host tool" per cyfiber.h's own doc comment */
+#include "cyfiber.h"
 #include "mir.h"
 #include "mir-dbinfo.h"
 #include "mir-gen.h"
@@ -32,7 +34,13 @@ static lib_t std_libs[] = {
     {"/lib64/libc.so.6", NULL}, {"/lib/x86_64-linux-gnu/libc.so.6", NULL},
     {"/lib64/libm.so.6", NULL}, {"/lib/x86_64-linux-gnu/libm.so.6", NULL},
     {"/usr/lib64/libpthread.so.0", NULL}, {"/lib/x86_64-linux-gnu/libpthread.so.0", NULL},
-    {"/usr/lib/libc.so", NULL}
+    {"/usr/lib/libc.so", NULL},
+    /* Not a general `-l` mechanism — jitrunner has no CLI flag to request
+       extra libraries, so a bmir built with `classyc -l foo` only resolves
+       if foo is hardcoded here too. Added for jit_backend (sqlite3, crypto);
+       widen this list (or add a real -l passthrough) as more get used. */
+    {"/lib/x86_64-linux-gnu/libsqlite3.so.0", NULL}, {"/usr/lib64/libsqlite3.so.0", NULL},
+    {"/lib/x86_64-linux-gnu/libcrypto.so.3", NULL}, {"/usr/lib64/libcrypto.so.3", NULL}
 };
 #elif defined(__aarch64__)
 static lib_t std_libs[] = {
@@ -51,8 +59,62 @@ static lib_t std_libs[] = {
 static void open_std_libs(void){ for(size_t i=0;i<sizeof(std_libs)/sizeof(lib_t);i++) std_libs[i].handler=dlopen(std_libs[i].name,RTLD_LAZY); }
 static int libs_opened=0;
 static void ensure_std_libs(void){ if(!libs_opened){ open_std_libs(); libs_opened=1; } }
+
+/* [[registry("NAME")]] cross-module reflection (JIT linker set), ported from
+ * classyc-driver.c's import_resolver/cyreg_anchor: classyc lowers each
+ * [[registry("NAME")]] record (e.g. httpserve.h's ROUTE()/[[HttpGet]]) to an
+ * exported ref_data symbol __cyreg_<NAME>__<var> pointing at the record, and
+ * leaves __start_cyreg_<NAME>/__stop_cyreg_<NAME> as undefined imports for
+ * whatever JIT driver loads the program to resolve -- the JIT analogue of
+ * GNU ld's __start_/__stop_ linker-set symbols used in AOT. classyc's own
+ * -eg/-el/-eb driver does this; jitrunner didn't, so any httpserve.h-based
+ * program failed to load here with "cannot resolve symbol:
+ * __start_cyreg_routes" even with zero routes registered (the registry
+ * machinery is compiled in unconditionally). MIR_link's import_resolver
+ * callback only takes a name, not the MIR_context_t, so g_cyreg_ctx (set in
+ * jit_link) stands in for classyc-driver.c's static main_ctx. */
+typedef struct { char *name; void **arr; size_t n; } cyreg_set_t;
+static cyreg_set_t *cyreg_sets = NULL;
+static size_t cyreg_nsets = 0, cyreg_cap = 0;
+static MIR_context_t g_cyreg_ctx = NULL;
+
+static cyreg_set_t *cyreg_get_set(const char *regname){
+    for(size_t i=0;i<cyreg_nsets;i++) if(strcmp(cyreg_sets[i].name,regname)==0) return &cyreg_sets[i];
+
+    char prefix[512];
+    int plen = snprintf(prefix, sizeof prefix, "__cyreg_%s__", regname);
+    void **arr = NULL;
+    size_t n = 0, cap = 0;
+    DLIST(MIR_module_t) *mlist = MIR_get_module_list(g_cyreg_ctx);
+    for(MIR_module_t m=DLIST_HEAD(MIR_module_t,*mlist); m!=NULL; m=DLIST_NEXT(MIR_module_t,m)){
+        for(MIR_item_t it=DLIST_HEAD(MIR_item_t,m->items); it!=NULL; it=DLIST_NEXT(MIR_item_t,it)){
+            if(it->item_type != MIR_ref_data_item) continue;
+            const char *nm = it->u.ref_data->name;
+            if(nm==NULL || strncmp(nm,prefix,(size_t)plen)!=0) continue;
+            void *rec = it->u.ref_data->ref_item!=NULL ? it->u.ref_data->ref_item->addr : NULL;
+            if(n>=cap){ cap = cap ? cap*2 : 8; arr = realloc(arr, cap*sizeof(void*)); }
+            arr[n++] = rec;
+        }
+    }
+    if(arr==NULL) arr = calloc(1, sizeof(void*)); /* non-NULL, unique base even when empty */
+    if(cyreg_nsets>=cyreg_cap){ cyreg_cap = cyreg_cap ? cyreg_cap*2 : 8; cyreg_sets = realloc(cyreg_sets, cyreg_cap*sizeof(cyreg_set_t)); }
+    cyreg_sets[cyreg_nsets].name = strdup(regname);
+    cyreg_sets[cyreg_nsets].arr = arr;
+    cyreg_sets[cyreg_nsets].n = n;
+    return &cyreg_sets[cyreg_nsets++];
+}
+
+static void *cyreg_anchor(const char *sym){
+    const char *reg; int stop;
+    if(strncmp(sym,"__start_cyreg_",14)==0){ reg=sym+14; stop=0; }
+    else if(strncmp(sym,"__stop_cyreg_",13)==0){ reg=sym+13; stop=1; }
+    else return NULL;
+    cyreg_set_t *s = cyreg_get_set(reg);
+    return stop ? (void*)(s->arr + s->n) : (void*)s->arr;
+}
 static void *import_resolver(const char *name){
     void *handler,*sym=NULL; ensure_std_libs();
+    { void *a = cyreg_anchor(name); if(a != NULL) return a; }
     for(size_t i=0;i<sizeof(std_libs)/sizeof(lib_t);i++){ handler=std_libs[i].handler; if(handler){ sym=dlsym(handler,name); if(sym) break; } }
     if(sym) return sym;
     if(strcmp(name,"dlopen")==0) return dlopen; if(strcmp(name,"dlerror")==0) return dlerror;
@@ -133,6 +195,42 @@ static void *import_resolver(const char *name){
     if(strcmp(name,"cy_obj_track")==0) return (void*)cy_obj_track;
     if(strcmp(name,"cy_obj_note_free")==0) return (void*)cy_obj_note_free;
     if(strcmp(name,"cy_obj_check")==0) return (void*)cy_obj_check;
+    /* Object arena (Any<I> handles / arena-managed collections; cobjarena.h) */
+    if(strcmp(name,"c2m_obj_track")==0) return (void*)c2m_obj_track;
+    if(strcmp(name,"c2m_obj_checkpoint")==0) return (void*)c2m_obj_checkpoint;
+    if(strcmp(name,"c2m_obj_release_to")==0) return (void*)c2m_obj_release_to;
+    if(strcmp(name,"c2m_obj_detach")==0) return (void*)c2m_obj_detach;
+    if(strcmp(name,"c2m_obj_cleanup")==0) return (void*)c2m_obj_cleanup;
+    /* Fiber / channel runtime (cyfiber.h, CYFIBER_IMPLEMENTATION above) */
+    if(strcmp(name,"cy_sched_init")==0) return (void*)cy_sched_init;
+    if(strcmp(name,"cy_sched_run")==0) return (void*)cy_sched_run;
+    if(strcmp(name,"cy_sched_shutdown")==0) return (void*)cy_sched_shutdown;
+    if(strcmp(name,"add_scheduler")==0) return (void*)add_scheduler;
+    if(strcmp(name,"add_schedular")==0) return (void*)add_schedular;
+    if(strcmp(name,"cy_spawn")==0) return (void*)cy_spawn;
+    if(strcmp(name,"cy_spawn8")==0) return (void*)cy_spawn8;
+    if(strcmp(name,"cy_yield")==0) return (void*)cy_yield;
+    if(strcmp(name,"cy_self")==0) return (void*)cy_self;
+    if(strcmp(name,"cy_fiber_outstanding")==0) return (void*)cy_fiber_outstanding;
+    if(strcmp(name,"cy_sleep_ms")==0) return (void*)cy_sleep_ms;
+    if(strcmp(name,"cy_chan_create")==0) return (void*)cy_chan_create;
+    if(strcmp(name,"cy_chan_send_park")==0) return (void*)cy_chan_send_park;
+    if(strcmp(name,"cy_chan_recv_park")==0) return (void*)cy_chan_recv_park;
+    if(strcmp(name,"cy_chan_try_send")==0) return (void*)cy_chan_try_send;
+    if(strcmp(name,"cy_chan_try_recv")==0) return (void*)cy_chan_try_recv;
+    if(strcmp(name,"cy_chan_send_timeout")==0) return (void*)cy_chan_send_timeout;
+    if(strcmp(name,"cy_chan_recv_timeout")==0) return (void*)cy_chan_recv_timeout;
+    if(strcmp(name,"cy_chan_close")==0) return (void*)cy_chan_close;
+    if(strcmp(name,"cy_chan_is_closed")==0) return (void*)cy_chan_is_closed;
+    if(strcmp(name,"cy_chan_size")==0) return (void*)cy_chan_size;
+    if(strcmp(name,"cy_chan_capacity")==0) return (void*)cy_chan_capacity;
+    if(strcmp(name,"cy_chan_dispose")==0) return (void*)cy_chan_dispose;
+    /* Emulated TLS (real MIR-library functions, statically linked via
+       libmir_static.a -- dlsym against dlopen'd .so handles won't find
+       them, so they need the same explicit-pointer treatment as the rest
+       of this statically-compiled-in runtime). */
+    if(strcmp(name,"mir.tls_addr")==0 || strcmp(name,"mir_tls_addr")==0) return (void*)mir_tls_addr;
+    if(strcmp(name,"mir.tls_base")==0 || strcmp(name,"mir_tls_base")==0) return (void*)mir_tls_base;
     fprintf(stderr,"[jitrunner] cannot resolve symbol: %s\n",name); return NULL;
 }
 void *jit_init(void){ ensure_std_libs(); return (void*)MIR_init(); }
@@ -151,6 +249,7 @@ void jit_gen_init(void *ctx){ MIR_gen_init((MIR_context_t)ctx); }
 void jit_gen_finish(void *ctx){ MIR_gen_finish((MIR_context_t)ctx); }
 void jit_link(void *ctx,int mode){
     MIR_context_t mctx=(MIR_context_t)ctx;
+    g_cyreg_ctx = mctx; /* import_resolver's callback signature has no ctx param */
     /* Interp/debug path: keep real CALL/RET so step-over can track call_depth.
        MIR's process_inlines() would otherwise bake callees into the caller. */
     if(mode==2) MIR_set_no_inlines(1);

@@ -61,9 +61,10 @@ done
 echo "=== Building classyc jitrunner ==="
 echo "  source: $JITRUNNER_SRC"
 
-# 1. Compile mir-bridge.c with gcc (needs real MIR headers + macros)
+# 1. Compile mir-bridge.c with gcc (needs real MIR headers + macros).
+#    -I ext/ccchan: cyfiber.h's CYFIBER_IMPLEMENTATION pulls in cchan.h/minicoro.h.
 echo "[1/4] Compiling mir-bridge.c (gcc)..."
-"$CC" -g -O2 -I "$MIR_DIR" -I "$INC_DIR" -c "$SRC/mir-bridge.c" -o "$WORK_DIR/mir-bridge.o"
+"$CC" -g -O2 -I "$MIR_DIR" -I "$INC_DIR" -I ext/ccchan -c "$SRC/mir-bridge.c" -o "$WORK_DIR/mir-bridge.o"
 
 # 2. Compile jitrunner with classyc → .bmir
 echo "[2/4] Compiling $(basename "$JITRUNNER_SRC") (classyc → bmir)..."
