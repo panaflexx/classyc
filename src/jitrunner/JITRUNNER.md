@@ -33,14 +33,29 @@ bash src/jitrunner/build.sh
 ./bin/jitrunner /tmp/prog.bmir --mode gen
 ./bin/jitrunner /tmp/prog.bmir --mode interp
 
-# Watch .bmir or source recompile+run
+# Runtime-link several .bmir files (HTTP package + app). Last main() wins.
+./bin/classyc -I include -c -o /tmp/link_lib.bmir src/jitrunner/testdata/link_lib.cy
+./bin/classyc -I include -c -o /tmp/link_app.bmir src/jitrunner/testdata/link_app.cy
+./bin/jitrunner /tmp/link_lib.bmir /tmp/link_app.bmir --mode gen
+
+# Watch .bmir(s) or source recompile+run. For a long-running child (server),
+# a change SIGTERMs it and relaunches — that's the hot-reload. Same reload
+# path can later be a DAP `restart` / custom request.
 ./bin/jitrunner /tmp/prog.bmir --watch
+./bin/jitrunner /tmp/http.bmir /tmp/api.bmir --watch --mode gen
 ./bin/jitrunner --compile examples/classy.cy --watch
 ```
 
 - Fork isolation: user code crashes stay in the child.
+- Multiple `.bmir` files: each `MIR_read` appends modules; one `MIR_link`.
 - Output capture in DAP mode (stdout/stderr → DAP `output` events).
 - Independent, strictly increasing DAP server `seq`; responses carry correct `request_seq`.
+- Multi-TU `.bmir` loads (`MIR_set_func_redef_permission`): header-inline
+  class methods (`Request`, `Sqlite.execute`, `List<T>`, …) emitted by
+  every TU that includes the header no longer abort with "func … is
+  prohibited for redefinition". Same ODR as `classyc -eg`. Needed for
+  `[[HttpGet]]` apps split like `examples/http_crud` (`items.cy` +
+  `main.cy`). Regression: `src/jitrunner/testdata/redef_{a,b}.cy`.
 
 ### DAP (stdio + TCP)
 

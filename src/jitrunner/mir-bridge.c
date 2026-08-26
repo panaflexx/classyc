@@ -189,6 +189,15 @@ static void *import_resolver(const char *name){
     if(strcmp(name,"cy_defer_discard_one")==0) return (void*)cy_defer_discard_one;
     if(strcmp(name,"cy_defer_release_to")==0) return (void*)cy_defer_release_to;
     if(strcmp(name,"_safety_trap")==0) return (void*)_safety_trap;
+    /* __builtin_unreachable: some C headers (e.g. an exhaustive switch with
+     * no default case, seen while testing ~/src/GUI/cejson's JsonType
+     * switch under jitrunner) end up with a call to this compiler builtin
+     * for the "impossible" fallthrough path. It's a zero-arg, no-return
+     * call -- _safety_trap takes 3 args (reason, file_id, line) so it's not
+     * a compatible substitute here; abort() matches the real calling
+     * convention and is the correct behavior if control genuinely reaches
+     * a path the compiler was told never happens. */
+    if(strcmp(name,"__builtin_unreachable")==0) return (void*)abort;
     if(strcmp(name,"cy_safe_alloc")==0) return (void*)cy_safe_alloc;
     if(strcmp(name,"cy_safe_free")==0) return (void*)cy_safe_free;
     if(strcmp(name,"cy_safe_deref")==0) return (void*)cy_safe_deref;
@@ -233,7 +242,20 @@ static void *import_resolver(const char *name){
     if(strcmp(name,"mir.tls_base")==0 || strcmp(name,"mir_tls_base")==0) return (void*)mir_tls_base;
     fprintf(stderr,"[jitrunner] cannot resolve symbol: %s\n",name); return NULL;
 }
-void *jit_init(void){ ensure_std_libs(); return (void*)MIR_init(); }
+void *jit_init(void){
+    ensure_std_libs();
+    MIR_context_t ctx = MIR_init();
+    /* Match classyc-driver.c: N source files → N MIR modules, and a class
+       (or any header-inline helper) defined in a shared header is emitted
+       by every TU that includes it. Without this, MIR_load_module aborts
+       with "func … is prohibited for redefinition" — which is why a
+       multi-TU [[HttpGet]] / httpserve.h app (http_crud, jit_backend)
+       runs under classyc -eg but failed to load here. Identical copies
+       get C++-inline / ODR semantics: linking to any one of them is
+       correct. */
+    MIR_set_func_redef_permission(ctx, TRUE);
+    return (void*)ctx;
+}
 void jit_finish(void *ctx){ if(ctx) MIR_finish((MIR_context_t)ctx); }
 int jit_read_bmir(void *ctx, char *path){ FILE *f=fopen(path,"rb"); if(!f) return -1; MIR_read((MIR_context_t)ctx,f); fclose(f); return 0; }
 void *jit_first_module(void *ctx){ DLIST(MIR_module_t) *mlist=MIR_get_module_list((MIR_context_t)ctx); return (void*)DLIST_HEAD(MIR_module_t,*mlist); }

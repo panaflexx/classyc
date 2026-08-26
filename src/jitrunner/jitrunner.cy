@@ -1,9 +1,10 @@
 /* jitrunner.c — ClassyC hot-reload runner for .bmir files
  *
  * A dogfood program written in ClassyC that:
- *   1. Loads a .bmir file and JIT-runs its main() in a forked child
- *   2. Watches the file for changes (inotify on Linux)
- *   3. On change, kills any running child and re-runs
+ *   1. Loads one or more .bmir files into one MIR context and JIT-runs main()
+ *      in a forked child (runtime link: HTTP package + app, etc.)
+ *   2. Watches those files for changes (inotify on Linux)
+ *   3. On change, kills any running child and re-runs (hot-reload)
  *   4. Optionally acts as a DAP server for IDE debugging (--dap <port>)
  *
  * Build (from project root):
@@ -11,6 +12,7 @@
  *
  * Usage:
  *   bin/jitrunner path/to/program.bmir [--watch] [--mode lazy|gen|interp]
+ *   bin/jitrunner lib.bmir app.bmir --mode gen
  *   bin/jitrunner --compile src.c -o program.bmir [--watch]
  *   bin/jitrunner --dap 4711                  # DAP server mode
  */
@@ -31,6 +33,7 @@ extern int    close(int fd);
 extern long   read(int fd, void *buf, long count);
 extern unsigned usleep(unsigned usec);
 extern int    waitpid(int pid, int *status, int options);
+extern int    kill(int pid, int sig);
 extern int    dup(int fd);
 extern int    dup2(int oldfd, int newfd);
 
@@ -50,6 +53,13 @@ extern int open(const char *pathname, int flags, unsigned mode);
 #ifndef WNOHANG
 #define WNOHANG   1
 #endif
+#ifndef SIGTERM
+#define SIGTERM   15
+#endif
+#ifndef SIGKILL
+#define SIGKILL   9
+#endif
+#define JIT_MAX_BMIR 32
 
 /* inotify */
 extern int    inotify_init(void);
@@ -100,17 +110,21 @@ extern int g_dap_ctrl_write_fd;
    ═══════════════════════════════════════════════════════════════════════ */
 
 class RunConfig {
-    String bmir_path;       /* path to the .bmir file to run          */
+    String bmir_path;       /* last / primary .bmir (DAP, -o, display) */
+    char **bmir_paths;      /* all .bmir files, load order; last main() wins */
+    int    nbmirs;
     String source_path;     /* optional: .c source to compile first   */
     String compiler_path;   /* path to classyc compiler               */
     int    watch;           /* 1 = watch for changes and re-run       */
     int    jit_mode;        /* 0=lazy  1=gen  2=interp                */
     int    verbose;         /* 1 = extra diagnostic output            */
     int    dap_port;        /* >0 = run as DAP server on this port    */
-    int dap_stdio;       /* 1 = DAP over stdin/stdout (for Zed)    */
+    int    dap_stdio;       /* 1 = DAP over stdin/stdout (for Zed)    */
 
     RunConfig() {
         this.bmir_path     = "";
+        this.bmir_paths    = (char **) malloc(JIT_MAX_BMIR * 8);
+        this.nbmirs        = 0;
         this.source_path   = "";
         this.compiler_path = "./bin/classyc";
         this.watch         = 0;
@@ -118,9 +132,28 @@ class RunConfig {
         this.verbose       = 0;
         this.dap_port      = 0;
         this.dap_stdio     = 0;
+        if (this.bmir_paths) {
+            for (int i = 0; i < JIT_MAX_BMIR; i++)
+                this.bmir_paths[i] = 0;
+        }
     }
 
-    ~RunConfig() {}
+    ~RunConfig() {
+        if (this.bmir_paths) free((void *) this.bmir_paths);
+        this.bmir_paths = 0;
+    }
+
+    void add_bmir(char *path) {
+        if (!path || !path[0] || !this.bmir_paths) return;
+        for (int i = 0; i < this.nbmirs; i++) {
+            if (this.bmir_paths[i] && strcmp(this.bmir_paths[i], path) == 0)
+                return;
+        }
+        if (this.nbmirs >= JIT_MAX_BMIR) return;
+        this.bmir_paths[this.nbmirs] = path;
+        this.nbmirs = this.nbmirs + 1;
+        this.bmir_path = path;
+    }
 };
 
 /* Global DAP debug log fd, shared with dap.h (declared extern earlier) */
@@ -134,12 +167,14 @@ class RunResult {
     int  exit_code;
     int  signal_num;       /* non-zero if child was killed by signal  */
     int  timed_out;
+    int  reloaded;         /* 1 = parent SIGTERM'd child because a .bmir changed */
     long elapsed_ms;       /* wall-clock milliseconds                 */
 
     RunResult() {
         this.exit_code  = -1;
         this.signal_num = 0;
         this.timed_out  = 0;
+        this.reloaded   = 0;
         this.elapsed_ms = 0;
     }
 
@@ -162,6 +197,30 @@ class RunResult {
    Time helpers
    ═══════════════════════════════════════════════════════════════════════ */
 
+/* Pack RunConfig's .bmir list plus an optional extra path (DAP launch). */
+static int collect_bmirs(RunConfig *cfg, char *extra, char **out, int cap) {
+    int n = 0;
+    if (cfg && cfg->bmir_paths) {
+        for (int i = 0; i < cfg->nbmirs && n < cap; i++) {
+            if (cfg->bmir_paths[i]) {
+                out[n] = cfg->bmir_paths[i];
+                n = n + 1;
+            }
+        }
+    }
+    if (extra && extra[0]) {
+        int dup = 0;
+        for (int i = 0; i < n; i++) {
+            if (out[i] && strcmp(out[i], extra) == 0) dup = 1;
+        }
+        if (!dup && n < cap) {
+            out[n] = extra;
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
 long time_ms(void) {
     long buf[2];  /* tv_sec, tv_nsec */
     buf[0] = 0;
@@ -171,15 +230,73 @@ long time_ms(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+   inotify — watch one or more paths (non-blocking poll for hot-reload)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+static int watch_open(char **paths, int n) {
+    int ifd = inotify_init();
+    if (ifd < 0) return -1;
+    int fl = fcntl(ifd, F_GETFL, 0);
+    if (fl >= 0) fcntl(ifd, F_SETFL, fl | O_NONBLOCK);
+    int added = 0;
+    for (int i = 0; i < n; i++) {
+        char *path = paths[i];
+        if (!path || !path[0]) continue;
+        int wd = inotify_add_watch(ifd, path, 0x002 | 0x008 | 0x080);
+        if (wd < 0) {
+            char *dir = (char *) malloc(strlen(path) + 1);
+            strcpy(dir, path);
+            char *slash = strrchr(dir, '/');
+            if (slash) *slash = '\0';
+            else strcpy(dir, ".");
+            wd = inotify_add_watch(ifd, dir, 0x100 | 0x080);
+            free(dir);
+        }
+        if (wd >= 0) added = added + 1;
+    }
+    if (!added) {
+        close(ifd);
+        return -1;
+    }
+    return ifd;
+}
+
+static int watch_poll(int ifd) {
+    if (ifd < 0) return 0;
+    char buf[4096];
+    long n = read(ifd, (void *) buf, 4096);
+    if (n > 0) return 1;
+    return 0;
+}
+
+static void kill_child(int pid) {
+    kill(pid, SIGTERM);
+    for (int i = 0; i < 50; i++) {
+        int st = 0;
+        int wr = waitpid(pid, &st, WNOHANG);
+        if (wr == pid) return;
+        usleep(20000);
+    }
+    kill(pid, SIGKILL);
+    int st = 0;
+    waitpid(pid, &st, 0);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
    JIT execution — fork + JIT in child
    ═══════════════════════════════════════════════════════════════════════ */
 
-RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb, void *cb_user) {
+RunResult *run_bmir(char **paths, int npaths, int jit_mode, int verbose,
+                    OutputCB out_cb, void *cb_user,
+                    char **watch_paths, int nwatch) {
     RunResult *result = new RunResult();
     long start = time_ms();
 
-    if (verbose)
-        printf("[jitrunner] loading %s (mode=%d)\n", bmir_path, jit_mode);
+    if (verbose) {
+        printf("[jitrunner] loading %d .bmir (mode=%d)\n", npaths, jit_mode);
+        for (int i = 0; i < npaths; i++)
+            printf("[jitrunner]   %s\n", paths[i]);
+    }
 
     int out_pipe[2] = {-1, -1};
     int err_pipe[2] = {-1, -1};
@@ -192,6 +309,9 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb,
             return result;
         }
     }
+
+    fflush(stdout);
+    fflush(stderr);
 
     int pid = fork();
 
@@ -236,21 +356,31 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb,
             _exit(126);
         }
 
-        if (jit_read_bmir(ctx, bmir_path) != 0) {
-            fprintf(stderr, "[jitrunner] error: cannot read %s\n", bmir_path);
+        if (npaths < 1 || !paths) {
+            fprintf(stderr, "[jitrunner] error: no .bmir files to load\n");
             jit_finish(ctx);
             _exit(125);
         }
+        for (int i = 0; i < npaths; i++) {
+            if (jit_read_bmir(ctx, paths[i]) != 0) {
+                fprintf(stderr, "[jitrunner] error: cannot read %s\n", paths[i]);
+                jit_finish(ctx);
+                _exit(125);
+            }
+        }
 
         JIT_item main_func = 0;
+        int nmain = 0;
         JIT_module mod = jit_first_module(ctx);
         while (mod) {
             JIT_item item = jit_first_item(mod);
             while (item) {
                 if (jit_item_is_func(item)) {
                     char *name = jit_func_name(item);
-                    if (name && strcmp(name, "main") == 0)
-                        main_func = item;
+                    if (name && strcmp(name, "main") == 0) {
+                        main_func = item; /* last definition wins */
+                        nmain = nmain + 1;
+                    }
                 }
                 item = jit_next_item(item);
             }
@@ -258,9 +388,14 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb,
             mod = jit_next_module(mod);
         }
 
+        if (nmain > 1)
+            fprintf(stderr, "[jitrunner] warning: %d main() symbols; using the last\n", nmain);
+
         if (!main_func) {
-            fprintf(stderr, "[jitrunner] error: no main() found in %s\n",
-                    bmir_path);
+            fprintf(stderr, "[jitrunner] error: no main() found in:");
+            for (int i = 0; i < npaths; i++)
+                fprintf(stderr, " %s", paths[i]);
+            fprintf(stderr, "\n");
             jit_finish(ctx);
             _exit(124);
         }
@@ -329,6 +464,10 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb,
     }
 
     /* ── parent process ───────────────────────── */
+    int wfd = -1;
+    if (nwatch > 0 && watch_paths)
+        wfd = watch_open(watch_paths, nwatch);
+
     int out_r = out_pipe[0];
     int err_r = err_pipe[0];
 
@@ -386,6 +525,34 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb,
                 }
             }
 
+            if (watch_poll(wfd)) {
+                kill_child(pid);
+                result->reloaded = 1;
+                result->exit_code = 0;
+                result->elapsed_ms = time_ms() - start;
+                if (wfd >= 0) close(wfd);
+                /* drain remaining output so the pipe doesn't stick */
+                fcntl(out_r, F_SETFL, 0);
+                fcntl(err_r, F_SETFL, 0);
+                if (out_open) {
+                    long n;
+                    while ((n = read(out_r, buf, sizeof(buf) - 1)) > 0) {
+                        buf[n] = '\0';
+                        out_cb(cb_user, "stdout", buf);
+                    }
+                    close(out_r);
+                }
+                if (err_open) {
+                    long n;
+                    while ((n = read(err_r, buf, sizeof(buf) - 1)) > 0) {
+                        buf[n] = '\0';
+                        out_cb(cb_user, "stderr", buf);
+                    }
+                    close(err_r);
+                }
+                return result;
+            }
+
             int wstatus = 0;
             int wr = waitpid(pid, &wstatus, WNOHANG);
             if (wr == pid) {
@@ -396,6 +563,7 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb,
                     result->exit_code = 128 + result->signal_num;
                 }
                 result->elapsed_ms = time_ms() - start;
+                if (wfd >= 0) close(wfd);
 
                 /* drain any remaining output (blocking) */
                 fcntl(out_r, F_SETFL, 0);
@@ -422,10 +590,30 @@ RunResult *run_bmir(char *bmir_path, int jit_mode, int verbose, OutputCB out_cb,
             usleep(2000); /* 2ms */
         }
     } else {
-        /* original no-capture path */
+        /* no-capture path — optionally poll inotify so --watch can
+           SIGTERM a long-running child (HTTP server) and relaunch. */
         int status = 0;
-        waitpid(pid, &status, 0);
+        if (wfd < 0) {
+            waitpid(pid, &status, 0);
+        } else {
+            while (1) {
+                if (watch_poll(wfd)) {
+                    kill_child(pid);
+                    result->reloaded = 1;
+                    result->exit_code = 0;
+                    result->elapsed_ms = time_ms() - start;
+                    close(wfd);
+                    return result;
+                }
+                int wr = waitpid(pid, &status, WNOHANG);
+                if (wr == pid) break;
+                usleep(2000);
+            }
+            close(wfd);
+            wfd = -1;
+        }
         result->elapsed_ms = time_ms() - start;
+        if (wfd >= 0) close(wfd);
 
         if ((status & 0x7f) == 0) {
             result->exit_code = (status >> 8) & 0xff;
@@ -508,6 +696,47 @@ int wait_for_change(char *path, int verbose) {
         return 0;
     }
 
+    return 1;
+}
+
+int wait_for_any_change(char **paths, int n, int verbose) {
+    if (n <= 0 || !paths) return 0;
+    if (n == 1) return wait_for_change(paths[0], verbose);
+    int ifd = inotify_init();
+    if (ifd < 0) {
+        fprintf(stderr, "[jitrunner] error: inotify_init failed\n");
+        return 0;
+    }
+    int added = 0;
+    for (int i = 0; i < n; i++) {
+        char *path = paths[i];
+        if (!path || !path[0]) continue;
+        int wd = inotify_add_watch(ifd, path, 0x002 | 0x008 | 0x080);
+        if (wd < 0) {
+            char *dir = (char *) malloc(strlen(path) + 1);
+            strcpy(dir, path);
+            char *slash = strrchr(dir, '/');
+            if (slash) *slash = '\0';
+            else strcpy(dir, ".");
+            wd = inotify_add_watch(ifd, dir, 0x100 | 0x080);
+            free(dir);
+        }
+        if (wd >= 0) added = added + 1;
+        if (verbose && wd >= 0)
+            printf("[jitrunner] watching %s for changes...\n", path);
+    }
+    if (!added) {
+        fprintf(stderr, "[jitrunner] error: cannot watch any .bmir\n");
+        close(ifd);
+        return 0;
+    }
+    char buf[4096];
+    long rn = read(ifd, (void *) buf, 4096);
+    close(ifd);
+    if (rn < 0) {
+        if (*__errno_location() == 4) return 1;
+        return 0;
+    }
     return 1;
 }
 
@@ -681,8 +910,10 @@ static RunResult *dap_run_program(DapServer *dap, RunConfig *cfg, char *bmir_pat
     }
 
     dap->on_pre_run(bmir_path);
-    RunResult *result = run_bmir(bmir_path, cfg->jit_mode, cfg->verbose,
-                                 dap_out_cb, (void *)dap);
+    char *paths[JIT_MAX_BMIR + 1];
+    int npaths = collect_bmirs(cfg, bmir_path, paths, JIT_MAX_BMIR + 1);
+    RunResult *result = run_bmir(paths, npaths, cfg->jit_mode, cfg->verbose,
+                                 dap_out_cb, (void *)dap, 0, 0);
 
     /* run_bmir parent path may already have closed the read end and
        cleared g_interp_child_ctrl_fd_from_env — avoid double-close. */
@@ -821,11 +1052,16 @@ void print_usage(void) {
     printf("classyc jitrunner \xe2\x80\x94 hot-reload .bmir runner\n\n");
     printf("Usage:\n");
     printf("  jitrunner <file.bmir> [options]\n");
+    printf("  jitrunner <lib.bmir ...> <app.bmir> [options]\n");
     printf("  jitrunner --compile <file.c> -o <file.bmir> [options]\n");
     printf("  jitrunner --dap <port>                       (DAP server)\n");
     printf("  jitrunner --dap-stdio                        (DAP over stdin/stdout)\n\n");
+    printf("  Multiple .bmir files are loaded into one MIR context and linked\n");
+    printf("  at run time (last main() wins). --watch SIGTERMs the child when\n");
+    printf("  any of those files change and relaunches — hot-reload for a\n");
+    printf("  long-running server. A DAP restart can use the same path later.\n\n");
     printf("Options:\n");
-    printf("  --watch, -w        Watch file and re-run on change\n");
+    printf("  --watch, -w        Watch .bmir(s) and re-run on change\n");
     printf("  --mode <m>         JIT mode: lazy (default), gen, interp\n");
     printf("  --compile <file.c> Compile .c to .bmir before running\n");
     printf("  --compiler <path>  Path to classyc (default: ./bin/classyc)\n");
@@ -909,7 +1145,7 @@ RunConfig *parse_args(int argc, char **argv) {
                 delete cfg;
                 return 0;
             }
-            cfg->bmir_path = argv[i];
+            cfg->add_bmir(argv[i]);
             i = i + 1;
             continue;
         }
@@ -937,9 +1173,8 @@ RunConfig *parse_args(int argc, char **argv) {
             continue;
         }
 
-        /* positional: .bmir path */
-        if (strlen(cfg->bmir_path) == 0)
-            cfg->bmir_path = arg;
+        /* positional: another .bmir (libs first, app last) */
+        cfg->add_bmir(arg);
 
         i = i + 1;
     }
@@ -1070,15 +1305,23 @@ void print_banner(void) {
     printf("\n");
 }
 
-void print_run_start(char *path, int run_num) {
+void print_run_start(char **paths, int npaths, int run_num) {
     char label[64];
     sprintf(label, "run #%d", run_num);
     term_hr_label(label);
-    printf("  file: %s\n", path);
+    if (npaths <= 1)
+        printf("  file: %s\n", npaths == 1 ? paths[0] : "");
+    else {
+        printf("  files:\n");
+        for (int i = 0; i < npaths; i++)
+            printf("         %s\n", paths[i]);
+    }
 }
 
 void print_run_result(RunResult *r) {
-    if (r->ok())
+    if (r->reloaded)
+        term_print_info("file changed, reloading...");
+    else if (r->ok())
         term_print_ok((char *)r->summary());
     else
         term_print_err((char *)r->summary());
@@ -1129,17 +1372,19 @@ int main(int argc, char **argv) {
     /* ── CLI mode (original behaviour) ───────────────────────────── */
 
     /* If --compile was given, figure out bmir_path from source */
-    if (strlen(cfg->source_path) > 0 && strlen(cfg->bmir_path) == 0) {
+    if (strlen(cfg->source_path) > 0 && cfg->nbmirs == 0) {
         int slen = strlen(cfg->source_path);
         char *out = (char *)malloc(slen + 6);
         strcpy(out, cfg->source_path);
         if (slen > 2 && strcmp(out + slen - 2, ".c") == 0)
             out[slen - 2] = '\0';
+        else if (slen > 3 && strcmp(out + slen - 3, ".cy") == 0)
+            out[slen - 3] = '\0';
         strcat(out, ".bmir");
-        cfg->bmir_path = out;
+        cfg->add_bmir(out);
     }
 
-    if (strlen(cfg->bmir_path) == 0) {
+    if (cfg->nbmirs == 0) {
         fprintf(stderr, "error: no .bmir file specified\n");
         print_usage();
         return 1;
@@ -1152,7 +1397,14 @@ int main(int argc, char **argv) {
     if (strlen(cfg->source_path) > 0)
         printf("  source: %s\n", cfg->source_path);
 
-    printf("  bmir:  %s\n\n", cfg->bmir_path);
+    if (cfg->nbmirs == 1)
+        printf("  bmir:  %s\n\n", cfg->bmir_paths[0]);
+    else {
+        printf("  bmir:\n");
+        for (int i = 0; i < cfg->nbmirs; i++)
+            printf("         %s\n", cfg->bmir_paths[i]);
+        printf("\n");
+    }
 
     int run_num = 0;
 
@@ -1178,49 +1430,68 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Check the .bmir file exists */
-        if (!File.exists((char *)cfg->bmir_path)) {
-            fprintf(stderr, "[jitrunner] error: %s not found\n",
-                    (char *)cfg->bmir_path);
+        /* Check every .bmir exists */
+        int missing = 0;
+        for (int i = 0; i < cfg->nbmirs; i++) {
+            if (!File.exists(cfg->bmir_paths[i])) {
+                fprintf(stderr, "[jitrunner] error: %s not found\n",
+                        cfg->bmir_paths[i]);
+                missing = 1;
+            }
+        }
+        if (missing) {
             if (!cfg->watch) return 1;
-            wait_for_change((char *)cfg->bmir_path, cfg->verbose);
+            wait_for_any_change(cfg->bmir_paths, cfg->nbmirs, cfg->verbose);
             continue;
         }
 
         run_num = run_num + 1;
-        print_run_start((char *)cfg->bmir_path, run_num);
+        print_run_start(cfg->bmir_paths, cfg->nbmirs, run_num);
 
-        /* Fork + JIT + run */
+        /* Watch list: all .bmirs, plus source if we're compiling. */
+        char *watch_paths[JIT_MAX_BMIR + 1];
+        int nwatch = 0;
+        if (cfg->watch) {
+            for (int i = 0; i < cfg->nbmirs; i++) {
+                watch_paths[nwatch] = cfg->bmir_paths[i];
+                nwatch = nwatch + 1;
+            }
+            if (strlen(cfg->source_path) > 0) {
+                watch_paths[nwatch] = (char *) cfg->source_path;
+                nwatch = nwatch + 1;
+            }
+        }
+
+        /* Fork + JIT + run. With --watch, a file change SIGTERMs the
+           child (hot-reload) instead of waiting for it to exit. */
         RunResult *result = run_bmir(
-            (char *)cfg->bmir_path,
+            cfg->bmir_paths, cfg->nbmirs,
             cfg->jit_mode,
             cfg->verbose,
-            NULL, NULL
+            NULL, NULL,
+            cfg->watch ? watch_paths : 0,
+            cfg->watch ? nwatch : 0
         );
 
-        print_run_result(result);
-
+        int reloaded = result->reloaded;
         int last_exit = result->exit_code;
+        print_run_result(result);
         delete result;
 
         if (!cfg->watch)
             return last_exit;
 
-        /* Watch for changes */
-        printf("\n");
-
-        char *watch_target = (char *)cfg->bmir_path;
-        if (strlen(cfg->source_path) > 0)
-            watch_target = (char *)cfg->source_path;
-
-        int changed = wait_for_change(watch_target, cfg->verbose);
-        if (!changed) {
-            fprintf(stderr, "[jitrunner] watch error, exiting\n");
-            return 1;
+        if (!reloaded) {
+            /* Child exited on its own — wait for the next edit. */
+            printf("\n");
+            int changed = wait_for_any_change(watch_paths, nwatch, cfg->verbose);
+            if (!changed) {
+                fprintf(stderr, "[jitrunner] watch error, exiting\n");
+                return 1;
+            }
+            term_print_info("file changed, reloading...");
+            printf("\n");
         }
-
-        term_print_info("file changed, reloading...");
-        printf("\n");
 
         usleep(100 * 1000);
 

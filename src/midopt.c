@@ -3126,8 +3126,20 @@ static int midopt_should_inline_p (c2m_ctx_t c2m_ctx, node_t func_def) {
 
   midopt_metrics_walk (FUNC_DEF_BLOCK (func_def), &nst, &ncall, &hard);
   if (hard) return 0;
+  /* TODO: budget=3 at -O2 still rejects ordinary "2 guard clauses + real
+     work" functions (e.g. stringbuf_append_char, 7 nst) even after the
+     call_ok relax below. Revisit raising it (toward level 3's 8) with the
+     same full regression pass (cy-testhard/cy-validate/run-examples). */
   budget = (lvl >= 3) ? 8 : 3;
-  call_ok = (lvl >= 3) ? 2 : 0;
+  /* call_ok was 0 at -O2, meaning any function that delegates to a helper --
+     e.g. a tiny append/push wrapper that calls a shared capacity/bounds-check
+     function before touching the buffer, a very common leaf-ish shape -- was
+     never inlined at the default level no matter how small it was. Measured
+     directly: a StringBuf append-one-byte wrapper stayed a real call at -O2
+     purely because of this, while gcc -O2 on equivalent C happily inlined
+     both levels; allowing exactly one nested call keeps the budget still
+     tight (see nst above) but stops penalizing this specific, common shape. */
+  call_ok = (lvl >= 3) ? 2 : 1;
   if (nst > budget || ncall > call_ok) return 0;
   if (lvl < 3 && !midopt_method_readonly_p (c2m_ctx, func_def, 0)) return 0;
   return 1;
@@ -3165,6 +3177,40 @@ static int midopt_trivial_scalar_getter_p (c2m_ctx_t c2m_ctx, node_t func_def) {
   return 1;
 }
 
+/* Mark small free (non-method) functions MIR_INLINE, mirroring step 4's
+   class-method treatment below. midopt_should_inline_p itself has no
+   method-specific logic in its body -- its two helper checks are safe for
+   a plain function: midopt_ptr_into_this_ret_p only blocks pointer-to-
+   class/struct returns (irrelevant to e.g. a `bool` return), and
+   midopt_method_readonly_p only rejects a *write through an identifier
+   literally named `this``, which can never appear in a free function's AST,
+   so it's a vacuous pass there rather than a real purity check. The actual
+   reason free functions were never inlined by this pass wasn't the size/
+   call-count budget in midopt_should_inline_p -- it's that only class
+   methods were ever enumerated as candidates (via the midopt_keep
+   reachability set, built for the separate concern of dead-method
+   pruning). Free functions have no such pruning concept, so this walks
+   the module directly instead of consulting midopt_keep, and runs
+   unconditionally (not gated behind the "zero keeps" class-method safety
+   net above, which does not apply here). */
+static void midopt_mark_inline_free_funcs (c2m_ctx_t c2m_ctx, node_t n) {
+  if (n == NULL) return;
+
+  if (n->code == N_FUNC_DEF && midopt_decl_ready_p (n) && !midopt_class_method_p (n)) {
+    decl_t d = (decl_t) n->attr;
+    const char *nm = midopt_func_name (n);
+    if (nm != NULL && d != NULL && !d->decl_spec.inline_p
+        && midopt_should_inline_p (c2m_ctx, n)) {
+      d->decl_spec.inline_p = TRUE;
+      if (midopt_verbose_p) fprintf (stderr, "  [midopt] inline mark (free) %s\n", nm);
+    }
+  }
+
+  if (!midopt_node_has_ops (n->code)) return;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    midopt_mark_inline_free_funcs (c2m_ctx, c);
+}
+
 static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
   MIR_alloc_t alloc;
   int n_methods = 0, n_dead = 0;
@@ -3185,6 +3231,12 @@ static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
 
   if (midopt_verbose_p)
     fprintf (stderr, "  [midopt] start (P0/P1 + IV/inline at -O%d)\n", midopt_level);
+
+  /* 0) Free-function inlining is independent of the class-method
+     reachability/pruning machinery below -- run it unconditionally, before
+     any early return (e.g. the "zero method keeps" safety net) that would
+     otherwise skip it in a file with no classyc classes at all. */
+  midopt_mark_inline_free_funcs (c2m_ctx, module);
 
   /* 1) Seed ONLY from free functions (and nested decls/ctors in them). */
   midopt_seed_from_free_funcs (c2m_ctx, module);

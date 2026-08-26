@@ -51,8 +51,16 @@ class Request {
     String method;     /* upper-case */
     String path;       /* as received (trimmed) */
     String query;      /* raw ?a=1&b=2 */
-    dict   body;       /* JSON body, or null */
+    dict   body;       /* JSON body, or null (only parsed when it looks like JSON) */
     String params;     /* path captures as "id=42&slug=foo" (query-string shape) */
+    /* Raw recv-buffer views. Optional: server cores that have the original
+       bytes call req_attach_raw() after construction. Needed for Cookie /
+       Content-Type lookup and for non-JSON bodies (multipart, urlencoded).
+       Not owned — they alias the connection buffer for the request lifetime. */
+    char *raw_body;
+    long  body_len;
+    char *header_buf;
+    long  header_len;
 
     Request(String method, String path, String query, String bodyJson) {
         this.method = method.trim().upper();
@@ -61,8 +69,18 @@ class Request {
         else this.query = "";
         this.params = "";
         this.body   = 0;
-        if ((char*)bodyJson != NULL && strlen((char*)bodyJson) > 0)
-            this.body = json(bodyJson);
+        this.raw_body = 0;
+        this.body_len = 0;
+        this.header_buf = 0;
+        this.header_len = 0;
+        /* Login/upload send urlencoded or multipart; json() on those is
+           either a throw or garbage. Only auto-parse object/array JSON. */
+        if ((char*)bodyJson != NULL && strlen((char*)bodyJson) > 0) {
+            char *p = (char*)bodyJson;
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+            if (*p == '{' || *p == '[')
+                this.body = json(bodyJson);
+        }
     }
 
     ~Request() { delete this.body; }
@@ -85,11 +103,83 @@ class Request {
         return atoi((char*)s);
     }
 
+    /* Case-insensitive, line-anchored lookup in the raw header block.
+       Returns a fresh arena String, or NULL if the header is absent. */
+    String header(String name) {
+        if (this.header_buf == 0 || this.header_len <= 0 || (char*)name == 0)
+            return 0;
+        const char *buf = this.header_buf;
+        long header_end = this.header_len;
+        const char *n = (char*)name;
+        int nlen = (int)strlen(n);
+        for (long i = 0; i + nlen < header_end; i++) {
+            if (i > 0 && buf[i - 1] != '\n') continue;
+            int match = 1;
+            for (int j = 0; j < nlen; j++) {
+                char a = buf[i + j], b = n[j];
+                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                if (a != b) { match = 0; break; }
+            }
+            if (!match) continue;
+            long k = i + nlen;
+            if (buf[k] != ':') continue;
+            k++;
+            while (k < header_end && buf[k] == ' ') k++;
+            long vstart = k;
+            while (k < header_end && buf[k] != '\r' && buf[k] != '\n') k++;
+            long vlen = k - vstart;
+            char valbuf[1024];
+            if (vlen >= (long)sizeof(valbuf)) vlen = (long)sizeof(valbuf) - 1;
+            memcpy(valbuf, buf + vstart, (size_t)vlen);
+            valbuf[vlen] = 0;
+            return f"{valbuf}";
+        }
+        return 0;
+    }
+
+    /* Cookie: name lookup in the Cookie header. NULL if missing. */
+    String cookie(String name) {
+        String cookies = this.header("Cookie");
+        char *p = (char*)cookies;
+        if (!p || (char*)name == 0) return 0;
+        int nlen = (int)strlen((char*)name);
+        while (*p) {
+            while (*p == ' ' || *p == ';') p++;
+            if (!*p) break;
+            char *eq = strchr(p, '=');
+            if (!eq) break;
+            char *semi = strchr(eq, ';');
+            int klen = (int)(eq - p);
+            int vlen = semi ? (int)(semi - eq - 1) : (int)strlen(eq + 1);
+            if (klen == nlen && strncmp(p, (char*)name, (size_t)nlen) == 0) {
+                char valbuf[256];
+                if (vlen >= (int)sizeof(valbuf)) vlen = (int)sizeof(valbuf) - 1;
+                memcpy(valbuf, eq + 1, (size_t)vlen);
+                valbuf[vlen] = 0;
+                return f"{valbuf}";
+            }
+            p = semi ? semi + 1 : eq + 1 + vlen;
+        }
+        return 0;
+    }
+
     /* Back-compat aliases */
     String QueryParam(String key) { return qparam(this.query, key); }
     String PathParam(String key)  { return qparam(this.params, key); }
     int    PathParamInt(String key) { return this.argInt(key); }
 };
+
+/* Stash recv-buffer views on a Request. Not owned; valid until the caller
+   recycles the connection buffer. body may contain embedded NULs (multipart). */
+static void req_attach_raw(Request *req, char *buf, long header_end,
+                           char *body, long body_len) {
+    if (req == 0) return;
+    req->header_buf = buf;
+    req->header_len = header_end;
+    req->raw_body = body_len > 0 ? body : 0;
+    req->body_len = body_len;
+}
 
 /* ── Response ────────────────────────────────────────────────────────── */
 
@@ -97,13 +187,17 @@ class Response {
     int    status;
     String statusText;
     String body;
-    int    keep_alive; /* set by the server core */
+    int    keep_alive;  /* set by the server core */
+    String contentType; /* default application/json */
+    String setCookie;   /* "" when absent; emitted as Set-Cookie */
 
     Response(int status, String statusText, String body) {
-        this.status     = status;
-        this.statusText = statusText;
-        this.body       = body;
-        this.keep_alive = 0;
+        this.status      = status;
+        this.statusText  = statusText;
+        this.body        = body;
+        this.keep_alive  = 0;
+        this.contentType = "application/json";
+        this.setCookie   = "";
     }
 
     String wire() {
@@ -114,7 +208,13 @@ class Response {
         else conn = "close";
         int st = this.status;
         String stxt = this.statusText;
-        return f"HTTP/1.1 {st} {stxt}\r\nContent-Type: application/json\r\nContent-Length: {n}\r\nConnection: {conn}\r\n\r\n{b}";
+        String ct = this.contentType;
+        if ((char*)ct == NULL || ((char*)ct)[0] == 0) ct = "application/json";
+        if ((char*)this.setCookie != NULL && ((char*)this.setCookie)[0] != 0) {
+            String ck = this.setCookie;
+            return f"HTTP/1.1 {st} {stxt}\r\nContent-Type: {ct}\r\nContent-Length: {n}\r\nConnection: {conn}\r\nSet-Cookie: {ck}\r\n\r\n{b}";
+        }
+        return f"HTTP/1.1 {st} {stxt}\r\nContent-Type: {ct}\r\nContent-Length: {n}\r\nConnection: {conn}\r\n\r\n{b}";
     }
 };
 
