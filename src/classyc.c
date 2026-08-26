@@ -1467,9 +1467,9 @@ int c2mir_compile (MIR_context_t ctx, struct c2mir_options *ops, int (*getc_func
       n_error_before = n_errors;
       do_context (c2m_ctx, r);
       t_check = stage_time (&prev_time);
-      if (c2m_options->verbose_p) {
-          symbol_dump(c2m_ctx, stderr); // Dump all symbols
-          tpname_dump(c2m_ctx, stderr); // Dump all typenames
+      if (c2m_options->debug_p) {
+          symbol_dump(c2m_ctx, stderr); /* -d: dump all symbols */
+          tpname_dump(c2m_ctx, stderr);
       }
       if (n_errors > n_error_before) {
         if (c2m_options->debug_p) print_node (c2m_ctx, c2m_options->message_file, r, 0, FALSE);

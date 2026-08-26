@@ -739,6 +739,14 @@ struct expr {
      is never mutated in the loop.  gen memoizes its pre-header value and reuses
      it at the loop-bottom condition instead of re-calling each iteration. */
   unsigned int hoist_call_p : 1;
+  /* Midopt C2: divisor interval does not contain 0 — gen skips div0 trap.
+     Set on N_DIV / N_MOD / N_DIV_ASSIGN / N_MOD_ASSIGN. */
+  unsigned int elide_div0_p : 1;
+  /* Midopt C2: shift count interval is inside [0, width) — gen skips range trap.
+     Set on N_LSH / N_RSH / N_LSH_ASSIGN / N_RSH_ASSIGN. */
+  unsigned int elide_shift_p : 1;
+  /* Midopt C2: signed MIN / -1 overflow is impossible on this divide. */
+  unsigned int elide_div_ovf_p : 1;
   union {
     node_t lvalue_node;       /* for id, str, field, deref field, ind, deref, compound literal */
     node_t label_addr_target; /* for label address */
@@ -808,9 +816,10 @@ struct decl {
      The ownership pass (src/ownership.c) tracks these bindings as single-owner,
      move-only, and guarantees a single scope-exit release unless moved out. */
   unsigned owned_p : 1;
-  /* Midopt (check→gen): class method proved unreachable from live roots.
-     gen skips body emission and forward MIR items. Free functions are never
-     marked dead (C linkage / export). See src/midopt.c. */
+  /* Midopt (check→gen): proved unreachable from live roots.  gen skips body
+     emission and forward MIR items.  Class methods (P0) and internal-linkage
+     (`static`) free functions (C16) may be marked; exported C functions are
+     never pruned. See src/midopt.c and DOC/MIDOPT-C.md. */
   unsigned midopt_dead_p : 1;
   /* Midopt (R2): for-in element loop var proven read-only over an unmutated
      dense collection — gen binds it by reference (pointer into the buffer)
@@ -6560,6 +6569,9 @@ static struct type *make_list_ptr_type (c2m_ctx_t c2m_ctx, struct type *el, pos_
          calls as "loop-invariant pure", making gen reuse a stale pre-header
          value at a loop back-edge (infinite loop — gcc/20010129-1.c). */
       e->hoist_call_p = FALSE;
+      e->elide_div0_p = FALSE;
+      e->elide_shift_p = FALSE;
+      e->elide_div_ovf_p = FALSE;
       e->bind_p = e->lenient_p = FALSE;
       e->own_deref_class = DEREF_GUARD_DEFAULT;
       e->mut_sub_p = 0;

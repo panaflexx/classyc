@@ -2292,6 +2292,7 @@ int main (int argc, char **argv) {
     const char *opt = getenv ("B2OBJ_OPT");
     int level = opt_level >= 0 ? opt_level : (opt != NULL ? atoi (opt) : 1);
     MIR_gen_set_optimize_level (ctx, (unsigned)level);
+    MIR_set_inline_level (level);
     DBG ("optimize level = %d", level);
   }
   DBG ("starting MIR_link (eager code generation of all functions)");

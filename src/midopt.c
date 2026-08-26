@@ -2,7 +2,9 @@
  *
  * STATUS: Phase B–J + demand-driven keep + open-code skip-keep + Phase 3 IVs
  * + Phase 4 MIR_INLINE of tiny methods (budget/hardness from -On)
- * + C11 dead-arm / unevaluated walks (_Generic, const if/?:/&&/||, sizeof).
+ * + C11 dead-arm / unevaluated walks (_Generic, const if/?:/&&/||, sizeof)
+ * + MIDOPT-C Phase C-A/C-B/C-C/C-D: C interval VRP, trap elision, libc purity,
+ *   static DCE, noreturn, auto-inline recursion guard.  See DOC/MIDOPT-C.md.
  *
  * Single-TU build model: this file is `#include`d from `src/classyc.c`
  * next to `ownership.c`, so it sees internal types (`c2m_ctx_t`, `node_t`,
@@ -16,12 +18,15 @@
  *
  * Goals:
  *   P0 — Mark unreachable *class methods* `midopt_dead_p` so gen skips
- *        bodies and MIR forwards. Free functions always stay (C linkage).
- *        Reachability is method-level (free-func seed → worklist) plus
- *        gen-time protocol stamps (for-in, class[i], helpers).  Whole-class
- *        expand is NOT used (it pinned entire monomorph public APIs).
- *   P1 — Local nullness + integer intervals: stamp SAFE / elide_oob when
- *        proven; warn (or -fsafety-errors) on definite null/OOB/div0/shift.
+ *        bodies and MIR forwards. Exported free functions always stay
+ *        (C linkage). Internal-linkage (`static`) free functions may be
+ *        pruned (C16) when unreferenced. Reachability is method-level
+ *        (free-func seed → worklist) plus gen-time protocol stamps
+ *        (for-in, class[i], helpers).  Whole-class expand is NOT used
+ *        (it pinned entire monomorph public APIs).
+ *   P1 — Local nullness + integer intervals: stamp SAFE / elide_oob /
+ *        elide_div0 / elide_shift when proven; warn (or -fsafety-errors)
+ *        on definite null/OOB/div0/shift.
  *
  * Flags:
  *   default on; `-fno-midopt` skips; `-fsafety-errors` promotes diagnostics
@@ -86,8 +91,29 @@ static const char *midopt_func_name (node_t func_def) {
 
 static VARR (node_t) * midopt_keep;
 static VARR (node_t) * midopt_work;
+static VARR (node_t) * midopt_icand; /* inline candidates; stamped in commit */
 static int midopt_verbose_p;
+static int midopt_dump_p; /* -fdump-midopt: timed phases + per-func safety */
+static double midopt_t0;
+static int midopt_n_safety_func;
 static int midopt_level; /* latched from -On at midopt_run; 2 if unspecified */
+
+static double midopt_now (void) {
+  struct timespec ts;
+  clock_gettime (CLOCK_MONOTONIC, &ts);
+  return (double) ts.tv_sec + (double) ts.tv_nsec * 1e-9;
+}
+
+static void midopt_log (const char *fmt, ...) {
+  va_list ap;
+  if (!midopt_dump_p && !midopt_verbose_p) return;
+  fprintf (stderr, "  [midopt +%6.3fs] ", midopt_now () - midopt_t0);
+  va_start (ap, fmt);
+  vfprintf (stderr, fmt, ap);
+  va_end (ap);
+  fputc ('\n', stderr);
+  fflush (stderr);
+}
 
 /* Unspecified (-1) matches MIR's default (= 2). */
 static int midopt_opt_level (void) {
@@ -605,6 +631,10 @@ struct midopt_fact {
   int sym_minus; /* bound is Count()-sym_minus (0 for a raw Count()) */
   int addr_taken_p; /* &decl observed anywhere (monotone) — disables sym proofs */
   int uniq_ptr_p; /* local pointer from `new`, never copied — alias-free */
+  /* C15: element count of a heap buffer from const malloc/calloc.
+     heap_len_p=0 means unknown.  Killed on copy, &taken, or non-pure call. */
+  int heap_len_p;
+  mir_llong heap_len;
 };
 
 struct midopt_env {
@@ -664,6 +694,8 @@ static struct midopt_fact *midopt_env_get (struct midopt_env *env, node_t decl) 
   p->sym_minus = 0;
   p->addr_taken_p = 0;
   p->uniq_ptr_p = 0;
+  p->heap_len_p = 0;
+  p->heap_len = 0;
   return p;
 }
 
@@ -697,6 +729,7 @@ static void midopt_env_join (struct midopt_env *dst, const struct midopt_env *a,
       fo->sym_recv = NULL;
       fo->uniq_ptr_p = 0;
       fo->addr_taken_p = fa->addr_taken_p;
+      fo->heap_len_p = 0;
     } else {
       fo->nullness = midopt_null_join (fa->nullness, fb->nullness);
       if (fa->ival_p && fb->ival_p) {
@@ -714,6 +747,12 @@ static void midopt_env_join (struct midopt_env *dst, const struct midopt_env *a,
         fo->sym_recv = NULL;
       fo->addr_taken_p = fa->addr_taken_p || fb->addr_taken_p;
       fo->uniq_ptr_p = fa->uniq_ptr_p && fb->uniq_ptr_p;
+      if (fa->heap_len_p && fb->heap_len_p && fa->heap_len == fb->heap_len) {
+        fo->heap_len_p = 1;
+        fo->heap_len = fa->heap_len;
+      } else {
+        fo->heap_len_p = 0;
+      }
     }
   }
   for (i = 0; i < b->n; i++) {
@@ -725,6 +764,7 @@ static void midopt_env_join (struct midopt_env *dst, const struct midopt_env *a,
     fo->sym_recv = NULL;
     fo->uniq_ptr_p = 0;
     fo->addr_taken_p = b->f[i].addr_taken_p;
+    fo->heap_len_p = 0;
   }
   *dst = out;
 }
@@ -774,22 +814,180 @@ static enum midopt_null midopt_expr_nullness (struct midopt_env *env, node_t n) 
   return f->nullness;
 }
 
+static int midopt_add_ok (mir_llong a, mir_llong b, mir_llong *out) {
+  if ((b > 0 && a > MIR_LLONG_MAX - b) || (b < 0 && a < MIR_LLONG_MIN - b)) return 0;
+  *out = a + b;
+  return 1;
+}
+
+static int midopt_sub_ok (mir_llong a, mir_llong b, mir_llong *out) {
+  if ((b > 0 && a < MIR_LLONG_MIN + b) || (b < 0 && a > MIR_LLONG_MAX + b)) return 0;
+  *out = a - b;
+  return 1;
+}
+
+static int midopt_mul_ok (mir_llong a, mir_llong b, mir_llong *out) {
+  if (a == 0 || b == 0) {
+    *out = 0;
+    return 1;
+  }
+  if (a == MIR_LLONG_MIN || b == MIR_LLONG_MIN) {
+    if (a == 1) {
+      *out = b;
+      return 1;
+    }
+    if (b == 1) {
+      *out = a;
+      return 1;
+    }
+    if (a == -1 || b == -1) return 0;
+    return 0;
+  }
+  if (a > 0 && b > 0) {
+    if (a > MIR_LLONG_MAX / b) return 0;
+  } else if (a < 0 && b < 0) {
+    if ((-a) > MIR_LLONG_MAX / (-b)) return 0;
+  } else if (a > 0 && b < 0) {
+    if (b < MIR_LLONG_MIN / a) return 0;
+  } else { /* a < 0 && b > 0 */
+    if (a < MIR_LLONG_MIN / b) return 0;
+  }
+  *out = a * b;
+  return 1;
+}
+
+static int midopt_ival_fits_type (struct type *t, mir_llong lo, mir_llong hi) {
+  enum basic_type bt;
+  if (t == NULL || !integer_type_p (t)) return 0;
+  if (t->mode == TM_ENUM) bt = TP_INT;
+  else if (t->mode == TM_BASIC) bt = t->u.basic_type;
+  else return 0;
+  switch (bt) {
+  case TP_BOOL: return lo >= 0 && hi <= 1;
+  case TP_SCHAR: return lo >= -128 && hi <= 127;
+  case TP_UCHAR: return lo >= 0 && hi <= 255;
+  case TP_SHORT: return lo >= -32768 && hi <= 32767;
+  case TP_USHORT: return lo >= 0 && hi <= 65535;
+  case TP_INT: case TP_UINT:
+    /* int is 32-bit on every target ClassyC ships. */
+    if (bt == TP_UINT) return lo >= 0 && hi <= 4294967295LL;
+    return lo >= (-2147483647LL - 1) && hi <= 2147483647LL;
+  default:
+    /* long / llong / unsigned long: interval already lives in mir_llong. */
+    if (!signed_integer_type_p (t) && lo < 0) return 0;
+    return 1;
+  }
+}
+
+static int midopt_expr_ival (struct midopt_env *env, node_t n, mir_llong *lo, mir_llong *hi);
+
+/* C3: interval of a binary + - * (and unary -).  Overflow → unknown. */
+static int midopt_expr_ival_arith (struct midopt_env *env, node_t n, mir_llong *lo, mir_llong *hi) {
+  node_t a, b;
+  mir_llong alo, ahi, blo, bhi, r[4], rlo, rhi;
+  int i, nres;
+
+  if (n == NULL) return 0;
+  a = NL_HEAD (n->u.ops);
+  b = a != NULL ? NL_NEXT (a) : NULL;
+
+  /* unary + / -  (N_ADD / N_SUB with a single operand) */
+  if (b == NULL) {
+    if (!midopt_expr_ival (env, a, &alo, &ahi)) return 0;
+    if (n->code == N_ADD) {
+      *lo = alo;
+      *hi = ahi;
+      return 1;
+    }
+    if (n->code == N_SUB) {
+      if (alo == MIR_LLONG_MIN || ahi == MIR_LLONG_MIN) return 0;
+      *lo = -ahi;
+      *hi = -alo;
+      return 1;
+    }
+    return 0;
+  }
+
+  if (!midopt_expr_ival (env, a, &alo, &ahi)) return 0;
+  if (!midopt_expr_ival (env, b, &blo, &bhi)) return 0;
+
+  if (n->code == N_ADD) {
+    if (!midopt_add_ok (alo, blo, lo) || !midopt_add_ok (ahi, bhi, hi)) return 0;
+    return 1;
+  }
+  if (n->code == N_SUB) {
+    if (!midopt_sub_ok (alo, bhi, lo) || !midopt_sub_ok (ahi, blo, hi)) return 0;
+    return 1;
+  }
+  if (n->code == N_MUL) {
+    nres = 0;
+    if (!midopt_mul_ok (alo, blo, &r[nres++])) return 0;
+    if (!midopt_mul_ok (alo, bhi, &r[nres++])) return 0;
+    if (!midopt_mul_ok (ahi, blo, &r[nres++])) return 0;
+    if (!midopt_mul_ok (ahi, bhi, &r[nres++])) return 0;
+    rlo = rhi = r[0];
+    for (i = 1; i < nres; i++) {
+      if (r[i] < rlo) rlo = r[i];
+      if (r[i] > rhi) rhi = r[i];
+    }
+    *lo = rlo;
+    *hi = rhi;
+    return 1;
+  }
+  return 0;
+}
+
 static int midopt_expr_ival (struct midopt_env *env, node_t n, mir_llong *lo, mir_llong *hi) {
   struct expr *e;
-  node_t decl;
+  node_t decl, inner;
   struct midopt_fact *f;
+  mir_llong tlo, thi, elo, ehi;
+
   if (n == NULL || n->attr == NULL) return 0;
   e = (struct expr *) n->attr;
   if (e->const_p && e->type != NULL && integer_type_p (e->type)) {
     *lo = *hi = (mir_llong) e->c.i_val;
     return 1;
   }
+
+  if (n->code == N_COMMA)
+    return midopt_expr_ival (env, NL_EL (n->u.ops, 1), lo, hi);
+
+  if (n->code == N_CAST) {
+    inner = NL_EL (n->u.ops, 1);
+    if (!midopt_expr_ival (env, inner, &tlo, &thi)) return 0;
+    if (e->type == NULL || !integer_type_p (e->type)) return 0;
+    if (!midopt_ival_fits_type (e->type, tlo, thi)) return 0;
+    *lo = tlo;
+    *hi = thi;
+    return 1;
+  }
+
+  if (n->code == N_ADD || n->code == N_SUB || n->code == N_MUL) {
+    if (!midopt_expr_ival_arith (env, n, lo, hi)) return 0;
+    return 1;
+  }
+
+  if (n->code == N_COND) {
+    inner = NL_HEAD (n->u.ops);
+    inner = inner != NULL ? NL_NEXT (inner) : NULL;
+    if (inner == NULL || NL_NEXT (inner) == NULL) return 0;
+    if (!midopt_expr_ival (env, inner, &tlo, &thi)) return 0;
+    if (!midopt_expr_ival (env, NL_NEXT (inner), &elo, &ehi)) return 0;
+    *lo = tlo < elo ? tlo : elo;
+    *hi = thi > ehi ? thi : ehi;
+    return 1;
+  }
+
   decl = midopt_id_decl (n);
   if (decl == NULL) return 0;
   f = midopt_env_find (env, decl);
   if (f == NULL || !f->ival_p) return 0;
   *lo = f->lo;
   *hi = f->hi;
+  /* Do NOT stamp const_p on N_ID: the same identifier node can be an
+     lvalue (`i++`, `i += k`).  Singleton locals reach gen via C2 elide
+     flags on the operator (div/shift) and via ival on indexes. */
   return 1;
 }
 
@@ -838,6 +1036,12 @@ static void midopt_refine_cond (struct midopt_env *env, node_t cond, int then_p)
     midopt_refine_cond (env, NL_NEXT (NL_HEAD (cond->u.ops)), 1);
     return;
   }
+  /* else of `p || q` ⇒ both sides false. */
+  if (cond->code == N_OROR && !then_p) {
+    midopt_refine_cond (env, NL_HEAD (cond->u.ops), 0);
+    midopt_refine_cond (env, NL_NEXT (NL_HEAD (cond->u.ops)), 0);
+    return;
+  }
   /* p == 0 / 0 == p / p != 0 */
   if (cond->code == N_EQ || cond->code == N_NE) {
     a = NL_HEAD (cond->u.ops);
@@ -863,47 +1067,89 @@ static void midopt_refine_cond (struct midopt_env *env, node_t cond, int then_p)
     return;
   }
 
-  /* Relational: then-arm only.  `i >= K` raises lo; `i < Count()` sets sym.
-     Gated at -O2+ (hardness). */
-  if (!then_p || midopt_opt_level () < 2) return;
+  /* Relational VRP.  Else-arm flips the comparison (C5).  Gated at -O2+. */
+  if (midopt_opt_level () < 2) return;
   if (cond->code != N_LT && cond->code != N_LE && cond->code != N_GT && cond->code != N_GE)
     return;
   a = NL_HEAD (cond->u.ops);
   b = a != NULL ? NL_NEXT (a) : NULL;
   if (a == NULL || b == NULL) return;
-
-  /* i >= K / K <= i  (const K) */
-  if ((cond->code == N_GE || cond->code == N_GT) && a->code == N_ID
-      && midopt_expr_ival (env, b, &blo, &bhi) && blo == bhi) {
-    decl = midopt_id_decl (a);
-    f = decl != NULL ? midopt_env_get (env, decl) : NULL;
-    if (f != NULL) {
-      klo = blo + (cond->code == N_GT ? 1 : 0);
-      if (!f->ival_p) {
-        f->ival_p = 1;
-        f->lo = klo;
-        f->hi = 0x7fffffffffffffffLL;
-      } else if (klo > f->lo)
-        f->lo = klo;
+  {
+    node_code_t rel = cond->code;
+    if (!then_p) {
+      if (rel == N_LT) rel = N_GE;
+      else if (rel == N_LE) rel = N_GT;
+      else if (rel == N_GT) rel = N_LE;
+      else rel = N_LT;
     }
-    return;
-  }
-  if ((cond->code == N_LE || cond->code == N_LT) && b->code == N_ID
-      && midopt_expr_ival (env, a, &blo, &bhi) && blo == bhi) {
-    decl = midopt_id_decl (b);
-    f = decl != NULL ? midopt_env_get (env, decl) : NULL;
-    if (f != NULL) {
-      klo = blo + (cond->code == N_LT ? 1 : 0);
-      if (!f->ival_p) {
-        f->ival_p = 1;
-        f->lo = klo;
-        f->hi = 0x7fffffffffffffffLL;
-      } else if (klo > f->lo)
-        f->lo = klo;
+
+    /* i >= K / i > K  (const K) — raise lo */
+    if ((rel == N_GE || rel == N_GT) && a->code == N_ID
+        && midopt_expr_ival (env, b, &blo, &bhi) && blo == bhi) {
+      decl = midopt_id_decl (a);
+      f = decl != NULL ? midopt_env_get (env, decl) : NULL;
+      if (f != NULL) {
+        klo = blo + (rel == N_GT ? 1 : 0);
+        if (!f->ival_p) {
+          f->ival_p = 1;
+          f->lo = klo;
+          f->hi = 0x7fffffffffffffffLL;
+        } else if (klo > f->lo)
+          f->lo = klo;
+      }
+      return;
     }
-    return;
+    /* K <= i / K < i */
+    if ((rel == N_LE || rel == N_LT) && b->code == N_ID
+        && midopt_expr_ival (env, a, &blo, &bhi) && blo == bhi) {
+      decl = midopt_id_decl (b);
+      f = decl != NULL ? midopt_env_get (env, decl) : NULL;
+      if (f != NULL) {
+        klo = blo + (rel == N_LT ? 1 : 0);
+        if (!f->ival_p) {
+          f->ival_p = 1;
+          f->lo = klo;
+          f->hi = 0x7fffffffffffffffLL;
+        } else if (klo > f->lo)
+          f->lo = klo;
+      }
+      return;
+    }
+    /* i < K / i <= K — lower hi.  No nonneg requirement (C5 clamp-then-loop). */
+    if ((rel == N_LT || rel == N_LE) && a->code == N_ID
+        && midopt_expr_ival (env, b, &blo, &bhi)) {
+      /* i < [lo,hi] only proves i <= hi-1 (use bhi, the sound upper). */
+      mir_llong nh = bhi - (rel == N_LT ? 1 : 0);
+      decl = midopt_id_decl (a);
+      f = decl != NULL ? midopt_env_get (env, decl) : NULL;
+      if (f != NULL) {
+        if (!f->ival_p) {
+          f->ival_p = 1;
+          f->lo = MIR_LLONG_MIN;
+          f->hi = nh;
+        } else if (nh < f->hi)
+          f->hi = nh;
+      }
+      /* fall through for Count() symbolic on then-arm */
+    }
+    if ((rel == N_GT || rel == N_GE) && b->code == N_ID
+        && midopt_expr_ival (env, a, &blo, &bhi)) {
+      mir_llong nh = blo - (rel == N_GT ? 1 : 0);
+      decl = midopt_id_decl (b);
+      f = decl != NULL ? midopt_env_get (env, decl) : NULL;
+      if (f != NULL) {
+        if (!f->ival_p) {
+          f->ival_p = 1;
+          f->lo = MIR_LLONG_MIN;
+          f->hi = nh;
+        } else if (nh < f->hi)
+          f->hi = nh;
+      }
+    }
   }
 
+  /* Count() symbolic bound: then-arm of `i < recv.Count()` only. */
+  if (!then_p) return;
   iv = NULL;
   bound_expr = NULL;
   strict = 1;
@@ -946,14 +1192,6 @@ static void midopt_refine_cond (struct midopt_env *env, node_t cond, int then_p)
       f->sym_lo = f->ival_p && f->lo >= 0 ? f->lo : 0;
       f->sym_minus = (int) minus;
     }
-  } else if (midopt_expr_ival (env, bound_expr, &blo, &bhi)) {
-    mir_llong hi = bhi - (strict ? 1 : 0);
-    if (!f->ival_p) {
-      f->ival_p = 1;
-      f->lo = 0;
-      f->hi = hi;
-    } else if (hi < f->hi)
-      f->hi = hi;
   }
 }
 
@@ -968,6 +1206,96 @@ static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *e
 static void midopt_safety_while (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *env);
 static int midopt_pure_coll_method_p (const char *nm);
 static int midopt_recv_mutated_p (node_t n, node_t recv);
+
+/* Callee identifier of a direct N_CALL, or NULL (indirect / method). */
+static const char *midopt_call_name (node_t n) {
+  node_t func;
+  if (n == NULL || n->code != N_CALL) return NULL;
+  func = NL_HEAD (n->u.ops);
+  if (func == NULL || func->code != N_ID) return NULL;
+  return func->u.s.s;
+}
+
+static int midopt_const_ll (node_t n, mir_llong *out) {
+  struct expr *e;
+  if (n == NULL || n->attr == NULL) return 0;
+  e = (struct expr *) n->attr;
+  if (!e->const_p || e->type == NULL || !integer_type_p (e->type)) return 0;
+  *out = (mir_llong) e->c.i_val;
+  return 1;
+}
+
+/* C15: `malloc`/`calloc` byte count → element count of the pointer being
+   assigned, when the size is a compile-time constant (or `N * sizeof *p`). */
+static int midopt_malloc_nelem (c2m_ctx_t c2m_ctx, struct midopt_env *env, node_t rhs, node_t lhs,
+                                mir_llong *nelem) {
+  node_t call = rhs, args, a0, a1, func;
+  const char *nm;
+  struct expr *le;
+  struct type *pt, *el;
+  mir_llong bytes = 0, n0 = 0, n1 = 0, elsz;
+  int g = 0;
+
+  (void) env;
+  while (call != NULL && g++ < 8 && call->code == N_CAST)
+    call = NL_EL (call->u.ops, 1);
+  if (call == NULL || call->code != N_CALL) return 0;
+  nm = midopt_call_name (call);
+  if (nm == NULL) return 0;
+  func = NL_HEAD (call->u.ops);
+  args = func != NULL ? NL_NEXT (func) : NULL;
+  a0 = (args != NULL && args->code == N_LIST) ? NL_HEAD (args->u.ops) : NULL;
+  a1 = a0 != NULL ? NL_NEXT (a0) : NULL;
+  le = lhs != NULL ? lhs->attr : NULL;
+  if (le == NULL || le->type == NULL || le->type->mode != TM_PTR) return 0;
+  pt = le->type;
+  el = pt->u.ptr_type;
+  if (el == NULL) return 0;
+  elsz = (mir_llong) type_size (c2m_ctx, el);
+  if (elsz <= 0) return 0;
+
+  if (strcmp (nm, "calloc") == 0) {
+    if (!midopt_const_ll (a0, &n0) || !midopt_const_ll (a1, &n1) || n0 < 0 || n1 < 0)
+      return 0;
+    if (n1 == elsz) {
+      *nelem = n0;
+      return n0 > 0;
+    }
+    if (n0 > 0 && n1 > 0 && n1 * n0 / n0 == n1 && (n0 * n1) % elsz == 0) {
+      *nelem = (n0 * n1) / elsz;
+      return *nelem > 0;
+    }
+    return 0;
+  }
+  if (strcmp (nm, "malloc") != 0 && strcmp (nm, "realloc") != 0) return 0;
+  /* malloc: arg0 is bytes.  realloc: arg1 is bytes.  Peel `N * sizeof`. */
+  if (strcmp (nm, "realloc") == 0) a0 = a1;
+  if (midopt_const_ll (a0, &bytes) && bytes > 0) {
+    if (bytes % elsz != 0) return 0;
+    *nelem = bytes / elsz;
+    return *nelem > 0;
+  }
+  if (a0 != NULL && a0->code == N_MUL) {
+    node_t x = NL_HEAD (a0->u.ops);
+    node_t y = x != NULL ? NL_NEXT (x) : NULL;
+    node_t szn = NULL, kn = NULL;
+    if (x != NULL && (x->code == N_SIZEOF || x->code == N_EXPR_SIZEOF)) {
+      szn = x;
+      kn = y;
+    } else if (y != NULL && (y->code == N_SIZEOF || y->code == N_EXPR_SIZEOF)) {
+      szn = y;
+      kn = x;
+    }
+    if (szn != NULL && midopt_const_ll (kn, &n0) && n0 > 0) {
+      struct expr *se = szn->attr;
+      if (se != NULL && se->const_p && se->c.i_val == elsz) {
+        *nelem = n0;
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
 
 /* True when N is `new T(...)` (casts peeled). */
 static int midopt_expr_is_new (node_t n) {
@@ -1047,7 +1375,7 @@ static node_t midopt_count_call_recv (struct midopt_env *env, node_t n) {
 }
 
 /* Apply assignment of `rhs` into `lhs` (N_ID or *p etc.). */
-static void midopt_on_assign (struct midopt_env *env, node_t lhs, node_t rhs) {
+static void midopt_on_assign (c2m_ctx_t c2m_ctx, struct midopt_env *env, node_t lhs, node_t rhs) {
   node_t decl;
   enum midopt_null nn;
   mir_llong lo, hi;
@@ -1092,6 +1420,19 @@ static void midopt_on_assign (struct midopt_env *env, node_t lhs, node_t rhs) {
           pf->uniq_ptr_p = 0;
           if (rf != NULL) rf->uniq_ptr_p = 0; /* copy aliases — neither unique */
         }
+      }
+    }
+  }
+  /* C15: const malloc/calloc length.  Any other assignment severs it. */
+  {
+    struct midopt_fact *pf = midopt_env_get (env, decl);
+    mir_llong nlen = 0;
+    if (pf != NULL) {
+      if (midopt_malloc_nelem (c2m_ctx, env, rhs, lhs, &nlen)) {
+        pf->heap_len_p = 1;
+        pf->heap_len = nlen;
+      } else {
+        pf->heap_len_p = 0;
       }
     }
   }
@@ -1155,22 +1496,30 @@ static void midopt_check_ind_oob (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env
   ae = arr->attr;
   if (ae == NULL || ae->type == NULL) return;
   arr_type = ae->type;
+  len = -1;
 
-  if (!(arr_type->mode == TM_PTR && arr_type->arr_type != NULL
-        && arr_type->arr_type->mode == TM_ARR))
-    return;
-  /* Pointer-to-struct FAM (`p->a[i]` on trailing `T a[1]`): the declared
-     length is not the live bound.  Value-object `s.a[i]` still uses it. */
-  if (type_flex_arr_p (arr_type)) {
-    node_t abase = arr;
-    while (abase != NULL && abase->code == N_CAST) abase = NL_EL (abase->u.ops, 1);
-    if (abase == NULL || abase->code != N_FIELD) return;
+  if (arr_type->mode == TM_PTR && arr_type->arr_type != NULL
+      && arr_type->arr_type->mode == TM_ARR) {
+    /* Pointer-to-struct FAM (`p->a[i]` on trailing `T a[1]`): the declared
+       length is not the live bound.  Value-object `s.a[i]` still uses it. */
+    if (type_flex_arr_p (arr_type)) {
+      node_t abase = arr;
+      while (abase != NULL && abase->code == N_CAST) abase = NL_EL (abase->u.ops, 1);
+      if (abase == NULL || abase->code != N_FIELD) return;
+    }
+    sz_node = arr_type->arr_type->u.arr_type->size;
+    if (sz_node == NULL || sz_node->code == N_IGNORE || sz_node->attr == NULL) return;
+    sze = (struct expr *) sz_node->attr;
+    if (!sze->const_p || sze->c.i_val <= 0) return;
+    len = sze->c.i_val;
+  } else if (arr_type->mode == TM_PTR) {
+    /* C15: `int *p = malloc(N * sizeof *p); p[i]` with known N. */
+    node_t ad = midopt_id_decl (arr);
+    struct midopt_fact *af = ad != NULL ? midopt_env_find (env, ad) : NULL;
+    if (af != NULL && af->heap_len_p && !af->addr_taken_p && af->heap_len > 0)
+      len = af->heap_len;
   }
-  sz_node = arr_type->arr_type->u.arr_type->size;
-  if (sz_node == NULL || sz_node->code == N_IGNORE || sz_node->attr == NULL) return;
-  sze = (struct expr *) sz_node->attr;
-  if (!sze->const_p || sze->c.i_val <= 0) return;
-  len = sze->c.i_val;
+  if (len <= 0) return;
 
   if (!midopt_expr_ival (env, idx, &lo, &hi)) return;
 
@@ -1193,16 +1542,42 @@ static void midopt_check_ind_oob (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env
 }
 
 static void midopt_check_div (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *env) {
-  node_t rhs;
-  mir_llong lo, hi;
+  node_t rhs, lhs;
+  mir_llong lo, hi, dlo, dhi;
+  struct expr *e;
+  struct type *rt;
   if (n == NULL) return;
   if (n->code != N_DIV && n->code != N_MOD && n->code != N_DIV_ASSIGN && n->code != N_MOD_ASSIGN)
     return;
-  rhs = (n->code == N_DIV || n->code == N_MOD) ? NL_EL (n->u.ops, 1) : NL_EL (n->u.ops, 1);
+  lhs = NL_HEAD (n->u.ops);
+  rhs = lhs != NULL ? NL_NEXT (lhs) : NULL;
+  e = n->attr;
   if (!midopt_expr_ival (env, rhs, &lo, &hi)) return;
   /* Only report when the divisor is *exactly* zero on all paths. */
   if (lo == 0 && hi == 0)
     midopt_safety_report (c2m_ctx, POS (n), "definite division by zero");
+  /* C2: interval excludes 0 → skip the trap. */
+  if (e != NULL && (hi < 0 || lo > 0)) {
+    if (!e->elide_div0_p) {
+      e->elide_div0_p = 1;
+      midopt_safety_n_elide++;
+    }
+  }
+  rt = NULL;
+  if (e != NULL)
+    rt = (n->code == N_DIV_ASSIGN || n->code == N_MOD_ASSIGN) ? e->type2 : e->type;
+  if (e != NULL && rt != NULL && signed_integer_type_p (rt)) {
+    mir_size_t sz = type_size (c2m_ctx, rt);
+    mir_llong minv = sz >= 8 ? MIR_LLONG_MIN : (-2147483647LL - 1);
+    int den_not_m1 = (hi < -1 || lo > -1);
+    int can_elide_ovf = den_not_m1;
+    if (!can_elide_ovf && midopt_expr_ival (env, lhs, &dlo, &dhi))
+      can_elide_ovf = (dhi < minv || dlo > minv);
+    if (can_elide_ovf && !e->elide_div_ovf_p) {
+      e->elide_div_ovf_p = 1;
+      midopt_safety_n_elide++;
+    }
+  }
 }
 
 static void midopt_check_shift (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *env) {
@@ -1210,12 +1585,16 @@ static void midopt_check_shift (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
   mir_llong lo, hi;
   int width = 64;
   struct expr *e;
+  struct type *rt;
   if (n == NULL) return;
   if (n->code != N_LSH && n->code != N_RSH && n->code != N_LSH_ASSIGN && n->code != N_RSH_ASSIGN)
     return;
   e = n->attr;
-  if (e != NULL && e->type != NULL && integer_type_p (e->type)) {
-    mir_size_t sz = type_size (c2m_ctx, e->type);
+  rt = NULL;
+  if (e != NULL)
+    rt = (n->code == N_LSH_ASSIGN || n->code == N_RSH_ASSIGN) ? e->type2 : e->type;
+  if (rt != NULL && integer_type_p (rt)) {
+    mir_size_t sz = type_size (c2m_ctx, rt);
     if (sz > 0 && sz <= 8) width = (int) (sz * 8);
   }
   rhs = NL_EL (n->u.ops, 1);
@@ -1224,6 +1603,48 @@ static void midopt_check_shift (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
     midopt_safety_report (c2m_ctx, POS (n),
                           "definite shift out of range (count in [%lld,%lld], width %d)",
                           (long long) lo, (long long) hi, width);
+  /* C2: entire interval inside [0, width). */
+  if (e != NULL && lo >= 0 && hi < width) {
+    if (!e->elide_shift_p) {
+      e->elide_shift_p = 1;
+      midopt_safety_n_elide++;
+    }
+  }
+}
+
+/* C13: libc calls that do not write through any pointer argument. */
+static int midopt_libc_pure_p (const char *nm) {
+  static const char *const names[]
+    = {"strlen",  "strcmp", "strncmp", "memcmp", "memchr", "strchr", "strrchr",
+       "strstr",  "strspn", "strcspn", "abs",    "labs",   "llabs",  "fabs",
+       "fabsf",   "fabsl",  "sqrt",    "sqrtf",  "sqrtl",  "floor",  "ceil",
+       "sin",     "cos",    "tan",     "exp",    "log",    "log10",  "pow",
+       "tolower", "toupper", "isalnum", "isalpha", "isdigit", "isspace",
+       NULL};
+  size_t i;
+  if (nm == NULL) return 0;
+  for (i = 0; names[i] != NULL; i++)
+    if (strcmp (nm, names[i]) == 0) return 1;
+  return 0;
+}
+
+/* C13: dest is args[0] (memcpy/strcpy family) — kill dest facts only. */
+static int midopt_libc_dst0_p (const char *nm) {
+  static const char *const names[]
+    = {"memcpy", "memmove", "memset", "strcpy", "strncpy", "strcat", "strncat", NULL};
+  size_t i;
+  if (nm == NULL) return 0;
+  for (i = 0; names[i] != NULL; i++)
+    if (strcmp (nm, names[i]) == 0) return 1;
+  return 0;
+}
+
+/* C8 */
+static int midopt_noreturn_name_p (const char *nm) {
+  if (nm == NULL) return 0;
+  return strcmp (nm, "abort") == 0 || strcmp (nm, "exit") == 0 || strcmp (nm, "_Exit") == 0
+         || strcmp (nm, "quick_exit") == 0 || strcmp (nm, "__builtin_unreachable") == 0
+         || strcmp (nm, "__builtin_trap") == 0;
 }
 
 /* Side-effect walk: update env for subexpressions that assign (++, --, =). */
@@ -1245,16 +1666,36 @@ static void midopt_safety_expr (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
     midopt_safety_expr (c2m_ctx, rhs, env);
     midopt_safety_expr (c2m_ctx, lhs, env);
     if (n->code == N_ASSIGN)
-      midopt_on_assign (env, lhs, rhs);
+      midopt_on_assign (c2m_ctx, env, lhs, rhs);
     else {
       decl = midopt_id_decl (lhs);
       if (decl != NULL) {
-        midopt_kill_ival (env, decl);
-        /* compound assign on pointer rare; kill nullness if any */
-        {
-          struct midopt_fact *f = midopt_env_find (env, decl);
-          if (f != NULL && (n->code == N_ADD_ASSIGN || n->code == N_SUB_ASSIGN))
+        struct expr *le = lhs->attr;
+        struct midopt_fact *f = midopt_env_find (env, decl);
+        /* Pointer += / -= : address changes, kill nullness + ival. */
+        if (le != NULL && le->type != NULL && le->type->mode == TM_PTR) {
+          midopt_kill_ival (env, decl);
+          if (f != NULL) {
             f->nullness = MN_TOP;
+            f->heap_len_p = 0;
+          }
+        } else if (n->code == N_ADD_ASSIGN || n->code == N_SUB_ASSIGN) {
+          /* C6: i += k / i -= k with known intervals. */
+          mir_llong llo, lhi, rlo, rhi, nlo, nhi;
+          int ok = 0;
+          if (midopt_expr_ival (env, lhs, &llo, &lhi)
+              && midopt_expr_ival (env, rhs, &rlo, &rhi)) {
+            if (n->code == N_ADD_ASSIGN)
+              ok = midopt_add_ok (llo, rlo, &nlo) && midopt_add_ok (lhi, rhi, &nhi);
+            else
+              ok = midopt_sub_ok (llo, rhi, &nlo) && midopt_sub_ok (lhi, rlo, &nhi);
+          }
+          if (ok)
+            midopt_set_ival (env, decl, nlo, nhi);
+          else
+            midopt_kill_ival (env, decl);
+        } else {
+          midopt_kill_ival (env, decl);
         }
       }
     }
@@ -1268,9 +1709,18 @@ static void midopt_safety_expr (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
     node_t op = NL_HEAD (n->u.ops);
     midopt_safety_expr (c2m_ctx, op, env);
     decl = midopt_id_decl (op);
-    if (decl != NULL && midopt_expr_ival (env, op, &lo, &hi) && lo == hi) {
+    if (decl != NULL && midopt_expr_ival (env, op, &lo, &hi)) {
       mir_llong d = (n->code == N_INC || n->code == N_POST_INC) ? 1 : -1;
-      midopt_set_ival (env, decl, lo + d, hi + d);
+      mir_llong nlo, nhi;
+      int ok;
+      if (d > 0)
+        ok = midopt_add_ok (lo, d, &nlo) && midopt_add_ok (hi, d, &nhi);
+      else
+        ok = midopt_sub_ok (lo, -d, &nlo) && midopt_sub_ok (hi, -d, &nhi);
+      if (ok)
+        midopt_set_ival (env, decl, nlo, nhi);
+      else
+        midopt_kill_ival (env, decl);
     } else if (decl != NULL) {
       midopt_kill_ival (env, decl);
     }
@@ -1352,20 +1802,49 @@ static void midopt_safety_expr (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
        Safe (count-preserving) methods keep them. */
     rd = midopt_method_call_recv (funcn, &nm);
     if (rd != NULL && !midopt_method_safe_p (nm)) midopt_kill_sym_for (env, rd);
-    /* Kill facts for pointer/int args (may free / mutate / escape). */
-    if (args != NULL && args->code == N_LIST) {
-      for (a = NL_HEAD (args->u.ops); a != NULL; a = NL_NEXT (a)) {
-        if (skip_first && a == first) continue;
-        decl = midopt_id_decl (a);
-        if (decl == NULL && a->code == N_ADDR) {
-          decl = midopt_id_decl (NL_HEAD (a->u.ops));
-          if (decl != NULL) midopt_kill_sym_for (env, decl); /* &recv may shrink */
-        }
-        if (decl != NULL) {
-          struct midopt_fact *f = midopt_env_find (env, decl);
-          if (f != NULL) {
-            f->nullness = MN_TOP;
-            f->ival_p = 0;
+    /* Kill facts for escaping args.  By-value integer N_IDs are never
+       modified by the callee (C).  Pure libc (C13) kills nothing.
+       memcpy-family kills only the dest (arg0, or its &x). */
+    {
+      const char *cnm = midopt_call_name (n);
+      int pure = midopt_libc_pure_p (cnm);
+      int dst0 = midopt_libc_dst0_p (cnm);
+      int ai = 0;
+      if (args != NULL && args->code == N_LIST && !pure) {
+        for (a = NL_HEAD (args->u.ops); a != NULL; a = NL_NEXT (a), ai++) {
+          struct expr *ae;
+          int is_ptr;
+          if (skip_first && a == first) continue;
+          if (dst0 && ai != 0) continue;
+          decl = midopt_id_decl (a);
+          if (decl == NULL && a->code == N_ADDR) {
+            decl = midopt_id_decl (NL_HEAD (a->u.ops));
+            if (decl != NULL) {
+              midopt_kill_sym_for (env, decl);
+              {
+                struct midopt_fact *f = midopt_env_find (env, decl);
+                if (f != NULL) {
+                  f->ival_p = 0;
+                  f->nullness = MN_TOP;
+                  f->heap_len_p = 0;
+                  f->uniq_ptr_p = 0;
+                }
+              }
+            }
+            continue;
+          }
+          ae = a != NULL ? a->attr : NULL;
+          is_ptr = ae != NULL && ae->type != NULL && ae->type->mode == TM_PTR;
+          if (decl != NULL && is_ptr) {
+            struct midopt_fact *f = midopt_env_find (env, decl);
+            midopt_kill_sym_for (env, decl);
+            if (f != NULL) {
+              f->nullness = MN_TOP;
+              f->uniq_ptr_p = 0;
+              f->heap_len_p = 0;
+              /* pointer *value* in the caller is unchanged; ival of a
+                 pointer local is unused.  Keep ival of integers: skip. */
+            }
           }
         }
       }
@@ -1407,6 +1886,7 @@ static void midopt_safety_expr (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
     node_t rhs = lhs != NULL ? NL_NEXT (lhs) : NULL;
     node_t decl;
     struct midopt_fact *f;
+    struct midopt_env saved;
     int known;
 
     midopt_safety_expr (c2m_ctx, lhs, env);
@@ -1419,7 +1899,12 @@ static void midopt_safety_expr (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
       if (n->code == N_ANDAND && f->nullness == MN_NULL) return;
       if (n->code == N_OROR && f->nullness == MN_NONNULL) return;
     }
+    /* C4: RHS of && sees lhs-true; RHS of || sees lhs-false.  Join with the
+       pre-RHS env because the RHS may not run. */
+    midopt_env_copy (&saved, env);
+    midopt_refine_cond (env, lhs, n->code == N_ANDAND ? 1 : 0);
     midopt_safety_expr (c2m_ctx, rhs, env);
+    midopt_env_join (env, &saved, env);
     return;
   }
   case N_COND: {
@@ -1728,6 +2213,9 @@ static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *e
       if (bound_recv != NULL && bound_minus == 0
           && midopt_count_call_recv (env, bound_expr) != NULL)
         bound_call = bound_expr; /* exact Count() — eligible for R-LICM */
+      else if (bound_expr != NULL && bound_expr->code == N_CALL
+               && midopt_libc_pure_p (midopt_call_name (bound_expr)))
+        bound_call = bound_expr; /* C14: strlen etc. */
       bound_decl = midopt_id_decl (bound_expr);
       if (bound_recv == NULL && bound_decl != NULL) {
         struct midopt_fact *bf = midopt_env_find (env, bound_decl);
@@ -1814,13 +2302,32 @@ static void midopt_safety_for (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *e
        loop-invariant.  Stamp the call so gen memoizes its pre-header value and
        stops re-calling it every iteration.  This is STRICTER than the OOB proof
        above (which tolerates growth): here any mutation, incl. Add, disqualifies. */
-    if (bound_call != NULL && bound_recv != NULL && !recv_escaped
-        && bound_call->attr != NULL
-        && !midopt_recv_mutated_p (stmt, bound_recv)
-        && !midopt_recv_mutated_p (iter, bound_recv)) {
+    if (bound_call != NULL && bound_call->attr != NULL) {
+      if (bound_recv != NULL && !recv_escaped
+          && !midopt_recv_mutated_p (stmt, bound_recv)
+          && !midopt_recv_mutated_p (iter, bound_recv)) {
+        ((struct expr *) bound_call->attr)->hoist_call_p = 1;
+        if (midopt_verbose_p)
+          fprintf (stderr, "  [midopt] R-LICM hoist loop-invariant Count() bound\n");
+      }
+    }
+  }
+
+  /* C14: hoist loop-invariant pure libc bound (`strlen(s)`) even when we
+     have no integer interval for the IV (the call's value is unknown). */
+  if (bound_call != NULL && bound_call->attr != NULL && bound_recv == NULL
+      && midopt_libc_pure_p (midopt_call_name (bound_call))) {
+    node_t fn = NL_HEAD (bound_call->u.ops);
+    node_t ag = fn != NULL ? NL_NEXT (fn) : NULL;
+    node_t a0 = (ag != NULL && ag->code == N_LIST) ? NL_HEAD (ag->u.ops) : NULL;
+    node_t ad;
+    if (a0 != NULL && a0->code == N_ADDR) a0 = NL_HEAD (a0->u.ops);
+    ad = midopt_id_decl (a0);
+    if ((ad == NULL || (!midopt_recv_mutated_p (stmt, ad)
+                        && !midopt_recv_mutated_p (iter, ad)))) {
       ((struct expr *) bound_call->attr)->hoist_call_p = 1;
       if (midopt_verbose_p)
-        fprintf (stderr, "  [midopt] R-LICM hoist loop-invariant Count() bound\n");
+        fprintf (stderr, "  [midopt] C14 hoist loop-invariant libc call bound\n");
     }
   }
 
@@ -2637,7 +3144,7 @@ static void midopt_safety_decl (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
         if (midopt_expr_is_new (initializer)) f->uniq_ptr_p = 1;
       }
     }
-    if (id != NULL && id->code == N_ID) midopt_on_assign (env, id, initializer);
+    if (id != NULL && id->code == N_ID) midopt_on_assign (c2m_ctx, env, id, initializer);
   }
   if (dd != NULL && dd->ctor_call != NULL) midopt_safety_expr (c2m_ctx, dd->ctor_call, env);
 }
@@ -2704,6 +3211,11 @@ static void midopt_safety_stmt (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
         }
       }
       if (ts != NULL && ts->code == N_RETURN) then_returns = 1;
+      else if (ts != NULL) {
+        node_t ex = ts->code == N_EXPR ? NL_EL (ts->u.ops, 1) : ts;
+        if (ex != NULL && ex->code == N_CALL && midopt_noreturn_name_p (midopt_call_name (ex)))
+          then_returns = 1;
+      }
       if (then_returns)
         midopt_env_copy (env, &env_else);
       else
@@ -2768,8 +3280,15 @@ static void midopt_safety_stmt (c2m_ctx_t c2m_ctx, node_t n, struct midopt_env *
 static void midopt_safety_func (c2m_ctx_t c2m_ctx, node_t func_def) {
   struct midopt_env env;
   node_t block, decls;
+  const char *nm;
   if (func_def == NULL || func_def->code != N_FUNC_DEF) return;
   env.n = 0;
+  midopt_n_safety_func++;
+  if (midopt_dump_p) {
+    nm = midopt_func_name (func_def);
+    midopt_log ("safety #%d  %s  facts_elide=%d", midopt_n_safety_func,
+                nm != NULL ? nm : "?", midopt_safety_n_elide);
+  }
   /* Method `this` is non-null at entry */
   decls = FUNC_DEF_DECLS (func_def);
   if (decls != NULL) midopt_safety_stmt (c2m_ctx, decls, &env);
@@ -2780,10 +3299,9 @@ static void midopt_safety_func (c2m_ctx_t c2m_ctx, node_t func_def) {
 static void midopt_safety_module (c2m_ctx_t c2m_ctx, node_t n) {
   if (n == NULL) return;
   if (n->code == N_FUNC_DEF) {
-    /* Skip methods midopt will not emit — their traps never reach gen. */
-    if (midopt_class_method_p (n) && midopt_decl_ready_p (n)
-        && ((decl_t) n->attr)->midopt_dead_p) {
-      /* fall through to children (none on FUNC_DEF that matter) */
+    /* Skip anything gen will not emit (dead methods / C16 statics). */
+    if (midopt_decl_ready_p (n) && ((decl_t) n->attr)->midopt_dead_p) {
+      /* no safety walk */
     } else {
       midopt_safety_func (c2m_ctx, n);
     }
@@ -3012,21 +3530,45 @@ static void midopt_dump_mir_stats (c2m_ctx_t c2m_ctx, MIR_module_t m) {
   MIR_context_t ctx = c2m_ctx->ctx;
   MIR_item_t item;
   long n_func = 0, n_fwd = 0, n_other = 0;
-  long n_insn = 0, n_call = 0;
+  long n_insn = 0, n_call = 0, n_inline = 0;
+  struct {
+    const char *name;
+    long ninsns;
+  } top[8];
+  int ntop = 0, i, j;
   FILE *f = c2m_options != NULL && c2m_options->message_file != NULL
               ? c2m_options->message_file
               : stderr;
 
+  memset (top, 0, sizeof top);
   if (m == NULL) return;
   for (item = DLIST_HEAD (MIR_item_t, m->items); item != NULL;
        item = DLIST_NEXT (MIR_item_t, item)) {
     if (item->item_type == MIR_func_item) {
       MIR_insn_t insn;
+      long fn = 0;
       n_func++;
       for (insn = DLIST_HEAD (MIR_insn_t, item->u.func->insns); insn != NULL;
            insn = DLIST_NEXT (MIR_insn_t, insn)) {
         n_insn++;
-        if (MIR_call_code_p (insn->code)) n_call++;
+        fn++;
+        if (insn->code == MIR_INLINE)
+          n_inline++;
+        else if (MIR_call_code_p (insn->code))
+          n_call++;
+      }
+      if (ntop < 8) {
+        top[ntop].name = item->u.func->name;
+        top[ntop].ninsns = fn;
+        ntop++;
+      } else {
+        int lo = 0;
+        for (i = 1; i < 8; i++)
+          if (top[i].ninsns < top[lo].ninsns) lo = i;
+        if (fn > top[lo].ninsns) {
+          top[lo].name = item->u.func->name;
+          top[lo].ninsns = fn;
+        }
       }
     } else if (item->item_type == MIR_forward_item) {
       n_fwd++;
@@ -3037,8 +3579,21 @@ static void midopt_dump_mir_stats (c2m_ctx_t c2m_ctx, MIR_module_t m) {
   (void) ctx;
   fprintf (f,
            "  [mir-stats] module=%s funcs=%ld forwards=%ld other_items=%ld "
-           "insns=%ld calls=%ld\n",
-           m->name != NULL ? m->name : "?", n_func, n_fwd, n_other, n_insn, n_call);
+           "insns=%ld calls=%ld inlines=%ld\n",
+           m->name != NULL ? m->name : "?", n_func, n_fwd, n_other, n_insn, n_call, n_inline);
+  for (i = 0; i < ntop; i++)
+    for (j = i + 1; j < ntop; j++)
+      if (top[j].ninsns > top[i].ninsns) {
+        const char *tn = top[i].name;
+        long ti = top[i].ninsns;
+        top[i].name = top[j].name;
+        top[i].ninsns = top[j].ninsns;
+        top[j].name = tn;
+        top[j].ninsns = ti;
+      }
+  for (i = 0; i < ntop; i++)
+    fprintf (f, "    [mir-stats] %-40s %ld insns\n", top[i].name != NULL ? top[i].name : "?",
+             top[i].ninsns);
 }
 
 /* ── entry point ─────────────────────────────────────────────────────────── */
@@ -3100,6 +3655,74 @@ static void midopt_metrics_walk (node_t n, int *nst, int *ncall, int *hard) {
     midopt_metrics_walk (c, nst, ncall, hard);
 }
 
+static int midopt_calls_self_p (node_t n, node_t self) {
+  node_t c, func, def;
+  struct expr *e;
+  if (n == NULL || self == NULL) return 0;
+  if (n->code == N_CALL) {
+    func = NL_HEAD (n->u.ops);
+    if (func != NULL && func->attr != NULL && midopt_expr_node_p (func->code)) {
+      e = (struct expr *) func->attr;
+      def = e->def_node;
+      if (def == self) return 1;
+    }
+  }
+  if (!midopt_node_has_ops (n->code)) return 0;
+  for (c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    if (midopt_calls_self_p (c, self)) return 1;
+  return 0;
+}
+
+static int midopt_always_inline_name_p (const char *nm) {
+  return nm != NULL
+         && (strcmp (nm, "Count") == 0 || strcmp (nm, "IsEmpty") == 0
+             || strcmp (nm, "Capacity") == 0);
+}
+
+/* Extra estimated MIR insns midopt is allowed to add by stamping inline_p.
+   Calibrated so -O1 eager gen of oggenc stays well under 3 minutes once MIR
+   also caps caller size (see process_inlines).  -On is the lever. */
+static int midopt_inline_extra_budget (int lvl) {
+  if (lvl <= 0) return 0;
+  if (lvl == 1) return 6000;
+  if (lvl == 2) return 20000;
+  return 50000;
+}
+
+static void midopt_cost_walk (node_t n, int *nnode, int *ncall) {
+  if (n == NULL) return;
+  (*nnode)++;
+  if (n->code == N_CALL) (*ncall)++;
+  if (!midopt_node_has_ops (n->code)) return;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    midopt_cost_walk (c, nnode, ncall);
+}
+
+/* AST → MIR insn estimate.  oggenc -c is ~83 MIR insns/func; 2*nodes + 6*calls
+   is a conservative upper bound used only to spend the extra-insn budget. */
+static int midopt_est_insns (node_t func_def) {
+  int nnode = 0, ncall = 0, est;
+  midopt_cost_walk (FUNC_DEF_BLOCK (func_def), &nnode, &ncall);
+  est = nnode * 2 + ncall * 6;
+  if (est < 4) est = 4;
+  return est;
+}
+
+static int midopt_icand_has (node_t f) {
+  size_t i, n;
+  if (f == NULL || midopt_icand == NULL) return 0;
+  n = VARR_LENGTH (node_t, midopt_icand);
+  for (i = 0; i < n; i++)
+    if (VARR_GET (node_t, midopt_icand, i) == f) return 1;
+  return 0;
+}
+
+static void midopt_add_icand (node_t f) {
+  if (f == NULL || f->code != N_FUNC_DEF || midopt_icand == NULL) return;
+  if (midopt_icand_has (f)) return;
+  VARR_PUSH (node_t, midopt_icand, f);
+}
+
 static int midopt_should_inline_p (c2m_ctx_t c2m_ctx, node_t func_def) {
   const char *nm;
   decl_t d;
@@ -3109,12 +3732,17 @@ static int midopt_should_inline_p (c2m_ctx_t c2m_ctx, node_t func_def) {
 
   nm = midopt_func_name (func_def);
   if (nm == NULL) return 0;
-  if (strcmp (nm, "Count") == 0 || strcmp (nm, "IsEmpty") == 0 || strcmp (nm, "Capacity") == 0)
-    return 1;
+  /* Header / compiler names (`__builtin_*`, `__bswap_*`): the source already
+     marked `inline` if it wanted MIR_INLINE.  Auto-marking them on a C
+     amalgamation multiplied MIR_link inlines; MIR now caps expansion, but
+     still do not pile extra stamps on compiler internals. */
+  if (nm[0] == '_' && nm[1] == '_') return 0;
+  if (midopt_always_inline_name_p (nm)) return 1;
   if (midopt_ptr_into_this_ret_p (func_def)) return 0;
+  /* C17: recursive functions must keep a MIR body; MIR_INLINE of self is unsafe. */
+  if (midopt_calls_self_p (FUNC_DEF_BLOCK (func_def), func_def)) return 0;
   lvl = midopt_opt_level ();
   if (lvl <= 0) return 0;
-  if (lvl == 1) return midopt_trivial_scalar_getter_p (c2m_ctx, func_def);
 
   if (!midopt_decl_ready_p (func_def)) return 0;
   d = (decl_t) func_def->attr;
@@ -3126,22 +3754,23 @@ static int midopt_should_inline_p (c2m_ctx_t c2m_ctx, node_t func_def) {
 
   midopt_metrics_walk (FUNC_DEF_BLOCK (func_def), &nst, &ncall, &hard);
   if (hard) return 0;
-  /* TODO: budget=3 at -O2 still rejects ordinary "2 guard clauses + real
-     work" functions (e.g. stringbuf_append_char, 7 nst) even after the
-     call_ok relax below. Revisit raising it (toward level 3's 8) with the
-     same full regression pass (cy-testhard/cy-validate/run-examples). */
-  budget = (lvl >= 3) ? 8 : 3;
-  /* call_ok was 0 at -O2, meaning any function that delegates to a helper --
-     e.g. a tiny append/push wrapper that calls a shared capacity/bounds-check
-     function before touching the buffer, a very common leaf-ish shape -- was
-     never inlined at the default level no matter how small it was. Measured
-     directly: a StringBuf append-one-byte wrapper stayed a real call at -O2
-     purely because of this, while gcc -O2 on equivalent C happily inlined
-     both levels; allowing exactly one nested call keeps the budget still
-     tight (see nst above) but stops penalizing this specific, common shape. */
-  call_ok = (lvl >= 3) ? 2 : 1;
+  if (lvl <= 1) {
+    budget = 1;
+    call_ok = 0;
+  } else if (lvl == 2) {
+    budget = 3;
+    call_ok = 1;
+  } else {
+    budget = 8;
+    call_ok = 2;
+  }
   if (nst > budget || ncall > call_ok) return 0;
-  if (lvl < 3 && !midopt_method_readonly_p (c2m_ctx, func_def, 0)) return 0;
+  if (midopt_class_method_p (func_def) && lvl < 3
+      && !midopt_method_readonly_p (c2m_ctx, func_def, 0))
+    return 0;
+  if (!midopt_class_method_p (func_def) && lvl <= 1
+      && !midopt_trivial_scalar_getter_p (c2m_ctx, func_def))
+    return 0;
   return 1;
 }
 
@@ -3200,15 +3829,266 @@ static void midopt_mark_inline_free_funcs (c2m_ctx_t c2m_ctx, node_t n) {
     decl_t d = (decl_t) n->attr;
     const char *nm = midopt_func_name (n);
     if (nm != NULL && d != NULL && !d->decl_spec.inline_p
-        && midopt_should_inline_p (c2m_ctx, n)) {
-      d->decl_spec.inline_p = TRUE;
-      if (midopt_verbose_p) fprintf (stderr, "  [midopt] inline mark (free) %s\n", nm);
-    }
+        && midopt_should_inline_p (c2m_ctx, n))
+      midopt_add_icand (n);
   }
 
   if (!midopt_node_has_ops (n->code)) return;
   for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
     midopt_mark_inline_free_funcs (c2m_ctx, c);
+}
+
+static void midopt_count_sites_walk (node_t n, node_t *cands, int *sites, int nc) {
+  struct expr *e;
+  node_t def, func;
+  int i;
+
+  if (n == NULL) return;
+  if (n->code == N_CALL) {
+    func = NL_HEAD (n->u.ops);
+    if (func != NULL && func->attr != NULL && midopt_expr_node_p (func->code)) {
+      e = (struct expr *) func->attr;
+      def = e->def_node;
+      if (def != NULL && def->code == N_FUNC_DEF)
+        for (i = 0; i < nc; i++)
+          if (cands[i] == def) {
+            sites[i]++;
+            break;
+          }
+    }
+  }
+  if (!midopt_node_has_ops (n->code)) return;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    midopt_count_sites_walk (c, cands, sites, nc);
+}
+
+/* Spend the -On extra-insn budget on the cheapest candidates first.
+   Always-inline names (Count/IsEmpty/Capacity) are taken regardless. */
+static void midopt_commit_inlines (c2m_ctx_t c2m_ctx, node_t module) {
+  size_t n, i, j;
+  node_t *cands;
+  int *cost, *sites, *ord, budget, n_mark = 0, extra_spent = 0, lvl;
+  FILE *f;
+
+  if (midopt_icand == NULL) return;
+  n = VARR_LENGTH (node_t, midopt_icand);
+  lvl = midopt_opt_level ();
+  budget = midopt_inline_extra_budget (lvl);
+  if (n == 0) {
+    if (midopt_verbose_p)
+      fprintf (stderr, "  [midopt] inline: 0 candidates (budget %d insns at -O%d)\n", budget, lvl);
+    return;
+  }
+  cands = VARR_ADDR (node_t, midopt_icand);
+  cost = (int *) calloc (n, sizeof (int));
+  sites = (int *) calloc (n, sizeof (int));
+  ord = (int *) malloc (n * sizeof (int));
+  if (cost == NULL || sites == NULL || ord == NULL) {
+    free (cost);
+    free (sites);
+    free (ord);
+    return;
+  }
+  for (i = 0; i < n; i++) {
+    const char *nm = midopt_func_name (cands[i]);
+    cost[i] = midopt_always_inline_name_p (nm) ? 0 : midopt_est_insns (cands[i]);
+    ord[i] = (int) i;
+  }
+  midopt_count_sites_walk (module, cands, sites, (int) n);
+  /* Smallest first; always-inline (cost 0) stays at the front. */
+  for (i = 0; i < n; i++)
+    for (j = i + 1; j < n; j++)
+      if (cost[ord[j]] < cost[ord[i]]
+          || (cost[ord[j]] == cost[ord[i]] && sites[ord[j]] > sites[ord[i]])) {
+        int t = ord[i];
+        ord[i] = ord[j];
+        ord[j] = t;
+      }
+  for (i = 0; i < n; i++) {
+    int k = ord[i];
+    decl_t d;
+    const char *nm;
+    int extra, sites_k;
+    d = (decl_t) cands[k]->attr;
+    if (d == NULL || d->decl_spec.inline_p) continue;
+    nm = midopt_func_name (cands[k]);
+    sites_k = sites[k] > 0 ? sites[k] : 1;
+    extra = cost[k] * sites_k;
+    if (cost[k] != 0 && extra > budget) continue;
+    d->decl_spec.inline_p = TRUE;
+    n_mark++;
+    if (cost[k] != 0) {
+      budget -= extra;
+      extra_spent += extra;
+    }
+    if (midopt_dump_p)
+      fprintf (stderr, "  [midopt] inline mark %s cost=%d sites=%d extra=%d%s\n",
+               nm != NULL ? nm : "?", cost[k], sites_k, extra,
+               cost[k] == 0 ? " (always)" : "");
+  }
+  f = (c2m_options != NULL && c2m_options->message_file != NULL) ? c2m_options->message_file
+                                                                : stderr;
+  if (midopt_verbose_p || (c2m_options != NULL && c2m_options->verbose_p))
+    fprintf (f,
+             "  [midopt] inline: marked %d / %lu candidates, extra~%d insns, leftover budget %d "
+             "(-O%d)\n",
+             n_mark, (unsigned long) n, extra_spent, budget, lvl);
+  free (cost);
+  free (sites);
+  free (ord);
+}
+
+/* C16: internal-linkage (`static`) free functions unreferenced from live
+   roots (exported funcs, kept methods, file-scope initializers) are marked
+   midopt_dead_p.  Exported C functions are never pruned. */
+static VARR (node_t) * midopt_skeep;
+static VARR (node_t) * midopt_swork;
+
+static int midopt_internal_free_p (node_t f) {
+  decl_t d;
+  const char *nm;
+  if (f == NULL || f->code != N_FUNC_DEF) return 0;
+  if (!midopt_decl_ready_p (f) || midopt_class_method_p (f)) return 0;
+  d = (decl_t) f->attr;
+  if (d == NULL || d->decl_spec.linkage != N_STATIC) return 0;
+  nm = midopt_func_name (f);
+  if (nm == NULL || strcmp (nm, "main") == 0) return 0;
+  /* Compiler-synthesized (`__thunk_dtor_*`, `__genfn_*`) and libc
+     header inlines (`__builtin_*`, `__bswap_*`) are referenced from gen
+     or macros in ways the AST walk misses.  Only prune user-level names. */
+  if (nm[0] == '_' && nm[1] == '_') return 0;
+  return 1;
+}
+
+static int midopt_skeep_has (node_t f) {
+  size_t i, n;
+  if (f == NULL || midopt_skeep == NULL) return 0;
+  n = VARR_LENGTH (node_t, midopt_skeep);
+  for (i = 0; i < n; i++)
+    if (VARR_GET (node_t, midopt_skeep, i) == f) return 1;
+  return 0;
+}
+
+static void midopt_skeep_mark (node_t f) {
+  if (!midopt_internal_free_p (f)) return;
+  if (midopt_skeep_has (f)) return;
+  VARR_PUSH (node_t, midopt_skeep, f);
+  VARR_PUSH (node_t, midopt_swork, f);
+}
+
+static void midopt_skeep_walk (node_t n);
+
+static void midopt_skeep_from_expr (node_t n) {
+  struct expr *e;
+  node_t def;
+  if (n == NULL || !midopt_expr_node_p (n->code)) return;
+  if (n->attr == NULL || n->attr == (void *) ((intptr_t) -1)) return;
+  e = (struct expr *) n->attr;
+  def = e->def_node;
+  if (def == NULL || def == (node_t) (intptr_t) 1 || def == (node_t) (intptr_t) 2) return;
+  if (def->code == N_FUNC_DEF) midopt_skeep_mark (def);
+}
+
+static void midopt_skeep_walk (node_t n) {
+  if (n == NULL) return;
+  midopt_skeep_from_expr (n);
+  if (!midopt_node_has_ops (n->code)) return;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    midopt_skeep_walk (c);
+}
+
+static void midopt_skeep_seed (c2m_ctx_t c2m_ctx, node_t n) {
+  (void) c2m_ctx;
+  if (n == NULL) return;
+  if (n->code == N_FUNC_DEF && midopt_decl_ready_p (n)) {
+    if (midopt_class_method_p (n)) {
+      decl_t d = (decl_t) n->attr;
+      if (d != NULL && !d->midopt_dead_p) {
+        midopt_skeep_walk (FUNC_DEF_BLOCK (n));
+        midopt_skeep_walk (FUNC_DEF_DECLS (n));
+      }
+    } else if (!midopt_internal_free_p (n)) {
+      midopt_skeep_walk (FUNC_DEF_BLOCK (n));
+      midopt_skeep_walk (FUNC_DEF_DECLS (n));
+    }
+  }
+  if (n->code == N_SPEC_DECL)
+    midopt_skeep_walk (SPEC_DECL_INIT (n));
+  if (!midopt_node_has_ops (n->code)) return;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    midopt_skeep_seed (c2m_ctx, c);
+}
+
+static void midopt_prune_mark_static (c2m_ctx_t c2m_ctx, node_t n, int *n_static, int *n_dead) {
+  if (n == NULL) return;
+  if (n->code == N_FUNC_DEF && midopt_internal_free_p (n)) {
+    decl_t d = (decl_t) n->attr;
+    (*n_static)++;
+    /* Check's used_p is a backstop: K&R / implicit-decl calls in amalgamations
+       (oggenc parse_options) can miss the AST def_node walk.  Pruning those
+       left main calling a NULL stub at -O1/-O2. */
+    if (!midopt_skeep_has (n) && !d->used_p) {
+      d->midopt_dead_p = TRUE;
+      (*n_dead)++;
+      if (midopt_verbose_p) {
+        const char *nm = midopt_func_name (n);
+        fprintf (stderr, "  [midopt] dead static %s\n", nm != NULL ? nm : "?");
+      }
+    }
+  }
+  if (!midopt_node_has_ops (n->code)) return;
+  for (node_t c = NL_HEAD (n->u.ops); c != NULL; c = NL_NEXT (c))
+    midopt_prune_mark_static (c2m_ctx, c, n_static, n_dead);
+}
+
+static void midopt_prune_static_funcs (c2m_ctx_t c2m_ctx, node_t module) {
+  MIR_alloc_t alloc = c2m_alloc (c2m_ctx);
+  size_t wi;
+  int n_static = 0, n_dead = 0;
+
+  VARR_CREATE (node_t, midopt_skeep, alloc, 16);
+  VARR_CREATE (node_t, midopt_swork, alloc, 16);
+  midopt_skeep_seed (c2m_ctx, module);
+  wi = 0;
+  while (wi < VARR_LENGTH (node_t, midopt_swork)) {
+    node_t f = VARR_GET (node_t, midopt_swork, wi++);
+    midopt_skeep_walk (FUNC_DEF_BLOCK (f));
+    midopt_skeep_walk (FUNC_DEF_DECLS (f));
+  }
+  midopt_prune_mark_static (c2m_ctx, module, &n_static, &n_dead);
+  if (midopt_verbose_p && n_static > 0)
+    fprintf (stderr, "  [midopt] static funcs=%d kept=%lu dead=%d\n", n_static,
+             (unsigned long) VARR_LENGTH (node_t, midopt_skeep), n_dead);
+  VARR_DESTROY (node_t, midopt_skeep);
+  VARR_DESTROY (node_t, midopt_swork);
+  midopt_skeep = NULL;
+  midopt_swork = NULL;
+}
+
+/* Safety lattice only pays when gen will emit traps.  -fno-exceptions (the
+   oggenc / C-bench profile) has nothing to elide; skip the walk. */
+static int midopt_want_safety_p (c2m_ctx_t c2m_ctx) {
+  return c2m_options == NULL || c2m_options->exceptions_p;
+}
+
+/* C16 first (so safety skips dead_p), then optional P1, then R2. */
+static void midopt_late_passes (c2m_ctx_t c2m_ctx, node_t module) {
+  midopt_log ("phase 7: static DCE");
+  midopt_prune_static_funcs (c2m_ctx, module);
+
+  midopt_safety_n_warn = 0;
+  midopt_safety_n_elide = 0;
+  if (midopt_want_safety_p (c2m_ctx)) {
+    midopt_log ("phase 5: safety lattice");
+    midopt_safety_module (c2m_ctx, module);
+    midopt_log ("phase 5b: structural elide walk (elisions=%d)", midopt_safety_n_elide);
+    midopt_elide_walk (c2m_ctx, module);
+  } else {
+    midopt_log ("skip safety lattice (-fno-exceptions: no traps to elide)");
+  }
+
+  midopt_log ("phase 6: for-in byref");
+  midopt_byref_module (c2m_ctx, module);
 }
 
 static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
@@ -3224,35 +4104,51 @@ static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
   }
 
   alloc = c2m_alloc (c2m_ctx);
-  midopt_verbose_p = c2m_options != NULL && c2m_options->verbose_p;
-  midopt_level = midopt_latch_opt_level (c2m_ctx);
+  midopt_dump_p = c2m_options != NULL && c2m_options->dump_midopt_p;
+  midopt_verbose_p = (c2m_options != NULL && c2m_options->verbose_p) || midopt_dump_p;
+  /* Latch after dump flags so -O0 can log the skip.  optimize_level==0 is a
+     real -O0; unspecified (-1) becomes 2. */
+  midopt_level = (c2m_options != NULL && c2m_options->optimize_level == 0)
+                   ? 0
+                   : midopt_latch_opt_level (c2m_ctx);
+  midopt_t0 = midopt_now ();
+  midopt_n_safety_func = 0;
+  if (midopt_level == 0) {
+    if (midopt_verbose_p || midopt_dump_p)
+      fprintf (stderr, "  [midopt] SKIPPED (-O0: no inline/DCE/safety)\n");
+    return;
+  }
   VARR_CREATE (node_t, midopt_keep, alloc, 64);
   VARR_CREATE (node_t, midopt_work, alloc, 64);
+  VARR_CREATE (node_t, midopt_icand, alloc, 64);
 
-  if (midopt_verbose_p)
-    fprintf (stderr, "  [midopt] start (P0/P1 + IV/inline at -O%d)\n", midopt_level);
+  midopt_log ("start (P0/P1 + IV/inline at -O%d)", midopt_level);
 
   /* 0) Free-function inlining is independent of the class-method
      reachability/pruning machinery below -- run it unconditionally, before
      any early return (e.g. the "zero method keeps" safety net) that would
      otherwise skip it in a file with no classyc classes at all. */
+  midopt_log ("phase 0: mark inline free funcs");
   midopt_mark_inline_free_funcs (c2m_ctx, module);
 
   /* 1) Seed ONLY from free functions (and nested decls/ctors in them). */
+  midopt_log ("phase 1: seed from free funcs");
   midopt_seed_from_free_funcs (c2m_ctx, module);
 
   /* 2) Method-level fixpoint (same-class name resolution for this->Foo). */
+  midopt_log ("phase 2: method worklist (seeded %lu)",
+              (unsigned long) VARR_LENGTH (node_t, midopt_work));
   wi = 0;
   while (wi < VARR_LENGTH (node_t, midopt_work)) {
     node_t f = VARR_GET (node_t, midopt_work, wi++);
     midopt_collect_uses_body (c2m_ctx, f);
   }
 
-  if (midopt_verbose_p)
-    fprintf (stderr, "  [midopt] method-level keep=%lu before helper-fill\n",
-             (unsigned long) VARR_LENGTH (node_t, midopt_keep));
+  midopt_log ("method-level keep=%lu before helper-fill",
+              (unsigned long) VARR_LENGTH (node_t, midopt_keep));
 
   /* 3) Keep collection helpers on live monomorphs (not the whole public API). */
+  midopt_log ("phase 3: helper fill");
   midopt_keep_helpers_for_live (c2m_ctx, module);
 
   /* 3b) Drain callees of newly kept helpers / methods. */
@@ -3277,26 +4173,38 @@ static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
 
   /* 3d) Safety net: zero keeps → do not prune (P1 elision still runs). */
   if (VARR_LENGTH (node_t, midopt_keep) == 0) {
-    if (midopt_verbose_p)
-      fprintf (stderr, "  [midopt] no method keeps found — skip dead pruning\n");
+    midopt_log ("no method keeps — skip dead pruning");
+    midopt_log ("phase 4b: commit inlines (cost analyzer)");
+    midopt_commit_inlines (c2m_ctx, module);
+    /* Pure C TU (oggenc): C16 static DCE has been observed to drop live
+       helpers whose def_node the AST walk missed (K&R / implicit decl).
+       Skip prune; still run safety/byref no-ops. */
     midopt_safety_n_warn = 0;
     midopt_safety_n_elide = 0;
-    midopt_safety_module (c2m_ctx, module);
-    midopt_elide_walk (c2m_ctx, module);
+    if (midopt_want_safety_p (c2m_ctx)) {
+      midopt_log ("phase 5: safety lattice");
+      midopt_safety_module (c2m_ctx, module);
+      midopt_elide_walk (c2m_ctx, module);
+    }
     midopt_byref_module (c2m_ctx, module);
     if (c2m_options != NULL && c2m_options->verbose_p) {
       FILE *f = c2m_options->message_file != NULL ? c2m_options->message_file : stderr;
       fprintf (f, "  [midopt] class methods=unknown kept=0 dead=0 (prune skipped)\n");
       fprintf (f, "  [midopt] safety: diagnostics=%d elisions=%d\n", midopt_safety_n_warn,
                midopt_safety_n_elide);
+      fflush (f);
     }
+    midopt_log ("done (safety funcs=%d elisions=%d)", midopt_n_safety_func, midopt_safety_n_elide);
     VARR_DESTROY (node_t, midopt_keep);
     VARR_DESTROY (node_t, midopt_work);
+    VARR_DESTROY (node_t, midopt_icand);
     midopt_keep = NULL;
     midopt_work = NULL;
+    midopt_icand = NULL;
     return;
   }
 
+  midopt_log ("phase 3d: mark dead methods");
   midopt_mark_dead_methods (c2m_ctx, module, &n_methods, &n_dead);
 
   /* 4) Mark only trivial scalar accessors for MIR_INLINE.
@@ -3310,23 +4218,16 @@ static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
       const char *nm = midopt_func_name (f);
       decl_t d = f->attr;
       if (nm == NULL || d == NULL) continue;
-      if (midopt_should_inline_p (c2m_ctx, f)) {
-        d->decl_spec.inline_p = TRUE;
-        if (midopt_verbose_p) fprintf (stderr, "  [midopt] inline mark %s\n", nm);
-      }
+      if (!d->decl_spec.inline_p && midopt_should_inline_p (c2m_ctx, f))
+        midopt_add_icand (f);
     }
   }
 
-  /* 5) P1 safety lattice: nullness + intervals → diagnose / elide. */
-  midopt_safety_n_warn = 0;
-  midopt_safety_n_elide = 0;
-  midopt_safety_module (c2m_ctx, module);
-  /* Structural fallback elision (this / &local / const index). */
-  midopt_elide_walk (c2m_ctx, module);
+  midopt_log ("phase 4b: commit inlines (cost analyzer)");
+  midopt_commit_inlines (c2m_ctx, module);
 
-  /* 6) R2: prove for-in loop vars borrowable (read-only + unmutated dense
-     collection) and stamp them for by-reference binding in gen. */
-  midopt_byref_module (c2m_ctx, module);
+  /* 5–7) DCE statics, then safety (if traps exist), then for-in byref. */
+  midopt_late_passes (c2m_ctx, module);
 
   if (midopt_verbose_p || (c2m_options != NULL && c2m_options->verbose_p)) {
     FILE *f = c2m_options != NULL && c2m_options->message_file != NULL
@@ -3337,10 +4238,14 @@ static void midopt_run (c2m_ctx_t c2m_ctx, node_t module) {
     fprintf (f, "  [midopt] safety: diagnostics=%d elisions=%d%s\n", midopt_safety_n_warn,
              midopt_safety_n_elide,
              (c2m_options != NULL && c2m_options->safety_errors_p) ? " (-fsafety-errors)" : "");
+    fflush (f);
   }
+  midopt_log ("done (safety funcs=%d elisions=%d)", midopt_n_safety_func, midopt_safety_n_elide);
 
   VARR_DESTROY (node_t, midopt_keep);
   VARR_DESTROY (node_t, midopt_work);
+  VARR_DESTROY (node_t, midopt_icand);
   midopt_keep = NULL;
   midopt_work = NULL;
+  midopt_icand = NULL;
 }

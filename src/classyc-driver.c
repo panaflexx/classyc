@@ -410,6 +410,7 @@ static void init_options (int argc, char *argv[]) {
   options.optimize_level = -1; /* -On: MIR + midopt; -1 means midopt default (=2) */
   options.safety_errors_p = FALSE; /* -fsafety-errors: definite null/OOB as errors */
   options.dump_mir_stats_p = FALSE; /* -fdump-mir-stats: MIR func/insn/call counts after gen */
+  options.dump_midopt_p = FALSE; /* -fdump-midopt: timed midopt phase/func log */
   options.fibers_p = FALSE; /* -ffibers: opt-in go/await fiber syntax */
   gen_debug_level = -1;
   VARR_CREATE (char, temp_string, &default_alloc, 0);
@@ -474,6 +475,8 @@ static void init_options (int argc, char *argv[]) {
       options.safety_errors_p = FALSE;
     } else if (strcmp (argv[i], "-fdump-mir-stats") == 0) {
       options.dump_mir_stats_p = TRUE;
+    } else if (strcmp (argv[i], "-fdump-midopt") == 0) {
+      options.dump_midopt_p = TRUE;
     } else if (strcmp (argv[i], "-ffibers") == 0) {
       options.fibers_p = TRUE;
     } else if (strcmp (argv[i], "-fno-fibers") == 0) {
@@ -584,9 +587,13 @@ static void init_options (int argc, char *argv[]) {
       fprintf (stderr, "  -g -- emit source-level debug info (source locations, types, variables)\n");
       fprintf (stderr, "  -S, -c -- generate corresponding textual or binary MIR files\n");
       fprintf (stderr, "  -o file -- put output code into given file\n");
-      fprintf (stderr, "  -On -- optimization level for MIR-generator and midopt\n");
-      fprintf (stderr, "         (0=min, 1=while-IV+tiny getters, 2=default,\n");
-      fprintf (stderr, "          3=larger inline budget / more IV cases)\n");
+      fprintf (stderr, "  -On -- optimization level for MIR-generator, midopt, and inliner\n");
+      fprintf (stderr, "         (0=no midopt, no inlining, fast gen;\n");
+      fprintf (stderr, "          1=midopt light, MIR RA, no MIR_INLINE;\n");
+      fprintf (stderr, "          2=default: MIR_INLINE + SSA, budgeted inliner;\n");
+      fprintf (stderr, "          3=larger midopt/MIR inline budget / more IV cases)\n");
+      fprintf (stderr, "         MIR caps callee size, caller growth, and max func insns per -On.\n");
+      fprintf (stderr, "  -fdump-midopt -- timed midopt phases and per-function safety walk\n");
       fprintf (stderr, "  -p[n] -- use given parallelism level in C2MIR and MIR-generator\n");
       fprintf (stderr, "  -ei -- execute code in the interpreter with given options\n");
       fprintf (stderr, "         (all trailing args are passed to the program)\n");
@@ -1437,11 +1444,17 @@ int main (int argc, char *argv[], char *env[]) {
       MIR_load_external (main_ctx, "_MIR_flush_code_cache", _MIR_flush_code_cache);
       start_time = real_usec_time ();
       if (interp_exec_p) {
+        MIR_set_inline_level (optimize_level >= 0 ? optimize_level : 2);
         if (options.verbose_p)
           fprintf (stderr, "MIR link interp start  -- %.0f usec\n", real_usec_time () - start_time);
         MIR_link (main_ctx, MIR_set_interp_interface, import_resolver);
-        if (options.verbose_p)
-          fprintf (stderr, "MIR Link finish        -- %.0f usec\n", real_usec_time () - start_time);
+        if (options.verbose_p) {
+          const MIR_link_stats_t *st = MIR_get_link_stats ();
+          fprintf (stderr, "MIR inlines            -- %.0f msec (calls=%lu)\n", st->inline_ms,
+                   st->n_inlined);
+          fprintf (stderr, "MIR Link finish        -- %.0f msec\n",
+                   (real_usec_time () - start_time) / 1000.0);
+        }
         start_time = real_usec_time ();
         MIR_interp (main_ctx, main_func, &val, 3,
                     (MIR_val_t){.i = VARR_LENGTH (char_ptr_t, exec_argv)},
@@ -1473,7 +1486,10 @@ int main (int argc, char *argv[], char *env[]) {
         if (options.verbose_p)
           fprintf (stderr, "MIR gen init finish         -- %.0f usec\n",
                    real_usec_time () - start_time);
-        if (optimize_level >= 0) MIR_gen_set_optimize_level (main_ctx, (unsigned) optimize_level);
+        if (optimize_level >= 0)
+          MIR_gen_set_optimize_level (main_ctx, (unsigned) optimize_level);
+        /* Match MIR_gen -On.  Unspecified (-1) is MIR default 2. */
+        MIR_set_inline_level (optimize_level >= 0 ? optimize_level : 2);
         if (gen_debug_level >= 0) {
           MIR_gen_set_debug_file (main_ctx, stderr);
           MIR_gen_set_debug_level (main_ctx, gen_debug_level);
@@ -1483,8 +1499,22 @@ int main (int argc, char *argv[], char *env[]) {
                   : lazy_gen_exec_p ? MIR_set_lazy_gen_interface
                                     : MIR_set_lazy_bb_gen_interface,
                   import_resolver);
-        if (options.verbose_p)
-          fprintf (stderr, "MIR link finish        -- %.0f usec\n", real_usec_time () - start_time);
+        if (options.verbose_p) {
+          const MIR_link_stats_t *st = MIR_get_link_stats ();
+          fprintf (stderr, "MIR simplify           -- %.0f msec\n", st->simplify_ms);
+          fprintf (stderr,
+                   "MIR inlines            -- %.0f msec (calls=%lu, insns %lu -> %lu, "
+                   "skip callee=%lu growth=%lu cap=%lu level=%lu)\n",
+                   st->inline_ms, st->n_inlined, st->n_insns_before, st->n_insns_after,
+                   st->skipped_callee, st->skipped_growth, st->skipped_cap, st->skipped_level);
+          if (st->max_func_name[0] != '\0')
+            fprintf (stderr, "MIR largest after inline: %s (%lu insns)\n", st->max_func_name,
+                     st->max_func_insns);
+          fprintf (stderr, "MIR gen                -- %.0f msec\n", st->interface_ms);
+          MIR_gen_dump_timing (stderr);
+          fprintf (stderr, "MIR link finish        -- %.0f msec\n",
+                   (real_usec_time () - start_time) / 1000.0);
+        }
         if (options.debug_info_p) {
           classyc_register_jit_funcs (main_ctx);
           cstktr_mir_ctx = main_ctx; /* enable lazy lookup for -el/-eb */

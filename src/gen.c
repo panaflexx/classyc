@@ -5430,6 +5430,20 @@ static void gen_forward_class_methods (c2m_ctx_t c2m_ctx, node_t module) {
    methods).  Scalar args are promoted/cast to the parameter types; aggregate
    args must already be memory ops.  Returns the call result (a meaningless op
    for void functions). */
+/* Emit MIR_INLINE for `inline` / midopt stamps at -O2+.  -O0/-O1 stay CALL.
+   -O1 still runs MIR RA; inlining starts at -O2 where process_inlines caps
+   callee size, growth, and caller size.  Emitting INLINE at -O1 into oggenc
+   main made process_inlines hang (simplify of those sites) or crash (bare
+   opcode rewrite left a NULL call). */
+static int gen_mir_inline_ok_p (c2m_ctx_t c2m_ctx, int decl_inline_p) {
+  int lvl;
+  if (!decl_inline_p) return 0;
+  if (c2m_options == NULL) return 1;
+  lvl = c2m_options->optimize_level;
+  if (lvl < 0) lvl = 2; /* unspecified = MIR / midopt default */
+  return lvl >= 2;
+}
+
 static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_type *ft,
                               MIR_op_t func_op, op_t *args, int n_args, op_t *agg_dest,
                               int mir_inline_p) {
@@ -5506,7 +5520,9 @@ static op_t gen_funcptr_call (c2m_ctx_t c2m_ctx, MIR_item_t proto, struct func_t
     param = NL_NEXT (param);
   }
   {
-    MIR_insn_t ci = MIR_new_insn_arr (ctx, mir_inline_p ? MIR_INLINE : MIR_CALL,
+    MIR_insn_t ci = MIR_new_insn_arr (ctx,
+                                     gen_mir_inline_ok_p (c2m_ctx, mir_inline_p) ? MIR_INLINE
+                                                                                : MIR_CALL,
                                       VARR_LENGTH (MIR_op_t, call_ops) - ops_start,
                                       VARR_ADDR (MIR_op_t, call_ops) + ops_start);
     emit_insn (c2m_ctx, ci);
@@ -5934,7 +5950,7 @@ static op_t gen_class_method_call_dest (c2m_ctx_t c2m_ctx, node_t func_def,
   all_args[0] = this_op; /* 'this' is the first parameter of the method */
   for (int j = 0; j < n_args; j++) all_args[j + 1] = args[j];
   return gen_funcptr_call (c2m_ctx, proto, ft, MIR_new_ref_op (ctx, mdecl->u.item), all_args,
-                           n_args + 1, agg_dest, mdecl->decl_spec.inline_p);
+                           n_args + 1, agg_dest, gen_mir_inline_ok_p (c2m_ctx, mdecl->decl_spec.inline_p));
 }
 
 static op_t gen_class_method_call_flags (c2m_ctx_t c2m_ctx, node_t func_def,
@@ -6481,16 +6497,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     /* Integer division-by-zero guard — only for / and %, not &, |, <<, * etc. */
     if (c2m_options->exceptions_p && (r->code == N_DIV || r->code == N_MOD)
         && integer_type_p (((struct expr *) r->attr)->type)) {
-      struct type *rt = ((struct expr *) r->attr)->type;
+      struct expr *op_e = (struct expr *) r->attr;
+      struct type *rt = op_e->type;
       node_t den_n = NL_EL (r->u.ops, 1);
       struct expr *den_e = den_n != NULL ? den_n->attr : NULL;
-      /* Constant non-zero divisor: the trap is dead. */
-      int den_known_nz = den_e != NULL && den_e->const_p && den_e->c.i_val != 0;
+      /* Constant non-zero divisor, or midopt interval proof (C1/C2). */
+      int den_known_nz = (den_e != NULL && den_e->const_p && den_e->c.i_val != 0)
+                         || op_e->elide_div0_p;
       op_t div_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
       if (!den_known_nz)
         gen_div_zero_check (c2m_ctx, div_reg, (long) POS (r).lno);
       /* Signed MIN / -1 overflow (SIGFPE) guard. */
-      if (signed_integer_type_p (rt)) {
+      if (signed_integer_type_p (rt) && !op_e->elide_div_ovf_p) {
         mir_size_t sz = type_size (c2m_ctx, rt);
         long long minv = sz >= 8 ? (-9223372036854775807LL - 1) : (long long) (-2147483647 - 1);
         op_t dvd_reg = force_reg (c2m_ctx, op1, MIR_T_I64);
@@ -6500,17 +6518,18 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     /* Shift amount range: count in [0, width) of the (promoted) left type. */
     if (c2m_options->exceptions_p && (r->code == N_LSH || r->code == N_RSH)
         && integer_type_p (((struct expr *) r->attr)->type)) {
-      struct type *rt = ((struct expr *) r->attr)->type;
+      struct expr *op_e = (struct expr *) r->attr;
+      struct type *rt = op_e->type;
       mir_size_t sz = type_size (c2m_ctx, rt);
       int width = (int) (sz * MIR_CHAR_BIT);
       if (width < 8) width = 8;
       if (width > 64) width = 64;
       node_t cnt_n = NL_EL (r->u.ops, 1);
       struct expr *cnt_e = cnt_n != NULL ? cnt_n->attr : NULL;
-      /* Constant count already in range: the trap is dead.  This is the
-         common case for libc inline helpers (bswap, etc.). */
-      if (!(cnt_e != NULL && cnt_e->const_p && cnt_e->c.i_val >= 0
-            && cnt_e->c.i_val < width)) {
+      /* Constant count already in range, or midopt interval proof (C1/C2). */
+      if (!(op_e->elide_shift_p
+            || (cnt_e != NULL && cnt_e->const_p && cnt_e->c.i_val >= 0
+                && cnt_e->c.i_val < width))) {
         op_t cnt_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
         gen_shift_range_check (c2m_ctx, cnt_reg, width, (long) POS (r).lno);
       }
@@ -6681,15 +6700,17 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     /* Integer division-by-zero guard for /= and %= (exceptions mode only). */
     if (c2m_options->exceptions_p && (r->code == N_DIV_ASSIGN || r->code == N_MOD_ASSIGN)
         && integer_type_p (((struct expr *) r->attr)->type2)) {
-      struct type *rt = ((struct expr *) r->attr)->type2;
+      struct expr *op_e = (struct expr *) r->attr;
+      struct type *rt = op_e->type2;
       node_t den_n = NL_EL (r->u.ops, 1);
       struct expr *den_e = den_n != NULL ? den_n->attr : NULL;
-      int den_known_nz = den_e != NULL && den_e->const_p && den_e->c.i_val != 0;
+      int den_known_nz = (den_e != NULL && den_e->const_p && den_e->c.i_val != 0)
+                         || op_e->elide_div0_p;
       op_t div_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
       if (!den_known_nz)
         gen_div_zero_check (c2m_ctx, div_reg, (long) POS (r).lno);
       /* Signed MIN / -1 overflow (SIGFPE) guard. */
-      if (signed_integer_type_p (rt)) {
+      if (signed_integer_type_p (rt) && !op_e->elide_div_ovf_p) {
         mir_size_t sz = type_size (c2m_ctx, rt);
         long long minv = sz >= 8 ? (-9223372036854775807LL - 1) : (long long) (-2147483647 - 1);
         op_t dvd_reg = force_reg (c2m_ctx, val, MIR_T_I64);
@@ -6699,15 +6720,17 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     if (c2m_options->exceptions_p
         && (r->code == N_LSH_ASSIGN || r->code == N_RSH_ASSIGN)
         && integer_type_p (((struct expr *) r->attr)->type2)) {
-      struct type *rt = ((struct expr *) r->attr)->type2;
+      struct expr *op_e = (struct expr *) r->attr;
+      struct type *rt = op_e->type2;
       mir_size_t sz = type_size (c2m_ctx, rt);
       int width = (int) (sz * MIR_CHAR_BIT);
       if (width < 8) width = 8;
       if (width > 64) width = 64;
       node_t cnt_n = NL_EL (r->u.ops, 1);
       struct expr *cnt_e = cnt_n != NULL ? cnt_n->attr : NULL;
-      if (!(cnt_e != NULL && cnt_e->const_p && cnt_e->c.i_val >= 0
-            && cnt_e->c.i_val < width)) {
+      if (!(op_e->elide_shift_p
+            || (cnt_e != NULL && cnt_e->const_p && cnt_e->c.i_val >= 0
+                && cnt_e->c.i_val < width))) {
         op_t cnt_reg = force_reg (c2m_ctx, op2, MIR_T_I64);
         gen_shift_range_check (c2m_ctx, cnt_reg, width, (long) POS (r).lno);
       }
@@ -8583,7 +8606,7 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       VARR_PUSH (MIR_op_t, call_ops, MIR_new_ref_op (ctx, proto_item));
       op1 = val_gen (c2m_ctx, func);
       if (!jcall_p && op1.mir_op.mode == MIR_OP_REF && func->code == N_ID
-          && ((decl_t) func_expr->def_node->attr)->decl_spec.inline_p)
+          && gen_mir_inline_ok_p (c2m_ctx, ((decl_t) func_expr->def_node->attr)->decl_spec.inline_p))
         inline_p = TRUE;
       if (op1.mir_op.u.ref == NULL) {
           warning (c2m_ctx, POS (func), "MIR_OP_REF has null func reference");

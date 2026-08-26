@@ -2758,11 +2758,25 @@ int main(int argc, char **argv) {
         const char *opt = getenv("B2OBJ_OPT");
         int level = opt_level >= 0 ? opt_level : (opt != NULL ? atoi(opt) : 1);
         MIR_gen_set_optimize_level(ctx, (unsigned)level);
+        MIR_set_inline_level(level);
         DBG("optimize level = %d", level);
     }
     DBG("starting MIR_link (eager code generation of all functions)");
     MIR_link(ctx, MIR_set_gen_interface, hybrid_import_resolver);
     DBG("MIR_link done (all functions generated)");
+    if (getenv("B2OBJ_DEBUG") != NULL) {
+        const MIR_link_stats_t *st = MIR_get_link_stats();
+        fprintf(stderr,
+                "[b2obj] simplify=%.0fms inlines=%.0fms gen=%.0fms inlined=%lu insns %lu->%lu "
+                "skip callee=%lu growth=%lu cap=%lu\n",
+                st->simplify_ms, st->inline_ms, st->interface_ms, st->n_inlined,
+                st->n_insns_before, st->n_insns_after, st->skipped_callee, st->skipped_growth,
+                st->skipped_cap);
+        if (st->max_func_name[0] != '\0')
+            fprintf(stderr, "[b2obj] largest after inline: %s (%lu insns)\n", st->max_func_name,
+                    st->max_func_insns);
+        MIR_gen_dump_timing(stderr);
+    }
 
     /* Generate code for all functions and write the ELF object */
     create_object_file_from_module(ctx, output_file);
