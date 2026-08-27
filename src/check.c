@@ -2006,9 +2006,20 @@ static void def_symbol (c2m_ctx_t c2m_ctx, enum symbol_mode mode, node_t id, nod
   if (tab_decl_spec.thread_local_p != decl_spec.thread_local_p) {
     error (c2m_ctx, POS (id), "thread local and non-thread local declarations of %s", id->u.s.s);
   }
-  if ((decl_spec.linkage == N_EXTERN && linkage == N_STATIC)
-      || (decl_spec.linkage == N_STATIC && linkage == N_EXTERN))
-    warning (c2m_ctx, POS (id), "%s defined with external and internal linkage", id->u.s.s);
+  /* C11 6.2.2: a `static` declaration whose identifier has a prior visible
+     declaration with external linkage is a constraint violation (GCC/Clang:
+     "static declaration of 'f' follows non-static declaration").  Accepting
+     it silently is fatal here: call sites bind to the extern decl while the
+     static definition's own decl stays unused, so midopt's static DCE prunes
+     the body and leaves an unresolvable forward (call *0 at runtime) -- seen
+     with jit_backend's static http_listen/http_handle_client colliding with
+     httpserve.h's externs.  The reverse (extern after static) is legal: the
+     declaration inherits internal linkage per 6.2.2p4.
+     (The condition this replaces compared the NEW decl's linkage against
+     itself -- dead -- and could fire spuriously for that legal case.) */
+  if (tab_decl_spec.linkage == N_EXTERN && decl_spec.linkage == N_STATIC)
+    error (c2m_ctx, POS (id), "static declaration of %s follows non-static declaration", id->u.s.s);
+  (void) linkage;
   VARR_PUSH (node_t, sym.defs, def_node);
   if (incomplete_type_p (c2m_ctx, tab_decl_spec.type)) symbol_def_replace (c2m_ctx, sym, def_node);
 }

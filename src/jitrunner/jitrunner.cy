@@ -98,6 +98,7 @@ extern void        jit_load_module(JIT_context ctx, JIT_module m);
 extern void        jit_gen_init(JIT_context ctx);
 extern void        jit_gen_finish(JIT_context ctx);
 extern void        jit_link(JIT_context ctx, int mode);
+extern int         jit_check_unresolved_forwards(JIT_context ctx);
 extern void       *jit_get_func_addr(JIT_item item);
 extern void       *jit_gen_func(JIT_context ctx, JIT_item item);
 
@@ -398,6 +399,16 @@ RunResult *run_bmir(char **paths, int npaths, int jit_mode, int verbose,
             fprintf(stderr, "\n");
             jit_finish(ctx);
             _exit(124);
+        }
+
+        /* Refuse to run with unresolved forward declarations: MIR_link
+         * silently binds those to a NULL address and the first call jumps
+         * to 0 (SIGSEGV with no message). Report them here instead. */
+        int nunresolved = jit_check_unresolved_forwards(ctx);
+        if (nunresolved > 0) {
+            fprintf(stderr, "[jitrunner] error: %d unresolved symbol(s) above — refusing to run (calls would jump to address 0)\n", nunresolved);
+            jit_finish(ctx);
+            _exit(125);
         }
 
         jit_gen_init(ctx);

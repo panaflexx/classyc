@@ -61,6 +61,7 @@ void        jit_gen_init(JIT_context ctx);
 void        jit_gen_finish(JIT_context ctx);
 void        jit_link(JIT_context ctx, int mode);
 
+int         jit_check_unresolved_forwards(JIT_context ctx);
 void       *jit_get_func_addr(JIT_item item);
 size_t      jit_func_code_len(JIT_item item);
 void       *jit_gen_func(JIT_context ctx, JIT_item item);

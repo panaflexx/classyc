@@ -278,6 +278,52 @@ void jit_link(void *ctx,int mode){
     else MIR_set_no_inlines(0);
     switch(mode){ case 1: MIR_link(mctx,MIR_set_gen_interface,import_resolver); break; case 2: MIR_link(mctx,MIR_set_interp_interface,import_resolver); break; default: MIR_link(mctx,MIR_set_lazy_gen_interface,import_resolver); break; }
 }
+
+/* Scan all loaded modules for MIR_forward_item declarations that have no
+   matching definition *in their own module*. MIR_link resolves a forward
+   via the module's own symbol table, which contains the forward itself
+   when no definition exists -- so it silently binds the forward to its own
+   NULL addr and gen later emits `call *0` (SIGSEGV at rip=0 with no
+   message). A producer bug (e.g. classyc's midopt dropping a static
+   function body, leaving only its forward declaration) hits exactly this
+   hole; catch it up front instead. Cross-module references are imports,
+   not forwards, so same-module resolution matches MIR's own semantics.
+   Returns the number of distinct unresolved symbols (0 = safe to run). */
+int jit_check_unresolved_forwards(void *ctx){
+    MIR_context_t mctx=(MIR_context_t)ctx;
+    if(!mctx) return 0;
+    char **reported=NULL; size_t nreported=0;
+    int bad=0;
+    DLIST(MIR_module_t) *mlist=MIR_get_module_list(mctx);
+    for(MIR_module_t m=DLIST_HEAD(MIR_module_t,*mlist); m!=NULL; m=DLIST_NEXT(MIR_module_t,m)){
+        for(MIR_item_t it=DLIST_HEAD(MIR_item_t,m->items); it!=NULL; it=DLIST_NEXT(MIR_item_t,it)){
+            if(it->item_type!=MIR_forward_item) continue;
+            const char *name=it->u.forward_id;
+            if(name==NULL) continue;
+            int found=0;
+            for(MIR_item_t d=DLIST_HEAD(MIR_item_t,m->items); d!=NULL; d=DLIST_NEXT(MIR_item_t,d)){
+                if(d->item_type==MIR_forward_item||d->item_type==MIR_export_item
+                   ||d->item_type==MIR_import_item||d->item_type==MIR_proto_item) continue;
+                const char *dn=MIR_item_name(mctx,d);
+                if(dn!=NULL && strcmp(dn,name)==0){ found=1; break; }
+            }
+            if(found) continue;
+            int dup=0;
+            for(size_t r=0;r<nreported;r++) if(strcmp(reported[r],name)==0){ dup=1; break; }
+            if(dup) continue;
+            reported=realloc(reported,(nreported+1)*sizeof(char*));
+            reported[nreported++]=(char*)name;
+            const char *src=(m->num_source_files>0 && m->source_files!=NULL) ? m->source_files[0] : NULL;
+            if(src)
+                fprintf(stderr,"[jitrunner] unresolved symbol: %s (forward-declared in module '%s' but defined in no loaded .bmir)\n",name,src);
+            else
+                fprintf(stderr,"[jitrunner] unresolved symbol: %s (forward-declared but defined in no loaded .bmir)\n",name);
+            bad++;
+        }
+    }
+    free(reported);
+    return bad;
+}
 void *jit_get_func_addr(void *item){ if(!item) return NULL; return ((MIR_item_t)item)->addr; }
 size_t jit_func_code_len(void *item){ if(!item) return 0; MIR_item_t it=(MIR_item_t)item; if(it->item_type!=MIR_func_item) return 0; return it->u.func->machine_code_len; }
 void *jit_gen_func(void *ctx,void *item){ if(!ctx||!item) return NULL; return MIR_gen((MIR_context_t)ctx,(MIR_item_t)item); }
