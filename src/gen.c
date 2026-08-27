@@ -2899,6 +2899,58 @@ static void gen_oob_check (c2m_ctx_t c2m_ctx, op_t idx_op, MIR_op_t len_op, long
    `a[i]` in `&a[i].f`) keep the strict bound. */
 static int gen_ind_one_past_p;
 
+/* Peel a chain of ± integer constants off a signed index so the remainder
+   can be sign-extended first and the constant applied as an I64 add/sub.
+   SSA combine then folds that into the mem displacement (`a[i-1]` →
+   `-4(%base,%i,4)`).  Unsigned is left alone: zext(i-1) != zext(i)-1 at i==0.
+   Relies on C signed overflow being UB (in-bounds array indices). */
+static node_t peel_signed_index_const (node_t idx, mir_llong *delta) {
+  *delta = 0;
+  for (;;) {
+    node_t a, b, next;
+    struct expr *ae, *be, *ne;
+    mir_llong c;
+
+    if (idx == NULL) break;
+    if (idx->code == N_CAST) {
+      idx = NL_EL (idx->u.ops, 1);
+      continue;
+    }
+    if (idx->code != N_ADD && idx->code != N_SUB) break;
+    a = NL_HEAD (idx->u.ops);
+    b = NL_EL (idx->u.ops, 1);
+    if (a == NULL || b == NULL || a->attr == NULL || b->attr == NULL) break;
+    ae = (struct expr *) a->attr;
+    be = (struct expr *) b->attr;
+    if (idx->code == N_ADD) {
+      if (be->const_p && integer_type_p (be->type) && signed_integer_type_p (be->type)) {
+        c = be->c.i_val;
+        next = a;
+      } else if (ae->const_p && integer_type_p (ae->type) && signed_integer_type_p (ae->type)) {
+        c = ae->c.i_val;
+        next = b;
+      } else
+        break;
+    } else { /* SUB: only `expr - const`, not `const - expr` */
+      if (be->const_p && integer_type_p (be->type) && signed_integer_type_p (be->type)) {
+        if (be->c.i_val == MIR_LLONG_MIN) break; /* -const would overflow */
+        c = -be->c.i_val;
+        next = a;
+      } else
+        break;
+    }
+    if (next->attr == NULL) break;
+    ne = (struct expr *) next->attr;
+    if (ne->type == NULL || !signed_integer_type_p (ne->type)) break;
+    if ((c > 0 && *delta > (mir_llong) INT32_MAX - c)
+        || (c < 0 && *delta < (mir_llong) INT32_MIN - c))
+      break;
+    *delta += c;
+    idx = next;
+  }
+  return idx;
+}
+
 /* Load an integer member at BASE_PTR+offset and widen it to i64. */
 static op_t gen_load_member_i64 (c2m_ctx_t c2m_ctx, op_t base_ptr, decl_t member) {
   MIR_context_t ctx = c2m_ctx->ctx;
@@ -7229,17 +7281,38 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     }
     t = get_mir_type (c2m_ctx, el_type);
     op1 = val_gen (c2m_ctx, arr);
-    op2 = val_gen (c2m_ctx, NL_EL (r->u.ops, 1));
-    ind_t = get_mir_type (c2m_ctx, ((struct expr *) NL_EL (r->u.ops, 1)->attr)->type);
+    {
+      node_t raw_idx = NL_EL (r->u.ops, 1);
+      struct expr *raw_ie = raw_idx != NULL ? (struct expr *) raw_idx->attr : NULL;
+      mir_llong idx_delta = 0;
+      node_t idx_node = raw_idx;
+
+      /* Signed `a[i ± c]`: extend i first, apply c as I64.  SSA combine
+         folds that into the mem displacement (oggenc dradf4 `cc[t3-1]`). */
+      if (raw_ie != NULL && raw_ie->type != NULL && signed_integer_type_p (raw_ie->type))
+        idx_node = peel_signed_index_const (raw_idx, &idx_delta);
+      op2 = val_gen (c2m_ctx, idx_node);
+      ind_t = get_mir_type (c2m_ctx, ((struct expr *) idx_node->attr)->type);
 #if MIR_PTR32
-    op2 = force_reg (c2m_ctx, op2, ind_t);
-#else
-    if (op2.mir_op.mode != MIR_OP_REG) {
       op2 = force_reg (c2m_ctx, op2, ind_t);
-    } else if (ind_t != MIR_T_I64 && ind_t != MIR_T_U64) {
-      op2 = cast (c2m_ctx, op2, ind_t == MIR_T_I32 ? MIR_T_I64 : MIR_T_U64, FALSE);
-    }
+#else
+      if (op2.mir_op.mode != MIR_OP_REG) {
+        op2 = force_reg (c2m_ctx, op2, ind_t);
+      } else if (ind_t != MIR_T_I64 && ind_t != MIR_T_U64) {
+        op2 = cast (c2m_ctx, op2, ind_t == MIR_T_I32 ? MIR_T_I64 : MIR_T_U64, FALSE);
+      }
 #endif
+      if (idx_delta != 0) {
+        op_t with = get_new_temp (c2m_ctx, MIR_T_I64);
+
+        if (op2.mir_op.mode != MIR_OP_REG) op2 = force_reg (c2m_ctx, op2, MIR_T_I64);
+        if (idx_delta > 0)
+          emit3 (c2m_ctx, MIR_ADD, with.mir_op, op2.mir_op, MIR_new_int_op (ctx, idx_delta));
+        else
+          emit3 (c2m_ctx, MIR_SUB, with.mir_op, op2.mir_op, MIR_new_int_op (ctx, -idx_delta));
+        op2 = with;
+      }
+    }
     /* Static C array bounds guard (exceptions mode only).  Fixed-size arrays
        use the declared length; trailing FAM (`T a[1]`/`a[0]`/`a[]`) uses a
        sibling capacity if we named one, never the placeholder 1. */
