@@ -19,7 +19,9 @@
 # Options:
 #     -o FILE        name of the output executable (default: a.out)
 #     -I DIR / -IDIR, -D..., -U..., -include F, -std=..., -O..., -w, -pedantic
-#                    passed through to classyc (the C front end)
+#                    passed through to classyc (the C front end).
+#                    -O / -O0..-O3 is also passed to b2obj / b2objmac
+#                    (default -O3, matching the old hardcoded AOT gen level).
 #     -F DIR / -FDIR, -framework NAME
 #                    clang-style frameworks: classyc (headers + JIT) and the linker
 #     -L..., -l...   passed through to gcc (the linker)
@@ -99,6 +101,9 @@ verbose=0
 debug=0            # -g: build a debug (DWARF) binary
 with_mir=0         # link the MIR core (mir.o + mir-gen.o)
 chanfibers=0       # -ffibers: compile mir-aot-runtime.c with -DCHANFIBERS
+# MIR codegen level for b2obj / b2objmac.  classyc already sees -On via
+# c2m_flags; this used to be hardcoded -O3 on the b2obj line.
+b2obj_opt="-O3"
 
 # Initialize all arrays properly (critical with `set -u`)
 c2m_flags=()
@@ -140,6 +145,16 @@ while [ $# -gt 0 ]; do
     -F*)
       c2m_flags+=("$arg")
       ld_flags_v+=("$arg") ;;
+    -O|-O[0-3])
+      c2m_flags+=("$arg")
+      # b2obj / b2objmac accept only -O0..-O3 as a leading flag.
+      # classyc treats a bare -O as -O2.
+      if [ "$arg" = "-O" ]; then
+        b2obj_opt="-O2"
+      else
+        b2obj_opt="$arg"
+      fi
+      ;;
     -I*|-D*|-U*|-std=*|-O*|-w|-pedantic|-fsigned-char|-fno-*)
       c2m_flags+=("$arg") ;;
     # -ffibers: opt-in go/await syntax for classyc, and pull the fiber/channel
@@ -250,10 +265,10 @@ for src in "${sources[@]}"; do
 	  compile_cmd+=(-c -o "$bmir" "$src")
 	  run "${compile_cmd[@]}"
 
-      run "$B2OBJ" "-O3" "$bmir" "$obj"
+      run "$B2OBJ" "$b2obj_opt" "$bmir" "$obj"
       ;;
     *.bmir)
-      run "$B2OBJ" "-O3" "$src" "$obj"
+      run "$B2OBJ" "$b2obj_opt" "$src" "$obj"
       ;;
   esac
   objects+=("$obj")

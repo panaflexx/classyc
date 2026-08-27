@@ -54,6 +54,11 @@ DEF_HTAB (MIR_item_t);
 struct gen_ctx {
   op_t zero_op, one_op, minus_one_op;
   MIR_item_t curr_func;
+  /* Entry ALLOCA of the current function plus the frame displacement of an
+     8-byte scratch slot reserved past the regular frame (bit-punning for the
+     fabs/fabsf lowering).  -1/NULL when not reserved yet. */
+  MIR_insn_t frame_alloca_insn;
+  long frame_scratch_disp;
   DLIST (MIR_insn_t) slow_code_part;
   HTAB (reg_var_t) * reg_var_tab;
   int reg_free_mark;
@@ -226,6 +231,8 @@ struct gen_ctx {
 #define one_op gen_ctx->one_op
 #define minus_one_op gen_ctx->minus_one_op
 #define curr_func gen_ctx->curr_func
+#define frame_alloca_insn gen_ctx->frame_alloca_insn
+#define frame_scratch_disp gen_ctx->frame_scratch_disp
 #define slow_code_part gen_ctx->slow_code_part
 #define reg_var_tab gen_ctx->reg_var_tab
 #define reg_free_mark gen_ctx->reg_free_mark
@@ -766,6 +773,27 @@ static MIR_alias_t get_type_alias (c2m_ctx_t c2m_ctx, struct type *type) {
 
 static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_t false_label,
                  int val_p, op_t *desirable_dest, int *expect_res);
+
+/* Reserve (once per function) an 8-byte scratch slot at the end of the frame,
+   used to bit-pun FP values (fabs/fabsf lowering).  Returns the FP
+   displacement of the slot.  The entry ALLOCA is created if the function had
+   no frame at all. */
+static mir_size_t gen_frame_scratch8 (c2m_ctx_t c2m_ctx) {
+  gen_ctx_t gen_ctx = c2m_ctx->gen_ctx;
+  MIR_context_t ctx = c2m_ctx->ctx;
+
+  if (frame_scratch_disp >= 0) return (mir_size_t) frame_scratch_disp;
+  if (frame_alloca_insn == NULL) { /* leaf function without a frame yet */
+    MIR_reg_t fp_reg = MIR_new_func_reg (ctx, curr_func->u.func, MIR_T_I64, FP_NAME);
+
+    frame_alloca_insn = MIR_new_insn (ctx, MIR_ALLOCA, MIR_new_reg_op (ctx, fp_reg),
+                                      MIR_new_int_op (ctx, 0));
+    MIR_prepend_insn (ctx, curr_func, frame_alloca_insn);
+  }
+  frame_scratch_disp = frame_alloca_insn->ops[1].u.i;
+  frame_alloca_insn->ops[1].u.i += 8;
+  return (mir_size_t) frame_scratch_disp;
+}
 #if !MIR_NO_DBINFO
 static void dbinfo_emit_func_vars (c2m_ctx_t c2m_ctx, node_t func_def_node);
 #endif
@@ -8060,6 +8088,59 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
       }
       break;
     }
+    /* Inline fabs/fabsf as a sign-bit clear through an 8/4-byte frame slot.
+       A libm call costs ~20 insns through the PLT and, worse, clobbers all
+       caller-saved regs, forcing RA spill/restore around every call site in
+       hot loops (oggenc bark_noise_hybridmp).  The pun is ~6 insns and looks
+       like plain memory traffic to the RA.  Only when the name resolves to an
+       extern function *declaration*: a user-defined fabs (N_FUNC_DEF), a
+       shadowing variable, or a function pointer keeps the call. */
+    if (func->code == N_ID && !call_expr->builtin_call_p && type != NULL
+        && (strcmp (func->u.s.s, "fabs") == 0 || strcmp (func->u.s.s, "fabsf") == 0)) {
+      struct expr *fexpr = func->attr;
+      int dbl_p = func->u.s.s[4] == '\0';
+      node_t arg = args != NULL ? NL_HEAD (args->u.ops) : NULL;
+      struct type *at = arg != NULL ? ((struct expr *) arg->attr)->type : NULL;
+      int want_bt = dbl_p ? TP_DOUBLE : TP_FLOAT;
+
+      if (fexpr != NULL && fexpr->def_node != NULL && fexpr->def_node->code == N_SPEC_DECL
+          && ((decl_t) fexpr->def_node->attr)->decl_spec.type != NULL
+          && ((decl_t) fexpr->def_node->attr)->decl_spec.type->mode == TM_FUNC
+          && type->mode == TM_BASIC && type->u.basic_type == want_bt && arg != NULL
+          && NL_NEXT (arg) == NULL && at != NULL && scalar_type_p (at)) {
+        MIR_type_t ft = dbl_p ? MIR_T_D : MIR_T_F;
+        mir_size_t disp = gen_frame_scratch8 (c2m_ctx);
+        op_t v, addr, i;
+        MIR_op_t fmem, imem;
+
+        v = gen (c2m_ctx, arg, NULL, NULL, TRUE, NULL, NULL);
+        v = promote (c2m_ctx, v, ft, FALSE);
+        if (v.mir_op.mode != MIR_OP_REG) { /* force_reg only handles int/ref ops */
+          op_t vr = get_new_temp (c2m_ctx, ft);
+          emit2 (c2m_ctx, dbl_p ? MIR_DMOV : MIR_FMOV, vr.mir_op, v.mir_op);
+          v = vr;
+        }
+        addr = get_new_temp (c2m_ctx, MIR_T_I64);
+        emit3 (c2m_ctx, MIR_ADD, addr.mir_op,
+               MIR_new_reg_op (ctx, MIR_reg (ctx, FP_NAME, curr_func->u.func)),
+               MIR_new_int_op (ctx, (long long) disp));
+        fmem = MIR_new_mem_op (ctx, ft, 0, addr.mir_op.u.reg, 0, 1);
+        imem = MIR_new_mem_op (ctx, dbl_p ? MIR_T_I64 : MIR_T_I32, 0, addr.mir_op.u.reg, 0, 1);
+        emit2 (c2m_ctx, dbl_p ? MIR_DMOV : MIR_FMOV, fmem, v.mir_op);
+        i = get_new_temp (c2m_ctx, MIR_T_I64);
+        emit2 (c2m_ctx, MIR_MOV, i.mir_op, imem);
+        if (dbl_p) { /* 0x7fff… does not fit an imm32: shift the sign bit out */
+          emit3 (c2m_ctx, MIR_LSH, i.mir_op, i.mir_op, MIR_new_int_op (ctx, 1));
+          emit3 (c2m_ctx, MIR_URSH, i.mir_op, i.mir_op, MIR_new_int_op (ctx, 1));
+        } else {
+          emit3 (c2m_ctx, MIR_ANDS, i.mir_op, i.mir_op, MIR_new_int_op (ctx, 0x7fffffff));
+        }
+        emit2 (c2m_ctx, MIR_MOV, imem, i.mir_op);
+        res = get_new_temp (c2m_ctx, ft);
+        emit2 (c2m_ctx, dbl_p ? MIR_DMOV : MIR_FMOV, res.mir_op, fmem);
+        break;
+      }
+    }
     if (add_overflow_p || sub_overflow_p || mul_overflow_p) {
       op1 = val_gen (c2m_ctx, NL_HEAD (args->u.ops));
       op2 = val_gen (c2m_ctx, NL_EL (args->u.ops, 1));
@@ -9404,6 +9485,8 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     stmtexpr_last_expr = NULL;
     curr_func_def = r;
     curr_call_arg_area_offset = 0;
+    frame_alloca_insn = NULL;
+    frame_scratch_disp = -1;
     collect_args_and_func_types (c2m_ctx, decl_type->u.func_type, NULL);
 
     /* Mangled MIR name for this function/method; uses the same encoding as
@@ -9431,9 +9514,9 @@ static op_t gen (c2m_ctx_t c2m_ctx, node_t r, MIR_label_t true_label, MIR_label_
     if (ns->stack_var_p /* we can have empty struct only with size 0 and still need a frame: */
         || ns->size > 0) {
       fp_reg = MIR_new_func_reg (ctx, curr_func->u.func, MIR_T_I64, FP_NAME);
-      MIR_append_insn (ctx, curr_func,
-                       MIR_new_insn (ctx, MIR_ALLOCA, MIR_new_reg_op (ctx, fp_reg),
-                                     MIR_new_int_op (ctx, ns->size)));
+      frame_alloca_insn = MIR_new_insn (ctx, MIR_ALLOCA, MIR_new_reg_op (ctx, fp_reg),
+                                        MIR_new_int_op (ctx, ns->size));
+      MIR_append_insn (ctx, curr_func, frame_alloca_insn);
     }
     for (size_t i = 0; i < VARR_LENGTH (MIR_var_t, proto_info.arg_vars); i++)
       get_reg_var (c2m_ctx, MIR_T_UNDEF, VARR_GET (MIR_var_t, proto_info.arg_vars, i).name, NULL);
